@@ -28,6 +28,58 @@ Depending on what the agent is doing, the conversation can display:
 `/profile` selects an agent profile and clears those overrides.
 Session details and `/info` show the selected values separately from the last model call.
 
+Thinking selections have distinct meanings:
+
+| Command | Meaning |
+|---|---|
+| `/thinking clear` | Remove the session override and inherit the profile or agent configuration |
+| `/thinking reset` or `/thinking inherit` | Same as `clear` |
+| `/thinking default` | Use the provider/model default, without an inherited effort hint |
+| `/thinking none` or `/thinking off` | Disable thinking, if the model supports it |
+| `/thinking high` | Use the selected supported effort |
+
+`off` now means disabled thinking, not inheritance. Use `clear` for inheritance.
+For adaptive Claude models, provider default sends adaptive thinking without an effort hint.
+Models with mandatory thinking do not offer `none`.
+`/thinking` shows the session selection separately from the effective effort and its source.
+If model metadata is unavailable, explicit effort changes fail without changing the saved selection.
+Clearing an override does not require model metadata.
+
+Agent and profile forms use the same states: **Inherit**, **Provider default**,
+**Disabled**, and the supported effort levels. Profile inheritance uses the agent configuration.
+Provider default stops effort inheritance even if a lower layer specifies `low`.
+
+Fast mode also distinguishes **Inherit**, **Enabled**, and **Disabled**.
+`/fast clear` removes the session override. `default`, `reset`, and `inherit` are aliases for `clear`.
+`/fast off` suppresses inherited acceleration parameters; it does not enable inheritance.
+The command resolves the next request's provider and model, not the last completed request.
+Disabled and Inherit remain available if capability discovery fails.
+
+Fast mode support depends on the provider transport as well as the model.
+Native Claude API fast mode currently supports Opus 5 and Opus 4.8.
+It uses `speed: "fast"` and the fast-mode beta header.
+Codex uses the accelerated service tier from its registry.
+Model support does not confirm account eligibility. Premium pricing can apply.
+Claude rate-limit or eligibility errors remain errors; Cognis does not silently downgrade Claude fast requests.
+Existing Codex tier-rejection recovery can retry at normal priority.
+The selected fast-mode setting describes a request, not proof of accelerated execution.
+Anthropic's response `usage.speed` reports the actual speed (`fast` or `standard`) independently.
+
+### Provider model registry drift
+
+In Settings → Providers, select **Discover** to compare configured models with a fresh registry snapshot.
+Discovery can use a bundled catalog or supply partial metadata. It does not change saved configuration.
+If connection fields have changed, save or discard those changes before discovery.
+Changing the connection invalidates the comparison.
+
+Each model shows differing supplied fields, with configured and registry values.
+Expand **Registry drift** to reset one field or all discovered fields for that model.
+The model editor provides the same comparison.
+These actions change only the draft. Save the provider to apply the changes, or discard the draft.
+Fields absent from discovery remain unchanged.
+A model absent from discovery is not automatically obsolete and is never automatically removed.
+Differences can be intentional administrator overrides, including explicit disabled capabilities.
+
 Cognis stores these selections in its database. They survive controller restarts
 and compaction. A session reset or renewal clears the overrides.
 

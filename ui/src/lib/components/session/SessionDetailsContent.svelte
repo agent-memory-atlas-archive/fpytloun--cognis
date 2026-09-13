@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
+  import { thinkingEffortLabel } from '$lib/thinking';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { CodexUsage, CodexUsageWindow, ContextUsage, GenerationPerformanceSnapshot, RuntimeSelection, TokenUsage } from '$lib/types/api';
+  import type { CodexUsageWindow, ContextUsage, GenerationPerformanceSnapshot, ProviderUsage, RuntimeSelection, TokenUsage } from '$lib/types/api';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import Star from 'lucide-svelte/icons/star';
 
@@ -61,18 +62,34 @@
     onRestore?: (() => void | Promise<void>) | undefined;
     onDelete?: (() => void | Promise<void>) | undefined;
   }>();
-  let codexUsage = $state<CodexUsage | null>(null);
-  let codexUsageError = $state<string | null>(null);
+  let providerUsage = $state<ProviderUsage | null>(null);
+  let providerUsageError = $state<string | null>(null);
 
   onMount(async () => {
     const providerId = contextUsage?.provider_id;
-    if (providerId !== 'codex') return;
+    if (!providerId) return;
     try {
-      codexUsage = await api.llmProviders.codexUsage(providerId);
+      // Every provider is asked; those without hosted usage reporting answer
+      // ok=false and the panel falls back to request performance.
+      const usage = await api.llmProviders.providerUsage(providerId);
+      if (usage?.ok) providerUsage = usage;
     } catch (error) {
-      codexUsageError = error instanceof Error ? error.message : 'Subscription limits unavailable.';
+      providerUsageError = error instanceof Error ? error.message : 'Usage limits unavailable.';
     }
   });
+
+  function providerUsageTitle(usage: ProviderUsage): string {
+    switch (usage.source) {
+      case 'anthropic_subscription_usage':
+        return 'Claude subscription limits';
+      case 'anthropic_rate_limit_headers':
+        return 'Anthropic API rate limits';
+      case 'chatgpt_codex_usage':
+        return 'Codex subscription limits';
+      default:
+        return 'Provider usage limits';
+    }
+  }
 
   function fmt(value: number | null | undefined): string {
     return typeof value === 'number' ? value.toLocaleString() : 'Unknown';
@@ -97,6 +114,7 @@
 
   function codexLimitLabel(window: CodexUsageWindow, position: string): string {
     const minutes = window.window_duration_mins ?? 0;
+    if (minutes === 300) return '5-hour rolling limit';
     if (minutes >= 7 * 24 * 60) return 'Weekly rolling limit';
     if (minutes >= 24 * 60) return 'Long-term rolling limit';
     return position === 'primary' ? 'Short-term rolling limit' : 'Secondary rolling limit';
@@ -106,7 +124,7 @@
     return window.resets_at ? `Resets ${new Date(window.resets_at).toLocaleString()}` : 'Reset time unavailable';
   }
 
-  function codexUsageWindows(usage: CodexUsage): Array<[string, CodexUsageWindow | null]> {
+  function codexUsageWindows(usage: ProviderUsage): Array<[string, CodexUsageWindow | null]> {
     return [['primary', usage.primary], ['secondary', usage.secondary]];
   }
 
@@ -208,7 +226,7 @@
       <dl class="mt-2 grid gap-2 text-xs sm:grid-cols-3">
         <div><dt class="text-slate-500">Profile</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.profile_id}</dd></div>
         <div><dt class="text-slate-500">Model</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.provider_id ? `${detail.runtime_selection.provider_id}/` : ''}{detail.runtime_selection.model ?? 'Provider default'}</dd></div>
-        <div><dt class="text-slate-500">Thinking</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.reasoning_effort ?? 'Default'}</dd></div>
+        <div><dt class="text-slate-500">Thinking</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.reasoning_effort === null ? 'Inherit routing/provider configuration' : thinkingEffortLabel(detail.runtime_selection.reasoning_effort)}</dd><dd class="text-slate-500">Source: {detail.runtime_selection.reasoning_effort_source.replaceAll('_', ' ')}</dd></div>
       </dl>
     </section>
   {/if}
@@ -264,6 +282,7 @@
     {/if}
 
     {#if tokenUsage}
+      {@const cacheReadTokens = tokenUsage.cache_read_input_tokens ?? tokenUsage.cached_tokens}
       <div class="mt-3 border-t border-slate-800 pt-3" data-testid="session-token-usage">
         <div class="mb-2 flex items-center justify-between gap-3 text-xs">
           <p class="font-semibold uppercase tracking-widest text-slate-500">Last call usage</p>
@@ -276,14 +295,14 @@
             {/if}
           {/each}
         </div>
-        <div class="mt-1.5 flex gap-4 text-xs">
-          <span class="text-sky-300">Input {fmt(tokenUsage.prompt_tokens)}</span>
-          <span class="text-violet-300">Output {fmt(tokenUsage.completion_tokens)}</span>
-          {#if tokenUsage.cache_read_input_tokens}
-            <span class="text-emerald-300">Cache read {fmt(tokenUsage.cache_read_input_tokens)}</span>
+        <div class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-xs" data-testid="session-token-usage-stats">
+          <span class="whitespace-nowrap text-sky-300">Input {fmt(tokenUsage.prompt_tokens)}</span>
+          <span class="whitespace-nowrap text-violet-300">Output {fmt(tokenUsage.completion_tokens)}</span>
+          {#if cacheReadTokens}
+            <span class="whitespace-nowrap text-emerald-300">Cache read {fmt(cacheReadTokens)}</span>
           {/if}
           {#if tokenUsage.cache_write_tokens ?? tokenUsage.cache_creation_input_tokens}
-            <span class="text-amber-300">Cache write {fmt(tokenUsage.cache_write_tokens ?? tokenUsage.cache_creation_input_tokens)}</span>
+            <span class="whitespace-nowrap text-amber-300">Cache write {fmt(tokenUsage.cache_write_tokens ?? tokenUsage.cache_creation_input_tokens)}</span>
           {/if}
         </div>
       </div>
@@ -291,11 +310,16 @@
   </section>
 
   <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
-    {#if contextUsage?.provider_id === 'codex'}
-      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Codex subscription limits</p>
-      {#if codexUsage}
-        <p class="mt-2 text-xs text-slate-400">Plan <span class="text-slate-200">{codexUsage.plan_type ?? 'unknown'}</span>{codexUsage.fetched_at ? ` · fetched ${new Date(codexUsage.fetched_at).toLocaleString()}` : ''}</p>
-        <div class="mt-3 space-y-3" data-testid="session-codex-subscription-limits">
+    {#if providerUsage}
+      {@const codexUsage = providerUsage}
+      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{providerUsageTitle(codexUsage)}</p>
+      {#if codexUsage.limit_reached}
+        <p class="mt-2 text-xs text-rose-200">Limit reached{codexUsage.rate_limit_reached_type ? ` (${codexUsage.rate_limit_reached_type})` : ''}</p>
+      {/if}
+      {#if codexUsage.plan_type || codexUsage.fetched_at}
+        <p class="mt-2 text-xs text-slate-400">{codexUsage.plan_type ? `Plan ${codexUsage.plan_type}` : 'Usage'}{codexUsage.fetched_at ? ` · fetched ${new Date(codexUsage.fetched_at).toLocaleString()}` : ''}</p>
+      {/if}
+      <div class="mt-3 space-y-3" data-testid="session-provider-usage-limits">
           {#each codexUsageWindows(codexUsage) as [position, window]}
             {#if window}
               <div>
@@ -315,7 +339,7 @@
               <div>
                 <div class="mb-1.5 flex items-center justify-between gap-3 text-xs">
                   <span class="text-slate-300">{limit.limit_name ?? limit.limit_id ?? 'Additional feature limit'}</span>
-                  <span class="text-slate-200">{Math.round(limit.primary.used_percent)}% used</span>
+                  <span class="text-slate-200">{Math.round(limit.primary.used_percent)}% used{typeof limit.primary.remaining === 'number' && typeof limit.primary.limit === 'number' ? ` · ${fmt(limit.primary.remaining)} / ${fmt(limit.primary.limit)} left` : ''}</span>
                 </div>
                 <div class="h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${limit.limit_name ?? limit.limit_id ?? 'Additional'} subscription limit`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={limit.primary.used_percent}>
                   <div class={`h-full rounded-full ${contextBarColor(limit.primary.used_percent)}`} style={`width: ${clampPercent(limit.primary.used_percent)}%`}></div>
@@ -325,10 +349,8 @@
             {/if}
           {/each}
         </div>
-      {:else if codexUsageError}
-        <p class="mt-2 text-xs text-slate-500">Subscription limits unavailable: {codexUsageError}</p>
-      {:else}
-        <p class="mt-2 text-xs text-slate-500">Loading authenticated subscription limits…</p>
+      {#if providerUsage.usage_url}
+        <a class="mt-2 inline-block text-xs text-sky-300 underline" href={providerUsage.usage_url} target="_blank" rel="noreferrer">Open provider usage dashboard</a>
       {/if}
     {:else if performance}
       <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{performance.is_local ? 'Runtime and performance' : 'Request performance'}</p>
@@ -340,6 +362,9 @@
     {:else}
       <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Provider usage</p>
       <p class="mt-2 text-xs text-slate-500">Usage appears after the provider reports a completed call.</p>
+    {/if}
+    {#if providerUsageError}
+      <p class="mt-2 text-xs text-slate-500" data-testid="session-provider-usage-error">Usage limits unavailable: {providerUsageError}</p>
     {/if}
   </section>
   </div>
@@ -371,6 +396,17 @@
           <div><dt class="text-slate-500">Last agent profile</dt><dd class="mt-0.5 text-slate-200">{contextUsage?.agent_profile_id ?? 'Default'}</dd></div>
           <div><dt class="text-slate-500">Projection budget</dt><dd class="mt-0.5 text-slate-200">{fmt(contextUsage?.available_prompt_tokens ?? contextUsage?.effective_prompt_budget)} tokens</dd></div>
           <div><dt class="text-slate-500">Provider</dt><dd class="mt-0.5 text-slate-200">{contextUsage?.provider_id ?? 'default'}</dd></div>
+          {#if contextUsage?.raw_prompt_tokens != null}
+            <div><dt class="text-slate-500">Raw prompt estimate</dt><dd class="mt-0.5 text-slate-200">{fmt(contextUsage.raw_prompt_tokens)} tokens</dd></div>
+          {/if}
+          {#if contextUsage?.prompt_token_calibration}
+            <div><dt class="text-slate-500">Session calibration</dt><dd class="mt-0.5 text-slate-200">×{contextUsage.prompt_token_calibration.applied_ratio.toFixed(3)} from {contextUsage.prompt_token_calibration.source_request_id}</dd></div>
+          {:else}
+            <div><dt class="text-slate-500">Session calibration</dt><dd class="mt-0.5 text-slate-200">No compatible calibration applied</dd></div>
+          {/if}
+          {#if contextUsage?.estimator_identity}
+            <div><dt class="text-slate-500">Estimator</dt><dd class="mt-0.5 break-all text-slate-200">{contextUsage.estimator_identity}</dd></div>
+          {/if}
         </dl>
       </div>
     </details>

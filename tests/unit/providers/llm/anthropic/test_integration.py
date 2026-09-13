@@ -87,6 +87,24 @@ def test_official_api_key_provider_auto_uses_native_messages() -> None:
     assert "anthropic-beta" not in headers
 
 
+def test_native_fast_mode_survives_controller_and_executor_request_preparation() -> None:
+    from cognis.providers.llm.fast_mode import enrich_fast_mode, prepare_fast_mode
+
+    info = ModelInfo.model_validate(enrich_fast_mode({"model_id": "claude-opus-5"}, "anthropic"))
+    kwargs = prepare_fast_mode({"fast_mode": True}, info)
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model=info.model_id,
+        model_info=info,
+        messages=[{"role": "user", "content": "hello"}],
+        request_kwargs=kwargs,
+        credential_ref="$credential:test",
+    )
+    assert payload["speed"] == "fast"
+    assert "fast-mode-2026-02-01" in payload["extra_headers"]["anthropic-beta"]
+    assert "service_tier" not in payload
+
+
 def test_native_request_preserves_adaptive_thinking_and_output_effort() -> None:
     _context, payload, _bundle = build_native_request(
         provider=_provider(),
@@ -915,7 +933,7 @@ def test_pause_turn_replays_server_search_envelope_without_tool_results() -> Non
     ]
 
 
-def test_end_turn_with_developer_only_follow_up_appends_user_tail() -> None:
+def test_end_turn_with_developer_only_follow_up_becomes_positional_user_notice() -> None:
     context, bundle = build_native_chain(
         provider=_provider(),
         model="claude-sonnet-5",
@@ -971,11 +989,14 @@ def test_end_turn_with_developer_only_follow_up_appends_user_tail() -> None:
         "user",
     ]
     assert payload["messages"][1]["content"] == envelope.to_dict()["native_blocks"]
-    assert payload["messages"][2] == {
-        "role": "user",
-        "content": [{"type": "text", "text": "Continue."}],
-    }
-    assert payload["system"][-1]["text"] == ("A tool reminder requires another controller cycle.")
+    tail_block = payload["messages"][2]["content"][0]
+    assert tail_block["type"] == "text"
+    assert tail_block["text"].startswith('<system-notice canonical-role="developer"')
+    assert "A tool reminder requires another controller cycle." in tail_block["text"]
+    assert all(
+        "A tool reminder requires another controller cycle." not in block["text"]
+        for block in payload["system"]
+    )
 
 
 def test_native_search_reference_outside_frozen_bundle_fails_closed() -> None:
@@ -1041,3 +1062,163 @@ def test_native_search_reference_outside_frozen_bundle_fails_closed() -> None:
             },
             credential_ref="$credential:test",
         )
+
+
+def _cache_control(ttl: str = "5m") -> dict[str, str]:
+    return {"type": "ephemeral", "ttl": ttl}
+
+
+def test_native_request_keeps_cache_breakpoints_on_tool_results_and_tool_only_turns() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "t",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-opus-5",
+        model_info=ModelInfo(model_id="claude-opus-5"),
+        messages=[
+            {"role": "system", "content": "prefix"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+                ],
+                "_cache_control": _cache_control(),
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": [{"type": "text", "text": "result", "cache_control": _cache_control()}],
+            },
+        ],
+        request_kwargs={"tools": tools},
+        credential_ref="$credential:test",
+    )
+
+    assistant_blocks = payload["messages"][1]["content"]
+    assert assistant_blocks[-1]["type"] == "tool_use"
+    assert assistant_blocks[-1]["cache_control"] == _cache_control()
+    result_blocks = payload["messages"][2]["content"]
+    assert result_blocks[0]["type"] == "tool_result"
+    assert result_blocks[0]["cache_control"] == _cache_control()
+
+
+def test_native_replay_keeps_cache_breakpoint_on_last_non_thinking_block() -> None:
+    context, bundle = build_native_chain(
+        provider=_provider(),
+        model="claude-opus-5",
+        model_info=ModelInfo(model_id="claude-opus-5"),
+        exposed_tools=[],
+        alias_map={},
+        stable_id_map={},
+        argument_alias_map={},
+        thinking={"type": "adaptive"},
+        credential_ref="$credential:test",
+    )
+    envelope = AnthropicNativeEnvelope(
+        native_blocks=(
+            {"type": "text", "text": "done"},
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+        ),
+        stop_reason="end_turn",
+        stop_details={},
+        usage={},
+        pending_client_message_id=None,
+        pending_server_message_id="msg_1",
+        bundle_fingerprint=bundle.fingerprint,
+        provider_fingerprint=context.chain_id,
+        model_fingerprint=context.model,
+        thinking_fingerprint=context.thinking_fingerprint,
+    )
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-opus-5",
+        model_info=ModelInfo(model_id="claude-opus-5"),
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done", "cache_control": _cache_control()}],
+                "_anthropic_native_envelope": envelope.to_dict(),
+            },
+            {"role": "user", "content": "next"},
+        ],
+        request_kwargs={
+            NATIVE_REQUEST_CONTEXT_KWARG: context.to_dict(),
+            NATIVE_TOOL_BUNDLE_KWARG: bundle.to_dict(),
+            "thinking": {"type": "adaptive"},
+        },
+        credential_ref="$credential:test",
+    )
+
+    blocks = payload["messages"][1]["content"]
+    assert blocks[0] == {"type": "text", "text": "done", "cache_control": _cache_control()}
+    assert "cache_control" not in blocks[1]
+
+
+def test_non_leading_system_messages_stay_in_transcript_position() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "t",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-opus-5",
+        model_info=ModelInfo(model_id="claude-opus-5"),
+        messages=[
+            {"role": "system", "content": "leading prefix"},
+            {"role": "developer", "content": "leading operator note"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+                ],
+            },
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "late notice", "cache_control": _cache_control()}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+            {
+                "role": "system",
+                "content": '<system-notice hidden="true">\nwrapped\n</system-notice>',
+            },
+        ],
+        request_kwargs={"tools": tools},
+        credential_ref="$credential:test",
+    )
+
+    assert [block["text"] for block in payload["system"]] == [
+        "leading prefix",
+        "leading operator note",
+    ]
+    assert [message["role"] for message in payload["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    tail = payload["messages"][2]["content"]
+    assert tail[0]["type"] == "tool_result"
+    assert tail[1]["type"] == "text"
+    assert tail[1]["text"] == (
+        '<system-notice canonical-role="system" hidden="true">\nlate notice\n</system-notice>'
+    )
+    assert tail[1]["cache_control"] == _cache_control()
+    assert tail[2]["text"] == '<system-notice hidden="true">\nwrapped\n</system-notice>'

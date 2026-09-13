@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -70,6 +70,193 @@ TERMINAL_STATUSES = frozenset(
 )
 NONTERMINAL_STATUSES = CLAIMABLE_STATUSES | ACTIVE_STATUSES
 OPERATOR_RECOVERY_LEASE_SECONDS = 30
+
+TOOL_IN_FLIGHT_PHASE = "tool_in_flight"
+TOOL_RESULT_PERSISTED_PHASE = "tool_result_persisted"
+# One direct turn can execute tool batches from several Intaris sessions at
+# once, because delegate children share the parent turn's execution fence. The
+# group count is therefore bounded by the sessions holding a live batch, and
+# each group is removed as its batch settles. Never bound the recorded groups or
+# their descriptors while reading or writing: a dropped entry is a dispatched
+# call that restart recovery can no longer settle, and silent truncation hides
+# it. Tool recovery enforces this bound instead, and reports an over-long
+# descriptor set as ambiguous rather than discarding the excess.
+TOOL_DISPATCH_DESCRIPTOR_LIMIT = 500
+
+
+@dataclass(frozen=True)
+class ToolDispatchGroup:
+    """One session's in-flight tool batch under a shared direct-turn fence.
+
+    ``session_id`` and ``turn_id`` identify the canonical history that owns the
+    descriptors. They are not interchangeable with the direct-turn row's own
+    ``session_id``/``turn_id``: a delegate child runs its tools under the
+    parent's fence but records them in its own session and turn.
+    """
+
+    session_id: str
+    turn_id: str
+    tool_calls: tuple[dict[str, Any], ...]
+
+    def as_json(self) -> dict[str, Any]:
+        """Return the persisted JSON form of this group."""
+        return {
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "tool_calls": [dict(descriptor) for descriptor in self.tool_calls],
+        }
+
+
+class ToolDispatchMergeStatus(StrEnum):
+    """Why a dispatch binding did or did not reach the durable record."""
+
+    MERGED = "merged"
+    FENCE_LOST = "fence_lost"
+    CANCELLED = "cancelled"
+    UNKNOWN_CALL = "unknown_call"
+
+
+@dataclass(frozen=True)
+class ToolDispatchMergeResult:
+    """Outcome of merging one physical dispatch binding."""
+
+    status: ToolDispatchMergeStatus
+    row: DirectTurnRequestRow | None = None
+
+    @property
+    def fence_held(self) -> bool:
+        """Return whether the caller still owns the direct-turn fence."""
+        return self.status in {
+            ToolDispatchMergeStatus.MERGED,
+            ToolDispatchMergeStatus.UNKNOWN_CALL,
+        }
+
+
+def _coerce_dispatch_group(raw: Any) -> ToolDispatchGroup | None:
+    if not isinstance(raw, dict):
+        return None
+    session_id = raw.get("session_id")
+    turn_id = raw.get("turn_id")
+    descriptors = raw.get("tool_calls")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    if not isinstance(descriptors, list) or not descriptors:
+        return None
+    # Descriptor contents stay verbatim: tool recovery owns their validation and
+    # must still see a malformed or over-long descriptor set instead of a
+    # silently dropped call.
+    return ToolDispatchGroup(
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_calls=tuple(descriptors),
+    )
+
+
+def read_tool_dispatch_groups(
+    outcome: Any,
+    *,
+    fallback_session_id: str | None = None,
+    fallback_turn_id: str | None = None,
+) -> list[ToolDispatchGroup]:
+    """Return every session's in-flight tool batch recorded on one direct turn.
+
+    Rows written before per-session dispatch groups existed carry a single flat
+    ``tool_calls`` list plus the last writer's ``session_id``/``turn_id``. That
+    legacy shape is read here so a controller can still recover turns that were
+    in flight across an upgrade. Remove the fallback once no pre-upgrade row can
+    still be in ``tool_in_flight``.
+    """
+    if not isinstance(outcome, dict):
+        return []
+    raw_groups = outcome.get("tool_dispatch_groups")
+    if isinstance(raw_groups, list):
+        groups: list[ToolDispatchGroup] = []
+        for raw in raw_groups:
+            group = _coerce_dispatch_group(raw)
+            if group is not None:
+                groups.append(group)
+        return groups
+    legacy_descriptors = outcome.get("tool_calls")
+    if not isinstance(legacy_descriptors, list) or not legacy_descriptors:
+        return []
+    legacy_session_id = outcome.get("session_id") or fallback_session_id
+    legacy_turn_id = outcome.get("turn_id") or fallback_turn_id
+    legacy = _coerce_dispatch_group(
+        {
+            "session_id": legacy_session_id,
+            "turn_id": legacy_turn_id,
+            "tool_calls": legacy_descriptors,
+        }
+    )
+    return [legacy] if legacy is not None else []
+
+
+def unreadable_tool_dispatch_groups(outcome: Any) -> list[Any]:
+    """Return recorded group entries that cannot be read back as a group.
+
+    An entry lands here when it carries no usable session or turn identity, for
+    example a batch dispatched by a caller whose turn could not be resolved.
+    Such an entry still represents dispatched calls, so live writers must carry
+    it forward verbatim and let tool recovery report it.
+    """
+    if not isinstance(outcome, dict):
+        return []
+    raw_groups = outcome.get("tool_dispatch_groups")
+    if not isinstance(raw_groups, list):
+        return []
+    return [raw for raw in raw_groups if _coerce_dispatch_group(raw) is None]
+
+
+def write_tool_dispatch_groups(
+    outcome: dict[str, Any],
+    groups: list[ToolDispatchGroup],
+    *,
+    preserved: Sequence[Any] = (),
+) -> dict[str, Any]:
+    """Return ``outcome`` carrying ``groups`` plus ``preserved`` raw entries.
+
+    ``preserved`` holds entries that could not be read back as groups. Dropping
+    them here would erase dispatched calls from the durable record before tool
+    recovery ever inspects it, so every live writer carries them forward.
+
+    The flat legacy ``tool_calls`` slot is always dropped. Mirroring groups back
+    into it would let an older controller attribute a delegate child's calls to
+    the parent session and repair canonical history into the wrong session.
+    """
+    updated = {
+        key: value
+        for key, value in outcome.items()
+        if key not in {"tool_dispatch_groups", "tool_calls"}
+    }
+    recorded = [group.as_json() for group in groups] + list(preserved)
+    if recorded:
+        updated["tool_dispatch_groups"] = recorded
+    return updated
+
+
+def _resolve_dispatch_turn_id(turn_id: str | None, request: DirectTurnRequestRow) -> str:
+    """Return the canonical turn that owns a dispatch group.
+
+    The caller's own turn wins. A caller without one falls back to the direct
+    turn's turn, which matches where its canonical tool history is recorded. An
+    unresolvable turn is recorded as empty so recovery reports missing canonical
+    identity instead of silently dropping the batch.
+    """
+    if isinstance(turn_id, str) and turn_id:
+        return turn_id
+    return request.turn_id if isinstance(request.turn_id, str) and request.turn_id else ""
+
+
+def _replace_dispatch_group(
+    groups: list[ToolDispatchGroup],
+    replacement: ToolDispatchGroup,
+) -> list[ToolDispatchGroup]:
+    key = (replacement.session_id, replacement.turn_id)
+    merged = [group for group in groups if (group.session_id, group.turn_id) != key]
+    merged.append(replacement)
+    return merged
 
 
 def _outcome_datetime(value: Any) -> datetime | None:
@@ -1127,6 +1314,15 @@ class DirectTurnStore:
                                 ),
                                 else_=DirectTurnRequestRow.terminal_at,
                             ),
+                            next_attempt_at=case(
+                                (
+                                    DirectTurnRequestRow.status.in_(
+                                        [status.value for status in CLAIMABLE_STATUSES]
+                                    ),
+                                    None,
+                                ),
+                                else_=DirectTurnRequestRow.next_attempt_at,
+                            ),
                         )
                         .returning(DirectTurnRequestRow)
                         .execution_options(populate_existing=True)
@@ -1177,6 +1373,15 @@ class DirectTurnStore:
                             ),
                             else_=DirectTurnRequestRow.terminal_at,
                         ),
+                        next_attempt_at=case(
+                            (
+                                DirectTurnRequestRow.status.in_(
+                                    [status.value for status in CLAIMABLE_STATUSES]
+                                ),
+                                None,
+                            ),
+                            else_=DirectTurnRequestRow.next_attempt_at,
+                        ),
                         updated_at=now,
                     )
                     .returning(DirectTurnRequestRow)
@@ -1201,6 +1406,49 @@ class DirectTurnStore:
                 ),
             )
 
+    async def expedite_provider_retry(
+        self,
+        conversation_id: str,
+        *,
+        session_id: str,
+        previous_runtime_revision: int,
+    ) -> DirectTurnRequestRow | None:
+        """Make a provider-specific retry due after its runtime target changes."""
+
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(
+                        DirectTurnRequestRow.conversation_id == conversation_id,
+                        DirectTurnRequestRow.status == DirectTurnStatus.RECOVERABLE.value,
+                    )
+                    .order_by(DirectTurnRequestRow.admission_order)
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            outcome = row.outcome if isinstance(row.outcome, dict) else {}
+            retry_session_id = row.session_id or outcome.get("session_id")
+            if retry_session_id != session_id:
+                return None
+            retry_target = outcome.get("retry_target")
+            if (
+                not isinstance(retry_target, dict)
+                or retry_target.get("scope") != "provider_model"
+                or retry_target.get("runtime_revision") != previous_runtime_revision
+            ):
+                return None
+            now = await database_now(session)
+            if row.next_attempt_at is None:
+                return None
+            row.next_attempt_at = now
+            row.updated_at = now
+            await session.commit()
+            return row
+
     async def checkpoint(
         self,
         request_id: str,
@@ -1208,38 +1456,83 @@ class DirectTurnStore:
         lease: Lease,
         phase: str,
         metadata: dict[str, Any] | None = None,
+        clear_tool_dispatch: bool = False,
     ) -> DirectTurnRequestRow | None:
-        """Persist the latest execution boundary under the exact fence."""
-        async with self._session_factory() as session:
-            now = await database_now(session)
-            row = await self._owned_fenced_update(
-                session,
-                request_id=request_id,
-                lease=lease,
-                statuses=ACTIVE_STATUSES,
-                values={
-                    "outcome": {
-                        "phase": phase,
-                        "phase_started_at": now.isoformat(),
-                        **(metadata or {}),
-                    },
-                    "updated_at": now,
-                },
-            )
-            await session.commit()
-            return row
+        """Persist the latest execution boundary under the exact fence.
 
-    async def merge_tool_dispatch(
+        Live tool dispatch groups survive every other phase boundary. Several
+        sessions share one direct-turn fence, so a session reaching its own
+        boundary must not erase a sibling's in-flight batch, and the turn must
+        stay in ``tool_in_flight`` while any dispatched call can still need
+        restart recovery. The requested phase is kept as ``deferred_phase``.
+
+        ``clear_tool_dispatch`` is for the recovery-completion boundary, which
+        has already settled every group and must release the phase.
+        """
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if request is None or not self._owns_live_fence(request, lease):
+                return None
+            if not await session.scalar(select(self._lease_predicate(session, lease))):
+                return None
+            now = await database_now(session)
+            previous = dict(request.outcome) if isinstance(request.outcome, dict) else {}
+            live_groups = (
+                []
+                if clear_tool_dispatch
+                else read_tool_dispatch_groups(
+                    previous,
+                    fallback_session_id=request.session_id,
+                    fallback_turn_id=request.turn_id,
+                )
+            )
+            preserved = [] if clear_tool_dispatch else unreadable_tool_dispatch_groups(previous)
+            outcome = {
+                "phase": phase,
+                "phase_started_at": now.isoformat(),
+                **(metadata or {}),
+            }
+            if live_groups or preserved:
+                previous_started_at = previous.get("phase_started_at")
+                outcome["phase"] = TOOL_IN_FLIGHT_PHASE
+                outcome["phase_started_at"] = (
+                    previous_started_at
+                    if previous.get("phase") == TOOL_IN_FLIGHT_PHASE
+                    and isinstance(previous_started_at, str)
+                    else now.isoformat()
+                )
+                outcome["deferred_phase"] = phase
+            request.outcome = write_tool_dispatch_groups(
+                outcome,
+                live_groups,
+                preserved=preserved,
+            )
+            request.updated_at = now
+            await session.commit()
+            return request
+
+    async def record_tool_dispatch(
         self,
         request_id: str,
         *,
         lease: Lease,
-        call_id: str,
-        executor_id: str,
-        executor_instance_id: str | None,
-        dispatch_state: Literal["dispatching", "sent"],
+        session_id: str,
+        turn_id: str | None,
+        descriptors: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
     ) -> DirectTurnRequestRow | None:
-        """Merge one physical dispatch binding under the live direct-turn fence."""
+        """Record one session's in-flight tool batch, preserving sibling batches.
+
+        Delegate children share the parent turn's fence, so several sessions can
+        hold in-flight tool calls at once. Each call replaces only the group
+        owned by ``(session_id, turn_id)``; other sessions' groups survive.
+        """
 
         async with self._session_factory() as session:
             request = (
@@ -1249,26 +1542,165 @@ class DirectTurnStore:
                     .with_for_update()
                 )
             ).scalar_one_or_none()
-            if (
-                request is None
-                or request.status not in {status.value for status in ACTIVE_STATUSES}
-                or request.cancel_requested_at is not None
-                or request.owner_controller_id is None
-                or request.owner_incarnation_id is None
-                or lease.owner_id
-                != _owner_id(request.owner_controller_id, request.owner_incarnation_id)
-                or request.fencing_token != lease.fencing_token
-                or lease.resource_key != conversation_lease_key(request.conversation_id)
-                or not await session.scalar(select(self._lease_predicate(session, lease)))
-            ):
+            if request is None or not self._owns_live_fence(request, lease):
+                return None
+            if not await session.scalar(select(self._lease_predicate(session, lease))):
                 return None
             outcome = dict(request.outcome) if isinstance(request.outcome, dict) else {}
-            descriptors = outcome.get("tool_calls")
-            if not isinstance(descriptors, list):
+            groups = read_tool_dispatch_groups(
+                outcome,
+                fallback_session_id=request.session_id,
+                fallback_turn_id=request.turn_id,
+            )
+            now = await database_now(session)
+            merged = _replace_dispatch_group(
+                groups,
+                ToolDispatchGroup(
+                    session_id=session_id,
+                    turn_id=_resolve_dispatch_turn_id(turn_id, request),
+                    tool_calls=tuple(descriptors),
+                ),
+            )
+            # This session's new batch supersedes any earlier unreadable entry of
+            # its own, so only other sessions' entries carry forward.
+            preserved = [
+                raw
+                for raw in unreadable_tool_dispatch_groups(outcome)
+                if not isinstance(raw, dict) or raw.get("session_id") != session_id
+            ]
+            request.outcome = write_tool_dispatch_groups(
+                {
+                    "phase": TOOL_IN_FLIGHT_PHASE,
+                    "phase_started_at": now.isoformat(),
+                    **(metadata or {}),
+                },
+                merged,
+                preserved=preserved,
+            )
+            request.updated_at = now
+            await session.commit()
+            return request
+
+    async def complete_tool_dispatch(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        session_id: str,
+        turn_id: str | None,
+        call_ids: list[str],
+        metadata: dict[str, Any] | None = None,
+    ) -> DirectTurnRequestRow | None:
+        """Release one session's settled tool batch from the shared turn record.
+
+        The turn only leaves ``tool_in_flight`` once no session still holds an
+        in-flight batch. Clearing the phase while a sibling session is mid-batch
+        would make those calls invisible to restart recovery.
+        """
+
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if request is None or not self._owns_live_fence(request, lease):
                 return None
+            if not await session.scalar(select(self._lease_predicate(session, lease))):
+                return None
+            outcome = dict(request.outcome) if isinstance(request.outcome, dict) else {}
+            groups = read_tool_dispatch_groups(
+                outcome,
+                fallback_session_id=request.session_id,
+                fallback_turn_id=request.turn_id,
+            )
+            settled_key = (session_id, _resolve_dispatch_turn_id(turn_id, request))
+            remaining = [
+                group for group in groups if (group.session_id, group.turn_id) != settled_key
+            ]
+            preserved = unreadable_tool_dispatch_groups(outcome)
+            now = await database_now(session)
+            previous_phase = outcome.get("phase")
+            previous_started_at = outcome.get("phase_started_at")
+            if remaining or preserved:
+                # A sibling batch is still live: keep the in-flight phase and its
+                # original clock so a settled batch cannot defer staleness
+                # detection for the batch that is still running.
+                phase = TOOL_IN_FLIGHT_PHASE
+                phase_started_at = (
+                    previous_started_at
+                    if previous_phase == TOOL_IN_FLIGHT_PHASE
+                    and isinstance(previous_started_at, str)
+                    else now.isoformat()
+                )
+            else:
+                phase = TOOL_RESULT_PERSISTED_PHASE
+                phase_started_at = now.isoformat()
+            request.outcome = write_tool_dispatch_groups(
+                {
+                    "phase": phase,
+                    "phase_started_at": phase_started_at,
+                    **(metadata or {}),
+                    "call_ids": list(call_ids[:TOOL_DISPATCH_DESCRIPTOR_LIMIT]),
+                },
+                remaining,
+                preserved=preserved,
+            )
+            request.updated_at = now
+            await session.commit()
+            return request
+
+    async def merge_tool_dispatch(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        session_id: str,
+        turn_id: str | None,
+        call_id: str,
+        executor_id: str,
+        executor_instance_id: str | None,
+        dispatch_state: Literal["dispatching", "sent"],
+    ) -> ToolDispatchMergeResult:
+        """Merge one physical dispatch binding under the live direct-turn fence.
+
+        A missing descriptor is reported as ``UNKNOWN_CALL`` rather than as a
+        lost fence. The two conditions are unrelated: a binding can arrive after
+        its own batch settled, while the fence itself is still held.
+        """
+
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if request is None or not self._owns_live_fence(request, lease):
+                return ToolDispatchMergeResult(status=ToolDispatchMergeStatus.FENCE_LOST)
+            if not await session.scalar(select(self._lease_predicate(session, lease))):
+                return ToolDispatchMergeResult(status=ToolDispatchMergeStatus.FENCE_LOST)
+            if request.cancel_requested_at is not None:
+                return ToolDispatchMergeResult(status=ToolDispatchMergeStatus.CANCELLED)
+            outcome = dict(request.outcome) if isinstance(request.outcome, dict) else {}
+            groups = read_tool_dispatch_groups(
+                outcome,
+                fallback_session_id=request.session_id,
+                fallback_turn_id=request.turn_id,
+            )
+            owner_key = (session_id, _resolve_dispatch_turn_id(turn_id, request))
+            owner = next(
+                (group for group in groups if (group.session_id, group.turn_id) == owner_key),
+                None,
+            )
+            if owner is None:
+                return ToolDispatchMergeResult(status=ToolDispatchMergeStatus.UNKNOWN_CALL)
             matched = False
-            merged: list[dict[str, Any]] = []
-            for raw in descriptors[:500]:
+            merged_descriptors: list[dict[str, Any]] = []
+            for raw in owner.tool_calls:
                 if not isinstance(raw, dict):
                     continue
                 descriptor = dict(raw)
@@ -1281,14 +1713,41 @@ class DirectTurnStore:
                         }
                     )
                     matched = True
-                merged.append(descriptor)
+                merged_descriptors.append(descriptor)
             if not matched:
-                return None
+                return ToolDispatchMergeResult(status=ToolDispatchMergeStatus.UNKNOWN_CALL)
             now = await database_now(session)
-            request.outcome = {**outcome, "tool_calls": merged}
+            request.outcome = write_tool_dispatch_groups(
+                outcome,
+                _replace_dispatch_group(
+                    groups,
+                    ToolDispatchGroup(
+                        session_id=owner.session_id,
+                        turn_id=owner.turn_id,
+                        tool_calls=tuple(merged_descriptors),
+                    ),
+                ),
+                preserved=unreadable_tool_dispatch_groups(outcome),
+            )
             request.updated_at = now
             await session.commit()
-            return request
+            return ToolDispatchMergeResult(
+                status=ToolDispatchMergeStatus.MERGED,
+                row=request,
+            )
+
+    @staticmethod
+    def _owns_live_fence(request: DirectTurnRequestRow, lease: Lease) -> bool:
+        """Return whether ``lease`` still owns this active request's fence."""
+        return (
+            request.status in {status.value for status in ACTIVE_STATUSES}
+            and request.owner_controller_id is not None
+            and request.owner_incarnation_id is not None
+            and lease.owner_id
+            == _owner_id(request.owner_controller_id, request.owner_incarnation_id)
+            and request.fencing_token == lease.fencing_token
+            and lease.resource_key == conversation_lease_key(request.conversation_id)
+        )
 
     async def begin_tool_recovery(
         self,

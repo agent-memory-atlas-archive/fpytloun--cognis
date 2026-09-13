@@ -175,9 +175,9 @@ def test_formula_requires_real_immutable_urls_and_hashes() -> None:
     assert "cognis-executor logs --follow" in formula
     assert "token" not in formula.lower()
     head_formula = generate_formula.generate_formula(
-        **values, head_url="ssh://git.fpy.cz:2222/filip/cognis.git"
+        **values, head_url="https://github.com/acme/cognis.git"
     )
-    assert 'head "ssh://git.fpy.cz:2222/filip/cognis.git", branch: "main"' in head_formula
+    assert 'head "https://github.com/acme/cognis.git", branch: "main"' in head_formula
     with pytest.raises(ValueError, match="non-placeholder|immutable"):
         generate_formula.generate_formula(
             **{**values, "arm64_url": "https://downloads.example.invalid/asset.tar.gz"}

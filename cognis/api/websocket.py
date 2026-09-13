@@ -1065,6 +1065,7 @@ class WebSocketTurnObserver:
             conversation_id,
             volatile_items=chat_v2_items,
             active_session_id=session_id,
+            retire_assistant_streams=True,
         )
 
     async def on_tool_progress(
@@ -2127,6 +2128,7 @@ class WebSocketConnectionManager:
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
         lifecycle: str | None = None,
+        retire_assistant_streams: bool = False,
     ) -> None:
         """Fan out locally first, then enqueue the same generation for Redis relay."""
         relay = cast(Any, getattr(self.app.state, "chat_v2_runtime_relay", None))
@@ -2157,6 +2159,19 @@ class WebSocketConnectionManager:
             )
             if turn_id != context.turn_id:
                 cumulative = {}
+            if retire_assistant_streams:
+                # A tool boundary ends the preceding assistant stream. Keep
+                # its text until canonical sync, but never replay it as live.
+                cumulative = {
+                    item_id: (
+                        item.model_copy(update={"status": "complete", "partial": False})
+                        if item.kind == "message"
+                        and item.role == "assistant"
+                        and item.status == "running"
+                        else item
+                    )
+                    for item_id, item in cumulative.items()
+                }
             if has_active_turn or volatile_items:
                 for item in volatile_items:
                     cumulative[item.id] = item
@@ -2384,14 +2399,47 @@ class WebSocketConnectionManager:
                     or envelope.turn_id != current_authority.turn_id
                 ):
                     return AdmissionDecision.WRONG_TURN
-                if envelope.authority.lifecycle != current_authority.lifecycle:
+                # Completion observers run before the durable execution wrapper
+                # commits settlement. Accept the exact current owner's terminal
+                # announcement during that window, never a different generation.
+                owner_terminal = (
+                    current_authority.lifecycle == "active"
+                    and envelope.kind == RelayKind.TERMINAL
+                    and envelope.authority.lifecycle == "terminal"
+                )
+                if (
+                    envelope.authority.lifecycle != current_authority.lifecycle
+                    and not owner_terminal
+                ):
                     return AdmissionDecision.STALE
                 if current_authority.lifecycle == "active":
                     context = await scheduler.durable_relay_generation_context(
                         envelope.conversation_id
                     )
                     if context is None:
+                        if owner_terminal:
+                            # Settlement can commit between the two reads.
+                            # Recheck only this terminal race, not streamed chunks.
+                            latest = await scheduler.durable_runtime_context(
+                                envelope.conversation_id
+                            )
+                            settled = latest.get("authority") if isinstance(latest, dict) else None
+                            if (
+                                isinstance(settled, RuntimeAuthority)
+                                and settled.lifecycle == "terminal"
+                                and settled.fencing_token == envelope.fencing_token
+                                and settled.direct_request_id == envelope.direct_request_id
+                                and settled.turn_id == envelope.turn_id
+                            ):
+                                return AdmissionDecision.ACCEPT
                         return AdmissionDecision.STALE
+                    if context.fencing_token != envelope.fencing_token:
+                        return AdmissionDecision.WRONG_FENCE
+                    if (
+                        context.direct_request_id != envelope.direct_request_id
+                        or context.turn_id != envelope.turn_id
+                    ):
+                        return AdmissionDecision.WRONG_TURN
                     if (
                         context.session_id != envelope.session_id
                         or context.owner_controller_id != envelope.owner.controller_id

@@ -158,6 +158,7 @@ def test_system_workflow_phase_membership_is_golden() -> None:
 
 def test_direct_workflow_has_single_step_no_evaluation() -> None:
     w = DIRECT_WORKFLOW
+    assert w.steps[0].reasoning_effort is None
     assert len(w.steps) == 1
     assert w.steps[0].name == "execute"
     assert w.steps[0].completion is not None

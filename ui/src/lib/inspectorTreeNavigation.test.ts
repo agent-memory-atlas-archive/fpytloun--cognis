@@ -3,6 +3,7 @@ import {
   activityOverviewInvalidationScopeKeys,
   canonicalWorkstreamSessionId,
   rootOverviewForConversation,
+  resolvedWorkSubtreeScope,
   selectedWorkSubtreeScope,
   structuralParentSessionId,
   traverseInspectorSession,
@@ -17,6 +18,28 @@ const overview = {
 } as ActivityOverviewResponse;
 
 describe('inspector tree navigation', () => {
+  it('uses the managed session owner, including compaction aliases', () => {
+    const nodes = [{
+      session_id: 'managed-current',
+      conversation_id: 'managed-conversation',
+      backing_session_ids: ['managed-old', 'managed-current'],
+    }] as ActivityOverviewResponse['workstreams'];
+    for (const session of ['managed-old', 'managed-current']) {
+      expect(resolvedWorkSubtreeScope('parent', session, nodes)).toEqual({
+        key: 'session:managed-current',
+        kind: 'session',
+        session_id: 'managed-current',
+        conversation_id: 'managed-conversation',
+      });
+    }
+    expect(resolvedWorkSubtreeScope('parent', 'managed-current', [], nodes[0]))
+      .toEqual(resolvedWorkSubtreeScope('parent', 'managed-current', nodes));
+    expect(resolvedWorkSubtreeScope('parent', 'unresolved', [], nodes[0])).toBeNull();
+    expect(resolvedWorkSubtreeScope('parent', null, [])).toEqual({
+      key: 'conversation:parent', kind: 'conversation', conversation_id: 'parent',
+    });
+  });
+
   it('never exposes conversation A tree while conversation B is active', () => {
     expect(rootOverviewForConversation(overview, 'a')).toBe(overview);
     expect(rootOverviewForConversation(overview, 'b')).toBeNull();

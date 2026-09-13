@@ -2038,6 +2038,7 @@ export interface ExecutorRuntimeConfig {
   lsp_diagnostics_timeout_ms?: number;
   lsp_idle_timeout_seconds?: number;
   lsp_max_concurrent_servers?: number;
+  lsp_python_type_diagnostics?: boolean;
   signal?: ExecutorSignalConfig;
   browser?: ExecutorBrowserConfig;
   officecli?: ExecutorOfficeCliConfig;
@@ -2759,6 +2760,9 @@ export interface SettingsCategory {
 }
 
 export interface ModelEntry {
+  /** Form-only provenance. Never serialized into provider configuration. */
+  _configuredFields?: string[];
+  _initialValues?: Record<string, unknown>;
   model_id: string;
   display_name?: string;
   context_window: number;
@@ -2775,6 +2779,7 @@ export interface ModelEntry {
   supports_reasoning: boolean;
   supports_fast_mode: boolean;
   fast_mode_tier?: string | null;
+  fast_mode_parameter?: 'speed' | 'service_tier' | null;
   reasoning_efforts: string[];
   supports_prompt_caching: boolean;
   supports_tool_search: boolean;
@@ -2868,6 +2873,8 @@ export interface CodexUsageWindow {
   window_duration_mins: number | null;
   resets_at: string | null;
   reset_after_seconds: number | null;
+  limit?: number | null;
+  remaining?: number | null;
 }
 
 export interface CodexUsageCredits {
@@ -2885,12 +2892,20 @@ export interface CodexUsageAdditionalLimit {
   limit_reached: boolean | null;
 }
 
-export interface CodexUsage {
+export type ProviderUsageSource =
+  | 'chatgpt_codex_usage'
+  | 'anthropic_subscription_usage'
+  | 'anthropic_rate_limit_headers'
+  | 'unsupported'
+  | string;
+
+export interface ProviderUsage {
   provider_id: string;
   ok: boolean;
-  source: string;
+  source: ProviderUsageSource;
   usage_url: string | null;
   fetched_at: string | null;
+  observed_at?: string | null;
   plan_type: string | null;
   primary: CodexUsageWindow | null;
   secondary: CodexUsageWindow | null;
@@ -2899,7 +2914,11 @@ export interface CodexUsage {
   allowed: boolean | null;
   limit_reached: boolean | null;
   additional_rate_limits: CodexUsageAdditionalLimit[];
+  rate_limit_headers?: Record<string, string> | null;
+  unavailable_reason?: string | null;
 }
+
+export type CodexUsage = ProviderUsage;
 
 export interface ModelRoutingEntry {
   model: string | null;
@@ -3250,7 +3269,22 @@ export interface ContextUsage {
   loop_pressure_threshold?: number;
   compaction_threshold?: number | null;
   projection_policy?: ProjectionPolicyUsage | null;
+  raw_prompt_tokens?: number | null;
+  estimator_identity?: string | null;
+  prompt_token_calibration?: PromptTokenCalibration | null;
   last_llm_usage?: TokenUsage;
+}
+
+export interface PromptTokenCalibration {
+  provider_id?: string | null;
+  model: string;
+  estimator_identity: string;
+  observed_ratio: number;
+  applied_ratio: number;
+  raw_prompt_tokens: number;
+  actual_prompt_tokens: number;
+  source_request_id: string;
+  updated_at: string;
 }
 
 export interface GenerationPerformanceSnapshot {

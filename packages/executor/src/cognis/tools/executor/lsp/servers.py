@@ -67,23 +67,72 @@ class LSPServerDefinition:
     npm_run: bool = False
     """If True, the resolved command is a JS file run via ``node``."""
 
+    python_venv_dirs: tuple[str, ...] = ()
+    """Virtualenv directory names under the root that select the interpreter.
+
+    When one exists, ``python.pythonPath`` points at it so the server resolves
+    project dependencies instead of the system interpreter's site-packages.
+    """
+
     def language_id(self, extension: str) -> str:
         """Return the LSP language ID for a file extension."""
         return self.language_id_map.get(extension, self.server_id)
 
     def workspace_configuration_for(self, root_path: str) -> dict[str, Any] | None:
-        """Return default workspace config unless native project config exists."""
-        if self._has_native_project_config(root_path):
-            return None
+        """Return default workspace config unless native project config exists.
 
-        return self.workspace_configuration
+        The interpreter path is still provided with native config because the
+        server only uses it when the project does not pin its own venv.
+        """
+        defaults = (
+            None if self._has_native_project_config(root_path) else self.workspace_configuration
+        )
+        return self._with_python_path(defaults, root_path)
 
     def initialization_options_for(self, root_path: str) -> dict[str, Any] | None:
         """Return init options merged with defaults unless native config exists."""
         options = dict(self.init_options or {})
-        if self.initialization_settings and not self._has_native_project_config(root_path):
-            options["settings"] = self.initialization_settings
+        defaults = (
+            None if self._has_native_project_config(root_path) else self.initialization_settings
+        )
+        settings = self._with_python_path(defaults, root_path)
+        if settings:
+            options["settings"] = settings
         return options or None
+
+    def project_python_path(self, root_path: str) -> str | None:
+        """Return the nearest project virtualenv interpreter for ``root_path``.
+
+        Monorepos keep one virtualenv at the top while language-server roots
+        are nested package directories, so ancestors are searched up to and
+        including the enclosing git checkout.
+        """
+        if not self.python_venv_dirs:
+            return None
+        current = Path(root_path)
+        while True:
+            for name in self.python_venv_dirs:
+                for candidate in ("bin/python", "Scripts/python.exe"):
+                    interpreter = current / name / candidate
+                    if interpreter.is_file():
+                        return str(interpreter)
+            if (current / ".git").exists() or current.parent == current:
+                return None
+            current = current.parent
+
+    def _with_python_path(
+        self, settings: dict[str, Any] | None, root_path: str
+    ) -> dict[str, Any] | None:
+        python_path = self.project_python_path(root_path)
+        if python_path is None:
+            return settings
+        merged: dict[str, Any] = {key: value for key, value in (settings or {}).items()}
+        python_section = merged.get("python")
+        merged["python"] = {
+            **(python_section if isinstance(python_section, dict) else {}),
+            "pythonPath": python_path,
+        }
+        return merged
 
     def _has_native_project_config(self, root_path: str) -> bool:
         """Return whether native project config should override Cognis defaults."""
@@ -204,6 +253,7 @@ PYRIGHT = LSPServerDefinition(
     project_config_files=("pyrightconfig.json",),
     pyproject_config_sections=("tool.pyright",),
     npm_run=True,
+    python_venv_dirs=(".venv", "venv"),
 )
 
 RUFF_LSP = LSPServerDefinition(
@@ -559,12 +609,16 @@ def get_servers_for_extension(
     extension: str,
     *,
     purpose: Literal["diagnostics", "semantic"] = "semantic",
+    python_type_diagnostics: bool = False,
 ) -> list[LSPServerDefinition]:
     """Return server definitions that handle the given file extension.
 
-    Python edit-time diagnostics intentionally prefer Ruff only.  Pyright is
-    still available for explicit semantic LSP queries where project-wide type
-    analysis is useful and the caller opted into a semantic operation.
+    Python edit-time diagnostics use Ruff only by default: it answers in
+    milliseconds and its findings are almost always real, whereas pyright's
+    whole-program analysis is slow on first open and noisy on projects that
+    are not typed strictly.  ``python_type_diagnostics`` opts pyright back
+    in for the edit path.  Pyright is always available for explicit
+    semantic LSP queries.
     """
     global _EXTENSION_MAP
     if _EXTENSION_MAP is None:
@@ -573,7 +627,7 @@ def get_servers_for_extension(
             for ext in server.extensions:
                 _EXTENSION_MAP.setdefault(ext, []).append(server)
     servers = _EXTENSION_MAP.get(extension, [])
-    if purpose == "diagnostics" and extension in {".py", ".pyi"}:
+    if purpose == "diagnostics" and not python_type_diagnostics and extension in {".py", ".pyi"}:
         return [server for server in servers if server.server_id == "ruff"]
     return servers
 

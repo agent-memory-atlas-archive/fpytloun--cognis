@@ -24,6 +24,7 @@ from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.events import Event, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentCapabilities, AgentDefinition, AgentRuntimeProfile
+from cognis.models.skill import AgentSkillRef
 from cognis.models.tool import stable_tool_id
 from cognis.providers.backends import get_backend
 from cognis.providers.memory.policy import memory_backend_descriptors
@@ -59,6 +60,7 @@ from cognis.store.queries import (
 )
 from cognis.tools.builtin.image import _image_bytes
 from cognis.tools.builtin.knowledgebase import knowledgebase_tools
+from cognis.tools.skills import is_agent_assignable_skill
 
 logger = get_logger(__name__)
 
@@ -214,6 +216,12 @@ async def handle_agent_management_action(
             return await _tools_update(
                 deps, actor_email, current_agent_id, arguments, mode=action.removeprefix("tools_")
             )
+        if action == "skills_get":
+            return await _skills_get(deps, actor_email, current_agent_id, arguments)
+        if action in {"skills_set", "skills_add", "skills_update", "skills_remove"}:
+            return await _skills_update(
+                deps, actor_email, current_agent_id, arguments, mode=action.removeprefix("skills_")
+            )
         if action == "knowledgebases_get":
             return await _knowledgebases_get(deps, actor_email, current_agent_id, arguments)
         if action in {"knowledgebases_set", "knowledgebases_add", "knowledgebases_remove"}:
@@ -276,7 +284,7 @@ async def _list_agents(
                 "description": row.description,
                 "agent_type": row.agent_type,
                 "status": row.status,
-                "manageable": row.agent_id != current_agent_id and not row.is_system,
+                "manageable": not row.is_system,
                 "default_agent_profile_id": resolve_agent_profile(
                     agent_definitions[row.agent_id]
                 ).profile_id,
@@ -863,6 +871,172 @@ async def _knowledgebases_get(
         "assigned_knowledgebases": assigned,
         "available_knowledgebases": await _available_knowledgebase_options(deps, actor_email),
     }
+
+
+async def _skills_get(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    return {
+        "status": "ok",
+        "agent_id": row.agent_id,
+        "skill_assignments": _configured_skill_assignments(row),
+        "available_skills": await _available_skill_options(deps, actor_email),
+    }
+
+
+async def _skills_update(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    available = {
+        item["skill_id"]: item for item in await _available_skill_options(deps, actor_email)
+    }
+    current = _configured_skill_assignments(row)
+    current_by_id = {item["skill_id"]: item for item in current}
+
+    if mode == "remove":
+        selected_ids = _validated_string_list(arguments.get("skill_ids"), "skill_ids")
+        invalid = sorted(set(selected_ids) - (set(available) | set(current_by_id)))
+        if invalid:
+            raise AgentManagementError(f"Invalid skill_ids: {', '.join(invalid)}")
+        selected = [item for item in current if item["skill_id"] not in set(selected_ids)]
+    else:
+        raw_assignments = arguments.get("skill_assignments")
+        if mode == "update":
+            if not isinstance(raw_assignments, list):
+                raise AgentManagementError("skill_assignments must be a list")
+            requested_ids = {
+                str(item.get("skill_id") or "").strip()
+                for item in raw_assignments
+                if isinstance(item, dict)
+            }
+            missing = sorted(requested_ids - set(current_by_id))
+            if missing:
+                raise AgentManagementError(
+                    f"Cannot update unassigned skill_ids: {', '.join(missing)}"
+                )
+            raw_assignments = [
+                {**current_by_id.get(str(item.get("skill_id") or "").strip(), {}), **item}
+                if isinstance(item, dict)
+                else item
+                for item in raw_assignments
+            ]
+        incoming = _validated_skill_assignments(raw_assignments, available)
+        incoming_by_id = {item["skill_id"]: item for item in incoming}
+        if mode == "set":
+            selected = incoming
+        elif mode == "add":
+            selected = [
+                *current,
+                *[item for item in incoming if item["skill_id"] not in current_by_id],
+            ]
+        else:
+            selected = [
+                (
+                    {**item, **incoming_by_id[item["skill_id"]]}
+                    if item["skill_id"] in incoming_by_id
+                    else item
+                )
+                for item in current
+            ]
+
+    skills = dict(row.skills) if isinstance(row.skills, dict) else {}
+    legacy_items = [
+        item for item in skills.get("items", []) if isinstance(item, dict) and "tool_names" in item
+    ]
+    skills["items"] = [*legacy_items, *selected]
+    async with deps.session_factory() as session:
+        ok = await update_agent(session, row.agent_id, updates={"skills": skills})
+        if not ok:
+            raise AgentManagementError("Agent skill assignment update failed")
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+    await _audit(deps, actor_email, row.agent_id, f"skills_{mode}", "success", arguments)
+    return {
+        "status": "updated",
+        "agent_id": row.agent_id,
+        "skill_assignments": _configured_skill_assignments(row),
+    }
+
+
+def _configured_skill_assignments(row: Any) -> list[dict[str, Any]]:
+    skills = row.skills if isinstance(row.skills, dict) else {}
+    items = skills.get("items")
+    if not isinstance(items, list):
+        return []
+    assignments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or "tool_names" in item:
+            continue
+        try:
+            ref = AgentSkillRef.model_validate(item)
+        except ValueError:
+            continue
+        if ref.skill_id in seen:
+            continue
+        seen.add(ref.skill_id)
+        assignments.append(ref.model_dump(mode="json"))
+    return assignments
+
+
+def _validated_skill_assignments(
+    value: Any, available: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise AgentManagementError("skill_assignments must be a list")
+    assignments: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise AgentManagementError("skill_assignments entries must be objects")
+        unknown = sorted(set(raw) - {"skill_id", "enabled", "auto_load_instructions"})
+        if unknown:
+            raise AgentManagementError(
+                f"Unsupported skill assignment field(s): {', '.join(unknown)}"
+            )
+        try:
+            ref = AgentSkillRef.model_validate(raw)
+        except ValueError as exc:
+            raise AgentManagementError(f"Invalid skill assignment: {exc}") from exc
+        if not ref.skill_id.strip():
+            raise AgentManagementError("skill_id must be a non-empty string")
+        ref.skill_id = ref.skill_id.strip()
+        if ref.skill_id not in available:
+            raise AgentManagementError(f"Invalid skill_id: {ref.skill_id}")
+        if ref.skill_id in seen:
+            raise AgentManagementError(f"Duplicate skill_id: {ref.skill_id}")
+        seen.add(ref.skill_id)
+        assignments.append(ref.model_dump(mode="json"))
+    return assignments
+
+
+async def _available_skill_options(
+    deps: AgentManagementDependencies, actor_email: str
+) -> list[dict[str, Any]]:
+    async with deps.session_factory() as session:
+        rows = await list_skills(session, owner_email=actor_email)
+    return [
+        {
+            "skill_id": row.skill_id,
+            "name": row.name,
+            "description": row.description,
+            "attach_to_all_agents": bool(row.auto_load),
+            "is_system": bool(getattr(row, "is_system", False)),
+        }
+        for row in rows
+        if is_agent_assignable_skill(row.skill_id)
+    ]
 
 
 async def _knowledgebases_update(

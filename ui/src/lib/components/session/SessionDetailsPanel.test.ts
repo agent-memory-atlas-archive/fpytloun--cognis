@@ -36,11 +36,25 @@ function detail(sessionId: string) {
       agent_profile_id: 'profile-a',
       provider_id: 'provider-a',
       effective_prompt_budget: 6000,
+      raw_prompt_tokens: 1000,
+      estimator_identity: 'litellm:1.82.6:anthropic:litellm_native:v1',
+      prompt_token_calibration: {
+        provider_id: 'provider-a',
+        model: 'model-a',
+        estimator_identity: 'litellm:1.82.6:anthropic:litellm_native:v1',
+        observed_ratio: 1.2,
+        applied_ratio: 1.2,
+        raw_prompt_tokens: 1000,
+        actual_prompt_tokens: 1200,
+        source_request_id: 'llmr_123',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
     },
     token_usage: {
       prompt_tokens: 1200,
       completion_tokens: 100,
       total_tokens: 1300,
+      cached_tokens: 900,
     },
     last_generation: {
       is_local: true,
@@ -89,6 +103,10 @@ describe('SessionDetailsPanel', () => {
     expect(screen.getByTestId('session-token-usage')).toBeTruthy();
     expect(screen.getByText('Input 1,200')).toBeTruthy();
     expect(screen.getByText('Output 100')).toBeTruthy();
+    expect(screen.getByText('Cache read 900')).toBeTruthy();
+    expect(screen.getByText('Raw prompt estimate')).toBeTruthy();
+    expect(screen.getByText('1,000 tokens')).toBeTruthy();
+    expect(screen.getByText('×1.200 from llmr_123')).toBeTruthy();
   });
 
   it('rejects a stale response after a scope switch', async () => {

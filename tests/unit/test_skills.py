@@ -561,7 +561,8 @@ def test_build_available_skills_metadata_basic() -> None:
     assert "<available_skills>" in metadata
     assert "<name>Git Release</name>" in metadata
     assert "<skill_id>git-release</skill_id>" in metadata
-    assert "<tools>tag_release</tools>" in metadata
+    assert "<tools>" not in metadata
+    assert "<linked_tools>" not in metadata
     # Description should use the real description field
     assert "Automate git release workflows" in metadata
     assert "<attached>true</attached>" in metadata
@@ -671,49 +672,6 @@ def test_skill_management_tool_count() -> None:
 
     tools = skill_management_tools()
     assert len(tools) == 12
-
-
-def test_skill_load_runtime_summaries_include_callable_names() -> None:
-    from cognis.tools.builtin.skill_management import _skill_tool_runtime_summaries
-
-    summaries = _skill_tool_runtime_summaries(
-        "youtube-transcript",
-        [
-            {
-                "name": "get_transcript",
-                "description": "Fetch a transcript",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-                "recipe": {
-                    "mode": "script",
-                    "entry": "assets/youtube_transcript.py",
-                    "required_assets": ["assets/youtube_transcript.py"],
-                },
-            }
-        ],
-    )
-
-    assert summaries == [
-        {
-            "name": "get_transcript",
-            "callable_name": "skill_youtube-transcript__get_transcript",
-            "stable_tool_id": "skill:youtube-transcript:get_transcript",
-            "description": "Fetch a transcript",
-            "parameters": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-            "recipe": {
-                "mode": "script",
-                "entry": "assets/youtube_transcript.py",
-                "required_assets": ["assets/youtube_transcript.py"],
-            },
-        }
-    ]
 
 
 def test_skill_load_asset_manifest_strips_internal_references() -> None:

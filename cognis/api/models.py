@@ -1258,6 +1258,8 @@ class CodexUsageWindowResponse(BaseModel):
     window_duration_mins: int | None = None
     resets_at: str | None = None
     reset_after_seconds: int | None = None
+    limit: int | None = None
+    remaining: int | None = None
 
 
 class CodexUsageCreditsResponse(BaseModel):
@@ -1275,12 +1277,20 @@ class CodexUsageAdditionalLimitResponse(BaseModel):
     limit_reached: bool | None = None
 
 
-class CodexUsageResponse(BaseModel):
+class ProviderUsageResponse(BaseModel):
+    """Hosted usage and limit windows for one LLM provider.
+
+    ``source`` identifies the upstream report (``chatgpt_codex_usage``,
+    ``anthropic_subscription_usage``, ``anthropic_rate_limit_headers``, or
+    ``unsupported``). ``ok`` is false when the provider reports nothing.
+    """
+
     provider_id: str
     ok: bool = True
     source: str = "chatgpt_codex_usage"
     usage_url: str | None = None
     fetched_at: str | None = None
+    observed_at: str | None = None
     plan_type: str | None = None
     primary: CodexUsageWindowResponse | None = None
     secondary: CodexUsageWindowResponse | None = None
@@ -1289,6 +1299,11 @@ class CodexUsageResponse(BaseModel):
     allowed: bool | None = None
     limit_reached: bool | None = None
     additional_rate_limits: list[CodexUsageAdditionalLimitResponse] = Field(default_factory=list)
+    rate_limit_headers: dict[str, str] | None = None
+    unavailable_reason: str | None = None
+
+
+CodexUsageResponse = ProviderUsageResponse
 
 
 class ModelRoutingEntry(BaseModel):

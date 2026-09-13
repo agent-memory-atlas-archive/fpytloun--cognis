@@ -281,7 +281,18 @@ class _LLMProvider:
             raise ValueError(f"Model {reference!r} is ambiguous")
         raise ValueError(f"Model {reference!r} is not present in configured providers")
 
-    async def get_model_info(self, model_id: str) -> object:
+    async def resolve_model_target(
+        self,
+        explicit_model=None,
+        task_type="default",
+        explicit_provider_id=None,
+        acting_user_email=None,
+    ):
+        return explicit_model or "gpt-5", explicit_provider_id or "openai"
+
+    async def get_model_info(
+        self, model_id: str, provider_id=None, acting_user_email=None
+    ) -> object:
         del model_id
         return SimpleNamespace(
             reasoning_efforts=["low", "medium", "high"],
@@ -2998,6 +3009,61 @@ async def test_benchmark_reports_safe_placeholder_with_current_local_target() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("default", "default"),
+        ("clear", None),
+        ("reset", None),
+        ("inherit", None),
+        ("off", "none"),
+        ("none", "none"),
+        ("high", "high"),
+    ],
+)
+async def test_thinking_selection_is_explicit(command, expected) -> None:
+    cache = _SessionCache({"model": "claude-opus-5"})
+    llm = SimpleNamespace(
+        resolve_model_target=AsyncMock(return_value=("claude-opus-5", "anthropic-sub")),
+        get_model_info=AsyncMock(
+            return_value=SimpleNamespace(
+                model_id="claude-opus-5",
+                reasoning_efforts=["default", "none", "low", "medium", "high", "xhigh", "max"],
+            )
+        ),
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(llm=llm),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    session = _session()
+    session.reasoning_effort_override = "low"
+    result = await dispatcher.dispatch(
+        f"/thinking {command}",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert session.reasoning_effort_override == expected
+    assert cache.reasoning_effort_override == expected
+    if command in {"clear", "reset", "inherit"}:
+        llm.get_model_info.assert_not_called()
+    else:
+        llm.get_model_info.assert_awaited_once_with(
+            "claude-opus-5",
+            provider_id="anthropic-sub",
+            acting_user_email="user@example.com",
+        )
+
+
+@pytest.mark.asyncio
 async def test_thinking_command_uses_model_specific_levels() -> None:
     cache = _SessionCache({"model": "gpt-5.4"})
     dispatcher = CommandDispatcher(
@@ -3007,11 +3073,12 @@ async def test_thinking_command_uses_model_specific_levels() -> None:
         compaction_strategy=None,
         providers=SimpleNamespace(
             llm=SimpleNamespace(
+                resolve_model_target=AsyncMock(return_value=("gpt-5.4", "openai")),
                 get_model_info=AsyncMock(
                     return_value=SimpleNamespace(
                         reasoning_efforts=["default", "none", "low", "medium", "high", "xhigh"]
                     )
-                )
+                ),
             )
         ),
         pause_waiter=PauseWaiter(),
@@ -3028,7 +3095,7 @@ async def test_thinking_command_uses_model_specific_levels() -> None:
 
     assert result is not None
     assert result.text is not None
-    assert "Thinking effort: default (not set)" in result.text
+    assert "Session thinking override: Inherit" in result.text
     assert "Available levels: default, none, low, medium, high, xhigh" in result.text
 
 
@@ -3042,11 +3109,12 @@ async def test_thinking_command_rejects_level_unsupported_by_current_model() -> 
         compaction_strategy=None,
         providers=SimpleNamespace(
             llm=SimpleNamespace(
+                resolve_model_target=AsyncMock(return_value=("gpt-5.4", "openai")),
                 get_model_info=AsyncMock(
                     return_value=SimpleNamespace(
                         reasoning_efforts=["default", "none", "low", "medium", "high", "xhigh"]
                     )
-                )
+                ),
             )
         ),
         pause_waiter=PauseWaiter(),
@@ -3078,7 +3146,8 @@ async def test_thinking_command_rejects_override_for_non_reasoning_model() -> No
         compaction_strategy=None,
         providers=SimpleNamespace(
             llm=SimpleNamespace(
-                get_model_info=AsyncMock(return_value=SimpleNamespace(reasoning_efforts=[]))
+                resolve_model_target=AsyncMock(return_value=("gpt-4o-mini", "openai")),
+                get_model_info=AsyncMock(return_value=SimpleNamespace(reasoning_efforts=[])),
             )
         ),
         pause_waiter=PauseWaiter(),
@@ -3110,7 +3179,8 @@ async def test_fast_command_sets_session_override_only_when_supported() -> None:
         compaction_strategy=None,
         providers=SimpleNamespace(
             llm=SimpleNamespace(
-                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=True))
+                resolve_model_target=AsyncMock(return_value=("gpt-5.4", "chatgpt")),
+                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=True)),
             )
         ),
         pause_waiter=PauseWaiter(),
@@ -3140,7 +3210,8 @@ async def test_fast_command_rejects_unsupported_model() -> None:
         compaction_strategy=None,
         providers=SimpleNamespace(
             llm=SimpleNamespace(
-                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=False))
+                resolve_model_target=AsyncMock(return_value=("gpt-4o-mini", "openai")),
+                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=False)),
             )
         ),
         pause_waiter=PauseWaiter(),
@@ -3158,6 +3229,45 @@ async def test_fast_command_rejects_unsupported_model() -> None:
     assert result is not None
     assert result.text == "Current model 'gpt-4o-mini' does not support fast mode."
     assert cache.fast_mode_override is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("clear", None),
+        ("reset", None),
+        ("default", None),
+        ("inherit", None),
+        ("off", False),
+    ],
+)
+async def test_fast_can_clear_or_disable_when_discovery_is_unavailable(command, expected):
+    cache = _SessionCache({"model": "stale-model", "provider_id": "old-provider"})
+    llm = SimpleNamespace(resolve_model_target=AsyncMock(side_effect=ValueError("Unavailable")))
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(llm=llm),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    session = _session()
+    session.fast_mode_override = True
+    result = await dispatcher.dispatch(
+        f"/fast {command}",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert session.fast_mode_override is expected
+    assert cache.fast_mode_override is expected
+    if command != "off":
+        llm.resolve_model_target.assert_not_called()
 
 
 @pytest.mark.asyncio

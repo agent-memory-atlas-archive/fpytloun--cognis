@@ -15,9 +15,10 @@ from cognis.api.models import (
 )
 from cognis.api.serializers import session_to_response
 from cognis.core.runtime_selection import resolve_runtime_selection
+from cognis.core.session import _to_conversation_model
 from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
 from cognis.models.session import SessionModel
-from cognis.store.queries import get_session_row
+from cognis.store.queries import get_conversation, get_session_row
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,9 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
     """Fetch Intaris session details (intention, call stats) for a session."""
     async with request.app.state.session_factory() as session:
         row = await get_session_row(session, session_id)
+        conversation_row = (
+            await get_conversation(session, row.conversation_id) if row is not None else None
+        )
     if row is None:
         raise api_exception(404, "not_found", "Session not found")
     require_resource_owner(request, row.user_email)
@@ -108,6 +112,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
         resolve_runtime_selection(
             agent,
             SessionModel.model_validate(row, from_attributes=True),
+            _to_conversation_model(conversation_row) if conversation_row is not None else None,
         ).as_dict()
         if agent is not None
         else None

@@ -209,6 +209,7 @@ def is_retryable_error(exc: Exception) -> bool:
         "context_overflow",
         "attachment_input",
         "content_policy",
+        "protocol",
     }:
         return False
 

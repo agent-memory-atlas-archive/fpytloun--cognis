@@ -20,7 +20,7 @@ This separation lets Cognis:
 The normal installation includes all built-in executor components:
 
 ```bash
-pip install "cognis-executor[full]==0.14.2"
+pip install "cognis-executor[full]==0.15.0"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 
@@ -186,6 +186,74 @@ executors. The command reports normalized executor-local status:
 
 `/lsp` is read-only. It does not auto-install language servers or trigger any
 network fetches.
+
+### Python edit-time diagnostics
+
+Automatic post-edit diagnostics for Python come from Ruff only by default.
+Ruff answers in milliseconds and its findings (syntax, undefined names, unused
+imports) are almost always real. Pyright's whole-program analysis is slow on
+first open and noisy on projects that are not typed strictly, so it is not
+part of the edit path unless opted in. Pyright is always used for explicit
+`lsp` queries.
+
+Set `lsp_python_type_diagnostics: true` in the executor config (Settings →
+Executors → LSP Diagnostics → "Python type diagnostics") or
+`COGNIS_LSP_PYTHON_TYPE_DIAGNOSTICS=1` to include pyright type errors in
+post-edit diagnostics. Compare `cognis_lsp_edit_*` metrics with the switch on
+and off before changing the default.
+
+## LSP code navigation (`lsp` tool)
+
+Besides automatic diagnostics, agents can query language servers directly
+with the `lsp` tool. It is executor-local and exposed only where LSP is
+enabled. Output is compact text (workspace-relative paths, 1-based
+coordinates, deduplicated, sorted), never raw protocol JSON, and every call
+is bounded by `limit` plus a byte budget with an explicit `truncated` marker.
+
+| Operation | Returns | Prefer over `grep` when |
+|---|---|---|
+| `goToDefinition`, `typeDefinition`, `goToImplementation` | `path:line:col` list | the symbol is imported, re-exported, overloaded, or an interface |
+| `findReferences` | grouped by file with the source line | assessing rename or signature-change impact for common names |
+| `hover` | signature and first documentation paragraph | you need a type or docstring without opening the file |
+| `documentSymbol` | indented outline with line spans and signatures | understanding a file before reading it |
+| `workspaceSymbol` | `kind name  path:line` for a name query | finding where something is defined |
+| `incomingCalls`, `outgoingCalls` | bounded call tree (depth, breadth, nodes, time) | answering "who calls this" or "what does this call" |
+| `outline` | outline of a directory under a file and byte budget | getting the structure of a package |
+| `capabilities` | which operations the file's servers support | deciding whether a query is worth issuing |
+| `diagnostics` | cached diagnostics for a file, no wait | re-checking after several edits |
+
+Per-server outcomes are reported explicitly: `ok`, `empty` (the server
+answered with nothing), `unsupported` (not negotiated), `timeout`, `failed`,
+or `partial` (limit reached or the server exited mid-traversal). `grep`,
+`read`, and `glob` remain the fallback for text patterns, configuration, and
+languages without a configured server.
+
+Queries do not wait for diagnostics. A freshly spawned server is given a
+bounded wait for its project-loading progress so the first query is not
+answered from a partial program.
+
+### Metrics
+
+Executors have no metrics endpoint. LSP facts travel as bounded fields in
+tool result metadata and are counted on the controller at the tool routing
+boundary, then exposed on `/metrics`:
+
+- `cognis_lsp_edit_diagnostics_total{status}`, `cognis_lsp_edit_injection_total{outcome}`,
+  `cognis_lsp_edit_wait_total{status}`, `cognis_lsp_edit_diagnostics_by_severity_total{severity}`,
+  `cognis_lsp_edit_injected_bytes` — automatic post-edit path
+- `cognis_lsp_tool_operations_total{operation,status}`, `cognis_lsp_tool_duration_seconds{operation}`,
+  `cognis_lsp_tool_output_bytes{operation}`, `cognis_lsp_tool_truncated_total{operation}`,
+  `cognis_lsp_tool_hierarchy_edges` — deliberate `lsp` tool path
+
+Label values are validated against fixed enums; paths, symbols, queries, URIs,
+server identifiers, and error text never become labels.
+
+Real-server smoke tests live in `tests/integration/test_lsp_real_servers.py`
+(`-m lsp_real`). They use pyright, typescript-language-server, and gopls from
+PATH or the LSP cache and skip per server when unavailable.
+`tests/benchmarks/lsp_navigation/run_benchmark.py` measures compact output
+versus raw protocol JSON and cold/warm latency for a fixed set of navigation
+tasks on this repository; the last stored report sits next to it.
 
 ## Multi-executor agents (Stage 36)
 

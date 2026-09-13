@@ -18,6 +18,7 @@ class MidStreamErrorCategory(StrEnum):
     CONTEXT_OVERFLOW = "context_overflow"
     ARTIFACT_FETCH = "artifact_fetch"
     ATTACHMENT_INPUT = "attachment_input"
+    INVALID_REQUEST = "invalid_request"
     PROVIDER_5XX = "provider_5xx"
     CONNECTION = "connection"
     IDLE_TIMEOUT_RAW = "idle_timeout_raw"
@@ -25,7 +26,38 @@ class MidStreamErrorCategory(StrEnum):
     IDLE_TIMEOUT_REASONING = "idle_timeout_reasoning"
     CONTENT_POLICY = "content_policy"
     REASONING_SUMMARY_REJECTED = "reasoning_summary_rejected"
+    PROTOCOL = "protocol"
     OTHER = "other"
+
+
+# Statuses that mean an identical request cannot succeed. This is an explicit
+# allowlist rather than "4xx except 408/429": statuses such as 409 Conflict,
+# 423 Locked, and 425 Too Early can clear on their own, and wrongly marking a
+# transient failure terminal would remove real recovery. Anything omitted here
+# keeps its previous classification.
+_DETERMINISTIC_CLIENT_ERROR_STATUSES = frozenset(
+    {
+        400,  # Bad Request
+        401,  # Unauthorized
+        403,  # Forbidden
+        404,  # Not Found
+        405,  # Method Not Allowed
+        406,  # Not Acceptable
+        410,  # Gone
+        413,  # Payload Too Large
+        414,  # URI Too Long
+        415,  # Unsupported Media Type
+        422,  # Unprocessable Entity
+    }
+)
+
+
+def is_deterministic_client_error_status(status: Any) -> bool:
+    """Return whether an HTTP status means an identical request cannot succeed."""
+
+    if not isinstance(status, int) or isinstance(status, bool):
+        return False
+    return status in _DETERMINISTIC_CLIENT_ERROR_STATUSES
 
 
 class MidStreamErrorPayload(TypedDict, total=False):
@@ -131,6 +163,10 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
                 payload_message = str(payload.get("message") or exc)
                 if _looks_like_artifact_fetch_error(payload_message.lower(), None):
                     payload = {**payload, "category": MidStreamErrorCategory.ARTIFACT_FETCH.value}
+                elif is_deterministic_client_error_status(getattr(exc, "status_code", None)):
+                    # A provider-normalized payload can still miss a deterministic
+                    # rejection when it classifies by message text alone.
+                    payload = {**payload, "category": MidStreamErrorCategory.INVALID_REQUEST.value}
             return payload
 
     message = str(exc) or type(exc).__name__
@@ -172,14 +208,21 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.ARTIFACT_FETCH
     elif _looks_like_attachment_input_error(lowered, param):
         category = MidStreamErrorCategory.ATTACHMENT_INPUT
+    elif any(marker in lowered for marker in ("content policy", "content_filter", "refusal")):
+        category = MidStreamErrorCategory.CONTENT_POLICY
+    elif is_deterministic_client_error_status(status) or code == "invalid_request_error":
+        # Deterministic provider rejection: replaying the identical request
+        # cannot succeed, so this must never consume the retry budget. The
+        # response status is authoritative and is checked before the message
+        # markers below, which would otherwise misread a 4xx body mentioning
+        # "server" or "timeout" as a transient fault.
+        category = MidStreamErrorCategory.INVALID_REQUEST
     elif status in {500, 502, 503, 504} or any(
         marker in lowered for marker in ("server error", "bad gateway", "service unavailable")
     ):
         category = MidStreamErrorCategory.PROVIDER_5XX
     elif any(marker in lowered for marker in ("connection", "timeout", "timed out")):
         category = MidStreamErrorCategory.CONNECTION
-    elif any(marker in lowered for marker in ("content policy", "content_filter", "refusal")):
-        category = MidStreamErrorCategory.CONTENT_POLICY
 
     classified_payload: MidStreamErrorPayload = {
         "category": category.value,
@@ -245,10 +288,16 @@ def classify_response_failure(details: dict[str, Any]) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.QUOTA_EXHAUSTED
     elif "rate" in lowered and "limit" in lowered:
         category = MidStreamErrorCategory.RATE_LIMIT
-    elif any(marker in lowered for marker in ("server_error", "internal_error", "5xx")):
-        category = MidStreamErrorCategory.PROVIDER_5XX
     elif "context" in lowered and any(token in lowered for token in ("window", "length", "token")):
         category = MidStreamErrorCategory.CONTEXT_OVERFLOW
+    elif is_deterministic_client_error_status(details.get("status_code")) or (
+        code == "invalid_request_error"
+    ):
+        # Checked before the 5xx markers so an authoritative 4xx status is not
+        # overridden by a message that merely mentions a server error.
+        category = MidStreamErrorCategory.INVALID_REQUEST
+    elif any(marker in lowered for marker in ("server_error", "internal_error", "5xx")):
+        category = MidStreamErrorCategory.PROVIDER_5XX
 
     payload: MidStreamErrorPayload = {
         "category": category.value,

@@ -37,7 +37,7 @@ from cognis.tools.skill_service import (
     normalize_skill_tools,
     resolve_current_skill_version,
 )
-from cognis.tools.skills import _qualified_skill_tool_name, skill_tools_to_definitions
+from cognis.tools.skills import skill_tools_to_definitions
 
 logger = get_logger(__name__)
 
@@ -83,7 +83,7 @@ SKILL_LIST_TOOL = ToolDefinition(
 SKILL_LOAD_TOOL = ToolDefinition(
     name="skill_load",
     description=(
-        "Load a skill's full instructions, prompt templates, and tool summaries. "
+        "Load a skill's full instructions, prompt templates, and asset manifest. "
         "Use this when you need to follow a skill's guidance. Always returns the "
         "latest published version. This is the primary way to access skill content "
         "— the available_skills metadata in the system prompt only contains summaries. "
@@ -568,8 +568,6 @@ def materialize_loaded_skill_context(
     import json
 
     asset_manifest = _skill_asset_llm_manifest(asset_refs)
-    available_skill_tools = _skill_tool_runtime_summaries(skill_id, tools)
-
     protected_context_parts = [
         "<loaded_skill>",
         f"<skill_id>{skill_id}</skill_id>",
@@ -579,16 +577,6 @@ def materialize_loaded_skill_context(
         protected_context_parts.append(f"<description>{description}</description>")
     if isinstance(instructions, str) and instructions.strip():
         protected_context_parts.append(f"<instructions>\n{instructions}\n</instructions>")
-    if tools:
-        protected_context_parts.append(
-            "<tool_summaries>\n" + json.dumps(tools, indent=2, default=str) + "\n</tool_summaries>"
-        )
-    if available_skill_tools:
-        protected_context_parts.append(
-            "<available_skill_tools>\n"
-            + json.dumps(available_skill_tools, indent=2, default=str)
-            + "\n</available_skill_tools>"
-        )
     if asset_manifest:
         protected_context_parts.append(
             "<asset_manifest>\n"
@@ -596,19 +584,16 @@ def materialize_loaded_skill_context(
             + "\n</asset_manifest>"
         )
         protected_context_parts.append(
-            "<asset_guidance>Prefer available_skill_tools for runnable skill behavior. "
-            "Use skill_asset_materialize only when you need an asset-only script or "
-            "need to inspect an asset as an executor-local file.</asset_guidance>"
+            "<asset_guidance>Use skill_asset_materialize only when you need an "
+            "asset-only script or need to inspect an asset as an executor-local "
+            "file. Runnable skill tools are exposed separately by the tool "
+            "runtime.</asset_guidance>"
         )
     if templates:
         protected_context_parts.append(
             "<prompt_templates>\n"
             + json.dumps(templates, indent=2, default=str)
             + "\n</prompt_templates>"
-        )
-    if steps:
-        protected_context_parts.append(
-            "<workflow_steps>\n" + json.dumps(steps, indent=2, default=str) + "\n</workflow_steps>"
         )
     protected_context_parts.append("</loaded_skill>")
 
@@ -633,18 +618,16 @@ def materialize_loaded_skill_context(
         "step_count": len(steps or []),
         "template_count": len(templates or {}),
         "asset_count": len(asset_refs),
-        "available_skill_tools": available_skill_tools,
         "asset_manifest": asset_manifest,
         "asset_guidance": (
-            "Prefer available_skill_tools for runnable behavior. Use "
-            "skill_asset_materialize(skill_id, asset_id) only for asset-only scripts "
-            "or asset inspection."
+            "Use skill_asset_materialize(skill_id, asset_id) only for asset-only "
+            "scripts or asset inspection. Runnable skill tools are exposed "
+            "separately by the tool runtime."
             if asset_manifest
             else None
         ),
         "message": "Skill loaded into working context for this turn.",
         "tags": tags or [],
-        "linked_tool_ids": linked_tool_ids or [],
         "version_id": version_id,
         "version_number": version_number,
         "content_hash": content_hash or "",
@@ -884,7 +867,7 @@ async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResul
 async def _handle_skill_load(
     session_factory: Any, user_email: str, arguments: dict[str, Any]
 ) -> ToolResult:
-    """Load a skill's full instructions, templates, and tool summaries.
+    """Load a skill's full instructions, templates, and asset manifest.
 
     This is the primary way the model accesses skill content.  Always
     returns the latest published version.
@@ -970,42 +953,6 @@ async def _handle_skill_load(
         output=json.dumps(result, indent=2, default=str),
         metadata=metadata,
     )
-
-
-def _skill_tool_runtime_summaries(
-    skill_id: str,
-    tools: list[dict[str, Any]] | dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Return LLM-facing runtime names for skill-defined tools."""
-
-    if not tools:
-        return []
-    raw_items = list(tools.values()) if isinstance(tools, dict) else tools
-    if not isinstance(raw_items, list):
-        return []
-    summaries: list[dict[str, Any]] = []
-    for raw in raw_items:
-        if not isinstance(raw, dict):
-            continue
-        raw_name = str(raw.get("name") or "").strip()
-        if not raw_name:
-            continue
-        recipe = raw.get("recipe") if isinstance(raw.get("recipe"), dict) else {}
-        summary: dict[str, Any] = {
-            "name": raw_name,
-            "callable_name": _qualified_skill_tool_name(skill_id, raw_name),
-            "stable_tool_id": f"skill:{skill_id}:{raw_name}",
-            "description": raw.get("description") or "",
-            "parameters": raw.get("parameters") or {"type": "object", "properties": {}},
-        }
-        if recipe:
-            summary["recipe"] = {
-                "mode": recipe.get("mode"),
-                "entry": recipe.get("entry"),
-                "required_assets": recipe.get("required_assets") or [],
-            }
-        summaries.append(summary)
-    return summaries
 
 
 def _skill_asset_llm_manifest(asset_refs: list[Any]) -> list[dict[str, Any]]:

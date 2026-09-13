@@ -305,7 +305,27 @@ def _format_lsp_collections(
         notices.append(f"{unchanged_warning_count} pre-existing warning(s) unchanged.")
 
     text = "\n\n".join(part for part in [formatted, *notices] if part)
+    if formatted:
+        injection = "injected"
+    elif (
+        fresh_waits and unchanged_warning_count == 0 and not timeout_servers and not failed_servers
+    ):
+        injection = "clean"
+    elif fresh_waits and unchanged_warning_count:
+        injection = "suppressed_unchanged"
+    else:
+        injection = "none"
+    fresh_errors = sum(wait.error_count for wait in fresh_waits)
+    fresh_warnings = sum(wait.warning_count for wait in fresh_waits)
+    injected_bytes = len(text.encode("utf-8"))
     metadata = {
+        # Bounded facts the controller turns into metrics; no paths or text.
+        "injection": injection,
+        "injected_bytes": injected_bytes,
+        "estimated_tokens": (injected_bytes + 3) // 4,
+        "error_count": fresh_errors,
+        "warning_count": fresh_warnings,
+        "suppressed_unchanged_count": unchanged_warning_count,
         "status_counts": status_counts,
         "waits": [
             {
@@ -392,6 +412,8 @@ _DEFAULT_IGNORE = {
     ".next",
     ".nuxt",
 }
+# Public alias for other executor tools that enumerate source trees.
+DEFAULT_IGNORE_NAMES = frozenset(_DEFAULT_IGNORE)
 
 _PRETTIER_EXTENSIONS = {
     ".js",

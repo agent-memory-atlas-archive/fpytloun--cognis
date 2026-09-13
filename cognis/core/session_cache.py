@@ -17,6 +17,7 @@ import collections
 import contextlib
 import hashlib
 import json
+import math
 import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1548,6 +1549,9 @@ class SessionCache:
         effective_reserve_output_tokens: int | None = None,
         compaction_threshold: float | None = None,
         projection_policy: dict[str, Any] | None = None,
+        raw_prompt_tokens: int | None = None,
+        estimator_identity: str | None = None,
+        prompt_token_calibration: dict[str, Any] | None = None,
         turn_id: str | None = None,
         runtime_selection_revision: int | None = None,
     ) -> None:
@@ -1576,6 +1580,8 @@ class SessionCache:
                 "runtime_selection_revision": runtime_selection_revision,
                 "measured_at": datetime.now(UTC).isoformat(),
                 "measurement_source": "projected_prompt",
+                "raw_prompt_tokens": raw_prompt_tokens,
+                "estimator_identity": estimator_identity,
             }
             for key, value in runtime_metadata.items():
                 if value is None:
@@ -1590,6 +1596,12 @@ class SessionCache:
                 entry.context_metadata["compaction_threshold"] = float(compaction_threshold)
             if projection_policy is not None:
                 entry.context_metadata["projection_policy"] = dict(projection_policy)
+            if prompt_token_calibration is None:
+                entry.context_metadata.pop("applied_prompt_token_calibration", None)
+            else:
+                entry.context_metadata["applied_prompt_token_calibration"] = dict(
+                    prompt_token_calibration
+                )
 
     def get_context_usage(self, session_id: str) -> dict[str, Any] | None:
         """Get the cached context usage for a session.
@@ -1636,6 +1648,11 @@ class SessionCache:
             "runtime_selection_revision": entry.context_metadata.get("runtime_selection_revision"),
             "measured_at": entry.context_metadata.get("measured_at"),
             "measurement_source": entry.context_metadata.get("measurement_source"),
+            "raw_prompt_tokens": entry.context_metadata.get("raw_prompt_tokens"),
+            "estimator_identity": entry.context_metadata.get("estimator_identity"),
+            "prompt_token_calibration": entry.context_metadata.get(
+                "applied_prompt_token_calibration"
+            ),
             "last_llm_usage": dict(entry.last_llm_usage),
         }
 
@@ -1646,6 +1663,66 @@ class SessionCache:
         if entry is None:
             return
         entry.last_llm_usage = dict(usage or {})
+
+    def apply_prompt_token_calibration(
+        self,
+        session_id: str,
+        *,
+        raw_prompt_tokens: int,
+        provider_id: str | None,
+        model: str,
+        estimator_identity: str,
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Apply the latest compatible provider observation within one session."""
+
+        entry = self._entries.get(session_id)
+        if entry is None or raw_prompt_tokens <= 0:
+            return raw_prompt_tokens, None
+        calibration = entry.context_metadata.get("prompt_token_calibration")
+        if not isinstance(calibration, dict):
+            return raw_prompt_tokens, None
+        if (
+            calibration.get("provider_id") != provider_id
+            or calibration.get("model") != model
+            or calibration.get("estimator_identity") != estimator_identity
+        ):
+            return raw_prompt_tokens, None
+        ratio = calibration.get("applied_ratio")
+        if not isinstance(ratio, int | float) or ratio <= 0:
+            return raw_prompt_tokens, None
+        calibrated = max(1, math.ceil(raw_prompt_tokens * float(ratio)))
+        return calibrated, dict(calibration)
+
+    def update_prompt_token_calibration(
+        self,
+        session_id: str,
+        *,
+        provider_id: str | None,
+        model: str,
+        estimator_identity: str,
+        raw_prompt_tokens: int,
+        actual_prompt_tokens: int,
+        source_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Replace session calibration with one correlated provider observation."""
+
+        entry = self._entries.get(session_id)
+        if entry is None or raw_prompt_tokens <= 0 or actual_prompt_tokens <= 0:
+            return None
+        observed_ratio = actual_prompt_tokens / raw_prompt_tokens
+        calibration = {
+            "provider_id": provider_id,
+            "model": model,
+            "estimator_identity": estimator_identity,
+            "observed_ratio": observed_ratio,
+            "applied_ratio": max(1.0, observed_ratio),
+            "raw_prompt_tokens": raw_prompt_tokens,
+            "actual_prompt_tokens": actual_prompt_tokens,
+            "source_request_id": source_request_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        entry.context_metadata["prompt_token_calibration"] = calibration
+        return dict(calibration)
 
     def update_last_generation_performance(
         self, session_id: str, performance: dict[str, Any] | None

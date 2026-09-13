@@ -26,8 +26,10 @@ from cognis.store.queries import (
     create_knowledgebase,
     create_llm_provider,
     create_schedule,
+    create_skill,
     create_user,
     create_workflow,
+    get_agent,
     update_schedule,
 )
 from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL, handle_agent_management_tool
@@ -737,6 +739,34 @@ def test_agent_management_list_includes_available_profiles(tmp_path: Path) -> No
     asyncio.run(_run())
 
 
+def test_agent_management_list_marks_current_agent_manageable(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="controller-agent",
+                owner_email="owner@example.com",
+                name="Controller Agent",
+                status="active",
+            )
+            await session.commit()
+
+        result = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "list"},
+        )
+
+        assert result["agents"][0]["manageable"] is True
+
+    asyncio.run(_run())
+
+
 def test_agent_management_settings_update_rejects_invalid_values(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -871,6 +901,229 @@ def test_agent_management_tool_assignment_crud_and_validation(tmp_path: Path) ->
             },
         )
         assert created_kb_state["assigned_knowledgebases"] == [kb.knowledgebase_id]
+
+    asyncio.run(_run())
+
+
+def test_agent_management_skill_assignment_crud_and_autoload(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                skills={
+                    "items": [
+                        {"name": "Legacy", "tool_names": ["legacy_tool"]},
+                        {"skill_id": "existing", "enabled": True},
+                    ]
+                },
+                status="active",
+            )
+            await create_skill(
+                session,
+                skill_id="existing",
+                owner_email="owner@example.com",
+                name="Existing",
+                instructions="Existing instructions.",
+            )
+            await create_skill(
+                session,
+                skill_id="coding",
+                owner_email=None,
+                name="Coding",
+                instructions="Coding instructions.",
+                auto_load=True,
+                is_system=True,
+            )
+            await create_skill(
+                session,
+                skill_id="cognis-orchestrator",
+                owner_email=None,
+                name="Orchestrator",
+                instructions="Scoped instructions.",
+                is_system=True,
+            )
+            await session.commit()
+
+        initial = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "skills_get", "agent_id": "managed-agent"},
+        )
+        assert initial["skill_assignments"] == [
+            {
+                "skill_id": "existing",
+                "enabled": True,
+                "auto_load_instructions": False,
+            }
+        ]
+        assert {item["skill_id"] for item in initial["available_skills"]} == {
+            "coding",
+            "existing",
+        }
+        assert (
+            next(item for item in initial["available_skills"] if item["skill_id"] == "coding")[
+                "attach_to_all_agents"
+            ]
+            is True
+        )
+
+        added = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "skills_add",
+                "agent_id": "managed-agent",
+                "skill_assignments": [
+                    {
+                        "skill_id": "coding",
+                        "enabled": True,
+                        "auto_load_instructions": True,
+                    }
+                ],
+            },
+        )
+        assert [item["skill_id"] for item in added["skill_assignments"]] == [
+            "existing",
+            "coding",
+        ]
+        assert added["skill_assignments"][1]["auto_load_instructions"] is True
+        readded = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "skills_add",
+                "agent_id": "managed-agent",
+                "skill_assignments": [{"skill_id": "coding"}],
+            },
+        )
+        assert readded["skill_assignments"][1]["auto_load_instructions"] is True
+
+        updated = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "skills_update",
+                "agent_id": "managed-agent",
+                "skill_assignments": [{"skill_id": "coding", "enabled": False}],
+            },
+        )
+        assert updated["skill_assignments"][1] == {
+            "skill_id": "coding",
+            "enabled": False,
+            "auto_load_instructions": True,
+        }
+
+        removed = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "skills_remove",
+                "agent_id": "managed-agent",
+                "skill_ids": ["existing"],
+            },
+        )
+        assert [item["skill_id"] for item in removed["skill_assignments"]] == ["coding"]
+        async with deps.session_factory() as session:
+            row = await get_agent(session, "managed-agent")
+            assert row is not None
+            assert row.skills["items"][0] == {
+                "name": "Legacy",
+                "tool_names": ["legacy_tool"],
+            }
+
+    asyncio.run(_run())
+
+
+def test_agent_management_skill_assignment_requires_self_mutation_approval(
+    tmp_path: Path,
+) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="controller-agent",
+                owner_email="owner@example.com",
+                name="Controller Agent",
+                status="active",
+            )
+            await session.commit()
+
+        try:
+            await handle_agent_management_action(
+                deps=deps,
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                arguments={
+                    "action": "skills_set",
+                    "agent_id": "controller-agent",
+                    "skill_assignments": [],
+                },
+            )
+        except AgentManagementError as exc:
+            assert "Self mutation requires explicit user approval" in str(exc)
+        else:
+            raise AssertionError("self skill mutation should require approval")
+
+    asyncio.run(_run())
+
+
+def test_agent_management_skill_assignment_rejects_unavailable_skill(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_user(
+                session, email="other@example.com", name="Other", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                status="active",
+            )
+            await create_skill(
+                session,
+                skill_id="other-private",
+                owner_email="other@example.com",
+                name="Other private",
+                instructions="Private.",
+            )
+            await session.commit()
+
+        try:
+            await handle_agent_management_action(
+                deps=deps,
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                arguments={
+                    "action": "skills_set",
+                    "agent_id": "managed-agent",
+                    "skill_assignments": [{"skill_id": "other-private"}],
+                },
+            )
+        except AgentManagementError as exc:
+            assert "Invalid skill_id: other-private" in str(exc)
+        else:
+            raise AssertionError("unavailable skill assignment should fail")
 
     asyncio.run(_run())
 

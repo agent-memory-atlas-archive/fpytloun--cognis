@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -309,6 +309,82 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
 
     relay.enqueue.assert_called_once_with(envelope, cumulative_boundary=False)
     assert relay.make_envelope.call_args.kwargs["volatile_items_complete"] is True
+
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conversation-1",
+        volatile_items=[],
+        retire_assistant_streams=True,
+    )
+    retired = relay.make_envelope.call_args.kwargs["volatile_items"]
+    assert len(retired) == 1
+    assert retired[0].content == item.content
+    assert retired[0].status == "complete"
+    assert retired[0].partial is False
+    await manager.send_chat_v2_runtime_to_conversation("conversation-1", volatile_items=[])
+    assert relay.make_envelope.call_args.kwargs["volatile_items"][0].status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_terminal_relay_precedes_durable_settlement_but_requires_current_owner() -> None:
+    from cognis.api.chat_v2.schemas import RuntimeAuthority
+
+    authority = RuntimeAuthority(
+        direct_request_id="request-1", turn_id="turn-1", fencing_token=7, lifecycle="active"
+    )
+    context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    scheduler = SimpleNamespace(
+        durable_runtime_context=AsyncMock(return_value={"authority": authority}),
+        durable_relay_generation_context=AsyncMock(return_value=context),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler))
+    )
+    envelope = ChatV2RuntimeRelayEnvelope(
+        kind=RelayKind.TERMINAL,
+        event_id="event-terminal",
+        generated_at=datetime.now(UTC),
+        origin=RelayOrigin(
+            controller_id="controller-a", incarnation_id="boot-a", runtime_epoch="runtime-a"
+        ),
+        conversation_id="conversation-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        direct_request_id="request-1",
+        owner=RelayOwner(controller_id="controller-a", incarnation_id="boot-a"),
+        fencing_token=7,
+        source_revision=2,
+        has_active_turn=False,
+        authority=authority.model_copy(update={"lifecycle": "terminal"}),
+    )
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.ACCEPT
+    scheduler.durable_relay_generation_context.return_value = None
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.STALE
+    scheduler.durable_runtime_context.side_effect = [
+        {"authority": authority},
+        {"authority": authority.model_copy(update={"lifecycle": "terminal"})},
+    ]
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.ACCEPT
+    scheduler.durable_runtime_context.side_effect = None
+    scheduler.durable_relay_generation_context.return_value = context
+    wrong_owner = envelope.model_copy(
+        update={"owner": RelayOwner(controller_id="controller-b", incarnation_id="boot-b")}
+    )
+    assert await manager.validate_relay_envelope(wrong_owner) == AdmissionDecision.STALE
+    scheduler.durable_relay_generation_context.return_value = replace(context, fencing_token=8)
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.WRONG_FENCE
+    scheduler.durable_relay_generation_context.return_value = context
+    scheduler.durable_runtime_context.return_value = {
+        "authority": authority.model_copy(update={"fencing_token": 8})
+    }
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.WRONG_FENCE
 
 
 @pytest.mark.asyncio
@@ -1347,6 +1423,7 @@ class _RecordingManager:
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
         lifecycle: str | None = None,
+        retire_assistant_streams: bool = False,
     ) -> None:
         del active_session_id, context_usage
         self.chat_v2_runtime_payloads.append(

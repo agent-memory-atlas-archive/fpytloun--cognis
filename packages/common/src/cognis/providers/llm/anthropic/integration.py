@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from cognis.models.config import ModelInfo
 from cognis.providers.llm.anthropic.contracts import (
+    CLAUDE_CODE_VERSION,
     AnthropicAuthPolicy,
     AnthropicLocation,
     AnthropicNativeEnvelope,
@@ -29,7 +30,6 @@ from cognis.providers.llm.anthropic.contracts import (
 from cognis.providers.llm.anthropic.tool_bundle import compile_anthropic_tool_bundle
 
 OFFICIAL_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages"
-CLAUDE_CODE_VERSION = "2.1.87"
 CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 CLAUDE_CODE_IDENTITY_BRIDGE = "The operative agent identity follows."
@@ -245,11 +245,6 @@ def build_native_request(
         require_active_continuation=require_active_continuation,
     )
     system, anthropic_messages = _convert_messages(replay_messages)
-    _append_developer_follow_up_user_tail(
-        replay_messages,
-        anthropic_messages,
-        require_active_continuation=require_active_continuation,
-    )
     if context.auth_policy is AnthropicAuthPolicy.OAUTH:
         first_user_text = _first_user_text(anthropic_messages)
         system = [
@@ -288,6 +283,7 @@ def build_native_request(
         "stop_sequences",
         "metadata",
         "thinking",
+        "speed",
         "output_config",
         "tool_choice",
         "parallel_tool_calls",
@@ -298,48 +294,6 @@ def build_native_request(
         if request_kwargs.get(key) is not None:
             payload[key] = request_kwargs[key]
     return context, payload, bundle
-
-
-def _append_developer_follow_up_user_tail(
-    source_messages: Sequence[Mapping[str, Any]],
-    anthropic_messages: list[dict[str, Any]],
-    *,
-    require_active_continuation: bool,
-) -> None:
-    """End developer-only follow-up cycles with a real Anthropic user message."""
-
-    if (
-        not require_active_continuation
-        or not anthropic_messages
-        or anthropic_messages[-1].get("role") != "assistant"
-    ):
-        return
-    native_index: int | None = None
-    envelope: AnthropicNativeEnvelope | None = None
-    for index in range(len(source_messages) - 1, -1, -1):
-        source = source_messages[index]
-        raw_envelope = source.get("_anthropic_native_envelope")
-        if source.get("role") != "assistant" or not isinstance(raw_envelope, Mapping):
-            continue
-        try:
-            envelope = AnthropicNativeEnvelope.from_dict(raw_envelope)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise AnthropicContinuationRejected("Corrupt active Anthropic native envelope") from exc
-        native_index = index
-        break
-    if envelope is None or native_index is None or envelope.stop_reason != "end_turn":
-        return
-    trailing_roles = [
-        str(message.get("role") or "") for message in source_messages[native_index + 1 :]
-    ]
-    if not trailing_roles or any(role not in {"developer", "system"} for role in trailing_roles):
-        return
-    anthropic_messages.append(
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": "Continue."}],
-        }
-    )
 
 
 def _prepare_native_replay_messages(
@@ -505,32 +459,56 @@ def _native_result_is_error(message: Mapping[str, Any]) -> bool:
 def _convert_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convert canonical chat messages into Anthropic ``system`` and ``messages``.
+
+    Only the leading run of ``system``/``developer`` messages becomes the
+    top-level ``system`` array.  Anthropic renders ``system`` ahead of every
+    message in the prompt-cache prefix, so hoisting a notice injected after
+    turn N would invalidate the cached history of turns 1..N on every cycle.
+    Later system messages therefore stay in transcript position as hidden
+    user-role notices, mirroring how the Responses bridge keeps them in the
+    ``input`` tail.
+
+    ``cache_control`` breakpoints placed by the controller survive the
+    conversion for every message shape, including tool results and assistant
+    turns replayed from native blocks.
+    """
+
     system_blocks: list[dict[str, Any]] = []
     output: list[dict[str, Any]] = []
+    leading_prefix = True
     for message in messages:
         role = str(message.get("role") or "")
+        cache_control = _message_cache_control(message)
+        if role in {"user", "assistant", "tool"}:
+            leading_prefix = False
         if role in {"system", "developer"}:
             blocks = _content_to_blocks(message.get("content"))
-            for block in blocks:
-                if block.get("type") == "text":
-                    text = block.get("text")
-                    if isinstance(text, str):
-                        block["text"] = _sanitize_system_text(text)
-                    system_blocks.append(block)
+            if leading_prefix:
+                for block in blocks:
+                    if block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            block["text"] = _sanitize_system_text(text)
+                        system_blocks.append(block)
+                _apply_cache_control_to_blocks(system_blocks, cache_control)
+                continue
+            notice = _positional_system_notice(role, blocks)
+            if notice is not None:
+                _apply_cache_control_to_blocks([notice], cache_control)
+                _append_anthropic_message(output, "user", [notice])
             continue
         if role == "tool":
-            _append_anthropic_message(
-                output,
-                "user",
-                [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": str(message.get("tool_call_id") or ""),
-                        "content": _content_to_text(message.get("content")),
-                        **({"is_error": True} if message.get("_tool_is_error") else {}),
-                    }
-                ],
-            )
+            blocks = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": str(message.get("tool_call_id") or ""),
+                    "content": _content_to_text(message.get("content")),
+                    **({"is_error": True} if message.get("_tool_is_error") else {}),
+                }
+            ]
+            _apply_cache_control_to_blocks(blocks, cache_control)
+            _append_anthropic_message(output, "user", blocks)
             continue
         if role not in {"user", "assistant"}:
             continue
@@ -564,11 +542,68 @@ def _convert_messages(
                                 "input": _parse_tool_arguments(function.get("arguments")),
                             }
                         )
+            _apply_cache_control_to_blocks(blocks, cache_control)
         if blocks:
             _append_anthropic_message(output, role, blocks)
     if not output:
         output.append({"role": "user", "content": [{"type": "text", "text": ""}]})
     return system_blocks, output
+
+
+def _message_cache_control(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the controller-placed cache breakpoint for one canonical message."""
+
+    explicit = message.get("_cache_control")
+    if isinstance(explicit, Mapping):
+        copied: dict[str, Any] = {}
+        _copy_cache_control({"cache_control": dict(explicit)}, copied)
+        if copied:
+            return dict(copied["cache_control"])
+    content = message.get("content")
+    if isinstance(content, list):
+        for item in reversed(content):
+            if isinstance(item, Mapping) and isinstance(item.get("cache_control"), Mapping):
+                copied = {}
+                _copy_cache_control({"cache_control": dict(item["cache_control"])}, copied)
+                if copied:
+                    return dict(copied["cache_control"])
+    return None
+
+
+def _apply_cache_control_to_blocks(
+    blocks: list[dict[str, Any]], cache_control: Mapping[str, Any] | None
+) -> None:
+    """Place a breakpoint on the last block that Anthropic allows to carry one."""
+
+    if cache_control is None:
+        return
+    for block in reversed(blocks):
+        if block.get("type") in {"thinking", "redacted_thinking"}:
+            continue
+        if "cache_control" not in block:
+            block["cache_control"] = dict(cache_control)
+        return
+
+
+def _positional_system_notice(role: str, blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Render a non-leading system/developer message as a hidden user notice."""
+
+    text = "\n\n".join(
+        str(block["text"]).strip()
+        for block in blocks
+        if block.get("type") == "text" and isinstance(block.get("text"), str) and block["text"]
+    ).strip()
+    if not text:
+        return None
+    if text.startswith("<system-notice"):
+        return {"type": "text", "text": text}
+    body = text.replace("</system-notice", "</ system-notice")
+    return {
+        "type": "text",
+        "text": (
+            f'<system-notice canonical-role="{role}" hidden="true">\n{body}\n</system-notice>'
+        ),
+    }
 
 
 def _append_anthropic_message(
@@ -577,7 +612,21 @@ def _append_anthropic_message(
     if messages and messages[-1].get("role") == role:
         existing = messages[-1].setdefault("content", [])
         if isinstance(existing, list):
-            existing.extend(blocks)
+            if role == "user":
+                # Anthropic requires tool_result blocks to lead a user message.
+                results = [block for block in blocks if block.get("type") == "tool_result"]
+                others = [block for block in blocks if block.get("type") != "tool_result"]
+                if results:
+                    insert_at = 0
+                    while insert_at < len(existing) and (
+                        isinstance(existing[insert_at], dict)
+                        and existing[insert_at].get("type") == "tool_result"
+                    ):
+                        insert_at += 1
+                    existing[insert_at:insert_at] = results
+                existing.extend(others)
+            else:
+                existing.extend(blocks)
             return
     messages.append({"role": role, "content": blocks})
 

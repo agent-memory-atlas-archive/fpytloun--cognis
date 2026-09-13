@@ -69,10 +69,10 @@ const KNOWN_CONFIG_KEYS = new Set([
 const DEFAULT_CODEX_TRANSPORT: CodexTransport = 'direct';
 
 /** All known ModelEntry keys (including optional ones that defaultModelEntry omits). */
-const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
+export const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'model_id', 'display_name', 'context_window', 'max_input_tokens', 'max_context_window', 'max_output_tokens',
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
-  'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'supports_fast_mode', 'fast_mode_tier', 'reasoning_efforts',
+  'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'supports_fast_mode', 'fast_mode_tier', 'fast_mode_parameter', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
   'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
   'supports_openai_apply_patch', 'supports_responses_api', 'supports_extended_thinking',
@@ -82,28 +82,31 @@ const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
 ];
 
 /** Parse a raw model dict from the DB into a typed ModelEntry. */
-function parseModelEntry(raw: Record<string, unknown>): ModelEntry {
+function parseModelEntry(raw: Record<string, unknown>, effective?: ModelEntry): ModelEntry {
   const base = defaultModelEntry(typeof raw.model_id === 'string' ? raw.model_id : '');
+  const source = { ...effective, ...raw };
   for (const key of MODEL_ENTRY_KEYS) {
-    if (key in raw && raw[key] !== undefined && raw[key] !== null) {
+    if (key in source && source[key] !== undefined && source[key] !== null) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (base as any)[key] = raw[key];
+      (base as any)[key] = source[key];
     }
   }
-  return base;
+  return { ...base, _configuredFields: Object.keys(raw), _initialValues: { ...base } };
 }
 
 /** Serialize a ModelEntry for the config.models array, omitting default values. */
 function serializeModelEntry(entry: ModelEntry): Record<string, unknown> {
   const defaults = defaultModelEntry(entry.model_id);
   const result: Record<string, unknown> = { model_id: entry.model_id };
-  if (entry.display_name) result.display_name = entry.display_name;
   for (const key of MODEL_ENTRY_KEYS) {
-    if (key === 'model_id' || key === 'display_name') continue;
+    if (key === 'model_id') continue;
     const val = entry[key];
     const def = defaults[key];
     // Include if value differs from default, or if it's set and default is undefined
-    if (val !== undefined && val !== null && JSON.stringify(val) !== JSON.stringify(def)) {
+    const changed = entry._initialValues
+      ? JSON.stringify(val) !== JSON.stringify(entry._initialValues[key])
+      : JSON.stringify(val) !== JSON.stringify(def);
+    if (val !== undefined && (changed || entry._configuredFields?.includes(key))) {
       result[key] = val;
     }
   }
@@ -190,7 +193,7 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
   const rawModels = Array.isArray(config.models) ? (config.models as Array<Record<string, unknown>>) : [];
   const models: ModelEntry[] = rawModels
     .filter((item): item is Record<string, unknown> => typeof item?.model_id === 'string' && item.model_id !== '')
-    .map(parseModelEntry);
+    .map((raw) => parseModelEntry(raw, provider?.models?.find((m) => m.model_id === raw.model_id)));
 
   const authInfo = readAuthConfig(config);
   const defaultEnvVar = PRESET_ENV_VARS[preset] ?? '';

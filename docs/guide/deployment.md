@@ -22,6 +22,44 @@ Executors own runtime work:
 
 For ephemeral jobs, a WebSocket executor can be mostly stateless. For browser profiles, local identity, code workspaces, and LSP caches, mount a persistent executor home directory.
 
+## Trusted internal MCP OAuth destinations
+
+OAuth HTTP requests reject private and link-local destinations by default.
+An infrastructure administrator can permit an internal HTTPS origin through the
+controller environment:
+
+```bash
+COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS='{"mcp-gws.fpy.cz:443":["192.168.33.208/32"]}'
+```
+
+Restart the controller after a change. This policy is not an MCP server setting,
+tool argument, or OAuth metadata field. It grants network access, not user access.
+
+Keys must be exact lowercase DNS hostnames with explicit ports. Wildcards, URLs,
+IP-literal keys, duplicate keys, and empty CIDR lists are invalid.
+Values must be canonical RFC1918 IPv4 subnets of `/24` or narrower, or ULA IPv6
+subnets of `/120` or narrower. Host routes (`/32` or `/128`) are preferred.
+At most 64 origins and 16 CIDRs per origin are permitted.
+Invalid configuration fails closed.
+
+Every DNS result for a configured origin must belong to its permitted CIDRs.
+A mixed answer that includes an unrelated private or public address is rejected.
+The exception does not permit link-local, loopback, multicast, or public networks.
+Unconfigured origins retain the default restrictions, including localhost
+development support.
+
+Discovery, registration, device authorization, token exchange, and refresh use
+the same destination guard. Metadata redirects receive a fresh check per hop.
+Credential-bearing requests do not follow redirects.
+Each HTTP request connects to a checked numeric IP and retains the original
+HTTP Host header, TLS SNI, and certificate hostname validation.
+Connection pools are separate for each origin and destination.
+OAuth HTTP clients do not use environment proxies or environment CA overrides.
+Private certificate authorities must be present in the controller's default
+certificate trust store.
+This policy does not change executor MCP connections, issuer/resource checks,
+or PKCE.
+
 ## Local development
 
 The simplest local run uses `uvx`:

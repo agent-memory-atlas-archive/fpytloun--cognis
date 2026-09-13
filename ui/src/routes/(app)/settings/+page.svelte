@@ -16,6 +16,7 @@
   import ExecutorCapabilitiesPanel from '$lib/components/executors/ExecutorCapabilitiesPanel.svelte';
   import LocalInferenceSettings from '$lib/components/executors/LocalInferenceSettings.svelte';
   import ModelCard from '$lib/components/settings/ModelCard.svelte';
+  import ModelRegistryDrift from '$lib/components/settings/ModelRegistryDrift.svelte';
   import ModelEditModal from '$lib/components/settings/ModelEditModal.svelte';
   import MfaSettings from '$lib/components/settings/MfaSettings.svelte';
   import ModelDiscoveryModal from '$lib/components/settings/ModelDiscoveryModal.svelte';
@@ -77,9 +78,9 @@
     HealthResponse,
     LLMProvider,
     LLMProviderOAuthStatus,
-    CodexUsage,
     CodexUsageAdditionalLimit,
     CodexUsageWindow,
+    ProviderUsage,
     ModelRouting,
     ProviderTestResult,
     PushSubscriptionStatusResponse,
@@ -357,8 +358,8 @@
   let providerForm = $state<ProviderFormState>(createProviderForm());
   let providerTestResult = $state<ProviderTestResult | null>(null);
   let providerOAuthStatus = $state<LLMProviderOAuthStatus | null>(null);
-  let providerCodexUsage = $state<CodexUsage | null>(null);
-  let providerCodexUsageError = $state('');
+  let providerUsage = $state<ProviderUsage | null>(null);
+  let providerUsageError = $state('');
   let anthropicOAuthCallbackInput = $state('');
   let showModelDiscovery = $state(false);
   let editingModel = $state<ModelEntry | null>(null);
@@ -869,8 +870,8 @@
     providerForm = createProviderForm(provider);
     providerTestResult = provider.last_test;
     providerOAuthStatus = null;
-    providerCodexUsage = null;
-    providerCodexUsageError = '';
+    providerUsage = null;
+    providerUsageError = '';
     anthropicOAuthCallbackInput = '';
   }
 
@@ -891,8 +892,8 @@
     providerForm = createProviderForm();
     providerTestResult = null;
     providerOAuthStatus = null;
-    providerCodexUsage = null;
-    providerCodexUsageError = '';
+    providerUsage = null;
+    providerUsageError = '';
     anthropicOAuthCallbackInput = '';
   }
 
@@ -932,13 +933,34 @@
       providerForm.backend = 'litellm';
     }
     providerOAuthStatus = null;
-    providerCodexUsage = null;
-    providerCodexUsageError = '';
+    providerUsage = null;
+    providerUsageError = '';
     anthropicOAuthCallbackInput = '';
   }
 
   function isAnthropicSubscriptionOAuth(): boolean {
     return providerForm.preset === 'anthropic' && providerForm.auth_mode === 'oauth';
+  }
+
+  function providerUsageSupported(): boolean {
+    if (providerForm.preset === 'chatgpt') return providerForm.auth_mode === 'oauth';
+    return providerForm.preset === 'anthropic';
+  }
+
+  function providerUsageTitle(): string {
+    if (providerForm.preset === 'chatgpt') return 'Codex usage and limits';
+    if (isAnthropicSubscriptionOAuth()) return 'Claude subscription usage and limits';
+    return 'Anthropic API rate limits';
+  }
+
+  function providerUsageHint(): string {
+    if (providerForm.preset === 'chatgpt') {
+      return 'Fetches the same Codex usage windows used by the Codex client. Exact remaining messages are not exposed.';
+    }
+    if (isAnthropicSubscriptionOAuth()) {
+      return 'Fetches the same 5-hour and 7-day utilization windows Claude Code shows, plus the latest rate-limit headers seen by this controller.';
+    }
+    return 'API-key providers have no usage endpoint. Cognis reports the per-minute rate-limit headers from the latest Anthropic response.';
   }
 
   async function resetProviderForm(): Promise<void> {
@@ -954,13 +976,34 @@
     initialSnapshot = snapshotState();
   }
 
+  let registrySnapshot = $state<{ scope: string; models: ModelEntry[] } | null>(null);
+
+  function discoveryScope(form = providerForm): string {
+    return JSON.stringify([
+      form.provider_id, form.preset, form.location, form.base_url, form.backend,
+      form.executor_id, form.executor_selector, form.auth_mode, form.auth_env_var,
+      form.auth_secret_name, form.auth_secret_value, form.advanced_settings,
+    ]);
+  }
+
+  const registryCurrent = $derived(registrySnapshot?.scope === discoveryScope());
+  function registryModel(id: string): ModelEntry | null {
+    return registryCurrent ? registrySnapshot?.models.find((m) => m.model_id === id) || null : null;
+  }
+
   async function discoverModels(): Promise<void> {
     busy = true;
     error = '';
+    registrySnapshot = null;
+    const scope = discoveryScope();
     try {
       let models: ModelEntry[];
       const useCurrentFormForDiscovery = providerForm.location === 'executor' && providerForm.preset === 'ollama';
       if (selectedProviderId && !useCurrentFormForDiscovery) {
+        const saved = selectedProvider();
+        if (saved && scope !== discoveryScope(createProviderForm(saved))) {
+          throw new Error('Save or discard provider connection changes before registry discovery.');
+        }
         const result = await api.llmProviders.discoverModels(selectedProviderId);
         models = result.models;
       } else {
@@ -985,6 +1028,8 @@
         });
         models = result.models;
       }
+      if (scope !== discoveryScope()) return;
+      registrySnapshot = { scope, models };
       providerForm.discovered_models = models;
       showModelDiscovery = true;
       addToast(`Discovered ${models.length} models.`, 'success');
@@ -1958,8 +2003,8 @@
     error = '';
     try {
       providerOAuthStatus = await api.llmProviders.startChatgptOAuth(selectedProviderId);
-      providerCodexUsage = null;
-      providerCodexUsageError = '';
+      providerUsage = null;
+      providerUsageError = '';
       addToast('ChatGPT OAuth started. Enter the device code in your browser.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1976,7 +2021,7 @@
     try {
       providerOAuthStatus = await api.llmProviders.chatgptOAuthStatus(selectedProviderId);
       if (providerOAuthStatus.status !== 'authorized') {
-        providerCodexUsage = null;
+        providerUsage = null;
       }
       if (providerOAuthStatus.status === 'authorized') {
         addToast('ChatGPT OAuth is authorized.', 'success');
@@ -1989,15 +2034,15 @@
     }
   }
 
-  async function refreshCodexUsage(): Promise<void> {
+  async function refreshProviderUsage(): Promise<void> {
     if (!selectedProviderId) return;
     busy = true;
-    providerCodexUsageError = '';
+    providerUsageError = '';
     try {
-      providerCodexUsage = await api.llmProviders.codexUsage(selectedProviderId);
+      providerUsage = await api.llmProviders.providerUsage(selectedProviderId);
     } catch (caughtError) {
-      providerCodexUsageError = asApiError(caughtError).message;
-      addToast(providerCodexUsageError, 'error', 4_000, 'Unable to fetch Codex usage');
+      providerUsageError = asApiError(caughtError).message;
+      addToast(providerUsageError, 'error', 4_000, 'Unable to fetch provider usage');
     } finally {
       busy = false;
     }
@@ -2010,8 +2055,8 @@
     try {
       await api.llmProviders.clearChatgptOAuth(selectedProviderId);
       providerOAuthStatus = null;
-      providerCodexUsage = null;
-      providerCodexUsageError = '';
+      providerUsage = null;
+      providerUsageError = '';
       addToast('ChatGPT OAuth tokens removed.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -3048,93 +3093,6 @@
                           </label>
                           <Button size="sm" variant="secondary" onclick={completeAnthropicOAuth} disabled={busy || !anthropicOAuthCallbackInput.trim()}>Complete OAuth</Button>
                         </div>
-                      {:else}
-                      <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
-                        <div class="flex flex-wrap items-center justify-between gap-2">
-                          <p class="font-medium text-slate-200">Codex usage and limits</p>
-                          <Button size="sm" variant="secondary" onclick={refreshCodexUsage} disabled={busy}>Refresh usage</Button>
-                        </div>
-                        {#if providerCodexUsage}
-                          <div class="mt-3 space-y-3">
-                            <div class="flex flex-wrap items-center justify-between gap-2">
-                              <p>Plan: <span class="font-mono text-slate-100">{providerCodexUsage.plan_type ?? 'unknown'}</span></p>
-                              {#if providerCodexUsage.limit_reached}
-                                <span class="rounded-full bg-rose-500/15 px-2 py-0.5 text-rose-200">Limit reached</span>
-                              {/if}
-                            </div>
-                            {#if providerCodexUsage.primary}
-                              {@const window = providerCodexUsage.primary}
-                              <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-primary-limit">
-                                <div class="flex items-center justify-between gap-3">
-                                  <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'primary')}</p>
-                                  <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
-                                </div>
-                                <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex short-term rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
-                                  <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
-                                </div>
-                                <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
-                              </div>
-                            {/if}
-                            {#if providerCodexUsage.secondary}
-                              {@const window = providerCodexUsage.secondary}
-                              <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-secondary-limit">
-                                <div class="flex items-center justify-between gap-3">
-                                  <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'secondary')}</p>
-                                  <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
-                                </div>
-                                <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex secondary rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
-                                  <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
-                                </div>
-                                <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
-                              </div>
-                            {/if}
-                            {#each providerCodexUsage.additional_rate_limits as limit}
-                              {#if limit.primary}
-                                {@const window = limit.primary}
-                                <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
-                                  <div class="flex items-center justify-between gap-3">
-                                    <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)}</p>
-                                    <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
-                                  </div>
-                                  <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
-                                    <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
-                                  </div>
-                                  <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
-                                </div>
-                              {/if}
-                              {#if limit.secondary}
-                                {@const window = limit.secondary}
-                                <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
-                                  <div class="flex items-center justify-between gap-3">
-                                    <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)} — secondary window</p>
-                                    <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
-                                  </div>
-                                  <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} secondary usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
-                                    <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
-                                  </div>
-                                  <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
-                                </div>
-                              {/if}
-                            {/each}
-                            {#if providerCodexUsage.rate_limit_reached_type}
-                              <p class="text-amber-200">Limit status: {providerCodexUsage.rate_limit_reached_type}</p>
-                            {/if}
-                            {#if providerCodexUsage.credits}
-                              <p>Credits: {providerCodexUsage.credits.unlimited ? 'unlimited' : providerCodexUsage.credits.balance ?? 'available'}</p>
-                            {/if}
-                            {#if providerCodexUsage.usage_url}
-                              <a class="text-sky-300 underline" href={providerCodexUsage.usage_url} target="_blank" rel="noreferrer">Open ChatGPT usage dashboard</a>
-                            {/if}
-                            {#if providerCodexUsage.fetched_at}
-                              <p class="text-slate-500">Fetched {new Date(providerCodexUsage.fetched_at).toLocaleString()}</p>
-                            {/if}
-                          </div>
-                        {:else if providerCodexUsageError}
-                          <p class="mt-2 text-rose-200">{providerCodexUsageError}</p>
-                        {:else}
-                          <p class="mt-2 text-slate-400">Fetches the same Codex usage windows used by the Codex client. Exact remaining messages are not exposed.</p>
-                        {/if}
-                      </div>
                       {/if}
                     {:else}
                       <p class="text-xs text-sky-300">Create the provider first, then start OAuth.</p>
@@ -3165,6 +3123,117 @@
                     {/if}
                   </div>
                 {/if}
+              </div>
+            </div>
+          {/if}
+
+          {#if selectedProviderId && providerUsageSupported()}
+            <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4" data-testid="provider-usage-card">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Usage and limits</p>
+              <div class="mt-3">
+                <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <p class="font-medium text-slate-200">{providerUsageTitle()}</p>
+                    <Button size="sm" variant="secondary" onclick={refreshProviderUsage} disabled={busy}>Refresh usage</Button>
+                  </div>
+                  {#if providerUsage}
+                    <div class="mt-3 space-y-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        {#if providerUsage.plan_type}
+                          <p>Plan: <span class="font-mono text-slate-100">{providerUsage.plan_type}</span></p>
+                        {:else}
+                          <p class="text-slate-400">{providerUsage.source === 'anthropic_rate_limit_headers' ? 'Per-minute rate limits' : 'Rolling usage windows'}</p>
+                        {/if}
+                        {#if providerUsage.limit_reached}
+                          <span class="rounded-full bg-rose-500/15 px-2 py-0.5 text-rose-200">Limit reached</span>
+                        {/if}
+                      </div>
+                      {#if providerUsage.primary}
+                        {@const window = providerUsage.primary}
+                        <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-primary-limit">
+                          <div class="flex items-center justify-between gap-3">
+                            <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'primary')}</p>
+                            <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                          </div>
+                          <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex short-term rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                            <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                          </div>
+                          <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                        </div>
+                      {/if}
+                      {#if providerUsage.secondary}
+                        {@const window = providerUsage.secondary}
+                        <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-secondary-limit">
+                          <div class="flex items-center justify-between gap-3">
+                            <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'secondary')}</p>
+                            <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                          </div>
+                          <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex secondary rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                            <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                          </div>
+                          <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                        </div>
+                      {/if}
+                      {#each providerUsage.additional_rate_limits as limit}
+                        {#if limit.primary}
+                          {@const window = limit.primary}
+                          <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
+                            <div class="flex items-center justify-between gap-3">
+                              <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)}</p>
+                              <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                            </div>
+                            <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                              <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                            </div>
+                            <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                          </div>
+                        {/if}
+                        {#if limit.secondary}
+                          {@const window = limit.secondary}
+                          <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
+                            <div class="flex items-center justify-between gap-3">
+                              <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)} — secondary window</p>
+                              <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                            </div>
+                            <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} secondary usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                              <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                            </div>
+                            <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                          </div>
+                        {/if}
+                      {/each}
+                      {#if providerUsage.rate_limit_reached_type}
+                        <p class="text-amber-200">Limit status: {providerUsage.rate_limit_reached_type}</p>
+                      {/if}
+                      {#if providerUsage.credits}
+                        <p>Credits: {providerUsage.credits.unlimited ? 'unlimited' : providerUsage.credits.balance ?? 'available'}</p>
+                      {/if}
+                      {#if providerUsage.usage_url}
+                        <a class="text-sky-300 underline" href={providerUsage.usage_url} target="_blank" rel="noreferrer">Open provider usage dashboard</a>
+                      {/if}
+                      {#if providerUsage.fetched_at}
+                        <p class="text-slate-500">Fetched {new Date(providerUsage.fetched_at).toLocaleString()}</p>
+                      {/if}
+                      {#if providerUsage.rate_limit_headers}
+                        <details class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="provider-usage-rate-limit-headers">
+                          <summary class="cursor-pointer text-slate-300">Latest rate-limit headers{providerUsage.observed_at ? ` · observed ${new Date(providerUsage.observed_at).toLocaleString()}` : ''}</summary>
+                          <dl class="mt-2 grid gap-1 font-mono text-[11px] text-slate-400">
+                            {#each Object.entries(providerUsage.rate_limit_headers) as [name, value]}
+                              <div class="flex justify-between gap-3"><dt>{name}</dt><dd class="text-slate-200">{value}</dd></div>
+                            {/each}
+                          </dl>
+                        </details>
+                      {/if}
+                      {#if !providerUsage.ok && providerUsage.unavailable_reason === 'no_requests_observed'}
+                        <p class="text-slate-400">No Anthropic responses observed on this controller replica yet. Rate-limit headers appear after the first request.</p>
+                      {/if}
+                    </div>
+                  {:else if providerUsageError}
+                    <p class="mt-2 text-rose-200">{providerUsageError}</p>
+                  {:else}
+                    <p class="mt-2 text-slate-400">{providerUsageHint()}</p>
+                  {/if}
+                </div>
               </div>
             </div>
           {/if}
@@ -3304,6 +3373,14 @@
             {/if}
 
             <!-- Model cards -->
+            <p class="mt-3 text-xs text-slate-400">
+              {#if registryCurrent}
+                Registry comparison is available below. Discovery can use a bundled catalog or return partial metadata.
+                Differences are not automatically errors. Resets affect only this draft until Save provider.
+              {:else}
+                Click Discover to compare configured models with the provider registry. No comparison is available for the current connection.
+              {/if}
+            </p>
             <div class="mt-3 space-y-2">
               {#each providerForm.models as model (model.model_id)}
                 <ModelCard
@@ -3312,6 +3389,9 @@
                   onedit={() => (editingModel = { ...model })}
                   onremove={() => handleRemoveModel(model.model_id)}
                 />
+                {#if registryCurrent}
+                  <ModelRegistryDrift {model} registry={registryModel(model.model_id)} onreset={handleSaveModelEdit} />
+                {/if}
               {/each}
             </div>
 
@@ -4273,7 +4353,8 @@
             <!-- LSP Diagnostics settings -->
             {@const lspConfig = exec.config || {}}
             {@const lspEnabled = lspConfig.lsp_enabled !== false}
-            {@const lspAutoInstall = lspConfig.lsp_auto_install !== false}
+             {@const lspAutoInstall = lspConfig.lsp_auto_install !== false}
+             {@const lspPythonTypes = lspConfig.lsp_python_type_diagnostics === true}
             <details class="group">
               <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
                 LSP Diagnostics
@@ -4305,9 +4386,22 @@
                         addToast(`Auto-install ${checked ? 'enabled' : 'disabled'}.`, 'success');
                       }}
                     />
-                    Auto-install servers
-                  </label>
-                </div>
+                     Auto-install servers
+                   </label>
+                   <label class="flex items-center gap-2 text-sm text-slate-300" title="Include pyright type errors in automatic post-edit diagnostics for Python. Off by default: ruff only (fast, low noise).">
+                       <input type="checkbox" checked={lspPythonTypes} disabled={!lspEnabled}
+                         class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                       onchange={async (e) => {
+                         const checked = e.currentTarget.checked;
+                         const cfg = { ...(exec.config || {}), lsp_python_type_diagnostics: checked };
+                         await api.executor.update(exec.executor_id, { config: cfg });
+                         await refreshPageState();
+                         addToast(`Python type diagnostics ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                       }}
+                     />
+                     Python type diagnostics (pyright)
+                   </label>
+                 </div>
                 <div class="grid gap-3 md:grid-cols-3">
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Diagnostics timeout (ms)</span>
@@ -6042,6 +6136,8 @@
 {#if editingModel}
   <ModelEditModal
     model={editingModel}
+    registry={registryModel(editingModel.model_id)}
+    registryChecked={registryCurrent}
     onclose={() => (editingModel = null)}
     onsave={handleSaveModelEdit}
   />

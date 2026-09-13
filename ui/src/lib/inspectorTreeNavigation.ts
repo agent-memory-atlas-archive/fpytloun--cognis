@@ -28,6 +28,20 @@ export function selectedWorkSubtreeScope(
     : conversationTimelineScope(conversationId);
 }
 
+export function resolvedWorkSubtreeScope(
+  conversationId: string,
+  sessionId: string | null,
+  nodes: WorkstreamRef[],
+  identity: WorkstreamRef | null = null,
+): TimelineScope | null {
+  if (!sessionId) return conversationTimelineScope(conversationId);
+  const node = workstreamForSession(nodes, sessionId)
+    ?? workstreamForSession(identity ? [identity] : [], sessionId);
+  return node?.conversation_id
+    ? sessionTimelineScope(node.session_id, node.conversation_id)
+    : null;
+}
+
 export function workstreamForSession(
   nodes: WorkstreamRef[],
   sessionId: string | null,

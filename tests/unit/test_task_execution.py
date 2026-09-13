@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -229,6 +230,52 @@ async def test_renewal_error_marks_fence_lost_and_cancels(
         await fence.close()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tool_dispatch_boundaries_reuse_task_ownership_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fence = TaskExecutionFence(
+        store=object(),  # type: ignore[arg-type]
+        claim=object(),  # type: ignore[arg-type]
+        cancel_event=asyncio.Event(),
+    )
+    checkpoint = AsyncMock()
+    monkeypatch.setattr(fence, "checkpoint", checkpoint)
+    descriptors = [
+        {
+            "call_id": "call-1",
+            "tool_name": "bash",
+            "dispatch_state": "pending",
+        }
+    ]
+
+    await fence.record_tool_dispatch(
+        session_id="sess-task",
+        turn_id="turn-task",
+        descriptors=descriptors,
+    )
+    await fence.complete_tool_dispatch(
+        session_id="sess-task",
+        turn_id="turn-task",
+        call_ids=["call-1"],
+    )
+
+    assert checkpoint.await_args_list == [
+        call(
+            "tool_in_flight",
+            session_id="sess-task",
+            turn_id="turn-task",
+            tool_calls=descriptors,
+        ),
+        call(
+            "tool_result_persisted",
+            session_id="sess-task",
+            turn_id="turn-task",
+            call_ids=["call-1"],
+        ),
+    ]
 
 
 @pytest.mark.asyncio

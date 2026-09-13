@@ -76,6 +76,25 @@ def _session() -> SessionModel:
     )
 
 
+@pytest.mark.parametrize(
+    "session_effort, profile_effort, expected, source",
+    [
+        ("default", "low", "default", "session_override"),
+        (None, "default", "default", "agent_profile"),
+        (None, None, "low", "agent_config"),
+        (None, "low", "low", "agent_profile"),
+        ("none", "low", "none", "session_override"),
+    ],
+)
+def test_default_stops_inheritance(session_effort, profile_effort, expected, source):
+    session = _session().model_copy(update={"reasoning_effort_override": session_effort})
+    agent = _agent()
+    agent.agent_profiles["developer"].reasoning_effort = profile_effort
+    selection = resolve_runtime_selection(agent, session, _conversation())
+    assert selection.reasoning_effort == expected
+    assert selection.reasoning_effort_source == source
+
+
 def test_runtime_selection_prefers_session_overrides() -> None:
     session = _session().model_copy(
         update={
@@ -101,7 +120,8 @@ def test_runtime_selection_prefers_session_overrides() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_updates_are_durable_and_profile_clear_is_atomic(tmp_path) -> None:
+@pytest.mark.parametrize("effort", ["high", "default", "none"])
+async def test_runtime_updates_are_durable_and_profile_clear_is_atomic(tmp_path, effort) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime.db")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -155,9 +175,13 @@ async def test_runtime_updates_are_durable_and_profile_clear_is_atomic(tmp_path)
         session_cache=cache,
         conversation=conversation,
         session=session,
-        reasoning_effort_override="high",
+        reasoning_effort_override=effort,
         fast_mode_override=False,
     )
+    async with factory() as db:
+        saved = await get_session_row(db, session.session_id)
+        assert saved is not None
+        assert saved.reasoning_effort_override == effort
     await persist_runtime_selection(
         session_factory=factory,
         session_cache=cache,

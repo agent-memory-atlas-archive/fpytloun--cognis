@@ -7,6 +7,7 @@ import contextlib
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any, cast
 
 import sqlalchemy as sa
@@ -131,6 +132,29 @@ class TaskExecutionStore:
         self.max_active_global = max_active_global
         self.max_active_per_agent = max_active_per_agent
         self.ttl_seconds = ttl_seconds
+
+    async def next_scheduled_delay(self, *, queue_name: str = "default") -> float | None:
+        """Read a DB-relative deadline; overdue capacity waits do not spin."""
+        async with self._session_factory() as session:
+            now = database_now_expression(session)
+            result = await session.execute(
+                select(
+                    sa.func.min(Task.scheduled_for),
+                    sa.type_coerce(now, sa.DateTime(timezone=True)),
+                ).where(
+                    Task.status == "ready",
+                    Task.queue_name == queue_name,
+                    Task.scheduled_for > now,
+                )
+            )
+            deadline, database_now = result.one()
+        if deadline is None:
+            return None
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        if database_now.tzinfo is None:
+            database_now = database_now.replace(tzinfo=UTC)
+        return max(0.0, float((deadline - database_now).total_seconds()))
 
     async def claim_ready(self, *, queue_name: str = "default") -> TaskExecutionClaim | None:
         async with self._session_factory() as session:
@@ -548,6 +572,36 @@ class TaskExecutionFence:
 
     async def checkpoint(self, _name: str, **_metadata: Any) -> None:
         await self.assert_current()
+
+    async def record_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        descriptors: list[dict[str, Any]],
+    ) -> None:
+        """Fence a scheduled task before its tool batch can be dispatched."""
+        await self.checkpoint(
+            "tool_in_flight",
+            session_id=session_id,
+            turn_id=turn_id,
+            tool_calls=descriptors,
+        )
+
+    async def complete_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        call_ids: list[str],
+    ) -> None:
+        """Fence a scheduled task after its tool batch has settled."""
+        await self.checkpoint(
+            "tool_result_persisted",
+            session_id=session_id,
+            turn_id=turn_id,
+            call_ids=call_ids,
+        )
 
     def mark_terminal(self, status: str) -> None:
         """Permit post-commit cleanup and delivery for this exact terminal winner."""

@@ -18,6 +18,12 @@ class LSPRuntimeConfig(BaseModel):
     diagnostics_timeout_ms: int = 10_000
     idle_timeout_seconds: int = 600
     max_concurrent_servers: int = 8
+    python_type_diagnostics: bool = False
+    """Include pyright type errors in automatic post-edit diagnostics for Python.
+
+    Off by default: edit-time Python feedback comes from ruff only, which is
+    fast and low-noise.  Pyright remains available for explicit ``lsp`` queries.
+    """
 
 
 class LSPStatusConfig(BaseModel):
@@ -26,6 +32,7 @@ class LSPStatusConfig(BaseModel):
     diagnostics_timeout_ms: int
     idle_timeout_seconds: int
     max_concurrent_servers: int
+    python_type_diagnostics: bool = False
 
 
 class LSPActiveServerStatus(BaseModel):
@@ -101,7 +108,18 @@ def resolve_lsp_runtime_config(source: Mapping[str, Any] | None = None) -> LSPRu
             data.get("lsp_max_concurrent_servers")
             or os.environ.get("COGNIS_LSP_MAX_CONCURRENT_SERVERS", "8")
         ),
+        python_type_diagnostics=resolve_python_type_diagnostics(data),
     )
+
+
+def resolve_python_type_diagnostics(data: Mapping[str, Any]) -> bool:
+    """Resolve the Python type-diagnostics switch from overrides or environment."""
+    value = data.get("lsp_python_type_diagnostics")
+    if value is None:
+        value = os.environ.get("COGNIS_LSP_PYTHON_TYPE_DIAGNOSTICS", "false")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def build_lsp_unavailable_report(
@@ -121,6 +139,7 @@ def build_lsp_unavailable_report(
         diagnostics_timeout_ms=runtime_config.diagnostics_timeout_ms,
         idle_timeout_seconds=runtime_config.idle_timeout_seconds,
         max_concurrent_servers=runtime_config.max_concurrent_servers,
+        python_type_diagnostics=runtime_config.python_type_diagnostics,
     )
     return LSPStatusReport(
         supported=supported,

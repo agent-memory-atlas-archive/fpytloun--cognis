@@ -114,6 +114,7 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
         default_memory_backend="mnemory",
         default_guardrails_backend="intaris",
         mcp_oauth_refresh_timeout_seconds=30.0,
+        mcp_oauth_trusted_destinations={},
     )
 
 

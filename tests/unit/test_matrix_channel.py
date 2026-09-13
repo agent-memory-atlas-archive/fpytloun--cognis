@@ -1102,7 +1102,7 @@ async def test_send_message_embeds_inline_rich_image_in_the_text_event() -> None
                 channel_type="matrix",
                 account_id="matrix-account",
                 chat_id="!room:example.org",
-                content="Daily brief",
+                content="# Daily brief\n\nSummary.\n\n- First item\n- Second item",
                 platform_data={"canonical_rich_markdown": True},
                 media=[
                     MediaAttachment(
@@ -1122,6 +1122,9 @@ async def test_send_message_embeds_inline_rich_image_in_the_text_event() -> None
     assert requests[1].url.path.startswith("/_matrix/client/v3/rooms/")
     payload = json.loads(requests[1].read())
     assert '<img src="mxc://example.org/inline" alt="brief.png">' in payload["formatted_body"]
+    assert "<p>Summary.</p>" in payload["formatted_body"]
+    assert "<ul>" in payload["formatted_body"]
+    assert "<li>First item</li>" in payload["formatted_body"]
     assert payload["msgtype"] != "m.image"
     assert payload["url_previews"] == []
 

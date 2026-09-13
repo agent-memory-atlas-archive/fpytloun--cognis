@@ -9,9 +9,12 @@ while request/response correlation uses per-ID futures.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 from contextlib import suppress
+from dataclasses import dataclass
+from itertools import islice
 from time import monotonic, perf_counter
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
@@ -33,6 +36,85 @@ logger = get_logger(__name__)
 # resolving ``wait_for_diagnostics``.  Servers often emit multiple batches
 # in rapid succession.
 _DIAGNOSTICS_DEBOUNCE_MS = 200
+
+# Server responses are untrusted.  Query methods inspect at most this many
+# raw list entries before normalizing; callers that want to report
+# truncation compare the raw length against ``MAX_RESPONSE_ITEMS``.
+MAX_RESPONSE_ITEMS = 2000
+_MAX_RAW_INSPECTED_ITEMS = MAX_RESPONSE_ITEMS + 1
+
+# Static ``ServerCapabilities`` key that announces support for a request method.
+# Methods without an entry are attempted without gating.
+_METHOD_CAPABILITY_KEYS: dict[str, str] = {
+    "textDocument/definition": "definitionProvider",
+    "textDocument/references": "referencesProvider",
+    "textDocument/hover": "hoverProvider",
+    "textDocument/documentSymbol": "documentSymbolProvider",
+    "workspace/symbol": "workspaceSymbolProvider",
+    "textDocument/implementation": "implementationProvider",
+    "textDocument/typeDefinition": "typeDefinitionProvider",
+    "textDocument/prepareCallHierarchy": "callHierarchyProvider",
+    "callHierarchy/incomingCalls": "callHierarchyProvider",
+    "callHierarchy/outgoingCalls": "callHierarchyProvider",
+}
+
+# Dynamic registrations for call hierarchy arrive under the prepare method.
+_DYNAMIC_METHOD_ALIASES: dict[str, str] = {
+    "callHierarchy/incomingCalls": "textDocument/prepareCallHierarchy",
+    "callHierarchy/outgoingCalls": "textDocument/prepareCallHierarchy",
+}
+
+
+@dataclass(slots=True, frozen=True)
+class DynamicRegistration:
+    """A ``client/registerCapability`` entry tracked until unregistered."""
+
+    method: str
+    document_selector: tuple[dict[str, Any], ...] | None
+
+    def matches(self, uri: str | None, language_id: str | None) -> bool:
+        """Return whether the selector applies to a document.
+
+        A missing selector applies to every document.  Filters follow the
+        LSP ``DocumentFilter`` shape: every present field must match.
+        """
+        if self.document_selector is None:
+            return True
+        if uri is None and language_id is None:
+            return True
+        for document_filter in self.document_selector:
+            if _document_filter_matches(document_filter, uri, language_id):
+                return True
+        return False
+
+
+def _document_filter_matches(
+    document_filter: dict[str, Any], uri: str | None, language_id: str | None
+) -> bool:
+    if not isinstance(document_filter, dict):
+        return False
+    expected_language = document_filter.get("language")
+    if (
+        isinstance(expected_language, str)
+        and language_id is not None
+        and expected_language != language_id
+    ):
+        return False
+    expected_scheme = document_filter.get("scheme")
+    if (
+        isinstance(expected_scheme, str)
+        and uri is not None
+        and urlparse(uri).scheme != expected_scheme
+    ):
+        return False
+    pattern = document_filter.get("pattern")
+    if isinstance(pattern, str) and uri is not None:
+        path = uri_to_path(uri)
+        if not fnmatch.fnmatch(path, pattern) and not fnmatch.fnmatch(
+            os.path.basename(path), pattern
+        ):
+            return False
+    return True
 
 
 def file_uri(path: str) -> str:
@@ -80,6 +162,20 @@ class LSPClient:
 
         self.process: asyncio.subprocess.Process | None = None
         self.server_name: str | None = None
+
+        # Negotiated ``ServerCapabilities`` from ``InitializeResult``.  ``None``
+        # until the handshake completes and after close.
+        self.capabilities: dict[str, Any] | None = None
+        # Dynamic registrations keyed by registration ID.
+        self._dynamic_registrations: dict[str, DynamicRegistration] = {}
+        # Active ``$/progress`` tokens (begin received, end not yet).  Servers
+        # report project loading and analysis this way; a query issued while
+        # a freshly spawned server is still loading its project can be
+        # answered from an incomplete program.
+        self._progress_active: set[str | int] = set()
+        self._progress_idle = asyncio.Event()
+        self._progress_idle.set()
+        self._progress_begun = asyncio.Event()
 
         # Request/response
         self._next_id = 0
@@ -141,6 +237,9 @@ class LSPClient:
             {
                 "processId": os.getpid(),
                 "rootUri": self.root_uri,
+                "workspaceFolders": [
+                    {"uri": self.root_uri, "name": os.path.basename(uri_to_path(self.root_uri))}
+                ],
                 "capabilities": {
                     "textDocument": {
                         "synchronization": {
@@ -152,22 +251,42 @@ class LSPClient:
                             "versionSupport": True,
                             "relatedInformation": False,
                         },
+                        "definition": {"dynamicRegistration": True, "linkSupport": True},
+                        "typeDefinition": {"dynamicRegistration": True, "linkSupport": True},
+                        "implementation": {"dynamicRegistration": True, "linkSupport": True},
+                        "references": {"dynamicRegistration": True},
+                        "hover": {
+                            "dynamicRegistration": True,
+                            "contentFormat": ["markdown", "plaintext"],
+                        },
+                        "documentSymbol": {
+                            "dynamicRegistration": True,
+                            "hierarchicalDocumentSymbolSupport": True,
+                        },
+                        "callHierarchy": {"dynamicRegistration": True},
                     },
                     "workspace": {
                         "configuration": True,
+                        "symbol": {"dynamicRegistration": True},
                         "didChangeWatchedFiles": {
                             "dynamicRegistration": False,
                         },
                     },
+                    "window": {"workDoneProgress": True},
                 },
                 **({"initializationOptions": self.init_options} if self.init_options else {}),
             },
             timeout=45.0,
         )
 
-        # Extract server info
+        # Extract server info and negotiated capabilities
+        init_result = init_result if isinstance(init_result, dict) else {}
         server_info = init_result.get("serverInfo", {})
+        if not isinstance(server_info, dict):
+            server_info = {}
         self.server_name = server_info.get("name", self.server_id)
+        raw_capabilities = init_result.get("capabilities")
+        self.capabilities = raw_capabilities if isinstance(raw_capabilities, dict) else {}
 
         # Send initialized notification
         await self._notify("initialized", {})
@@ -223,6 +342,12 @@ class LSPClient:
                 future.set_exception(RuntimeError("LSP client closed"))
         self._pending.clear()
 
+        # Negotiated state is only valid for the process that produced it.
+        self.capabilities = None
+        self._dynamic_registrations.clear()
+        self._progress_active.clear()
+        self._progress_idle.set()
+
         exit_code = process.returncode if process else None
         logger.info(
             "lsp: server closed",
@@ -235,6 +360,87 @@ class LSPClient:
             },
         )
         self.process = None
+
+    # ------------------------------------------------------------------
+    # Capabilities
+    # ------------------------------------------------------------------
+
+    def supports(
+        self, method: str, *, uri: str | None = None, language_id: str | None = None
+    ) -> bool:
+        """Return whether the server negotiated support for a request method.
+
+        Static ``ServerCapabilities`` win.  Dynamic registrations extend
+        support and may be scoped by document selector.  Methods without
+        a known capability key are assumed supported.  Before the
+        handshake completes nothing is known, so the method is attempted.
+        """
+        capability_key = _METHOD_CAPABILITY_KEYS.get(method)
+        if capability_key is None or self.capabilities is None:
+            return True
+        static_value = self.capabilities.get(capability_key)
+        if isinstance(static_value, dict):
+            return True
+        if static_value:
+            return True
+        dynamic_method = _DYNAMIC_METHOD_ALIASES.get(method, method)
+        return any(
+            registration.method == dynamic_method and registration.matches(uri, language_id)
+            for registration in self._dynamic_registrations.values()
+        )
+
+    def supported_methods(
+        self, *, uri: str | None = None, language_id: str | None = None
+    ) -> dict[str, bool]:
+        """Return support state for every gated method."""
+        return {
+            method: self.supports(method, uri=uri, language_id=language_id)
+            for method in _METHOD_CAPABILITY_KEYS
+        }
+
+    def _handle_register_capability(self, params: Any) -> None:
+        registrations = params.get("registrations") if isinstance(params, dict) else None
+        if not isinstance(registrations, list):
+            return
+        for entry in registrations:
+            if not isinstance(entry, dict):
+                continue
+            registration_id = entry.get("id")
+            method = entry.get("method")
+            if not isinstance(registration_id, str) or not isinstance(method, str):
+                continue
+            options = entry.get("registerOptions")
+            selector: tuple[dict[str, Any], ...] | None = None
+            if isinstance(options, dict):
+                raw_selector = options.get("documentSelector")
+                if isinstance(raw_selector, list):
+                    selector = tuple(item for item in raw_selector if isinstance(item, dict))
+            self._dynamic_registrations[registration_id] = DynamicRegistration(
+                method=method, document_selector=selector
+            )
+        logger.debug(
+            "lsp: capabilities registered",
+            extra={
+                "extra_data": {
+                    "server_id": self.server_id,
+                    "registration_count": len(self._dynamic_registrations),
+                }
+            },
+        )
+
+    def _handle_unregister_capability(self, params: Any) -> None:
+        unregistrations = params.get("unregisterations") if isinstance(params, dict) else None
+        if not isinstance(unregistrations, list) and isinstance(params, dict):
+            # LSP 3.16+ spells the field correctly; older servers use the typo.
+            unregistrations = params.get("unregistrations")
+        if not isinstance(unregistrations, list):
+            return
+        for entry in unregistrations:
+            if not isinstance(entry, dict):
+                continue
+            registration_id = entry.get("id")
+            if isinstance(registration_id, str):
+                self._dynamic_registrations.pop(registration_id, None)
 
     # ------------------------------------------------------------------
     # Document notifications
@@ -561,6 +767,44 @@ class LSPClient:
         )
         return _normalize_lsp_result_list(result)
 
+    async def type_definition(
+        self, file_path: str, line: int, character: int
+    ) -> list[dict[str, Any]]:
+        """Return type definitions at the given position."""
+
+        result = await self._request(
+            "textDocument/typeDefinition",
+            _position_params(file_path, line, character),
+        )
+        return _normalize_lsp_result_list(result)
+
+    async def prepare_call_hierarchy(
+        self, file_path: str, line: int, character: int
+    ) -> list[dict[str, Any]]:
+        """Return ``CallHierarchyItem`` entries for the symbol at a position."""
+
+        result = await self._request(
+            "textDocument/prepareCallHierarchy",
+            _position_params(file_path, line, character),
+        )
+        return _normalize_lsp_result_list(result)
+
+    async def incoming_calls(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return ``CallHierarchyIncomingCall`` entries for a prepared item.
+
+        The item must come from this client's ``prepare_call_hierarchy`` or
+        a previous call result; servers reject foreign items.
+        """
+
+        result = await self._request("callHierarchy/incomingCalls", {"item": item})
+        return _normalize_lsp_result_list(result)
+
+    async def outgoing_calls(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return ``CallHierarchyOutgoingCall`` entries for a prepared item."""
+
+        result = await self._request("callHierarchy/outgoingCalls", {"item": item})
+        return _normalize_lsp_result_list(result)
+
     # ------------------------------------------------------------------
     # JSON-RPC transport
     # ------------------------------------------------------------------
@@ -720,9 +964,62 @@ class LSPClient:
                     },
                 )
                 asyncio.create_task(self._respond(message["id"], response))
-        elif method == "client/registerCapability" and "id" in message:
-            # Accept dynamic registration requests
-            asyncio.create_task(self._respond(message["id"], None))
+        elif method == "client/registerCapability":
+            self._handle_register_capability(params)
+            if "id" in message:
+                asyncio.create_task(self._respond(message["id"], None))
+        elif method == "client/unregisterCapability":
+            self._handle_unregister_capability(params)
+            if "id" in message:
+                asyncio.create_task(self._respond(message["id"], None))
+        elif method == "window/workDoneProgress/create":
+            # The server announces a token; the work begins with ``$/progress``.
+            if "id" in message:
+                asyncio.create_task(self._respond(message["id"], None))
+        elif method == "$/progress":
+            self._handle_progress(params)
+
+    def _handle_progress(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        token = params.get("token")
+        value = params.get("value")
+        if not isinstance(token, (str, int)) or not isinstance(value, dict):
+            return
+        kind = value.get("kind")
+        if kind == "begin":
+            self._progress_active.add(token)
+            self._progress_idle.clear()
+            self._progress_begun.set()
+        elif kind == "end":
+            self._progress_active.discard(token)
+            if not self._progress_active:
+                self._progress_idle.set()
+
+    @property
+    def progress_active(self) -> bool:
+        """Whether the server has reported unfinished work-done progress."""
+        return bool(self._progress_active)
+
+    async def wait_for_progress_idle(self, *, grace_s: float, timeout_s: float) -> bool:
+        """Wait for in-flight server progress to finish.
+
+        Waits up to ``grace_s`` for progress to begin when none is active
+        (a just-spawned server may not have announced project loading yet),
+        then up to ``timeout_s`` for all active progress to end.  Returns
+        True when the server is idle, False on timeout.
+        """
+        if not self._progress_active:
+            self._progress_begun.clear()
+            try:
+                await asyncio.wait_for(self._progress_begun.wait(), timeout=grace_s)
+            except TimeoutError:
+                return True
+        try:
+            await asyncio.wait_for(self._progress_idle.wait(), timeout=timeout_s)
+        except TimeoutError:
+            return False
+        return True
 
     async def _respond(self, request_id: Any, result: Any) -> None:
         """Send a JSON-RPC response to a server-initiated request."""
@@ -994,9 +1291,28 @@ def _position_params(file_path: str, line: int, character: int) -> dict[str, Any
     }
 
 
-def _normalize_lsp_result_list(result: dict[str, Any] | list[Any] | None) -> list[dict[str, Any]]:
+class BoundedResultList(list[dict[str, Any]]):
+    """Normalized reply items plus whether the raw reply exceeded the cap.
+
+    ``truncated`` is derived from the raw list length (O(1)), so callers can
+    report partial results even when malformed entries were dropped from the
+    inspected prefix.
+    """
+
+    __slots__ = ("truncated",)
+
+    def __init__(self, items: list[dict[str, Any]], *, truncated: bool = False) -> None:
+        super().__init__(items)
+        self.truncated = truncated
+
+
+def _normalize_lsp_result_list(result: dict[str, Any] | list[Any] | None) -> BoundedResultList:
+    """Keep dict items from a server reply, inspecting a bounded prefix only."""
     if isinstance(result, list):
-        return [item for item in result if isinstance(item, dict)]
+        return BoundedResultList(
+            [item for item in islice(result, _MAX_RAW_INSPECTED_ITEMS) if isinstance(item, dict)],
+            truncated=len(result) > MAX_RESPONSE_ITEMS,
+        )
     if isinstance(result, dict):
-        return [result]
-    return []
+        return BoundedResultList([result])
+    return BoundedResultList([])

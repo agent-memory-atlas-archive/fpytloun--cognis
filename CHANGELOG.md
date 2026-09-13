@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2026-09-13
+
+### Added
+
+- Added bounded LSP code intelligence with capability negotiation, compact query output, directory outlines, call hierarchy, edit diagnostics, telemetry, and real-server coverage.
+- Added per-agent skill assignment management across the API, runtime, tools, and UI.
+- Added Anthropic usage and rate-limit reporting, adaptive reasoning support for Claude Fable 5.1, and model-registry drift visibility.
+
+### Changed
+
+- Improved provider reasoning, fast-mode handling, prompt estimation, and session-scoped runtime behavior.
+- Improved Matrix rich-message formatting and model settings diagnostics.
+
+### Fixed
+
+- Fixed direct-turn tool dispatch fencing and task dispatch compatibility across concurrent sessions.
+- Fixed Anthropic prompt caching, duplicate replay, deterministic rejection handling, and unbound wire tool-name recovery.
+- Hardened MCP OAuth network destinations and bounded untrusted LSP server output, startup, cancellation, and telemetry.
+- Fixed recoverable direct turns, stale stream retirement, and Chat v2 runtime authority behavior.
+- Fixed session runtime diagnostics and cached-token layout in session details.
+
 ## [0.14.2] - 2026-09-11
 
 ### Fixed

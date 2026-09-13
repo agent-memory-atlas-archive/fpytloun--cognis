@@ -208,7 +208,9 @@ def is_retryable_error(exc: Exception) -> bool:
         "quota_exhausted",
         "context_overflow",
         "attachment_input",
+        "invalid_request",
         "content_policy",
+        "protocol",
     }:
         return False
 

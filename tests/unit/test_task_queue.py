@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from cognis.core.agent_registry import AgentRegistry
-from cognis.core.events import EventBus
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.task_execution import TaskExecutionClaim
 from cognis.core.task_queue import TaskQueue, TaskRerunResult, _row_to_task_model
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -61,6 +63,248 @@ async def _bootstrap_db(tmp_path: object) -> tuple[object, object]:
         await session.commit()
 
     return engine, factory
+
+
+@pytest.mark.asyncio
+async def test_queue_remote_wakeup_and_idle_attempt_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bus = EventBus()
+    queue = TaskQueue(
+        session_factory=AsyncMock(),
+        workflow_engine=AsyncMock(),
+        workflow_registry=AsyncMock(),
+        event_bus=bus,
+    )
+    assert queue._poll_interval == 15
+    picks = AsyncMock()
+    monkeypatch.setattr(
+        queue._execution_store, "next_scheduled_delay", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(queue, "_try_pick_and_run", picks)
+    monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
+    monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    await queue.start()
+    try:
+        await asyncio.sleep(0.02)
+        assert picks.await_count == 1  # Startup recheck does not wait for a signal.
+        await asyncio.sleep(1.05)
+        assert picks.await_count == 1  # No old one-second idle claim attempt.
+        await bus.publish(
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={"kind": "task_queue_changed", "scope": {}},
+            )
+        )
+        await asyncio.sleep(0.02)
+        assert picks.await_count == 2
+    finally:
+        await queue.stop()
+    assert not bus._handlers[EventType.CLUSTER_SCOPE_INVALIDATED]
+
+
+@pytest.mark.asyncio
+async def test_queue_dropped_signal_fallback_and_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    queue = TaskQueue(
+        session_factory=AsyncMock(),
+        workflow_engine=AsyncMock(),
+        workflow_registry=AsyncMock(),
+        event_bus=EventBus(),
+        poll_interval_seconds=0.03,
+    )
+    picks = AsyncMock()
+    monkeypatch.setattr(
+        queue._execution_store, "next_scheduled_delay", AsyncMock(return_value=None)
+    )
+    recovery = AsyncMock()
+    monkeypatch.setattr(queue, "_try_pick_and_run", picks)
+    monkeypatch.setattr(queue, "recover_stale_tasks", recovery)
+    monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    await queue.start()
+    try:
+        await asyncio.sleep(0.11)
+        assert picks.await_count >= 3
+        assert recovery.await_count == 1
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_queue_error_backoff_is_interruptible(monkeypatch: pytest.MonkeyPatch) -> None:
+    queue = TaskQueue(
+        session_factory=AsyncMock(),
+        workflow_engine=AsyncMock(),
+        workflow_registry=AsyncMock(),
+        event_bus=EventBus(),
+    )
+    failed = asyncio.Event()
+    retried = asyncio.Event()
+
+    async def pick() -> None:
+        if not failed.is_set():
+            failed.set()
+            raise RuntimeError("Transient test database failure")
+        retried.set()
+
+    monkeypatch.setattr(queue, "_try_pick_and_run", pick)
+    monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
+    monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    monkeypatch.setattr(
+        queue._execution_store, "next_scheduled_delay", AsyncMock(return_value=None)
+    )
+    await queue.start()
+    try:
+        await asyncio.wait_for(failed.wait(), 1)
+        queue._wake_event.set()
+        await asyncio.wait_for(retried.wait(), 0.5)
+    finally:
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_ready_publication_observes_committed_state(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            row = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Commit ordering",
+                description="Queue wakeup",
+                status="queued",
+            )
+            await session.commit()
+            task_id = row.task_id
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=AsyncMock(),
+            workflow_registry=AsyncMock(),
+            event_bus=EventBus(),
+        )
+
+        async def published(*args: object, **kwargs: object) -> None:
+            async with factory() as session:
+                persisted = await get_task(session, task_id)
+                assert persisted.status == "ready"
+
+        publish = AsyncMock(side_effect=published)
+        queue.cluster_signals = SimpleNamespace(publish=publish)
+        assert await queue._try_transition_to_ready(task_id)
+        publish.assert_awaited_once()
+        assert queue._wake_event.is_set()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_already_ready_submission_publishes_queue_hint(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=AsyncMock(),
+            workflow_registry=AsyncMock(),
+            event_bus=EventBus(),
+        )
+        publish = AsyncMock()
+        queue.cluster_signals = SimpleNamespace(publish=publish, publish_task_change=AsyncMock())
+        task = await queue.submit(
+            created_by="user@test.com",
+            agent_id="agent-1",
+            title="Ready submission",
+            status="ready",
+        )
+        publish.assert_awaited_once()
+        assert publish.await_args.args[0] == "task_queue_changed"
+        async with factory() as session:
+            assert (await get_task(session, task.task_id)).status == "ready"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_coalesced_wakeup_drains_ready_burst(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    queue = TaskQueue(
+        session_factory=factory,
+        workflow_engine=AsyncMock(),
+        workflow_registry=AsyncMock(),
+        event_bus=EventBus(),
+    )
+    launched: list[str] = []
+    monkeypatch.setattr(
+        queue, "_launch_claimed_task_run", lambda task, claim: launched.append(task.task_id)
+    )
+    monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
+    monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    try:
+        async with factory() as session:
+            for number in range(3):
+                await create_task(
+                    session,
+                    created_by="user@test.com",
+                    agent_id="agent-1",
+                    title=f"Burst {number}",
+                    description="Coalesced wake",
+                    status="ready",
+                )
+            await session.commit()
+        await queue.start()
+        async with asyncio.timeout(2):
+            while len(launched) != 3:
+                await asyncio.sleep(0.01)
+        assert len(set(launched)) == 3
+    finally:
+        queue._stop_event.set()
+        queue._wake_event.set()
+        if queue._drain_task is not None:
+            await queue._drain_task
+        await queue.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_future_ready_task_wakes_at_deadline(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    queue = TaskQueue(
+        session_factory=factory,
+        workflow_engine=AsyncMock(),
+        workflow_registry=AsyncMock(),
+        event_bus=EventBus(),
+    )
+    launched = asyncio.Event()
+    monkeypatch.setattr(queue, "_launch_claimed_task_run", lambda task, claim: launched.set())
+    monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
+    monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    try:
+        # SQLite current_timestamp has whole-second precision.
+        due = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=2)
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Scheduled",
+                status="ready",
+                scheduled_for=due,
+            )
+            await session.commit()
+        await queue.start()
+        await asyncio.sleep(0.1)
+        assert not launched.is_set()
+        await asyncio.wait_for(launched.wait(), timeout=3)
+    finally:
+        queue._stop_event.set()
+        queue._wake_event.set()
+        if queue._drain_task is not None:
+            await queue._drain_task
+        await queue.stop()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

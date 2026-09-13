@@ -3068,6 +3068,33 @@ describe('Chat v2 sync engine', () => {
     expect(ids).not.toContain('message:turn-1:phase:0');
   });
 
+  it('hides stale partial runtime text by canonical phase without hiding a later stream', () => {
+    const saved = {
+      id: 'message:turn-1:phase:1', kind: 'message',
+      sort_key: '0000:000000000000005:000001:02:000000000',
+      source_refs: [], stable: true, status: 'complete', role: 'assistant',
+      content: 'Complete saved answer.', message_id: 'turn-1', turn_id: 'turn-1',
+      assistant_phase_index: 1, attachments: [], partial: false
+    } as TimelineItem;
+    const stale = {
+      ...saved, id: 'message:turn-1:phase:0', assistant_phase_index: 0,
+      sort_key: '9998:000000000000005:000000:02:000000000',
+      content: 'Complete saved', stable: false, status: 'running', partial: true
+    } as TimelineItem;
+    const later = {
+      ...stale, id: 'message:turn-1:phase:2', assistant_phase_index: 2,
+      content: 'Next response'
+    } as TimelineItem;
+    const state = applySnapshot(snapshot({
+      timeline: { items: [saved], has_more_before: false }
+    }));
+    const withRuntime = {
+      ...state,
+      runtime: { ...state.runtime!, has_active_turn: true, volatile_items: [stale, later] }
+    };
+    expect(visibleTimelineItems(withRuntime).map((item) => item.id)).toEqual([saved.id, later.id]);
+  });
+
   it('keeps carried later-phase assistant items until canonical catches up', () => {
     const carriedPhase2 = {
       id: 'message:turn-1:phase:2',

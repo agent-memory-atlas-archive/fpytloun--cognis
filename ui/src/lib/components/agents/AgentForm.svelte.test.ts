@@ -18,6 +18,21 @@ function setup(readonly = false) {
 }
 
 describe('AgentForm sections', () => {
+  it('distinguishes inheritance from provider default without invented effort options', async () => {
+    const { onSave } = setup();
+    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
+    const select = screen.getByRole('combobox', { name: /Thinking effort/ });
+    expect(within(select).getByRole('option', { name: 'Inherit' })).toHaveValue('');
+    expect(within(select).getByRole('option', { name: 'Provider default' })).toHaveValue('default');
+    expect(within(select).queryByRole('option', { name: 'High' })).not.toBeInTheDocument();
+    await fireEvent.change(select, { target: { value: 'default' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(onSave.mock.calls[0][0].llm_config.reasoning_effort).toBe('default');
+    await fireEvent.change(select, { target: { value: '' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(onSave.mock.calls[1][0].llm_config.reasoning_effort).toBeUndefined();
+  });
+
   it('shows identity first and preserves edits across sections', async () => {
     const { container } = setup();
     const name = screen.getByPlaceholderText('Research Assistant');

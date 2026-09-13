@@ -1749,6 +1749,92 @@ async def test_claimable_heads_wait_for_persisted_retry_deadline(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_stop_terminally_cancels_recoverable_head_and_releases_successor(
+    tmp_path: Path,
+) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        first = await _admit(harness, key="retry-head", content="first")
+        second = await _admit(harness, key="retry-successor", content="second")
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            first.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        assert await harness.store.settle_transient_failure(
+            first.request.request_id,
+            lease=lease,
+            outcome={"phase": "user_appended"},
+            retry_after_seconds=60,
+        )
+
+        cancelled = await harness.store.cancel_conversation("conv-a", clear_queue=False)
+        assert len(cancelled) == 1
+        assert cancelled[0].request.status == DirectTurnStatus.CANCELLED.value
+        assert cancelled[0].request.next_attempt_at is None
+        assert cancelled[0].request.terminal_at is not None
+        heads = await harness.store.list_claimable_heads()
+        assert [row.request_id for row in heads] == [second.request.request_id]
+
+        repeated = await harness.store.request_cancel(first.request.request_id)
+        assert repeated is not None
+        assert repeated.request.status == DirectTurnStatus.CANCELLED.value
+        assert (
+            await harness.store.claim(
+                first.request.request_id,
+                lease=lease,
+                controller_id="controller-a",
+                incarnation_id="boot-a",
+            )
+            is None
+        )
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_target_change_expedites_provider_retry(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="provider-retry", content="hello")
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        assert await harness.store.settle_transient_failure(
+            admitted.request.request_id,
+            lease=lease,
+            outcome={
+                "phase": "user_appended",
+                "session_id": "sess-a",
+                "retry_target": {
+                    "scope": "provider_model",
+                    "runtime_revision": 3,
+                    "reason_class": "rate_limit",
+                },
+            },
+            retry_after_seconds=60,
+        )
+        assert await harness.store.list_claimable_heads() == []
+
+        expedited = await harness.store.expedite_provider_retry(
+            "conv-a",
+            session_id="sess-a",
+            previous_runtime_revision=3,
+        )
+        assert expedited is not None
+        heads = await harness.store.list_claimable_heads()
+        assert [row.request_id for row in heads] == [admitted.request.request_id]
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_new_incarnation_fences_and_recovers_stale_claim(tmp_path: Path) -> None:
     harness = await _harness(tmp_path)
     try:

@@ -103,10 +103,10 @@ def _contains_localpart_mention(haystack: str, localpart: str) -> bool:
     return re.search(pattern, haystack, flags=re.IGNORECASE) is not None
 
 
-def _markdown_to_matrix_html(value: str, *, compact: bool = False) -> str:
+def _markdown_to_matrix_html(value: str) -> str:
     """Convert Markdown to Matrix-compatible HTML."""
 
-    return markdown_to_matrix_html(value, compact=compact)
+    return markdown_to_matrix_html(value)
 
 
 def _matrix_msgtype_for_mime(mime: str) -> str:
@@ -367,7 +367,7 @@ class MatrixAdapter(BaseChannelAdapter):
             else uuid.uuid4().hex
         )
 
-        compact = message.platform_data.get("canonical_rich_markdown") is True
+        canonical_rich_markdown = message.platform_data.get("canonical_rich_markdown") is True
         rendered_content, inline_images = await self._render_inline_media(
             message.content, inline_media
         )
@@ -376,7 +376,7 @@ class MatrixAdapter(BaseChannelAdapter):
             lambda match: match.group(1),
             message.content,
         )
-        formatted = _markdown_to_matrix_html(rendered_content, compact=compact)
+        formatted = _markdown_to_matrix_html(rendered_content)
         for marker, image in inline_images.items():
             formatted = formatted.replace(marker, image, 1)
         content: dict[str, Any] = {
@@ -385,7 +385,7 @@ class MatrixAdapter(BaseChannelAdapter):
             "format": _MATRIX_HTML_FORMAT,
             "formatted_body": formatted,
         }
-        if compact:
+        if canonical_rich_markdown:
             # MSC2385 best-effort hint. Clients that do not support it safely
             # ignore the unknown field and may still render URL previews.
             content["url_previews"] = []

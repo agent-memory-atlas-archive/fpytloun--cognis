@@ -17,7 +17,7 @@ vi.mock('$lib/api/client', () => ({
       resolve: vi.fn(),
     },
     sessions: { intarisDetail: vi.fn() },
-    llmProviders: { codexUsage: vi.fn() },
+    llmProviders: { providerUsage: vi.fn() },
   },
 }));
 

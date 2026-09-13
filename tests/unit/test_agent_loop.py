@@ -57,6 +57,7 @@ from cognis.core.agent_loop import (
     _filter_model_inventory_tools,
     _has_compactable_pre_turn_history,
     _iterate_llm_stream_with_idle_timeout,
+    _messages_reference_disabled_artifacts,
     _PreparedRegularToolCall,
     _project_hidden_history_calls_through_bridge,
     _queue_assistant_deliverable_event,
@@ -71,11 +72,11 @@ from cognis.core.agent_loop import (
     _runtime_tool_presentation,
     _same_cycle_duplicate_tool_call_sources,
     _same_turn_duplicate_tool_call_indexes,
-    _should_auto_continue_after_mid_stream_failure,
     _should_continue_after_exhausted_mid_stream_failure,
     _should_run_post_turn_auto_compaction,
     _should_run_pre_turn_auto_compaction,
     _step_complete_metadata,
+    _strip_disabled_artifact_urls_from_messages,
     _strip_internal_message_fields,
     _tool_visible_by_default,
     _turn_presentation_notice,
@@ -153,6 +154,7 @@ from cognis.models.workflow import (
     StepToolOverrides,
     WorkflowState,
 )
+from cognis.providers.llm.anthropic.contracts import AnthropicContinuationStatus
 from cognis.providers.llm.errors import (
     LLMStreamProviderError,
     MidStreamErrorCategory,
@@ -1010,37 +1012,135 @@ async def test_llm_stream_provider_error_preserves_quota_payload() -> None:
     assert exc_info.value.to_payload()["category"] == MidStreamErrorCategory.QUOTA_EXHAUSTED.value
 
 
-def test_idle_timeout_failure_can_start_auto_continuation() -> None:
-    assert _should_auto_continue_after_mid_stream_failure(
-        "LLM stream produced no meaningful activity for 90s"
-    )
-    assert _should_auto_continue_after_mid_stream_failure(
-        "LLM stream produced provider reasoning events but no meaningful output for 270s"
-    )
-    assert _should_auto_continue_after_mid_stream_failure("Provider disconnected while streaming")
-
-
 def test_exhausted_idle_timeout_can_auto_continue() -> None:
-    assert _should_continue_after_exhausted_mid_stream_failure(
-        "LLM stream produced no meaningful activity for 90s",
-        {"category": "idle_timeout_activity"},
-    )
-    assert _should_continue_after_exhausted_mid_stream_failure(
-        "Provider disconnected while streaming",
-        {"category": "connection"},
-    )
-    assert _should_continue_after_exhausted_mid_stream_failure(
-        "429 rate_limit_error",
-        {"category": "rate_limit"},
-    )
+    for category in ("idle_timeout_activity", "idle_timeout_reasoning", "connection", "rate_limit"):
+        assert _should_continue_after_exhausted_mid_stream_failure(
+            {"category": category},
+        )
     assert not _should_continue_after_exhausted_mid_stream_failure(
-        "HTTP 429 usage_limit_reached",
         {"category": "quota_exhausted"},
     )
+    # Unclassified failures include Cognis-internal faults, where continuing
+    # from saved work preserves real user work.
     assert _should_continue_after_exhausted_mid_stream_failure(
-        "TypeError: '<' not supported between instances of 'list' and 'int'",
         {"category": "other"},
     )
+
+
+def test_invalid_request_mid_stream_failures_are_terminal() -> None:
+    assert MidStreamErrorCategory.INVALID_REQUEST.value in _RECOVERY_NON_RETRYABLE_CATEGORIES
+    assert not _should_continue_after_exhausted_mid_stream_failure(
+        {
+            "category": "invalid_request",
+            "message": "Claude Code 2.1.87 does not support this model",
+        },
+    )
+
+
+def test_attachment_recovery_detects_real_transcript_progress() -> None:
+    # An immediate retry only makes progress when the rejected attachment is
+    # no longer in the prompt. Otherwise the retry replays the same payload.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Look at this."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://cognis.invalid/a.gif",
+                        "cognis_artifact": {"artifact_id": "att_bad"},
+                    },
+                },
+            ],
+        }
+    ]
+
+    assert _messages_reference_disabled_artifacts(messages, set(), {"att_bad"})
+    assert _strip_disabled_artifact_urls_from_messages(messages, set(), {"att_bad"})
+    assert not _messages_reference_disabled_artifacts(messages, set(), {"att_bad"})
+    # A second identical refusal removes nothing, so there is no new progress.
+    assert not _strip_disabled_artifact_urls_from_messages(messages, set(), {"att_bad"})
+
+
+def test_attachment_recovery_can_continue_after_exhausted_retries() -> None:
+    # A continuation appends a continuation prompt and the failure notice, so
+    # it is not an identical replay and stays available for attachment errors.
+    for category in ("attachment_input", "artifact_fetch"):
+        assert _should_continue_after_exhausted_mid_stream_failure({"category": category})
+
+
+def test_mid_stream_provider_message_is_sanitized_at_capture() -> None:
+    # This is the only point where untrusted provider text enters user-facing
+    # notices, durable turn errors, and model_error metadata.
+    message = agent_loop_module._mid_stream_provider_message(
+        {
+            "message": (
+                "Upstream rejected the request for "
+                "https://user:password@files.test/a.png with api_key=sk-must-not-leak"
+            )
+        },
+        "fallback error text",
+    )
+
+    assert "sk-must-not-leak" not in message
+    assert "user:password@" not in message
+    assert "Upstream rejected the request" in message
+
+
+def test_mid_stream_provider_message_redacts_signed_artifact_urls() -> None:
+    # A fetch failure echoes the signed URL it could not read; the signature
+    # must not reach a notice, model_error, or durable history.
+    message = agent_loop_module._mid_stream_provider_message(
+        {
+            "message": (
+                "Failed to download https://cognis.test/api/artifacts/content/"
+                "conv/art_1/a.png?exp=1789000000&sig=6f1c0b2d9a8e4f3b"
+            )
+        },
+        "",
+    )
+
+    assert "6f1c0b2d9a8e4f3b" not in message
+    assert "Failed to download" in message
+
+
+def test_strip_disabled_artifacts_reports_whether_anything_was_removed() -> None:
+    # Retry progress must come from a real removal. A provider can name an
+    # artifact that is no longer in the prompt.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.test/a.png",
+                        "cognis_artifact": {"artifact_id": "art-1"},
+                    },
+                },
+            ],
+        }
+    ]
+
+    assert not agent_loop_module._strip_disabled_artifact_urls_from_messages(
+        messages, set(), {"art-absent"}
+    )
+    assert len(messages[0]["content"]) == 2
+
+    assert agent_loop_module._strip_disabled_artifact_urls_from_messages(messages, set(), {"art-1"})
+    assert [part["type"] for part in messages[0]["content"]] == ["text"]
+
+    assert not agent_loop_module._strip_disabled_artifact_urls_from_messages(messages, set(), set())
+
+
+def test_mid_stream_provider_message_falls_back_to_stream_error() -> None:
+    assert (
+        agent_loop_module._mid_stream_provider_message({"category": "other"}, "  stream died  ")
+        == "stream died"
+    )
+    assert agent_loop_module._mid_stream_provider_message(None, "   ") == ""
 
 
 def test_context_overflow_mid_stream_failures_are_not_retried() -> None:
@@ -14607,7 +14707,7 @@ async def test_retry_boundary_attachment_only_message_is_persisted(
     monkeypatch.setattr(
         agent_loop_module,
         "_native_attachment_blocks",
-        lambda _attachments, _model_info: ([], []),
+        lambda _attachments, _model_info, *_disabled: ([], []),
     )
     agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
     ctx = StepContext(
@@ -14914,7 +15014,14 @@ class _ExecutorDispatchingLookupToolRouter:
 @pytest.mark.asyncio
 async def test_direct_turn_fence_preserves_executor_dispatch_states() -> None:
     bind_tool_dispatch = AsyncMock()
-    ctx = SimpleNamespace(execution_fence=SimpleNamespace(bind_tool_dispatch=bind_tool_dispatch))
+    ctx = SimpleNamespace(
+        execution_fence=SimpleNamespace(bind_tool_dispatch=bind_tool_dispatch),
+        session=SimpleNamespace(
+            session_id="sess-direct-turn",
+            intaris_session_id="sess-direct-turn",
+        ),
+        turn_id="turn-direct",
+    )
 
     await AgentLoop._bind_tool_dispatch_fence(
         ctx,
@@ -14934,11 +15041,19 @@ async def test_direct_turn_fence_preserves_executor_dispatch_states() -> None:
     assert bind_tool_dispatch.await_args_list == [
         (
             ("call-lookup", "exec-direct-turn", "instance-direct-turn"),
-            {"dispatch_state": "dispatching"},
+            {
+                "session_id": "sess-direct-turn",
+                "turn_id": "turn-direct",
+                "dispatch_state": "dispatching",
+            },
         ),
         (
             ("call-lookup", "exec-direct-turn", "instance-direct-turn"),
-            {"dispatch_state": "sent"},
+            {
+                "session_id": "sess-direct-turn",
+                "turn_id": "turn-direct",
+                "dispatch_state": "sent",
+            },
         ),
     ]
 
@@ -15099,6 +15214,8 @@ async def test_direct_turn_fence_loss_propagates_before_executor_dispatch() -> N
         "call-lookup",
         "exec-scheduled-task",
         "instance-scheduled-task",
+        session_id="sess-direct-turn",
+        turn_id=None,
         dispatch_state="dispatching",
     )
 
@@ -15720,6 +15837,9 @@ async def test_exhausted_model_stream_requests_bounded_successor(
         "provider_id": None,
         "model": "test-model",
         "reason_class": category,
+        # The sanitized provider cause travels with the failure so durable
+        # history can name it instead of reporting a generic failure.
+        "message": "Stream failed",
         "attempts": attempts,
         "continuation_attempts": attempts - 1,
         "tool_results_saved": True,
@@ -20567,6 +20687,71 @@ def test_build_tool_attachment_context_uses_user_blocks_for_vision_models() -> N
     assert message["content"][1]["type"] == "image_url"
 
 
+def _vision_step_context(**runtime_info: object) -> StepContext:
+    return StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
+        session=_SessionStub(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        current_model_info=SimpleNamespace(
+            supports_vision=True,
+            supports_pdf_input=False,
+            supports_audio_input=False,
+            supports_file_input=False,
+        ),
+        runtime_info=dict(runtime_info),
+    )
+
+
+def test_build_tool_attachment_context_skips_disabled_artifacts() -> None:
+    # Regression: tool-result attachments bypassed the disabled-artifact filter
+    # and re-injected an artifact the provider had already rejected.
+    loop = AgentLoop.__new__(AgentLoop)
+    ctx = _vision_step_context(disabled_artifact_ids=["art-1"])
+
+    message = loop._build_tool_attachment_context(
+        ctx,
+        ToolCall(call_id="call-1", name="browser_screenshot", arguments={}),
+        [
+            {
+                "artifact_id": "art-1",
+                "kind": "image",
+                "filename": "shot.png",
+                "url": "https://example.test/shot.png",
+            }
+        ],
+    )
+
+    assert message is not None
+    blocks = message["content"] if isinstance(message["content"], list) else []
+    assert not [block for block in blocks if block.get("type") == "image_url"]
+    assert "shot.png" in str(message["content"])
+
+
+def test_build_tool_attachment_context_skips_disabled_artifact_urls() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    ctx = _vision_step_context(
+        disabled_artifact_urls=["https://example.test/shot.png"],
+    )
+
+    message = loop._build_tool_attachment_context(
+        ctx,
+        ToolCall(call_id="call-1", name="browser_screenshot", arguments={}),
+        [
+            {
+                "artifact_id": "art-1",
+                "kind": "image",
+                "filename": "shot.png",
+                "url": "https://example.test/shot.png",
+            }
+        ],
+    )
+
+    assert message is not None
+    blocks = message["content"] if isinstance(message["content"], list) else []
+    assert not [block for block in blocks if block.get("type") == "image_url"]
+
+
 def test_context_pressure_exceeded_counts_exposed_tool_schemas() -> None:
     loop = AgentLoop.__new__(AgentLoop)
     loop.providers = SimpleNamespace(
@@ -20643,6 +20828,55 @@ def test_context_pressure_snapshot_clamps_oversized_output_reserve() -> None:
     assert snapshot.available_prompt_tokens == 201_250
     assert snapshot.threshold_prompt_tokens == 191_187
     assert snapshot.exceeded is False
+
+
+def test_context_pressure_snapshot_applies_session_prompt_calibration() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda messages, model: 1_000,
+            count_tokens=lambda text, model: 0,
+            token_estimator_identity=lambda model: "estimator:v1",
+        )
+    )
+    loop.session_cache = SimpleNamespace(
+        apply_prompt_token_calibration=lambda session_id, **kwargs: (
+            1_560,
+            {
+                "applied_ratio": 1.56,
+                "source_request_id": "llmr_previous",
+            },
+        )
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
+        session=_SessionStub(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        current_provider_id="anthropic",
+        current_model="claude-opus-5",
+        current_model_info=SimpleNamespace(max_output_tokens=1_000),
+    )
+
+    snapshot = loop._context_pressure_snapshot(
+        ctx,
+        messages=[{"role": "system", "content": "hello"}],
+        tool_schemas=[],
+        max_context_tokens=10_000,
+    )
+
+    assert snapshot is not None
+    assert snapshot.raw_prompt_tokens == 1_000
+    assert snapshot.prompt_tokens == 1_560
+    assert snapshot.estimator_identity == "estimator:v1"
+    assert snapshot.calibration == {
+        "applied_ratio": 1.56,
+        "source_request_id": "llmr_previous",
+    }
 
 
 @pytest.mark.asyncio
@@ -24571,3 +24805,146 @@ async def test_parallel_orchestration_batches_preserve_batch_event_order() -> No
         for event in events
         if getattr(event, "type", None) == "tool_call"
     ] == ["m0", "m1", "d0", "d1"]
+
+
+def test_protocol_mid_stream_failures_are_not_retried() -> None:
+    assert MidStreamErrorCategory.PROTOCOL.value in _RECOVERY_NON_RETRYABLE_CATEGORIES
+    assert not _should_continue_after_exhausted_mid_stream_failure(
+        {"category": "protocol"},
+    )
+
+
+def test_unbound_anthropic_tool_envelope_is_detected_as_non_continuable() -> None:
+    from cognis.core.agent_loop import _anthropic_envelope_is_non_continuable
+
+    assert _anthropic_envelope_is_non_continuable({"continuation_status": "non_continuable"})
+    assert not _anthropic_envelope_is_non_continuable({"continuation_status": "continuable"})
+    assert not _anthropic_envelope_is_non_continuable({})
+    assert not _anthropic_envelope_is_non_continuable(None)
+
+
+def test_unbound_anthropic_tool_names_are_collected_from_tool_calls() -> None:
+    from cognis.core.agent_loop import (
+        UNBOUND_ANTHROPIC_TOOL_ARGUMENT,
+        UNBOUND_ANTHROPIC_TOOL_NAME,
+        _unbound_anthropic_tool_names,
+    )
+
+    calls = [
+        ToolCall(
+            call_id="toolu_1",
+            name=UNBOUND_ANTHROPIC_TOOL_NAME,
+            arguments={UNBOUND_ANTHROPIC_TOOL_ARGUMENT: "bash_output"},
+        ),
+        ToolCall(call_id="toolu_2", name="read", arguments={"file_path": "/tmp/x"}),
+    ]
+
+    assert _unbound_anthropic_tool_names(calls) == {"bash_output"}
+
+
+def test_unbound_anthropic_tool_rejection_is_correctable_and_names_the_target() -> None:
+    from cognis.core.agent_loop import (
+        UNBOUND_ANTHROPIC_TOOL_ARGUMENT,
+        UNBOUND_ANTHROPIC_TOOL_NAME,
+        _unbound_anthropic_tool_rejection,
+    )
+
+    payload = json.loads(
+        _unbound_anthropic_tool_rejection(
+            ToolCall(
+                call_id="toolu_1",
+                name=UNBOUND_ANTHROPIC_TOOL_NAME,
+                arguments={UNBOUND_ANTHROPIC_TOOL_ARGUMENT: "apply_patch"},
+            )
+        )
+    )
+
+    assert payload["status"] == "rejected"
+    assert payload["reason"] == "tool_not_available"
+    assert payload["requested_tool"] == "apply_patch"
+    assert "search_tools" in payload["message"]
+
+
+def _anthropic_envelope_payload(tool_name: str, status: AnthropicContinuationStatus) -> dict:
+    """Build a real, contract-valid native envelope payload."""
+
+    from cognis.providers.llm.anthropic.contracts import AnthropicNativeEnvelope
+
+    return AnthropicNativeEnvelope(
+        native_blocks=({"type": "tool_use", "id": "toolu_1", "name": tool_name, "input": {}},),
+        stop_reason="tool_use",
+        stop_details={},
+        usage={},
+        pending_client_message_id=None,
+        pending_server_message_id="msg_1",
+        bundle_fingerprint="bundle",
+        provider_fingerprint="provider",
+        model_fingerprint="model",
+        thinking_fingerprint="thinking",
+        continuation_status=status,
+    ).to_dict()
+
+
+def test_non_continuable_anthropic_envelope_is_kept_out_of_the_replay_channel() -> None:
+    """A non-continuable envelope must not be replayed on the next cycle.
+
+    Regression: a tool-search response carries server_tool_use blocks, so
+    integration._validate_frozen_tool_search_references would reject its unbound
+    client tool reference and defeat the corrective tool result.
+    """
+
+    from cognis.core.agent_loop import (
+        ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD,
+        ANTHROPIC_NATIVE_ENVELOPE_INTERNAL_FIELD,
+        _attach_anthropic_native_envelope,
+    )
+
+    envelope = _anthropic_envelope_payload(
+        "not_frozen", AnthropicContinuationStatus.NON_CONTINUABLE
+    )
+
+    replay_target: dict = {}
+    _attach_anthropic_native_envelope(replay_target, envelope, durable=False)
+    assert ANTHROPIC_NATIVE_ENVELOPE_INTERNAL_FIELD not in replay_target
+
+    audit_target: dict = {}
+    _attach_anthropic_native_envelope(audit_target, envelope, durable=True)
+    assert ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD in audit_target
+
+
+def test_continuable_anthropic_envelope_still_reaches_the_replay_channel() -> None:
+    from cognis.core.agent_loop import (
+        ANTHROPIC_NATIVE_ENVELOPE_INTERNAL_FIELD,
+        _attach_anthropic_native_envelope,
+    )
+
+    envelope = _anthropic_envelope_payload("frozen_tool", AnthropicContinuationStatus.CONTINUABLE)
+
+    replay_target: dict = {}
+    _attach_anthropic_native_envelope(replay_target, envelope, durable=False)
+    assert ANTHROPIC_NATIVE_ENVELOPE_INTERNAL_FIELD in replay_target
+
+
+def test_anthropic_exposure_fingerprint_tracks_tool_surface_changes() -> None:
+    from types import SimpleNamespace
+
+    from cognis.core.agent_loop import _anthropic_exposure_fingerprint
+
+    base_tool = {"type": "function", "function": {"name": "a", "parameters": {}}}
+    before = _anthropic_exposure_fingerprint(
+        SimpleNamespace(tools=[base_tool], alias_map={}, argument_alias_map={}), None
+    )
+    same = _anthropic_exposure_fingerprint(
+        SimpleNamespace(tools=[dict(base_tool)], alias_map={}, argument_alias_map={}), None
+    )
+    promoted = _anthropic_exposure_fingerprint(
+        SimpleNamespace(
+            tools=[base_tool, {"type": "function", "function": {"name": "b", "parameters": {}}}],
+            alias_map={},
+            argument_alias_map={},
+        ),
+        None,
+    )
+
+    assert before == same
+    assert before != promoted

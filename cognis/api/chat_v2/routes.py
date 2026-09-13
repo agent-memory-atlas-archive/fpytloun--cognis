@@ -947,6 +947,9 @@ async def _execute_runtime_command(
                 )
             )
             conversation.active_session_id = active_session.session_id
+            previous_runtime_selection = resolve_runtime_selection(
+                agent, active_session, conversation
+            )
             plan = RuntimeSelectionPlan()
             # Provider discovery can do external I/O. It precedes the database transaction.
             command_result = await request.app.state.command_dispatcher.dispatch(
@@ -998,6 +1001,21 @@ async def _execute_runtime_command(
                     duplicate = False
             if not duplicate:
                 plan.publish(request.app.state.session_cache, active_session)
+                current_runtime_selection = resolve_runtime_selection(
+                    agent, active_session, conversation
+                )
+                if (
+                    previous_runtime_selection.provider_id,
+                    previous_runtime_selection.model,
+                ) != (
+                    current_runtime_selection.provider_id,
+                    current_runtime_selection.model,
+                ) and hasattr(request.app.state.turn_scheduler, "expedite_provider_retry"):
+                    await request.app.state.turn_scheduler.expedite_provider_retry(
+                        conversation_id,
+                        session_id=active_session.session_id,
+                        previous_runtime_revision=previous_runtime_selection.revision,
+                    )
 
     # Notices are derived Intaris events. A replay heals a crash after the DB commit.
     result = tx_row.result or {}

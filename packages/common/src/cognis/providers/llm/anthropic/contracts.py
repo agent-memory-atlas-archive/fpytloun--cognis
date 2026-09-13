@@ -18,6 +18,13 @@ CONTRACT_VERSION = 1
 CANONICAL_JSON_VERSION = 1
 MAX_ENVELOPE_BYTES = 256 * 1024
 MAX_ENVELOPE_BLOCKS = 256
+# Claude Code client version reported to Anthropic. Anthropic rejects a request
+# outright when this is older than the model requires, so it is declared once
+# here and derived everywhere else. Keep it in sync with
+# `cognis.providers.llm.anthropic_subscription.CLAUDE_CODE_VERSION`;
+# `tests/unit/providers/llm/anthropic/test_integration.py` enforces that both
+# produce the same user agent.
+CLAUDE_CODE_VERSION = "2.1.270"
 
 
 class AnthropicProtocol(StrEnum):

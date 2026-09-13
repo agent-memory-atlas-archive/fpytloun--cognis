@@ -1,7 +1,6 @@
 """Task queue — priority-based task picking, dependency resolution, and lifecycle.
 
-Uses polling for MVP (event-based wakeups can be added via asyncio.Event
-signaling or Postgres LISTEN/NOTIFY in Phase 2). Capacity enforcement
+Uses local and cluster wakeups with bounded fallback reconciliation. Capacity enforcement
 uses a unified model: max active steps globally and per-agent.
 """
 
@@ -96,7 +95,16 @@ TASK_RECOVERY_CLASSIFICATIONS = Counter(
 # Default capacity limits
 DEFAULT_MAX_ACTIVE_STEPS_GLOBAL = 10
 DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT = 5
-DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_POLL_INTERVAL_SECONDS = 15.0
+QUEUE_RECONCILIATIONS = Counter(
+    "cognis_task_queue_reconciliations_total",
+    "Queue reconciliation passes by bounded wake reason.",
+    ("reason",),
+)
+QUEUE_CLAIM_ATTEMPTS = Counter(
+    "cognis_task_queue_claim_attempts_total",
+    "Durable queue claim attempts.",
+)
 DEFAULT_STALE_AFTER_SECONDS = 300
 
 _RERUN_CLONE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
@@ -195,6 +203,18 @@ class TaskQueue:
         self._wake_event = asyncio.Event()
         self._next_recovery_at = 0.0
         self._turn_scheduler: Any = None
+        self.cluster_signals: Any = None
+
+    async def _on_cluster_change(self, event: Event) -> None:
+        if event.data.get("kind") == "task_queue_changed":
+            self._wake_event.set()
+
+    async def _wake_workers(self) -> None:
+        """Wake claimers after durable queue or capacity changes."""
+        from cognis.core.queue_wakeup import publish_queue_wakeup
+
+        self._wake_event.set()
+        await publish_queue_wakeup(self._event_bus, self.cluster_signals)
 
     def set_turn_scheduler(self, turn_scheduler: Any) -> None:
         """Attach the durable turn controller after application wiring completes."""
@@ -245,6 +265,8 @@ class TaskQueue:
         """Start the queue processing loop."""
         self._stop_event.clear()
         self._accepting = True
+        self._event_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, self._on_cluster_change)
+        self._wake_event.set()
         self._drain_task = asyncio.create_task(self._drain_loop())
         logger.info("Task queue started")
 
@@ -258,6 +280,7 @@ class TaskQueue:
         5. Cancel the drain loop
         """
         self._accepting = False
+        self._event_bus.unsubscribe(EventType.CLUSTER_SCOPE_INVALIDATED, self._on_cluster_change)
         self._stop_event.set()
         self._wake_event.set()
 
@@ -399,6 +422,8 @@ class TaskQueue:
         # If queued, try to transition to ready
         if status in {"queued", "ready"}:
             await self._try_transition_to_ready(task.task_id)
+        if status == "ready":
+            await self._wake_workers()
 
         # Wake the drain loop
         self._wake_event.set()
@@ -450,7 +475,7 @@ class TaskQueue:
                 row = await get_task(db_session, task_id)
                 if row is None:
                     return None
-        self._wake_event.set()
+        await self._wake_workers()
         return _row_to_task_model(row)
 
     async def create_draft(
@@ -1056,7 +1081,7 @@ class TaskQueue:
 
         # Wake the drain loop for newly ready tasks
         if transitioned:
-            self._wake_event.set()
+            await self._wake_workers()
 
         return transitioned
 
@@ -1404,18 +1429,29 @@ class TaskQueue:
 
     async def _drain_loop(self) -> None:
         """Main queue processing loop."""
+        next_scheduled: float | None = None
         while not self._stop_event.is_set():
             try:
                 # Wait for wake signal or poll interval
-                with contextlib.suppress(TimeoutError):
+                timeout = self._poll_interval
+                if next_scheduled is not None:
+                    timeout = min(
+                        timeout,
+                        max(0.0, next_scheduled - asyncio.get_running_loop().time()),
+                    )
+                reason = "signal"
+                try:
                     await asyncio.wait_for(
                         self._wake_event.wait(),
-                        timeout=self._poll_interval,
+                        timeout=timeout,
                     )
+                except TimeoutError:
+                    reason = "fallback"
                 self._wake_event.clear()
 
                 if self._stop_event.is_set():
                     break
+                QUEUE_RECONCILIATIONS.labels(reason=reason).inc()
 
                 # Clean up completed runs
                 for task_id in list(self._active_runs):
@@ -1430,15 +1466,29 @@ class TaskQueue:
                     await self.recover_paused_tasks()
 
                 # Try to pick and run a task
+                # Read the next deadline before claiming so a deadline crossed
+                # during this read is covered by the following durable claim.
+                deadline_base = asyncio.get_running_loop().time()
+                scheduled_delay = await self._execution_store.next_scheduled_delay()
+                next_scheduled = (
+                    deadline_base + scheduled_delay if scheduled_delay is not None else None
+                )
                 await self._try_pick_and_run()
 
             except Exception:
                 logger.exception("Task queue drain loop error")
-                await asyncio.sleep(self._poll_interval)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._wake_event.wait(), timeout=min(1.0, self._poll_interval)
+                    )
+                # Retry directly rather than adding another idle fallback wait.
+                next_scheduled = None
+                self._wake_event.set()
 
     async def _try_pick_and_run(self) -> None:
         """Try to pick the next ready task and start executing it."""
         async with self._pick_lock:
+            QUEUE_CLAIM_ATTEMPTS.inc()
             claim = await self._execution_store.claim_ready()
         if claim is None:
             return
@@ -1471,6 +1521,8 @@ class TaskQueue:
 
         # Start workflow execution in background
         self._launch_claimed_task_run(task, claim)
+        # Signals coalesce: drain until durable work or capacity is exhausted.
+        self._wake_event.set()
 
     async def _select_workflow_for_task(self, task: TaskModel) -> str:
         """Auto-select a workflow using the LLM classifier.
@@ -1753,6 +1805,7 @@ class TaskQueue:
             finally:
                 reset_task_execution_fence(fence_token)
                 await fence.close()
+                await self._wake_workers()
                 self._active_runs.pop(task.task_id, None)
                 self._run_controls.pop(task.task_id, None)
                 # Update queue depth metric
@@ -1799,9 +1852,11 @@ class TaskQueue:
                 await db_session.commit()
                 if ok:
                     TASKS_TOTAL.labels(status="ready").inc()
-                    return True
-            await db_session.commit()
-        return False
+            else:
+                ok = False
+        if ok:
+            await self._wake_workers()
+        return bool(ok)
 
     async def _launch_recovered_paused_task(self, task: TaskModel) -> None:
         active = self._active_runs.get(task.task_id)

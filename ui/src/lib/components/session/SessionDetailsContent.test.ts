@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import SessionDetailsContent from './SessionDetailsContent.svelte';
 
 vi.mock('$lib/api/client', () => ({
-  api: { llmProviders: { codexUsage: vi.fn() } },
+  api: { llmProviders: { providerUsage: vi.fn() } },
 }));
 
 const detail = {
@@ -34,7 +34,37 @@ describe('SessionDetailsContent', () => {
     expect(narrative).toHaveTextContent(detail.summary);
   });
 
-  it('separates the selected runtime from the last context runtime', () => {
+  it('wraps cached-token statistics within the context card', () => {
+    render(SessionDetailsContent, {
+      detail: {
+        ...detail,
+        token_usage: {
+          prompt_tokens: 114303,
+          completion_tokens: 2357,
+          total_tokens: 116660,
+          cache_read_input_tokens: 111835,
+          cache_write_tokens: 2466,
+        },
+      },
+    });
+
+    const stats = screen.getByTestId('session-token-usage-stats');
+    expect(stats).toHaveClass('flex-wrap');
+    expect(stats).toHaveTextContent('Input 114,303');
+    expect(stats).toHaveTextContent('Output 2,357');
+    expect(stats).toHaveTextContent('Cache read 111,835');
+    expect(stats).toHaveTextContent('Cache write 2,466');
+    for (const stat of stats.querySelectorAll('span')) {
+      expect(stat).toHaveClass('whitespace-nowrap');
+    }
+  });
+
+  it.each([
+    ['default', 'Provider default'],
+    ['none', 'Disabled'],
+    ['high', 'High'],
+    [null, 'Inherit routing/provider configuration'],
+  ])('separates selected thinking %s from the last context runtime', (effort, label) => {
     render(SessionDetailsContent, {
       detail: {
         ...detail,
@@ -45,8 +75,8 @@ describe('SessionDetailsContent', () => {
           model: 'gpt-6-astra',
           provider_id: 'codex',
           model_source: 'session_override',
-          reasoning_effort: 'high',
-          reasoning_effort_source: 'session_override',
+          reasoning_effort: effort,
+          reasoning_effort_source: effort === null ? 'provider_default' : 'session_override',
           fast_mode: false,
           fast_mode_source: 'session_override',
         },
@@ -66,6 +96,10 @@ describe('SessionDetailsContent', () => {
       'codex/gpt-6-astra'
     );
     expect(screen.getByText(/Last context:/)).toHaveTextContent('gpt-5.4');
+    expect(screen.getByTestId('session-selected-runtime')).toHaveTextContent(label!);
+    expect(screen.getByTestId('session-selected-runtime')).toHaveTextContent(
+      effort === null ? 'Source: provider default' : 'Source: session override'
+    );
   });
 
   it('renders Star as an icon-only action next to Open in Intaris', async () => {

@@ -831,6 +831,22 @@ def test_session_intaris_detail_prefers_intaris_summary(
                     agent_id="agent-1",
                     owner_email="user@example.com",
                     name="Agent 1",
+                    llm_config={"provider_id": "codex", "model": "gpt-default"},
+                    agent_profiles={
+                        "developer-senior": {
+                            "profile_id": "developer-senior",
+                            "provider_id": "codex",
+                            "model": "gpt-5.6-sol",
+                            "description": "Default profile",
+                        },
+                        "claude": {
+                            "profile_id": "claude",
+                            "provider_id": "anthropic",
+                            "model": "claude-opus-5",
+                            "description": "Claude profile",
+                        },
+                    },
+                    default_agent_profile_id="developer-senior",
                     status="active",
                 )
                 conversation = await create_conversation(
@@ -838,6 +854,7 @@ def test_session_intaris_detail_prefers_intaris_summary(
                     user_email="user@example.com",
                     agent_id="agent-1",
                     context_type="web",
+                    agent_profile_id="claude",
                 )
                 session_row = await create_session(
                     session,
@@ -920,6 +937,10 @@ def test_session_intaris_detail_prefers_intaris_summary(
         assert body["summary"] == "Latest Intaris summary"
         assert body["last_generation"]["model"] == "qwen3:8b"
         assert body["last_generation"]["generation_tokens_per_second"] == 25
+        assert body["runtime_selection"]["profile_id"] == "claude"
+        assert body["runtime_selection"]["profile_source"] == "conversation"
+        assert body["runtime_selection"]["provider_id"] == "anthropic"
+        assert body["runtime_selection"]["model"] == "claude-opus-5"
 
 
 def test_session_intaris_detail_falls_back_without_summary(

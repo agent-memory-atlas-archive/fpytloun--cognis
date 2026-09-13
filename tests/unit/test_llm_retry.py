@@ -164,3 +164,18 @@ async def test_with_llm_retry_rejects_normalized_retry_after_beyond_cap(
         await retry_module.with_llm_retry(rate_limited, max_retries=3, max_delay=30)
     assert calls == 1
     assert sleeps == []
+
+
+@pytest.mark.parametrize("retry_module", [llm_retry, executor_llm_retry])
+def test_protocol_stream_failures_are_not_retryable(retry_module: ModuleType) -> None:
+    from cognis.providers.llm.errors import MidStreamErrorCategory
+
+    assert not retry_module.is_retryable_error(
+        AnthropicTransportError("Anthropic tool_use references an unknown wire tool name")
+    )
+    assert retry_module.is_retryable_error(
+        AnthropicTransportError(
+            "Anthropic stream ended before message_stop",
+            category=MidStreamErrorCategory.CONNECTION,
+        )
+    )

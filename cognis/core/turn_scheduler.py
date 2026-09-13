@@ -172,6 +172,7 @@ from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now
 from cognis.store.direct_turns import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
+    TOOL_DISPATCH_DESCRIPTOR_LIMIT,
     AdmissionResult,
     DirectTurnAdmissionGuard,
     DirectTurnAdmissionRejected,
@@ -179,6 +180,7 @@ from cognis.store.direct_turns import (
     DirectTurnStatus,
     DirectTurnStore,
     MaterializedDirectTurnPayload,
+    read_tool_dispatch_groups,
 )
 from cognis.store.models import (
     DirectTurnRequestRow,
@@ -198,6 +200,36 @@ _MAX_ACTIVE_TOOL_OUTPUT_CHARS = 64_000
 _ACTIVE_TOOL_OUTPUT_SNAPSHOT_TTL_SECONDS = 6 * 60 * 60
 
 
+# Category-only wording for durable history. Keyed by the normalized model
+# failure category so a failed turn names its cause without persisting raw
+# provider text.
+_MODEL_ERROR_CATEGORY_MESSAGES = {
+    "invalid_request": (
+        "The model provider rejected this request. It cannot succeed until the "
+        "request or the model configuration changes."
+    ),
+    "attachment_input": "The model provider could not read an attachment in this request.",
+    "artifact_fetch": "The model provider could not fetch an attachment in this request.",
+    "context_overflow": "The conversation exceeded the model context window.",
+    "quota_exhausted": "The model provider quota is exhausted.",
+    "rate_limit": "The model provider rate-limited this request.",
+    "provider_5xx": "The model provider returned server errors while processing this turn.",
+    "connection": "The connection to the model provider failed while processing this turn.",
+    "content_policy": "The model provider refused this request under its content policy.",
+    "protocol": "The model provider returned a response Cognis could not decode.",
+    "idle_timeout_raw": "The model stopped producing output before this turn finished.",
+    "idle_timeout_activity": "The model stopped producing output before this turn finished.",
+    "idle_timeout_reasoning": "The model stopped producing output before this turn finished.",
+}
+
+
+def _turn_error_model_failure(error: TurnError) -> dict[str, Any]:
+    raw_detail = getattr(error, "detail", None)
+    detail = raw_detail if isinstance(raw_detail, dict) else {}
+    model_error = detail.get("model_error")
+    return model_error if isinstance(model_error, dict) else {}
+
+
 def _durable_turn_error_message(error: TurnError) -> str:
     """Return a stable category-only message safe for durable history."""
 
@@ -207,6 +239,11 @@ def _durable_turn_error_message(error: TurnError) -> str:
         return "The turn was cancelled."
     if error.code.startswith("provider_"):
         return "A required provider was unavailable while processing this turn."
+    reason_class = _turn_error_model_failure(error).get("reason_class")
+    if isinstance(reason_class, str):
+        category_message = _MODEL_ERROR_CATEGORY_MESSAGES.get(reason_class)
+        if category_message:
+            return category_message
     return "Turn execution failed."
 
 
@@ -818,7 +855,11 @@ def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
             is not None
         )
     )
-    detail: dict[str, Any] = {"error_detail": error_text[:2000]}
+    # Every other TurnError producer stores an already sanitized error_detail,
+    # and this one is read by the live WebSocket path, so sanitize it here too.
+    detail: dict[str, Any] = {
+        "error_detail": sanitize_client_error_detail(error_text, fallback="turn execution failed")
+    }
     if database_conflict:
         detail["client_safe_detail"] = (
             "The database reported a deadlock or serialization conflict. "
@@ -829,6 +870,13 @@ def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
         retry_after_seconds = model_error.get("retry_after_seconds")
         if isinstance(retry_after_seconds, (int, float)) and retry_after_seconds > 0:
             detail["retry_after_seconds"] = float(retry_after_seconds)
+        # Carry the provider cause so durable history and reloaded clients can
+        # show why the turn failed instead of only a generic category message.
+        # `_durable_turn_error_detail` is the single reader and sanitizes this
+        # candidate before it is persisted.
+        provider_message = model_error.get("message")
+        if isinstance(provider_message, str) and provider_message.strip():
+            detail.setdefault("client_safe_detail", provider_message.strip())
     return TurnError(
         code="database_conflict" if database_conflict else "step_failed",
         message=message[:500],
@@ -4056,6 +4104,7 @@ class TurnScheduler:
         interruption_reason: str | None = None,
         source_phase: str | None = None,
         retry_after_seconds: float | None = None,
+        retry_target: dict[str, Any] | None = None,
         ambiguous: bool = False,
         ambiguity_detail: dict[str, Any] | None = None,
     ) -> DirectTurnStatus:
@@ -4089,6 +4138,7 @@ class TurnScheduler:
                         if retry_after_seconds is not None
                         else {}
                     ),
+                    **({"retry_target": retry_target} if retry_target is not None else {}),
                 },
                 retry_after_seconds=retry_after_seconds,
             )
@@ -4156,19 +4206,106 @@ class TurnScheduler:
         row: DirectTurnRequestRow,
         lease: Lease,
     ) -> None:
-        """Settle every unresolved persisted tool call without replaying it."""
+        """Settle every unresolved persisted tool call without replaying it.
+
+        A direct turn can hold in-flight tool batches from several Intaris
+        sessions at once, because delegate children execute tools under the
+        parent turn's fence. Each group is settled against its own canonical
+        session and turn, and one failing group must not strand the others.
+        """
 
         del lease
         outcome = row.outcome if isinstance(row.outcome, dict) else {}
-        raw_descriptors = outcome.get("tool_calls")
-        descriptors: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        if not isinstance(raw_descriptors, list) or not raw_descriptors:
+        groups = read_tool_dispatch_groups(
+            outcome,
+            fallback_session_id=row.session_id,
+            fallback_turn_id=row.turn_id,
+        )
+        if not groups:
+            recorded = outcome.get("tool_dispatch_groups") or outcome.get("tool_calls")
             raise ToolRecoveryPersistenceError(
-                "Durable tool descriptors are missing.",
+                "Canonical tool history identity is missing."
+                if isinstance(recorded, list) and recorded
+                else "Durable tool descriptors are missing.",
                 ambiguous=True,
             )
-        for raw in raw_descriptors[:500]:
+        raw_groups = outcome.get("tool_dispatch_groups")
+        if isinstance(raw_groups, list) and len(raw_groups) != len(groups):
+            # Settling only the readable groups would clear the whole dispatch
+            # record and strand the unreadable one's calls. Fail before settling
+            # anything so the turn is reported as ambiguous instead.
+            raise ToolRecoveryPersistenceError(
+                "A durable tool dispatch group is malformed.",
+                ambiguous=True,
+            )
+        deadline_raw = outcome.get("recovery_deadline_at")
+        try:
+            deadline = datetime.fromisoformat(str(deadline_raw).replace("Z", "+00:00"))
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+        except ValueError as exc:
+            # begin_tool_recovery writes this deadline, so a malformed value
+            # means corrupted state rather than a known-safe frozen tool.
+            raise ToolRecoveryPersistenceError(
+                "The durable tool recovery deadline is malformed.",
+                ambiguous=True,
+            ) from exc
+        failures: list[ToolRecoveryPersistenceError] = []
+        for group in groups:
+            try:
+                await self._recover_tool_call_group(
+                    session_id=group.session_id,
+                    turn_id=group.turn_id,
+                    raw_descriptors=list(group.tool_calls),
+                    deadline=deadline,
+                )
+            except ToolRecoveryPersistenceError as exc:
+                failures.append(exc)
+            except Exception as exc:
+                # Any other failure is still confined to this group. Siblings
+                # own unsettled canonical calls of their own, so record the
+                # failure and keep settling instead of aborting the turn here.
+                # asyncio.CancelledError is a BaseException and still escapes.
+                logger.exception(
+                    "direct turn: tool recovery group failed",
+                    extra={
+                        "extra_data": {
+                            "session_id": group.session_id,
+                            "turn_id": group.turn_id,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                )
+                failures.append(
+                    ToolRecoveryPersistenceError(
+                        f"Could not settle interrupted tools for {group.session_id}: {exc}",
+                        ambiguous=True,
+                    )
+                )
+        invalidated = {group.session_id for group in groups}
+        if row.session_id:
+            invalidated.add(row.session_id)
+        for invalidated_session_id in sorted(invalidated):
+            await self._session_cache.invalidate_canonical(invalidated_session_id)
+        if failures:
+            raise ToolRecoveryPersistenceError(
+                "; ".join(str(failure) for failure in failures),
+                ambiguous=any(failure.ambiguous for failure in failures),
+            )
+
+    async def _recover_tool_call_group(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        raw_descriptors: list[Any],
+        deadline: datetime,
+    ) -> None:
+        """Settle one session's interrupted tool batch against its own history."""
+
+        descriptors: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_descriptors[:TOOL_DISPATCH_DESCRIPTOR_LIMIT]:
             if not isinstance(raw, dict):
                 raise ToolRecoveryPersistenceError(
                     "A durable tool descriptor is malformed.",
@@ -4198,31 +4335,15 @@ class TurnScheduler:
                 "The durable tool descriptor set exceeds its bound.",
                 ambiguous=True,
             )
-        session_id = outcome.get("session_id") or row.session_id
-        if not isinstance(session_id, str) or not session_id or not row.turn_id:
-            raise ToolRecoveryPersistenceError(
-                "Canonical tool history identity is missing.",
-                ambiguous=any(not descriptor["frozen"] for descriptor in descriptors),
-            )
 
         unresolved: list[dict[str, Any]] = []
         escalation_resolutions: dict[str, tuple[dict[str, Any], Any]] = {}
         question_resolutions: dict[str, tuple[dict[str, Any], Any]] = {}
-        deadline_raw = outcome.get("recovery_deadline_at")
-        try:
-            deadline = datetime.fromisoformat(str(deadline_raw).replace("Z", "+00:00"))
-            if deadline.tzinfo is None:
-                deadline = deadline.replace(tzinfo=UTC)
-        except ValueError as exc:
-            raise ToolRecoveryPersistenceError(
-                "The durable tool recovery deadline is malformed.",
-                ambiguous=any(not descriptor["frozen"] for descriptor in descriptors),
-            ) from exc
         try:
             canonical_pairs = await read_canonical_tool_pairs(
                 self._providers.guardrails,
                 session_id=session_id,
-                turn_id=row.turn_id,
+                turn_id=turn_id,
                 tool_names={
                     descriptor["call_id"]: descriptor["tool_name"] for descriptor in descriptors
                 },
@@ -4249,7 +4370,7 @@ class TurnScheduler:
                     await restore_missing_tool_call(
                         self._providers.guardrails,
                         session_id=session_id,
-                        turn_id=row.turn_id,
+                        turn_id=turn_id,
                         call_id=descriptor["call_id"],
                         tool_name=descriptor["tool_name"],
                         event=SessionEvent(type=event_type, data=event_data),
@@ -4286,7 +4407,7 @@ class TurnScheduler:
                                 "result": json.dumps(payload, sort_keys=True),
                                 "agent_visible": True,
                                 "view_kind": "model_tool_result",
-                                "turn_id": row.turn_id,
+                                "turn_id": turn_id,
                                 "recovery": True,
                                 "uncertain": True,
                             },
@@ -4297,7 +4418,7 @@ class TurnScheduler:
                         events=boundary,
                         source="cognis",
                         idempotency_key=(
-                            f"{session_id}:turn:{row.turn_id}:canonical-continuation:"
+                            f"{session_id}:turn:{turn_id}:canonical-continuation:"
                             f"{descriptor['call_id']}"
                         ),
                     )
@@ -4307,7 +4428,7 @@ class TurnScheduler:
             canonical_pairs = await read_canonical_tool_pairs(
                 self._providers.guardrails,
                 session_id=session_id,
-                turn_id=row.turn_id,
+                turn_id=turn_id,
                 tool_names={
                     descriptor["call_id"]: descriptor["tool_name"]
                     for descriptor in descriptors
@@ -4407,7 +4528,7 @@ class TurnScheduler:
             for descriptor in unresolved:
                 state = await self._interrupted_tool_snapshot_state(
                     descriptor,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                 )
                 states[descriptor["call_id"]] = state
                 if state == "active":
@@ -4438,12 +4559,12 @@ class TurnScheduler:
                 event = _recovered_escalation_tool_result_event(
                     descriptor=descriptor,
                     resolution=resolution,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                 )
                 await append_tool_result_once(
                     self._providers.guardrails,
                     session_id=session_id,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                     call_id=descriptor["call_id"],
                     tool_name=descriptor["tool_name"],
                     event=event,
@@ -4454,12 +4575,12 @@ class TurnScheduler:
                 event = _recovered_question_tool_result_event(
                     descriptor=descriptor,
                     resolution=resolution,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                 )
                 await append_tool_result_once(
                     self._providers.guardrails,
                     session_id=session_id,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                     call_id=descriptor["call_id"],
                     tool_name=descriptor["tool_name"],
                     event=event,
@@ -4503,7 +4624,7 @@ class TurnScheduler:
                         "result": json.dumps(payload, sort_keys=True),
                         "agent_visible": True,
                         "view_kind": "model_tool_result",
-                        "turn_id": row.turn_id,
+                        "turn_id": turn_id,
                         "recovery": True,
                         "uncertain": ambiguous,
                     },
@@ -4511,7 +4632,7 @@ class TurnScheduler:
                 await append_tool_result_once(
                     self._providers.guardrails,
                     session_id=session_id,
-                    turn_id=row.turn_id,
+                    turn_id=turn_id,
                     call_id=descriptor["call_id"],
                     tool_name=descriptor["tool_name"],
                     event=event,
@@ -4521,7 +4642,7 @@ class TurnScheduler:
             winners = await read_canonical_tool_pairs(
                 self._providers.guardrails,
                 session_id=session_id,
-                turn_id=row.turn_id,
+                turn_id=turn_id,
                 tool_names={
                     descriptor["call_id"]: descriptor["tool_name"]
                     for descriptor in descriptors
@@ -4541,7 +4662,6 @@ class TurnScheduler:
                     else any(not descriptor["frozen"] for descriptor in descriptors)
                 ),
             ) from exc
-        await self._session_cache.invalidate_canonical(row.session_id or session_id)
 
     async def _interrupted_tool_snapshot_state(
         self,
@@ -5328,6 +5448,10 @@ class TurnScheduler:
         )
         if cleared_queue or durable_cancelled:
             await self._notify_queue_updated(conversation_id)
+        if durable_cancelled:
+            runtime = getattr(self, "_direct_turn_runtime", None)
+            if runtime is not None:
+                await runtime.wake()
         cluster_signals = getattr(self, "cluster_signals", None)
         if cancelled_active_request_id is not None and cluster_signals is not None:
             from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
@@ -5502,7 +5626,11 @@ class TurnScheduler:
                     row,
                     self.running_turn_state(conversation_id),
                 )
-                if row.status in {status.value for status in ACTIVE_STATUSES}
+                if row.status
+                in {
+                    *(status.value for status in ACTIVE_STATUSES),
+                    DirectTurnStatus.RECOVERABLE.value,
+                }
                 else None
             ),
             "authority": self._runtime_authority_from_row(row),
@@ -5520,18 +5648,54 @@ class TurnScheduler:
             else "starting"
             if row.status == DirectTurnStatus.CLAIMED.value
             else "waiting"
-            if row.status == DirectTurnStatus.ABSORBING.value
+            if row.status in {DirectTurnStatus.ABSORBING.value, DirectTurnStatus.RECOVERABLE.value}
             else "running"
         )
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        retry_target = outcome.get("retry_target")
         return {
             "turn_id": row.turn_id,
-            "session_id": row.session_id or "",
+            "session_id": row.session_id or outcome.get("session_id") or "",
             "status": status,
             "chat_mode": local.get("chat_mode") if local else None,
             "chat_mode_source": local.get("chat_mode_source") if local else None,
             "started_at": row.started_at.isoformat() if row.started_at is not None else None,
             "updated_at": row.updated_at.isoformat(),
+            "retry_at": (
+                row.next_attempt_at.isoformat() if row.next_attempt_at is not None else None
+            ),
+            "retry_reason": (
+                retry_target.get("reason_class") if isinstance(retry_target, dict) else None
+            ),
+            "provider_id": (
+                retry_target.get("provider_id") if isinstance(retry_target, dict) else None
+            ),
+            "model": retry_target.get("model") if isinstance(retry_target, dict) else None,
         }
+
+    async def expedite_provider_retry(
+        self,
+        conversation_id: str,
+        *,
+        session_id: str,
+        previous_runtime_revision: int,
+    ) -> bool:
+        """Invalidate provider backoff after the effective model target changes."""
+
+        if self._direct_turn_store is None:
+            return False
+        row = await self._direct_turn_store.expedite_provider_retry(
+            conversation_id,
+            session_id=session_id,
+            previous_runtime_revision=previous_runtime_revision,
+        )
+        if row is None:
+            return False
+        await self._notify_queue_updated(conversation_id)
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.expedite(row.request_id)
+        return True
 
     async def durable_running_turn_states(
         self,
@@ -6789,7 +6953,19 @@ class TurnScheduler:
         max_llm_cycles = positive_optional_int(metadata.get("max_llm_cycles"))
         if follow_up is None:
             subject = _automatic_continuation_exhausted_subject(reason)
-            message = f"Automatic continuation stopped after repeated {subject}. Send a new message to continue manually."
+            # Name the repeated cause: without it the ceiling message hides why
+            # every continuation failed.
+            model_error = metadata.get("model_error")
+            raw_cause = model_error.get("message") if isinstance(model_error, dict) else None
+            cause = (
+                f" Last cause: {sanitize_client_error_detail(raw_cause, fallback='unknown')}"
+                if isinstance(raw_cause, str) and raw_cause.strip()
+                else ""
+            )
+            message = (
+                f"Automatic continuation stopped after repeated {subject}."
+                f"{cause} Send a new message to continue manually."
+            )
             await self._notify_observers_system_message(
                 conversation_id,
                 message,
@@ -10043,6 +10219,33 @@ class TurnScheduler:
                         interruption_reason=execution_fence.interruption_reason,
                         source_phase=execution_fence.last_phase,
                         retry_after_seconds=execution_fence.retry_after_seconds,
+                        retry_target=(
+                            {
+                                "scope": "provider_model",
+                                "runtime_revision": session.runtime_override_revision,
+                                "reason_class": (
+                                    (durable_retry_notice_error.detail or {})
+                                    .get("model_error", {})
+                                    .get("reason_class")
+                                ),
+                                "provider_id": (
+                                    (durable_retry_notice_error.detail or {})
+                                    .get("model_error", {})
+                                    .get("provider_id")
+                                ),
+                                "model": (
+                                    (durable_retry_notice_error.detail or {})
+                                    .get("model_error", {})
+                                    .get("model")
+                                ),
+                            }
+                            if durable_retry_notice_error is not None
+                            and isinstance(
+                                (durable_retry_notice_error.detail or {}).get("model_error"),
+                                dict,
+                            )
+                            else None
+                        ),
                     )
                 if settled_status is DirectTurnStatus.CANCELLED and durable_retry_pending:
                     durable_retry_pending = False

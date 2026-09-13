@@ -11,7 +11,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
-  import { GENERIC_THINKING_EFFORTS, thinkingEffortLabel } from '$lib/thinking';
+  import { thinkingEffortLabel } from '$lib/thinking';
   import {
     buildSystemPromptPreview,
     defaultSystemPrompt,
@@ -84,7 +84,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   let toolSearch = $state('');
   const sections = $derived.by(() => [
     { id: 'identity', label: 'Identity', suffix: errors.name ? '!' : '' },
-    { id: 'providers', label: 'Providers & models' },
+    { id: 'providers', label: 'Providers & models', suffix: errors.reasoningEffort ? '!' : '' },
     { id: 'tools', label: 'Tools & access', count: tools.length },
     ...(!isSystemAsset || editableFieldSet.has('agent_profiles')
       ? [{ id: 'profiles', label: 'Profiles', count: form.agentProfiles.length, suffix: errors.agentProfiles ? '!' : '' }]
@@ -318,9 +318,17 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     if (!form.name.trim()) {
       errors.name = 'Name is required.';
     }
+    if (canEditField('llm_config.reasoning_effort') &&
+        invalidThinking(form.reasoningEffort, availableThinkingEfforts())) {
+      errors.reasoningEffort = 'Thinking effort is unavailable for this model. Select an available value.';
+    }
     const seenProfileIds = new Set<string>();
     for (const profile of form.agentProfiles) {
       const profileId = profile.profileId.trim();
+      if (canEditProfiles() && invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))) {
+        errors.agentProfiles = `Thinking effort for profile "${profileId}" is unavailable. Select an available value.`;
+        break;
+      }
       if (!profileId) {
         errors.agentProfiles = 'Each runtime profile needs a profile ID.';
         break;
@@ -504,15 +512,21 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     if (modelInfo) {
       return modelInfo.reasoning_efforts.length > 0 ? modelInfo.reasoning_efforts : ['default'];
     }
-    return [...GENERIC_THINKING_EFFORTS];
+    return ['default'];
   }
 
   function availableThinkingEffortsForProfile(profile: AgentRuntimeProfileFormState): string[] {
-    const modelInfo = modelInfoForProvider(profile.providerId, profile.model);
+    const modelInfo = modelInfoForProvider(
+      profile.providerId || form.providerId, profile.model || form.model
+    );
     if (modelInfo) {
       return modelInfo.reasoning_efforts.length > 0 ? modelInfo.reasoning_efforts : ['default'];
     }
-    return [...GENERIC_THINKING_EFFORTS];
+    return ['default'];
+  }
+
+  function invalidThinking(value: string, available: string[]): boolean {
+    return value !== '' && !available.includes(value);
   }
 
   function addRuntimeProfile(): void {
@@ -1340,24 +1354,35 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Thinking effort</span>
-            <select bind:value={form.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.reasoning_effort')}>
-              <option value="">Default</option>
-              {#each availableThinkingEfforts().filter((value: string) => value !== 'default') as value}
+            <select bind:value={form.reasoningEffort} aria-describedby={`${editorId}-thinking-help`} aria-invalid={invalidThinking(form.reasoningEffort, availableThinkingEfforts())} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.reasoning_effort')}>
+              <option value="">Inherit</option>
+              {#if invalidThinking(form.reasoningEffort, availableThinkingEfforts())}
+                <option value={form.reasoningEffort}>{thinkingEffortLabel(form.reasoningEffort)} (unavailable)</option>
+              {/if}
+              {#each availableThinkingEfforts() as value}
                 <option value={value}>{thinkingEffortLabel(value)}</option>
               {/each}
             </select>
+            <span id={`${editorId}-thinking-help`} class="block text-xs text-slate-400">
+              Inherit uses routing/provider configuration. Provider default does not inherit an effort hint.
+              {#if !selectedProviderModelInfo()}Capabilities unavailable; only inheritance and provider default can be selected.{/if}
+              {#if invalidThinking(form.reasoningEffort, availableThinkingEfforts())}Select an available value before saving.{/if}
+            </span>
           </label>
-          {#if supportsFastMode()}
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Fast mode</span>
               <select bind:value={form.fastMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.fast_mode')}>
-                <option value="inherit">Default</option>
-                <option value="enabled">Enabled</option>
+                <option value="inherit">Inherit</option>
+                <option value="enabled" disabled={!supportsFastMode()}>Enabled{supportsFastMode() ? '' : ' (unavailable)'}</option>
                 <option value="disabled">Disabled</option>
               </select>
-              <span class="block text-xs text-slate-400">Uses the provider's accelerated tier; it may increase usage.</span>
+              <span class="block text-xs text-slate-400">
+                {#if supportsFastMode()}Requests accelerated execution; account eligibility is not confirmed and premium pricing can apply.
+                {:else if selectedProviderModelInfo()}Fast mode is not supported for this provider/model.
+                {:else}Fast-mode capabilities unavailable.{/if}
+                Inherit uses lower-layer configuration. Disabled suppresses inherited acceleration.
+              </span>
             </label>
-          {/if}
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Voice</span>
             <Input bind:value={form.voice} placeholder="Use system default" disabled={!canEditField('llm_config.voice')} />
@@ -1511,16 +1536,24 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     <span>Thinking effort</span>
                     <select
                       bind:value={profile.reasoningEffort}
+                      aria-describedby={`${editorId}-profile-${profile.profileId}-thinking-help`}
+                      aria-invalid={invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))}
                       class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
                       disabled={!canEditProfiles()}
                     >
-                      <option value="">Default</option>
-                      {#each availableThinkingEffortsForProfile(profile).filter((value: string) => value !== 'default') as value}
+                      <option value="">Inherit</option>
+                      {#if invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))}
+                        <option value={profile.reasoningEffort}>{thinkingEffortLabel(profile.reasoningEffort)} (unavailable)</option>
+                      {/if}
+                      {#each availableThinkingEffortsForProfile(profile) as value}
                         <option value={value}>{thinkingEffortLabel(value)}</option>
                       {/each}
                     </select>
+                    <span id={`${editorId}-profile-${profile.profileId}-thinking-help`} class="block text-xs text-slate-400">
+                      Inherit uses the agent's thinking configuration. Provider default does not inherit an effort hint.
+                      {#if invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))}Select an available value before saving.{/if}
+                    </span>
                   </label>
-                  {#if supportsFastModeForProfile(profile)}
                     <label class="space-y-2 text-sm font-medium text-slate-200">
                       <span>Fast mode</span>
                       <select
@@ -1529,11 +1562,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         disabled={!canEditProfiles()}
                       >
                         <option value="inherit">Inherit agent setting</option>
-                        <option value="enabled">Enabled</option>
+                        <option value="enabled" disabled={!supportsFastModeForProfile(profile)}>Enabled{supportsFastModeForProfile(profile) ? '' : ' (unavailable)'}</option>
                         <option value="disabled">Disabled</option>
                       </select>
+                      <span class="block text-xs text-slate-400">
+                        {#if supportsFastModeForProfile(profile)}Account eligibility is not confirmed; premium pricing can apply.
+                        {:else}Fast mode is unsupported or its capability metadata is unavailable.{/if}
+                        Inherit uses the agent configuration. Disabled suppresses inherited acceleration.
+                      </span>
                     </label>
-                  {/if}
 
                   <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
                     <span>System prompt extra</span>
@@ -1667,7 +1704,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <p>Save applies to all sections.</p>
             {#each Object.entries(errors) as [field, message]}
               <button type="button" class="mt-1 block text-left text-rose-300 underline"
-                onclick={() => { activeSection = field === 'name' ? 'identity' : field === 'agentProfiles' ? 'profiles' : 'workflows'; }}>
+                 onclick={() => { activeSection = field === 'name' ? 'identity' : field === 'reasoningEffort' ? 'providers' : field === 'agentProfiles' ? 'profiles' : 'workflows'; }}>
                 {message}
               </button>
             {/each}

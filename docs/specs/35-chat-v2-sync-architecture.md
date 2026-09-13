@@ -2,6 +2,19 @@
 
 ## Status: Approved for Phase 2 implementation
 
+### Implemented runtime completion boundaries
+
+Tool admission ends the preceding assistant stream. The cumulative relay snapshot
+retains its text as complete until canonical synchronization replaces it.
+Canonical assistant phases supersede earlier runtime phases by message identity,
+even when the runtime text is only a prefix of the saved text.
+
+The completion observer can publish a terminal envelope before the execution
+wrapper commits settlement. A receiving replica accepts this envelope only for
+the exact current request, turn, fence, and owner. A different owner or a newer
+fence still invalidates the envelope. This ordering adds no database operation
+to the streaming path.
+
 ## Purpose
 
 This spec defines the replacement architecture for Cognis chat timeline state

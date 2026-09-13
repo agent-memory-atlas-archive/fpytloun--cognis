@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,9 +11,11 @@ import pytest
 
 from cognis.tools.executor.lsp.manager import (
     LSPManager,
+    PreparedClient,
     _find_project_root,
     _should_skip_server_for_path,
 )
+from cognis.tools.executor.lsp.query import QueryOutcome, QueryStatus, aggregate_status
 from cognis.tools.executor.lsp.servers import GOPLS, PYRIGHT, RUST_ANALYZER
 from cognis.tools.executor.lsp.types import (
     DiagnosticFreshness,
@@ -107,11 +110,55 @@ class TestLSPManagerBasic:
             mock_client.is_alive = True
             mock_client_class.return_value = mock_client
 
-            await manager._clients_for_file(str(target), wait=True, purpose="semantic")
+            await manager.prepare_file(str(target))
 
         spawned_servers = [call.kwargs["server_id"] for call in mock_client_class.call_args_list]
         assert "pyright" not in spawned_servers
         assert "ruff" in spawned_servers
+
+    @pytest.mark.asyncio()
+    async def test_spawn_cancelled_during_start_closes_unregistered_client(
+        self, tmp_path: Path
+    ) -> None:
+        """A caller deadline during the handshake must not leak the server."""
+        project = tmp_path / "cancel"
+        project.mkdir()
+        target = project / "module.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        started = asyncio.Event()
+
+        async def slow_start() -> None:
+            started.set()
+            await asyncio.sleep(60)
+
+        with (
+            patch(
+                "cognis.tools.executor.lsp.manager.resolve_command",
+                new=AsyncMock(return_value="cmd"),
+            ),
+            patch("cognis.tools.executor.lsp.manager.LSPClient") as mock_client_class,
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_client = AsyncMock()
+            mock_client.is_alive = True
+            mock_client.start = AsyncMock(side_effect=slow_start)
+            mock_client.close = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            task = asyncio.create_task(manager.prepare_file(str(target)))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert mock_client.close.await_count >= 1
+        assert manager._clients == {}
+        assert manager._spawning == {}
 
     @pytest.mark.asyncio()
     async def test_spawn_passes_workspace_configuration(self, tmp_path: Path) -> None:
@@ -137,7 +184,7 @@ class TestLSPManagerBasic:
             mock_client.is_alive = True
             mock_client_class.return_value = mock_client
 
-            await manager._clients_for_file(str(target), wait=True, purpose="semantic")
+            await manager.prepare_file(str(target))
 
         kwargs = next(
             call.kwargs
@@ -278,6 +325,40 @@ class TestLSPManagerBasic:
         assert PYRIGHT.workspace_configuration_for(str(tmp_path)) is None
         assert PYRIGHT.initialization_options_for(str(tmp_path)) is None
 
+    def test_pyright_python_path_from_nearest_venv(self, tmp_path: Path) -> None:
+        """The interpreter is discovered up to the git boundary and always passed."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        interpreter = repo / ".venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+        package_root = repo / "packages" / "executor"
+        package_root.mkdir(parents=True)
+
+        assert PYRIGHT.project_python_path(str(package_root)) == str(interpreter)
+        config = PYRIGHT.workspace_configuration_for(str(package_root))
+        assert config is not None
+        assert config["python"]["pythonPath"] == str(interpreter)
+        assert config["python"]["analysis"]["diagnosticMode"] == "openFilesOnly"
+        options = PYRIGHT.initialization_options_for(str(package_root))
+        assert options is not None
+        assert options["settings"]["python"]["pythonPath"] == str(interpreter)
+
+        # Native project config drops Cognis analysis defaults but keeps the interpreter.
+        (package_root / "pyrightconfig.json").write_text("{}\n")
+        native = PYRIGHT.workspace_configuration_for(str(package_root))
+        assert native == {"python": {"pythonPath": str(interpreter)}}
+
+    def test_pyright_python_path_stops_at_git_boundary(self, tmp_path: Path) -> None:
+        outer = tmp_path / ".venv" / "bin" / "python"
+        outer.parent.mkdir(parents=True)
+        outer.touch()
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+
+        assert PYRIGHT.project_python_path(str(repo)) is None
+        assert PYRIGHT.workspace_configuration_for(str(repo)) == PYRIGHT.workspace_configuration
+
     def test_non_python_servers_have_safe_default_excludes(self, tmp_path: Path) -> None:
         """Broad workspace servers should receive safe default directory filters."""
         gopls_config = GOPLS.workspace_configuration_for(str(tmp_path))
@@ -417,6 +498,325 @@ class TestFirstTouchWait:
 
         fake_client.did_open.assert_awaited_once()
         fake_client.wait_for_diagnostics.assert_awaited_once()
+
+
+def _prepared_client(
+    server_id: str,
+    *,
+    supports: bool = True,
+    alive: bool = True,
+) -> tuple[PreparedClient, MagicMock]:
+    client = MagicMock()
+    client.server_id = server_id
+    client.is_alive = alive
+    client.supports.return_value = supports
+    entry = PreparedClient(
+        client=client,
+        client_key=f"{server_id}:/project",
+        uri="file:///project/a.py",
+        language_id="python",
+        version=0,
+    )
+    return entry, client
+
+
+class TestPrepareAndQuery:
+    """Query preparation and capability-gated fanout."""
+
+    @pytest.mark.asyncio()
+    async def test_prepare_file_syncs_without_waiting_for_diagnostics(self, tmp_path: Path) -> None:
+        project = tmp_path / "prep"
+        project.mkdir()
+        target = project / "app.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        fake_client = MagicMock()
+        fake_client.is_alive = True
+        fake_client.server_id = "pyright"
+        fake_client.did_open = AsyncMock()
+        fake_client.did_change = AsyncMock()
+        fake_client.wait_for_diagnostics = AsyncMock()
+        fake_client.wait_for_progress_idle = AsyncMock(return_value=True)
+
+        with (
+            patch("cognis.tools.executor.lsp.manager.get_servers_for_extension") as mock_servers,
+            patch.object(manager, "_spawn_client", AsyncMock(return_value=fake_client)),
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_server = MagicMock()
+            mock_server.server_id = "pyright"
+            mock_server.root_markers = ()
+            mock_server.language_id.return_value = "python"
+            mock_servers.return_value = [mock_server]
+
+            first = await manager.prepare_file(str(target))
+            second = await manager.prepare_file(str(target))
+
+        assert [entry.version for entry in first] == [0]
+        assert [entry.version for entry in second] == [1]
+        assert first[0].language_id == "python"
+        fake_client.did_open.assert_awaited_once()
+        fake_client.did_change.assert_awaited_once()
+        fake_client.wait_for_diagnostics.assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    async def test_prepare_file_disabled(self) -> None:
+        manager = LSPManager(enabled=False)
+        assert await manager.prepare_file("/src/a.py") == []
+
+    @pytest.mark.asyncio()
+    async def test_prepare_file_waits_for_cold_start_progress_once(self, tmp_path: Path) -> None:
+        project = tmp_path / "cold"
+        project.mkdir()
+        target = project / "app.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        fake_client = MagicMock()
+        fake_client.is_alive = True
+        fake_client.server_id = "pyright"
+        fake_client.did_open = AsyncMock()
+        fake_client.did_change = AsyncMock()
+        fake_client.wait_for_progress_idle = AsyncMock(return_value=False)
+        client_key = "pyright:" + str(project)
+
+        async def spawn(*_: object, **__: object) -> MagicMock:
+            # Mirrors _spawn_client registration: every spawn starts cold,
+            # whichever path (query or read warm-up) triggered it.
+            manager._clients[client_key] = fake_client
+            manager._cold_clients.add(client_key)
+            return fake_client
+
+        with (
+            patch("cognis.tools.executor.lsp.manager.get_servers_for_extension") as mock_servers,
+            patch.object(manager, "_spawn_client", spawn),
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_server = MagicMock()
+            mock_server.server_id = "pyright"
+            mock_server.root_markers = ()
+            mock_server.language_id.return_value = "python"
+            mock_servers.return_value = [mock_server]
+
+            # Spawned by a non-waiting warm-up (the read path): still cold.
+            await manager.touch_file(str(target), wait=False, purpose="semantic")
+            await asyncio.gather(*manager._spawning.values())
+            assert manager._cold_clients == {client_key}
+            fake_client.wait_for_progress_idle.assert_not_awaited()
+
+            await manager.prepare_file(str(target))
+            await manager.prepare_file(str(target))
+            # A diagnostics sync (edit path) never triggers the query wait.
+            manager._cold_clients.add(client_key)
+            await manager.touch_file(str(target), wait=False, purpose="diagnostics")
+
+        fake_client.wait_for_progress_idle.assert_awaited_once()
+        assert manager._cold_clients == {client_key}
+        fake_client.close = AsyncMock()
+        await manager._remove_client(client_key)
+        assert manager._cold_clients == set()
+
+    @pytest.mark.asyncio()
+    async def test_query_reports_mixed_support(self) -> None:
+        manager = LSPManager(enabled=True)
+        ok_entry, ok_client = _prepared_client("pyright")
+        unsupported_entry, unsupported_client = _prepared_client("ruff", supports=False)
+
+        async def invoke(client: MagicMock) -> list[dict[str, object]]:
+            return [{"uri": "file:///project/a.py"}] if client is ok_client else []
+
+        outcomes = await manager.query(
+            [ok_entry, unsupported_entry], "textDocument/definition", invoke
+        )
+
+        assert [(o.server_id, o.status) for o in outcomes] == [
+            ("pyright", QueryStatus.OK),
+            ("ruff", QueryStatus.UNSUPPORTED),
+        ]
+        assert outcomes[0].items == [{"uri": "file:///project/a.py"}]
+        unsupported_client.supports.assert_called_once_with(
+            "textDocument/definition", uri="file:///project/a.py", language_id="python"
+        )
+        assert manager._last_access["pyright:/project"] > 0
+
+    @pytest.mark.asyncio()
+    async def test_query_empty_timeout_and_failure(self) -> None:
+        manager = LSPManager(enabled=True)
+        empty_entry, empty_client = _prepared_client("a")
+        slow_entry, slow_client = _prepared_client("b")
+        failing_entry, failing_client = _prepared_client("c", alive=False)
+
+        async def invoke(client: MagicMock) -> object:
+            if client is empty_client:
+                return None
+            if client is slow_client:
+                await asyncio.sleep(10)
+            raise RuntimeError("boom")
+
+        outcomes = await manager.query(
+            [empty_entry, slow_entry, failing_entry],
+            "textDocument/hover",
+            invoke,
+            timeout_s=0.01,
+        )
+
+        assert [o.status for o in outcomes] == [
+            QueryStatus.EMPTY,
+            QueryStatus.TIMEOUT,
+            QueryStatus.FAILED,
+        ]
+        assert outcomes[2].message == "server exited"
+        assert "boom" not in (outcomes[2].message or "")
+        assert failing_client.is_alive is False
+
+    @pytest.mark.asyncio()
+    async def test_query_marks_oversized_reply_partial_even_with_malformed_entries(
+        self,
+    ) -> None:
+        """Truncation is decided on the raw length, not on accepted dict count."""
+        manager = LSPManager(enabled=True)
+        entry, _ = _prepared_client("a")
+        reply: list[object] = [{"uri": "file:///project/a.py"}] * 2000
+        reply.insert(0, "malformed")
+        reply.extend([{"uri": "file:///project/b.py"}] * 5)
+
+        async def invoke(_: MagicMock) -> object:
+            return reply
+
+        outcomes = await manager.query([entry], "textDocument/references", invoke)
+        assert outcomes[0].status is QueryStatus.PARTIAL
+        assert len(outcomes[0].items) == 2000
+        assert outcomes[0].message == "response truncated to 2000 items"
+
+    @pytest.mark.asyncio()
+    async def test_query_truncation_survives_real_client_normalization(self) -> None:
+        """The flag is carried from the client method, not recomputed downstream."""
+        from cognis.tools.executor.lsp.client import LSPClient
+
+        manager = LSPManager(enabled=True)
+        client = LSPClient("pyright", "cmd", [], "file:///project")
+        client._closed = False
+        client.process = MagicMock(returncode=None)
+        client.capabilities = {"referencesProvider": True}
+        reply: list[object] = ["malformed", *([{"uri": "file:///project/a.py"}] * 2500)]
+        client._request = AsyncMock(return_value=reply)  # type: ignore[method-assign]
+        entry = PreparedClient(
+            client=client,
+            client_key="pyright:/project",
+            uri="file:///project/a.py",
+            language_id="python",
+            version=0,
+        )
+
+        outcomes = await manager.query(
+            [entry],
+            "textDocument/references",
+            lambda c: c.references("/project/a.py", 0, 0),
+        )
+        assert outcomes[0].status is QueryStatus.PARTIAL
+        assert len(outcomes[0].items) == 2000
+
+    @pytest.mark.asyncio()
+    async def test_query_normalizes_scalar_results(self) -> None:
+        manager = LSPManager(enabled=True)
+        entry, _ = _prepared_client("a")
+
+        async def invoke(_: MagicMock) -> object:
+            return {"contents": "doc"}
+
+        outcomes = await manager.query([entry], "textDocument/hover", invoke)
+        assert outcomes[0].status is QueryStatus.OK
+        assert outcomes[0].items == [{"contents": "doc"}]
+
+    @pytest.mark.asyncio()
+    async def test_query_with_no_clients(self) -> None:
+        manager = LSPManager(enabled=True)
+
+        async def invoke(_: MagicMock) -> object:
+            raise AssertionError("must not be called")
+
+        assert await manager.query([], "textDocument/hover", invoke) == []
+
+    @pytest.mark.asyncio()
+    async def test_dead_client_is_replaced_on_prepare(self, tmp_path: Path) -> None:
+        """A crashed client is removed so the next prepare respawns with fresh state."""
+        project = tmp_path / "respawn"
+        project.mkdir()
+        target = project / "app.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        dead = MagicMock()
+        dead.is_alive = False
+        dead.close = AsyncMock()
+        manager._clients[f"pyright:{project}"] = dead
+        manager._opened_files[f"pyright:{project}"] = {"file:///stale"}
+
+        fresh = MagicMock()
+        fresh.is_alive = True
+        fresh.did_open = AsyncMock()
+        fresh.wait_for_progress_idle = AsyncMock(return_value=True)
+
+        with (
+            patch("cognis.tools.executor.lsp.manager.get_servers_for_extension") as mock_servers,
+            patch.object(manager, "_spawn_client", AsyncMock(return_value=fresh)),
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_server = MagicMock()
+            mock_server.server_id = "pyright"
+            mock_server.root_markers = ()
+            mock_server.language_id.return_value = "python"
+            mock_servers.return_value = [mock_server]
+
+            prepared = await manager.prepare_file(str(target))
+
+        assert prepared[0].client is fresh
+        dead.close.assert_awaited_once()
+        fresh.did_open.assert_awaited_once()
+
+
+class TestAggregateStatus:
+    def test_aggregate_rules(self) -> None:
+        def outcome(server: str, status: QueryStatus, items: int = 0) -> QueryOutcome:
+            return QueryOutcome(server_id=server, status=status, items=[{}] * items)
+
+        assert aggregate_status([]) is QueryStatus.UNSUPPORTED
+        assert aggregate_status([outcome("a", QueryStatus.OK, 1)]) is QueryStatus.OK
+        assert (
+            aggregate_status(
+                [outcome("a", QueryStatus.OK, 1), outcome("b", QueryStatus.UNSUPPORTED)]
+            )
+            is QueryStatus.OK
+        )
+        assert (
+            aggregate_status([outcome("a", QueryStatus.OK, 1), outcome("b", QueryStatus.TIMEOUT)])
+            is QueryStatus.PARTIAL
+        )
+        assert (
+            aggregate_status([outcome("a", QueryStatus.EMPTY), outcome("b", QueryStatus.FAILED)])
+            is QueryStatus.EMPTY
+        )
+        assert (
+            aggregate_status(
+                [outcome("a", QueryStatus.UNSUPPORTED), outcome("b", QueryStatus.UNSUPPORTED)]
+            )
+            is QueryStatus.UNSUPPORTED
+        )
+        assert (
+            aggregate_status([outcome("a", QueryStatus.TIMEOUT), outcome("b", QueryStatus.FAILED)])
+            is QueryStatus.TIMEOUT
+        )
+        assert aggregate_status([outcome("a", QueryStatus.FAILED)]) is QueryStatus.FAILED
 
 
 class TestLSPManagerStatus:

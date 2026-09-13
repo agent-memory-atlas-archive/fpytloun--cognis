@@ -6,11 +6,12 @@ are in the bootstrap module.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
 from dataclasses import dataclass
-from ipaddress import ip_address, ip_network
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -55,6 +56,79 @@ def _trusted_proxy_cidrs(raw: str) -> tuple[str, ...]:
     for cidr in cidrs:
         ip_network(cidr, strict=False)
     return cidrs
+
+
+def mcp_oauth_trusted_destinations() -> dict[tuple[str, int], tuple[str, ...]]:
+    """Read the controller-admin-only, exact-origin OAuth destination policy."""
+    name = "COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS"
+    raw = os.environ.get(name, "{}")
+
+    def unique_entries(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        entries: dict[str, object] = {}
+        for key, value in pairs:
+            if key in entries:
+                raise ValueError
+            entries[key] = value
+        return entries
+
+    try:
+        if len(raw) > 65536:
+            raise ValueError
+        entries = json.loads(raw, object_pairs_hook=unique_entries)
+        if not isinstance(entries, dict):
+            raise ValueError
+        result: dict[tuple[str, int], tuple[str, ...]] = {}
+        for authority, cidrs in entries.items():
+            if not isinstance(authority, str):
+                raise ValueError
+            parsed = urlsplit(f"https://{authority}")
+            host, port = parsed.hostname, parsed.port
+            if (
+                not host
+                or port is None
+                or not 1 <= port <= 65535
+                or authority != f"{host}:{port}"
+                or len(host) > 253
+                or "." not in host
+                or not all(
+                    re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    for label in host.split(".")
+                )
+            ):
+                raise ValueError
+            try:
+                ip_address(host)
+            except ValueError:
+                pass
+            else:
+                raise ValueError
+            if not isinstance(cidrs, list) or not cidrs or len(cidrs) > 16:
+                raise ValueError
+            for cidr in cidrs:
+                if not isinstance(cidr, str) or "/" not in cidr:
+                    raise ValueError
+                network = ip_network(cidr, strict=True)
+                # Permit small RFC1918/ULA subnets, never metadata/link-local ranges.
+                if isinstance(network, IPv4Network):
+                    allowed = network.prefixlen >= 24 and any(
+                        network.subnet_of(IPv4Network(parent))
+                        for parent in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+                    )
+                else:
+                    allowed = network.prefixlen >= 120 and network.subnet_of(
+                        IPv6Network("fc00::/7")
+                    )
+                if not allowed:
+                    raise ValueError
+            result[(host, port)] = tuple(cidrs)
+        if len(result) > 64:
+            raise ValueError
+        return result
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{name} must map exact lowercase hostname:port authorities to "
+            "nonempty narrow RFC1918/ULA CIDRs (IPv4 /24+, IPv6 /120+)"
+        ) from exc
 
 
 def _trusted_evidence_owner_allowlist(raw: str) -> tuple[str, ...]:
@@ -177,6 +251,7 @@ class CognisConfig:
 
     # Controller-owned MCP OAuth lifecycle
     mcp_oauth_refresh_timeout_seconds: float
+    mcp_oauth_trusted_destinations: dict[tuple[str, int], tuple[str, ...]]
 
     # Trusted Mnemory evidence rollout and bounded availability
     trusted_evidence_enabled: bool = False
@@ -417,6 +492,7 @@ def load_config() -> CognisConfig:
             minimum=60,
             maximum=7 * 24 * 60 * 60,
         ),
+        mcp_oauth_trusted_destinations=mcp_oauth_trusted_destinations(),
         mcp_oauth_refresh_timeout_seconds=_bounded_float_env(
             "COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS",
             30.0,
@@ -561,6 +637,7 @@ ENV_TEMPLATE = """\
 
 # MCP OAuth refresh (controller-owned, wall-clock bounded)
 # COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS=30
+# COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS={"mcp-gws.fpy.cz:443":["192.168.33.208/32"]}
 
 # LSP diagnostics (auto-detect language servers for edit feedback)
 # COGNIS_LSP_ENABLED=true

@@ -476,6 +476,10 @@ class RuntimeActiveTurn(StrictModel):
     chat_mode_source: str | None = None
     started_at: str | None = None
     updated_at: str | None = None
+    retry_at: str | None = None
+    retry_reason: str | None = None
+    provider_id: str | None = None
+    model: str | None = None
 
 
 RuntimeLifecycle = Literal[

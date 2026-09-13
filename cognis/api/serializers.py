@@ -43,6 +43,7 @@ from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskModel
 from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
+from cognis.providers.llm.fast_mode import enrich_fast_mode
 from cognis.providers.llm.reasoning import enrich_model_entry
 
 logger = get_logger(__name__)
@@ -444,7 +445,11 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
     if isinstance(raw_models, list):
         for entry in raw_models:
             if isinstance(entry, dict):
-                enriched_models.append(enrich_model_entry(dict(entry), provider_preset=preset))
+                enriched_models.append(
+                    enrich_fast_mode(
+                        enrich_model_entry(dict(entry), provider_preset=preset), preset, config
+                    )
+                )
             else:
                 enriched_models.append(entry)
     return LLMProviderResponse(

@@ -20,7 +20,7 @@ cognis-executor configure
 brew services start cognis-executor
 ```
 
-Before that first formula release, use the private Gitea development path or
+Before that first formula release, use the public GitHub development path or
 the local immutable-asset flow below.
 
 ## Configure and operate
@@ -76,21 +76,20 @@ brew uninstall cognis-executor
 Do not remove the Cognis executor configuration or data directories unless you
 also intend to remove enrollment, workspaces, browser profiles, and logs.
 
-## Private Gitea development and HEAD path
+## GitHub development and HEAD path
 
-For development, clone the private authoritative repository without putting
-credentials in commands or files:
+For development, clone the public repository:
 
 ```bash
-git clone ssh://git.fpy.cz:2222/filip/cognis.git
+git clone https://github.com/fpytloun/cognis.git
 cd cognis
 uv sync --all-extras
 uv run cognis-executor doctor
 ```
 
-The generated formula can use `--head-url` for a private Gitea HEAD formula.
-Public formulas must omit `--head-url`. A HEAD install may download Python
-dependencies during formula installation; stable asset installs do not.
+The generated development formula can use `--head-url` for a GitHub HEAD
+formula. A HEAD install may download Python dependencies during formula
+installation; stable asset installs do not.
 
 To test local immutable assets without a release, cross-resolution can build
 both assets from one checkout. Runtime validation still needs matching
@@ -99,31 +98,31 @@ hardware for each architecture. Generate a development formula with explicit
 
 ```bash
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture arm64 --output "$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz"
+  --architecture arm64 --output "$PWD/cognis-executor-0.15.0-macos-arm64.tar.gz"
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture x86_64 --output "$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz"
-arm_sha="$(shasum -a 256 cognis-executor-0.14.2-macos-arm64.tar.gz | awk '{print $1}')"
-intel_sha="$(shasum -a 256 cognis-executor-0.14.2-macos-x86_64.tar.gz | awk '{print $1}')"
+  --architecture x86_64 --output "$PWD/cognis-executor-0.15.0-macos-x86_64.tar.gz"
+arm_sha="$(shasum -a 256 cognis-executor-0.15.0-macos-arm64.tar.gz | awk '{print $1}')"
+intel_sha="$(shasum -a 256 cognis-executor-0.15.0-macos-x86_64.tar.gz | awk '{print $1}')"
 python3 packaging/homebrew/generate_formula.py --development \
-  --version 0.14.2 \
-  --arm64-url "file://$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz" \
+  --version 0.15.0 \
+  --arm64-url "file://$PWD/cognis-executor-0.15.0-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-url "file://$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz" \
+  --x86-64-url "file://$PWD/cognis-executor-0.15.0-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source ./CognisExecutor.rb
 ```
 
-For a private Gitea HEAD formula, use the same real local asset metadata and
-add the private repository URL:
+For a GitHub HEAD formula, use the same real local asset metadata and add the
+public repository URL:
 
 ```bash
 python3 packaging/homebrew/generate_formula.py --development \
-  --head-url ssh://git.fpy.cz:2222/filip/cognis.git \
-  --version 0.14.2 \
-  --arm64-asset "$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz" \
+  --head-url https://github.com/fpytloun/cognis.git \
+  --version 0.15.0 \
+  --arm64-asset "$PWD/cognis-executor-0.15.0-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-asset "$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz" \
+  --x86-64-asset "$PWD/cognis-executor-0.15.0-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source --HEAD ./CognisExecutor.rb

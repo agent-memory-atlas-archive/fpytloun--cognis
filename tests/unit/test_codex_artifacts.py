@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import io
 from contextlib import asynccontextmanager
@@ -9,10 +10,10 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from cognis.core.attachment_compat import DEFAULT_NATIVE_IMAGE_MIME_TYPES
 from cognis.models.artifact import ArtifactKind, ArtifactStatus
 from cognis.providers.llm import codex_artifacts
 from cognis.providers.llm.codex_artifacts import (
-    CodexArtifactError,
     CodexImageNormalizationCache,
     materialize_codex_artifact_images,
     strip_cognis_artifact_metadata,
@@ -22,6 +23,31 @@ from cognis.providers.llm.codex_artifacts import (
 def _png(*, size: tuple[int, int] = (4, 3)) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", size, "red").save(output, format="PNG")
+    return output.getvalue()
+
+
+def _jpeg(*, size: tuple[int, int] = (4, 3)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, "red").save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _webp(*, size: tuple[int, int] = (4, 3)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, "red").save(output, format="WEBP")
+    return output.getvalue()
+
+
+def _gif(*, size: tuple[int, int] = (4, 3)) -> bytes:
+    output = io.BytesIO()
+    Image.new("P", size, 1).save(output, format="GIF")
+    return output.getvalue()
+
+
+def _animated_gif(*, size: tuple[int, int] = (4, 3)) -> bytes:
+    output = io.BytesIO()
+    frames = [Image.new("P", size, index) for index in (1, 2, 3)]
+    frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:], duration=40)
     return output.getvalue()
 
 
@@ -45,6 +71,16 @@ def _messages(artifact_id: str = "img_123") -> list[dict[str, Any]]:
                 },
             ],
         }
+    ]
+
+
+def _image_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [part for part in messages[0]["content"] if part.get("type") == "image_url"]
+
+
+def _text_parts(messages: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(part.get("text") or "") for part in messages[0]["content"] if part.get("type") == "text"
     ]
 
 
@@ -195,7 +231,7 @@ async def test_normalization_cache_does_not_bypass_later_authorization_denial(
         _authorized,
     )
 
-    await materialize_codex_artifact_images(
+    authorized_result = await materialize_codex_artifact_images(
         _messages(),
         session_factory=_session_factory,
         artifact_store=store,
@@ -204,17 +240,22 @@ async def test_normalization_cache_does_not_bypass_later_authorization_denial(
         agent_id="agent_123",
         normalization_cache=cache,
     )
-    with pytest.raises(CodexArtifactError, match="unavailable"):
-        await materialize_codex_artifact_images(
-            _messages(),
-            session_factory=_session_factory,
-            artifact_store=store,
-            owner_email="owner@example.com",
-            conversation_id="conv_123",
-            agent_id="agent_123",
-            normalization_cache=cache,
-        )
+    assert _image_parts(authorized_result)
 
+    denied_result = await materialize_codex_artifact_images(
+        _messages(),
+        session_factory=_session_factory,
+        artifact_store=store,
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+        normalization_cache=cache,
+    )
+
+    # The cached normalization must not resurrect an image the second
+    # authorization check denied.
+    assert not _image_parts(denied_result)
+    assert any("img_123" in text for text in _text_parts(denied_result))
     assert store.loads == 1
 
 
@@ -256,7 +297,7 @@ async def test_normalization_cache_enforces_byte_bound_and_lru_order(
         (True, {}, b"not-an-image"),
     ],
 )
-async def test_materialize_codex_artifact_images_rejects_unavailable_or_invalid_images(
+async def test_materialize_codex_artifact_images_drops_unavailable_or_invalid_images(
     monkeypatch: pytest.MonkeyPatch,
     authorized: bool,
     record_updates: dict[str, Any],
@@ -274,15 +315,19 @@ async def test_materialize_codex_artifact_images_rejects_unavailable_or_invalid_
         _authorized,
     )
 
-    with pytest.raises(CodexArtifactError):
-        await materialize_codex_artifact_images(
-            _messages(),
-            session_factory=_session_factory,
-            artifact_store=_Store(content),
-            owner_email="owner@example.com",
-            conversation_id="conv_123",
-            agent_id="agent_123",
-        )
+    # An image Cognis must not or cannot send is replaced by a notice. Failing
+    # the whole request instead would make the identical retry fail again.
+    result = await materialize_codex_artifact_images(
+        _messages(),
+        session_factory=_session_factory,
+        artifact_store=_Store(content),
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+    )
+
+    assert not _image_parts(result)
+    assert any("img_123" in text for text in _text_parts(result))
 
 
 @pytest.mark.asyncio
@@ -342,15 +387,19 @@ async def test_materialize_codex_artifact_images_counts_duplicate_references(
         single_data_url_size * 2 - 1,
     )
 
-    with pytest.raises(CodexArtifactError, match="Encoded image payload exceeds"):
-        await materialize_codex_artifact_images(
-            messages,
-            session_factory=_session_factory,
-            artifact_store=_Store(content),
-            owner_email="owner@example.com",
-            conversation_id="conv_123",
-            agent_id="agent_123",
-        )
+    result = await materialize_codex_artifact_images(
+        messages,
+        session_factory=_session_factory,
+        artifact_store=_Store(content),
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+    )
+
+    # Duplicate references are counted once per occurrence, so the payload
+    # budget is reached and the image is degraded rather than sent twice.
+    assert not _image_parts(result)
+    assert any("payload limit" in text for text in _text_parts(result))
 
 
 @pytest.mark.asyncio
@@ -371,18 +420,99 @@ async def test_normalization_failure_identifies_only_the_invalid_artifact(
         _authorized,
     )
 
-    with pytest.raises(CodexArtifactError) as error:
-        await materialize_codex_artifact_images(
-            messages,
-            session_factory=_session_factory,
-            artifact_store=_Store(b"not-an-image"),
-            owner_email="owner@example.com",
-            conversation_id="conv_123",
-            agent_id="agent_123",
-        )
+    result = await materialize_codex_artifact_images(
+        messages,
+        session_factory=_session_factory,
+        artifact_store=_Store(b"not-an-image"),
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+    )
 
-    assert error.value.artifact_ids == ["img_invalid"]
-    assert error.value.to_payload()["artifact_ids"] == ["img_invalid"]
+    assert not _image_parts(result)
+    assert any("img_invalid" in text for text in _text_parts(result))
+
+
+@pytest.mark.asyncio
+async def test_materialize_codex_artifact_images_converts_unsupported_still_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _records(session: object, artifact_ids: list[str]) -> list[SimpleNamespace]:
+        return [_record()]
+
+    async def _authorized(session: object, **kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr("cognis.providers.llm.codex_artifacts.get_artifact_records", _records)
+    monkeypatch.setattr(
+        "cognis.providers.llm.codex_artifacts.artifact_authorized_for_conversation",
+        _authorized,
+    )
+
+    result = await materialize_codex_artifact_images(
+        _messages(),
+        session_factory=_session_factory,
+        artifact_store=_Store(_gif()),
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+    )
+
+    images = _image_parts(result)
+    assert len(images) == 1
+    assert images[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_materialize_codex_artifact_images_sends_first_frame_of_animation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _records(session: object, artifact_ids: list[str]) -> list[SimpleNamespace]:
+        return [_record()]
+
+    async def _authorized(session: object, **kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr("cognis.providers.llm.codex_artifacts.get_artifact_records", _records)
+    monkeypatch.setattr(
+        "cognis.providers.llm.codex_artifacts.artifact_authorized_for_conversation",
+        _authorized,
+    )
+
+    result = await materialize_codex_artifact_images(
+        _messages(),
+        session_factory=_session_factory,
+        artifact_store=_Store(_animated_gif()),
+        owner_email="owner@example.com",
+        conversation_id="conv_123",
+        agent_id="agent_123",
+    )
+
+    images = _image_parts(result)
+    assert len(images) == 1
+    encoded = images[0]["image_url"]["url"].split(",", 1)[1]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        assert image.format == "PNG"
+        assert not getattr(image, "is_animated", False)
+
+
+def test_every_declared_native_image_type_is_deliverable() -> None:
+    # Guard against the capability mismatch that made a declared format a
+    # poison pill: anything context assembly may project natively must be
+    # convertible by this transport.
+    samples = {
+        "image/png": _png(),
+        "image/jpeg": _jpeg(),
+        "image/webp": _webp(),
+        "image/gif": _gif(),
+    }
+    assert set(samples) == set(DEFAULT_NATIVE_IMAGE_MIME_TYPES)
+    for mime_type, content in samples.items():
+        encoded, resolved_mime = codex_artifacts._normalize_image(
+            content, artifact_id=f"img_{mime_type.replace('/', '_')}"
+        )
+        assert encoded
+        assert resolved_mime in codex_artifacts._FORMAT_MIME_TYPES.values()
 
 
 def test_strip_cognis_artifact_metadata_preserves_url_and_source() -> None:

@@ -11,12 +11,151 @@ import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.conversation_state import _pending_summary
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.notifications import (
     NotificationService,
     _find_direct_turn_owner,
     _user_interaction_display,
     safe_display_arguments,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wake", ["local", "remote", "dropped"])
+async def test_resolution_wakeups_recheck_durable_state(wake: str) -> None:
+    row = _notification_row()
+    bus = EventBus()
+    waiter = PauseWaiter()
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=waiter,
+        event_bus=bus,
+        providers=SimpleNamespace(),
+    )
+    running = asyncio.create_task(
+        service.wait_for_resolution(
+            row.notification_id, timeout=10, poll_seconds=0.05 if wake == "dropped" else 5
+        )
+    )
+    await asyncio.sleep(0.01)
+    # A stale/duplicate hint must not resolve a pending notification.
+    signal = Event(
+        type=EventType.CLUSTER_SCOPE_INVALIDATED,
+        data={
+            "kind": "notification_state_changed",
+            "scope": {"notification_id": row.notification_id},
+        },
+    )
+    await bus.publish(signal)
+    await bus.publish(signal)
+    await asyncio.sleep(0.01)
+    assert not running.done()
+    row.status = "resolved"
+    row.resolution = {"decision": "approve", "note": "durable"}
+    if wake == "remote":
+        await bus.publish(signal)
+    elif wake == "local":
+        from cognis.core.agent_loop import PauseResolution
+
+        waiter.resolve(row.notification_id, PauseResolution(decision="deny"))
+    result = await asyncio.wait_for(running, timeout=0.5)
+    assert result.decision == "approve"
+    assert not bus._handlers[EventType.CLUSTER_SCOPE_INVALIDATED]
+
+
+@pytest.mark.asyncio
+async def test_notification_wait_cancel_interrupts_five_second_fallback() -> None:
+    row = _notification_row()
+    cancelled = asyncio.Event()
+    bus = EventBus()
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=PauseWaiter(),
+        event_bus=bus,
+        providers=SimpleNamespace(),
+    )
+    running = asyncio.create_task(
+        service.wait_for_resolution(row.notification_id, timeout=10, cancel_event=cancelled)
+    )
+    await asyncio.sleep(0.01)
+    cancelled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=0.5)
+    assert not bus._handlers[EventType.CLUSTER_SCOPE_INVALIDATED]
+
+
+@pytest.mark.asyncio
+async def test_notification_wait_reduces_reads_and_releases_session() -> None:
+    row = _notification_row()
+    entered = 0
+    active = 0
+
+    class CountingSession(_FakeSession):
+        async def __aenter__(self) -> CountingSession:
+            nonlocal entered, active
+            entered += 1
+            active += 1
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            nonlocal active
+            active -= 1
+
+    service = NotificationService(
+        session_factory=lambda: CountingSession(row),
+        pause_waiter=PauseWaiter(),
+        event_bus=EventBus(),
+        providers=SimpleNamespace(),
+    )
+    running = asyncio.create_task(service.wait_for_resolution(row.notification_id, timeout=10))
+    try:
+        await asyncio.sleep(1.1)
+        assert entered == 1  # The old cadence would have performed three passes.
+        assert active == 0
+    finally:
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+
+@pytest.mark.asyncio
+async def test_notification_capacity_release_wakes_queue_after_suspend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.status = "resolved"
+    row.resolution = {"decision": "approve"}
+    bus = EventBus()
+    order: list[str] = []
+
+    async def suspended() -> None:
+        order.append("committed")
+
+    async def queue_hint(event: Event) -> None:
+        if event.data.get("kind") == "task_queue_changed":
+            assert order == ["committed"]
+            order.append("wake")
+
+    bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, queue_hint)
+    fence = SimpleNamespace(
+        suspend_capacity=AsyncMock(side_effect=suspended),
+        ensure_capacity=AsyncMock(side_effect=[False, True]),
+        claim=SimpleNamespace(task_id="task-capacity"),
+    )
+    monkeypatch.setattr("cognis.core.notifications.current_task_execution_fence", lambda: fence)
+    monkeypatch.setattr("cognis.core.notifications.assert_task_execution_fence", AsyncMock())
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=PauseWaiter(),
+        event_bus=bus,
+        providers=SimpleNamespace(),
+    )
+    result = await asyncio.wait_for(
+        service.wait_for_resolution(row.notification_id, timeout=0.01), timeout=1
+    )
+    assert result.decision == "approve"
+    assert order == ["committed", "wake"]
+    assert fence.ensure_capacity.await_count == 2
 
 
 def test_user_interaction_display_maps_question_options_to_safe_labels() -> None:
@@ -333,12 +472,14 @@ class _FakeGuardrails:
         return self.escalations.get(call_id)
 
 
-class _FakeEventBus:
+class _FakeEventBus(EventBus):
     def __init__(self) -> None:
+        super().__init__()
         self.events: list[Any] = []
 
     async def publish(self, event: Any) -> None:
         self.events.append(event)
+        await super().publish(event)
 
 
 def _notification_row() -> Any:

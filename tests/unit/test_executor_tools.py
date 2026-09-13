@@ -30,7 +30,6 @@ from cognis.tools.executor.filesystem import (
     handle_skill_asset_materialize,
     handle_write,
 )
-from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.lsp.types import (
     DiagnosticCollection,
     DiagnosticFreshness,
@@ -3107,95 +3106,6 @@ class TestListDirectoryTool:
         assert not result.is_error
         assert "file.txt" in result.output
         assert "other.txt" not in result.output
-
-
-class TestLspTool:
-    @pytest.mark.asyncio()
-    async def test_lsp_definition_returns_results(self, tmp_path: Path) -> None:
-        target = tmp_path / "sample.py"
-        target.write_text("value = 1\n")
-
-        class _FakeLsp:
-            def __init__(self) -> None:
-                self.touch_kwargs: dict[str, object] = {}
-
-            async def touch_file(self, *_: object, **kwargs: object) -> None:
-                self.touch_kwargs = kwargs
-                return None
-
-            async def has_clients(self, *_: object, **__: object) -> bool:
-                return True
-
-            async def definition(self, *_: object, **__: object) -> list[dict[str, object]]:
-                return [{"uri": "file:///tmp/sample.py", "range": {}}]
-
-        lsp = _FakeLsp()
-        context = _context(runtime_metadata={"lsp_manager": lsp})
-        result = await handle_lsp(
-            {
-                "operation": "goToDefinition",
-                "file_path": str(target),
-                "line": 1,
-                "character": 1,
-            },
-            context,
-        )
-
-        assert not result.is_error
-        assert '"uri": "file:///tmp/sample.py"' in result.output
-        assert lsp.touch_kwargs["purpose"] == "semantic"
-
-    @pytest.mark.asyncio()
-    async def test_lsp_requires_available_server(self, tmp_path: Path) -> None:
-        target = tmp_path / "sample.py"
-        target.write_text("value = 1\n")
-
-        class _FakeLsp:
-            async def touch_file(self, *_: object, **__: object) -> None:
-                return None
-
-            async def has_clients(self, *_: object, **__: object) -> bool:
-                return False
-
-        context = _context(runtime_metadata={"lsp_manager": _FakeLsp()})
-        result = await handle_lsp(
-            {
-                "operation": "goToDefinition",
-                "file_path": str(target),
-                "line": 1,
-                "character": 1,
-            },
-            context,
-        )
-
-        assert result.is_error
-        assert "No LSP server available" in result.output
-
-    @pytest.mark.asyncio()
-    async def test_lsp_requires_position_for_definition(self, tmp_path: Path) -> None:
-        target = tmp_path / "sample.py"
-        target.write_text("value = 1\n")
-
-        result = await handle_lsp(
-            {"operation": "goToDefinition", "file_path": str(target)},
-            _context(runtime_metadata={"lsp_manager": object()}),
-        )
-
-        assert result.is_error
-        assert "requires both line and character" in result.output
-
-    @pytest.mark.asyncio()
-    async def test_lsp_workspace_symbol_requires_query(self, tmp_path: Path) -> None:
-        target = tmp_path / "sample.py"
-        target.write_text("value = 1\n")
-
-        result = await handle_lsp(
-            {"operation": "workspaceSymbol", "file_path": str(target), "query": ""},
-            _context(runtime_metadata={"lsp_manager": object()}),
-        )
-
-        assert result.is_error
-        assert "requires a non-empty query" in result.output
 
 
 class TestResolvePath:

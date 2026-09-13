@@ -53,6 +53,11 @@ logger = get_logger(__name__)
 
 _ACTIVE_TASK_STATUSES = {"queued", "ready", "running", "paused"}
 _RESOLUTION_POLL_SECONDS = 0.5
+_WAIT_RECONCILE_SECONDS = 5.0
+NOTIFICATION_WAIT_READS = Counter(
+    "cognis_notification_wait_reads_total",
+    "Authoritative notification wait reconciliation passes.",
+)
 _RESOLUTION_CLAIM_SECONDS = 30.0
 _RESOLUTION_COMPLETION_GRACE_SECONDS = 2.0
 _INTARIS_SUBMISSION_TIMEOUT_SECONDS = 25.0
@@ -1768,13 +1773,21 @@ class NotificationService:
         *,
         timeout: float,
         cancel_event: asyncio.Event | None = None,
-        poll_seconds: float = _RESOLUTION_POLL_SECONDS,
+        poll_seconds: float = _WAIT_RECONCILE_SECONDS,
     ) -> PauseResolution:
         """Wait on the local fast path while polling the authoritative DB row."""
         cancel_event = cancel_event or current_task_cancel_event()
         execution_fence = current_task_execution_fence()
         if execution_fence is not None:
             await execution_fence.suspend_capacity()
+            from cognis.core.queue_wakeup import publish_queue_wakeup
+
+            self._run_best_effort(
+                publish_queue_wakeup(self._event_bus, self.cluster_signals),
+                operation="queue_wakeup",
+                notification_id=notification_id,
+                timeout=_CLUSTER_PUBLISH_TIMEOUT_SECONDS,
+            )
         deadline = monotonic() + timeout if timeout > 0 else None
         local_timeout = (
             timeout + _RESOLUTION_CLAIM_SECONDS + _RESOLUTION_COMPLETION_GRACE_SECONDS
@@ -1784,16 +1797,31 @@ class NotificationService:
         local_wait = asyncio.create_task(
             self._pause_waiter.wait(notification_id, timeout=local_timeout)
         )
+        changed = asyncio.Event()
+
+        async def on_change(event: Event) -> None:
+            scope = event.data.get("scope") or {}
+            if (
+                event.data.get("kind") == "notification_state_changed"
+                and scope.get("notification_id") == notification_id
+            ):
+                changed.set()
+
+        # Register before the first durable read; a signal during that read stays set.
+        self._event_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, on_change)
         resolved: PauseResolution | None = None
         claim_grace_applied = False
         try:
             while True:
+                changed.clear()
                 if local_wait.done() and resolved is None:
                     with contextlib.suppress(TimeoutError):
-                        resolved = await local_wait
+                        # Local completion is a wakeup, not authority for a decision.
+                        await local_wait
                 if cancel_event is not None and cancel_event.is_set():
                     raise asyncio.CancelledError
 
+                NOTIFICATION_WAIT_READS.inc()
                 async with self._session_factory() as db:
                     await assert_task_execution_fence(db)
                     if execution_fence is not None:
@@ -1842,19 +1870,28 @@ class NotificationService:
                 ):
                     return resolved
 
-                delay = poll_seconds
-                if deadline is not None:
+                # Capacity retries retain their original cadence after resolution.
+                delay = min(poll_seconds, _RESOLUTION_POLL_SECONDS) if resolved else poll_seconds
+                if deadline is not None and resolved is None:
                     delay = min(delay, max(0.0, deadline - monotonic()))
-                if cancel_event is None:
-                    await asyncio.sleep(delay)
-                else:
-                    try:
-                        await asyncio.wait_for(cancel_event.wait(), timeout=delay)
-                    except TimeoutError:
-                        pass
-                    else:
-                        raise asyncio.CancelledError
+                change_wait = asyncio.create_task(changed.wait())
+                cancel_wait = (
+                    asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
+                )
+                waits: set[asyncio.Task[Any]] = {change_wait}
+                if cancel_wait is not None:
+                    waits.add(cancel_wait)
+                if not local_wait.done():
+                    waits.add(local_wait)
+                try:
+                    await asyncio.wait(waits, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    transient = [change_wait] + ([cancel_wait] if cancel_wait is not None else [])
+                    for pending in transient:
+                        pending.cancel()
+                    await asyncio.gather(*transient, return_exceptions=True)
         finally:
+            self._event_bus.unsubscribe(EventType.CLUSTER_SCOPE_INVALIDATED, on_change)
             if not local_wait.done():
                 local_wait.cancel()
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):

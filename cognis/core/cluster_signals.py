@@ -87,6 +87,7 @@ def _bounded_revision(revision: str | int | datetime) -> str:
 class ClusterSignalKind(StrEnum):
     CHAT_SCOPE_CHANGED = "chat_scope_changed"
     TASK_PROGRESS_CHANGED = "task_progress_changed"
+    TASK_QUEUE_CHANGED = "task_queue_changed"
     NOTIFICATION_STATE_CHANGED = "notification_state_changed"
     SCHEDULE_ACTION_CHANGED = "schedule_action_changed"
     EXECUTOR_STATE_CHANGED = "executor_state_changed"

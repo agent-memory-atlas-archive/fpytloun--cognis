@@ -60,6 +60,93 @@ async def _session_factory(tmp_path: object):
     return engine, create_session_factory(engine)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"])
+async def test_known_claude_metadata_survives_stale_litellm(tmp_path, monkeypatch, model_id):
+    engine, factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(factory, _MemorySecrets())
+    row = LLMProvider(
+        provider_id="anthropic",
+        display_name="Anthropic",
+        location="controller",
+        backend="litellm",
+        config={"preset": "anthropic"},
+    )
+    monkeypatch.setattr(
+        litellm_provider_module.litellm,
+        "get_model_info",
+        lambda **kwargs: {"supports_reasoning": False, "supports_extended_thinking": False},
+    )
+    info = await provider._merge_litellm_model_info(model_id, row, {})
+    assert info.supports_reasoning
+    assert "high" in info.reasoning_efforts
+    assert "default" in info.reasoning_efforts
+    restricted = await provider._merge_litellm_model_info(
+        model_id,
+        row,
+        {"supports_reasoning": False},
+    )
+    assert not restricted.supports_reasoning
+    assert not restricted.reasoning_efforts
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_cache_observes_config_and_visibility_changes(tmp_path, monkeypatch):
+    engine, factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(factory, _MemorySecrets())
+    monkeypatch.setattr(
+        litellm_provider_module.litellm,
+        "get_model_info",
+        lambda **kwargs: {},
+    )
+    async with factory() as db:
+        db.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                owner_email=SYSTEM_USER_EMAIL,
+                config={
+                    "preset": "anthropic",
+                    "models": [{"model_id": "claude-opus-5", "supports_reasoning": False}],
+                },
+            )
+        )
+        await db.commit()
+    before = await provider.get_model_info("claude-opus-5", "anthropic")
+    assert not before.supports_reasoning
+    async with factory() as db:
+        row = await db.get(LLMProvider, "anthropic")
+        row.config = {"preset": "anthropic", "models": [{"model_id": "claude-opus-5"}]}
+        await db.commit()
+    after = await provider.get_model_info("claude-opus-5", "anthropic")
+    assert after.supports_reasoning
+    assert "high" in after.reasoning_efforts
+    async with factory() as db:
+        row = await db.get(LLMProvider, "anthropic")
+        row.owner_email = "private@example.com"
+        await db.commit()
+    hidden = await provider.get_model_info("claude-opus-5", "anthropic")
+    assert hidden == DEFAULT_MODEL_INFO
+    await engine.dispose()
+
+
+def test_explicit_effort_replaces_only_provider_native_defaults():
+    merged = litellm_provider_module._merge_request_kwargs(
+        {
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "reasoning_effort": "low",
+            "output_config": {"effort": "low", "format": {"type": "json_schema"}},
+        },
+        {"reasoning_effort": "default"},
+    )
+    assert merged["reasoning_effort"] == "default"
+    assert "thinking" not in merged
+    assert merged["output_config"] == {"format": {"type": "json_schema"}}
+
+
 def test_llm_latency_histograms_cover_long_provider_requests() -> None:
     expected_tail = (
         15.0,
@@ -720,7 +807,13 @@ async def test_anthropic_subscription_discover_models_uses_remote_models(
     assert "claude-model-only-from-api" in by_id
     assert by_id["claude-fable-5"]["name"] == "Claude Fable 5 Remote"
     assert by_id["claude-fable-5"]["supports_prompt_caching"] is True
-    assert "claude-sonnet-4-5" in by_id
+    # Discovery is a registry baseline, not a copy of configured model overrides.
+    assert "claude-sonnet-4-5" not in by_id
+    async with session_factory() as db:
+        saved = await db.get(LLMProvider, "anthropic-subscription")
+        assert saved.config["models"] == [{"model_id": "claude-sonnet-4-5"}]
+    assert by_id["claude-opus-5"]["supports_fast_mode"] is True
+    assert by_id["claude-opus-5"]["fast_mode_parameter"] == "speed"
     await engine.dispose()
 
 
@@ -1232,7 +1325,12 @@ async def test_chatgpt_discovery_uses_codex_catalog_fallback(tmp_path: object) -
     assert by_id["gpt-5.5"]["max_context_window"] == 400_000
     assert by_id["gpt-5.5"]["max_input_tokens"] == 272_000
     assert by_id["gpt-5.5"]["max_output_tokens"] == 128_000
-    assert by_id["future-codex"]["source"] == "configured"
+    assert "future-codex" not in by_id
+    async with session_factory() as db:
+        saved = await db.get(LLMProvider, "chatgpt")
+        assert saved.config["models"] == [
+            {"model_id": "future-codex", "display_name": "Future Codex"}
+        ]
     await engine.dispose()
 
 
@@ -2215,8 +2313,9 @@ async def test_litellm_provider_applies_route_reasoning_effort_when_not_explicit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["medium", "default", "none"])
 async def test_litellm_provider_explicit_reasoning_effort_overrides_route_default(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, effort: str
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -2279,10 +2378,14 @@ async def test_litellm_provider_explicit_reasoning_effort_overrides_route_defaul
     await provider.generate(
         [{"role": "user", "content": "hi"}],
         task_type="classifier",
-        reasoning_effort="medium",
+        reasoning_effort=effort,
     )
 
-    assert captured["reasoning_effort"] == "medium"
+    if effort == "default":
+        # OpenAI provider default omits the hint rather than sending "default".
+        assert "reasoning_effort" not in captured
+    else:
+        assert captured["reasoning_effort"] == effort
     await engine.dispose()
 
 
@@ -3477,6 +3580,30 @@ def test_litellm_provider_count_tokens_uses_litellm_for_anthropic(
     assert count == 42
     assert captured["model"] == "claude-sonnet-4-20250514"
     assert captured["messages"] == [{"role": "user", "content": "hello world"}]
+
+
+def test_litellm_provider_estimator_identity_tracks_version_and_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.token_counter",
+        lambda **_: 42,
+    )
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm._LITELLM_DISTRIBUTION_VERSION",
+        "1.82.6",
+    )
+
+    provider.count_messages_tokens(
+        [{"role": "user", "content": "hello world"}],
+        "claude-opus-5",
+    )
+
+    assert (
+        provider.token_estimator_identity("claude-opus-5")
+        == "litellm:1.82.6:anthropic:litellm_native:v1"
+    )
 
 
 def test_litellm_provider_count_tokens_falls_back_for_gemini_on_counter_error(
@@ -7285,6 +7412,33 @@ async def test_resolve_model_target_honors_explicit_provider_id(tmp_path: object
 
 
 @pytest.mark.asyncio
+async def test_resolve_model_target_rejects_explicit_disabled_provider(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="provider-disabled",
+                display_name="Disabled Provider",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "shared-model"},
+                status="disabled",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    with pytest.raises(ValueError, match="is not active"):
+        await provider.resolve_model_target(
+            task_type="default",
+            explicit_provider_id="provider-disabled",
+        )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_get_model_info_uses_provider_default_model_metadata_when_models_list_omits_entry(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -8671,3 +8825,151 @@ def test_fast_mode_rejection_requires_requested_service_tier() -> None:
         )
         is None
     )
+
+
+def test_apply_message_cache_hints_marks_tool_only_assistant_turns() -> None:
+    model_info = ModelInfo(model_id="claude-opus-5", supports_prompt_caching=True)
+    messages = [
+        {"role": "system", "content": "prefix"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t"}}],
+        },
+    ]
+
+    result = litellm_provider_module._apply_message_cache_hints(
+        messages,
+        "claude-opus-5",
+        model_info,
+        [{"index": 1, "ttl": "1h"}],
+    )
+
+    assert result[1]["content"] is None
+    assert result[1]["_cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert "_cache_control" not in messages[1]
+    assert litellm_provider_module._request_uses_extended_cache_ttl(result, {})
+
+
+@pytest.mark.asyncio
+async def test_get_provider_usage_reports_anthropic_rate_limit_headers(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic-key",
+                display_name="Anthropic API key",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "auth_config": {"mode": "secret", "secret_name": "anthropic"},
+                },
+                status="active",
+            )
+        )
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                config={"preset": "ollama", "base_url": "http://localhost:11434"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    try:
+        before = await provider.get_provider_usage("anthropic-key")
+        assert before["ok"] is False
+        assert before["source"] == "anthropic_rate_limit_headers"
+        assert before["unavailable_reason"] == "no_requests_observed"
+
+        provider._record_anthropic_rate_limit_headers(
+            "anthropic-key",
+            {
+                "content-type": "application/json",
+                "anthropic-ratelimit-input-tokens-limit": "2000000",
+                "anthropic-ratelimit-input-tokens-remaining": "500000",
+                "anthropic-ratelimit-input-tokens-reset": "2026-09-12T08:00:45Z",
+            },
+        )
+        after = await provider.get_provider_usage("anthropic-key")
+        assert after["ok"] is True
+        assert after["additional_rate_limits"][0]["limit_id"] == "input-tokens"
+        assert after["additional_rate_limits"][0]["primary"]["used_percent"] == 75.0
+        assert after["rate_limit_headers"] == {
+            "anthropic-ratelimit-input-tokens-limit": "2000000",
+            "anthropic-ratelimit-input-tokens-remaining": "500000",
+            "anthropic-ratelimit-input-tokens-reset": "2026-09-12T08:00:45Z",
+        }
+
+        unsupported = await provider.get_provider_usage("ollama")
+        assert unsupported == {**unsupported, "ok": False, "source": "unsupported"}
+        with pytest.raises(ValueError):
+            await provider.get_provider_usage("missing")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_provider_usage_merges_subscription_usage_with_rate_limits(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic-sub",
+                display_name="Claude subscription",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "auth_config": {"mode": "oauth", "provider": "anthropic_subscription"},
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    from cognis.providers.llm.anthropic_subscription import AnthropicSubscriptionAuth
+
+    async def _fake_auth(self: LiteLLMProvider, row: LLMProvider) -> AnthropicSubscriptionAuth:
+        assert row.provider_id == "anthropic-sub"
+        return AnthropicSubscriptionAuth("access-token")
+
+    async def _fake_usage(auth: AnthropicSubscriptionAuth) -> dict[str, Any]:
+        assert auth.access_token == "access-token"
+        return {
+            "ok": True,
+            "source": "anthropic_subscription_usage",
+            "primary": {"used_percent": 84.0},
+            "additional_rate_limits": [{"limit_id": "weekly_scoped"}],
+        }
+
+    monkeypatch.setattr(LiteLLMProvider, "_anthropic_subscription_auth", _fake_auth)
+    monkeypatch.setattr(litellm_provider_module, "_fetch_anthropic_subscription_usage", _fake_usage)
+
+    provider = LiteLLMProvider(session_factory)
+    try:
+        provider._record_anthropic_rate_limit_headers(
+            "anthropic-sub",
+            {
+                "anthropic-ratelimit-requests-limit": "50",
+                "anthropic-ratelimit-requests-remaining": "25",
+            },
+        )
+        usage = await provider.get_provider_usage("anthropic-sub")
+    finally:
+        await engine.dispose()
+
+    assert usage["source"] == "anthropic_subscription_usage"
+    assert usage["primary"] == {"used_percent": 84.0}
+    assert [limit["limit_id"] for limit in usage["additional_rate_limits"]] == [
+        "weekly_scoped",
+        "requests",
+    ]
+    assert usage["rate_limit_headers"]["anthropic-ratelimit-requests-remaining"] == "25"

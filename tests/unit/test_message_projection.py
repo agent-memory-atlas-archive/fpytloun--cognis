@@ -234,3 +234,47 @@ def test_litellm_anthropic_keeps_hidden_notice_as_user_message() -> None:
     assert any(entry.get("text") == "late system context" for entry in system)
     assert [message["role"] for message in litellm_messages] == ["user", "user"]
     assert litellm_messages[0]["content"].startswith("<system-notice")
+
+
+def test_anthropic_projection_keeps_late_system_messages_in_position() -> None:
+    provider = SimpleNamespace(config={"preset": "anthropic"})
+    messages = [
+        {"role": "system", "content": "immutable prefix", "_immutable_prefix": True},
+        {"role": "system", "content": "project context"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "working"},
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<memory_context>recalled</memory_context>",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                }
+            ],
+            "_audit_source": "memory_search",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+    result = project_messages_for_provider(
+        messages,
+        provider=provider,
+        llm_api="chat_completions",
+    )
+
+    assert [message["role"] for message in result.messages] == [
+        "system",
+        "system",
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    notice = result.messages[5]["content"]
+    assert isinstance(notice, list)
+    assert notice[0]["text"].startswith('<system-notice source="memory_search"')
+    assert "<memory_context>recalled</memory_context>" in notice[0]["text"]
+    assert notice[0]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert result.diagnostics["hidden_system_notice_count"] == 1

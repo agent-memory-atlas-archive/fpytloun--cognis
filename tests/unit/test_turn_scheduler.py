@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.chat_modes import ResolvedChatMode
+from cognis.core.direct_turn_runtime import ToolRecoveryPersistenceError
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
     LLM_CYCLE_CEILING_CONTINUATION_REASON,
@@ -41,11 +42,13 @@ from cognis.core.managed_conversations import (
 from cognis.core.message_envelope import render_user_message
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.turn_scheduler import (
+    _MODEL_ERROR_CATEGORY_MESSAGES,
     DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS,
     ActiveToolOutputSnapshot,
     TurnError,
     TurnResult,
     TurnScheduler,
+    _durable_turn_error_detail,
     _durable_turn_error_message,
     _effective_user_content,
     _escalation_timeout_seconds,
@@ -71,6 +74,7 @@ from cognis.models.session import (
 )
 from cognis.store import queries
 from cognis.store.direct_turns import (
+    TOOL_DISPATCH_DESCRIPTOR_LIMIT,
     DirectTurnAdmissionRejected,
     DirectTurnConflictError,
     DirectTurnStatus,
@@ -8084,6 +8088,64 @@ def test_durable_turn_error_message_never_persists_raw_failure_text() -> None:
     assert "password" not in message
 
 
+def test_durable_turn_error_message_names_the_model_failure_category() -> None:
+    # A deterministic provider rejection must not be reported as a generic
+    # execution failure: the user cannot act on "Turn execution failed."
+    error = TurnError(
+        code="step_failed",
+        message="Model stream recovery exhausted within this turn.",
+        recoverable=False,
+        detail={"model_error": {"reason_class": "invalid_request"}},
+    )
+
+    message = _durable_turn_error_message(error)
+
+    assert "rejected this request" in message
+    assert message != "Turn execution failed."
+
+
+def test_step_failure_carries_sanitized_provider_cause_to_durable_history() -> None:
+    classified = _turn_error_from_step_output(
+        SimpleNamespace(
+            error="Model stream recovery exhausted within this turn.",
+            summary="Model stream recovery exhausted within this turn.",
+            metadata={
+                "model_error": {
+                    "reason_class": "invalid_request",
+                    "message": (
+                        "Claude Code 2.1.87 does not support this model; "
+                        "version 2.1.251 or newer is required. api_key=sk-should-not-leak"
+                    ),
+                }
+            },
+        )
+    )
+
+    assert classified is not None
+    detail = _durable_turn_error_detail(classified)
+    assert detail is not None
+    assert "does not support this model" in detail
+    assert "sk-should-not-leak" not in detail
+    assert (
+        _durable_turn_error_message(classified) == _MODEL_ERROR_CATEGORY_MESSAGES["invalid_request"]
+    )
+
+
+def test_step_failure_error_detail_is_sanitized_for_live_clients() -> None:
+    classified = _turn_error_from_step_output(
+        SimpleNamespace(
+            error="Step failed: api_key=sk-live-secret at https://user:password@example.test",
+            summary="",
+        )
+    )
+
+    assert classified is not None
+    assert classified.detail is not None
+    error_detail = classified.detail["error_detail"]
+    assert "sk-live-secret" not in error_detail
+    assert "user:password@" not in error_detail
+
+
 @pytest.mark.parametrize(
     ("error_text", "transient"),
     [
@@ -13243,3 +13305,289 @@ async def test_post_turn_cache_entry_refreshes_only_when_needed(
 
     assert result is (refreshed if refresh_expected else cached_entry)
     assert refresh.await_count == int(refresh_expected)
+
+
+def _dispatch_descriptor(call_id: str, *, tool_name: str = "bash") -> dict[str, Any]:
+    return {
+        "call_id": call_id,
+        "tool_name": tool_name,
+        "frozen": True,
+        "dispatch_state": "pending",
+    }
+
+
+class _RecordingToolRecovery:
+    """Capture how interrupted tool batches are split across sessions."""
+
+    def __init__(self, *, failing_sessions: frozenset[str] = frozenset()) -> None:
+        self.recovered: list[tuple[str, str, tuple[str, ...]]] = []
+        self.invalidated: list[str] = []
+        self._failing_sessions = failing_sessions
+        self._session_cache = SimpleNamespace(invalidate_canonical=self._invalidate)
+
+    async def _invalidate(self, session_id: str) -> None:
+        self.invalidated.append(session_id)
+
+    async def _recover_tool_call_group(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        raw_descriptors: list[Any],
+        deadline: datetime,
+    ) -> None:
+        assert deadline.tzinfo is not None
+        self.recovered.append(
+            (
+                session_id,
+                turn_id,
+                tuple(descriptor["call_id"] for descriptor in raw_descriptors),
+            )
+        )
+        if session_id in self._failing_sessions:
+            raise ToolRecoveryPersistenceError(f"{session_id} failed", ambiguous=True)
+
+
+def _tool_in_flight_row(outcome: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="dtr-1",
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        outcome={
+            "phase": "tool_in_flight",
+            "recovery_deadline_at": datetime.now(UTC).isoformat(),
+            **outcome,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_settles_every_session_under_one_turn() -> None:
+    # A delegate child runs its tools under the parent turn's fence, so the
+    # parent and child batches must each settle against their own history.
+    recovery = _RecordingToolRecovery()
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-parent",
+                    "turn_id": "turn-parent",
+                    "tool_calls": [_dispatch_descriptor("call-parent", tool_name="delegate")],
+                },
+                {
+                    "session_id": "sess-child",
+                    "turn_id": "turn-child",
+                    "tool_calls": [
+                        _dispatch_descriptor("call-child-a"),
+                        _dispatch_descriptor("call-child-b"),
+                    ],
+                },
+            ]
+        }
+    )
+
+    await TurnScheduler._recover_interrupted_tool_calls(
+        cast(Any, recovery),
+        cast(Any, row),
+        cast(Any, None),
+    )
+
+    assert recovery.recovered == [
+        ("sess-parent", "turn-parent", ("call-parent",)),
+        ("sess-child", "turn-child", ("call-child-a", "call-child-b")),
+    ]
+    assert recovery.invalidated == ["sess-child", "sess-parent"]
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_reads_pre_upgrade_flat_descriptor_rows() -> None:
+    # Rows written before per-session groups existed carry one flat list plus
+    # the last writer's identity.
+    recovery = _RecordingToolRecovery()
+    row = _tool_in_flight_row(
+        {
+            "session_id": "sess-legacy",
+            "tool_calls": [_dispatch_descriptor("call-legacy")],
+        }
+    )
+
+    await TurnScheduler._recover_interrupted_tool_calls(
+        cast(Any, recovery),
+        cast(Any, row),
+        cast(Any, None),
+    )
+
+    assert recovery.recovered == [("sess-legacy", "turn-parent", ("call-legacy",))]
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_settles_siblings_when_one_session_fails() -> None:
+    recovery = _RecordingToolRecovery(failing_sessions=frozenset({"sess-parent"}))
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-parent",
+                    "turn_id": "turn-parent",
+                    "tool_calls": [_dispatch_descriptor("call-parent")],
+                },
+                {
+                    "session_id": "sess-child",
+                    "turn_id": "turn-child",
+                    "tool_calls": [_dispatch_descriptor("call-child")],
+                },
+            ]
+        }
+    )
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="sess-parent failed") as failure:
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, row),
+            cast(Any, None),
+        )
+
+    assert failure.value.ambiguous is True
+    assert [entry[0] for entry in recovery.recovered] == ["sess-parent", "sess-child"]
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_reports_missing_identity_separately_from_missing_calls() -> None:
+    recovery = _RecordingToolRecovery()
+    identityless = _tool_in_flight_row(
+        {"tool_dispatch_groups": [{"tool_calls": [_dispatch_descriptor("call-1")]}]}
+    )
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="Canonical tool history identity"):
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, identityless),
+            cast(Any, None),
+        )
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="Durable tool descriptors are missing"):
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, _tool_in_flight_row({})),
+            cast(Any, None),
+        )
+
+    assert recovery.recovered == []
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_refuses_a_partially_readable_group_set() -> None:
+    # Settling only the readable group would then clear the whole dispatch
+    # record, leaving the unreadable group's calls unresolved and unreported.
+    recovery = _RecordingToolRecovery()
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-child",
+                    "turn_id": "turn-child",
+                    "tool_calls": [_dispatch_descriptor("call-child")],
+                },
+                {"turn_id": "turn-parent", "tool_calls": [_dispatch_descriptor("call-parent")]},
+            ]
+        }
+    )
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="group is malformed") as failure:
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, row),
+            cast(Any, None),
+        )
+
+    assert failure.value.ambiguous is True
+    assert recovery.recovered == []
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_rejects_an_oversized_batch_instead_of_truncating() -> None:
+    # The store records a batch whole, so recovery is the single place that
+    # enforces the bound. Truncating here would settle a prefix and leave the
+    # remaining dispatched calls unresolved and unreported.
+    oversized = [
+        _dispatch_descriptor(f"call-{index}") for index in range(TOOL_DISPATCH_DESCRIPTOR_LIMIT + 1)
+    ]
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="exceeds its bound") as failure:
+        await TurnScheduler._recover_tool_call_group(
+            cast(Any, object()),
+            session_id="sess-child",
+            turn_id="turn-child",
+            raw_descriptors=cast(list[Any], oversized),
+            deadline=datetime.now(UTC),
+        )
+
+    assert failure.value.ambiguous is True
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_settles_siblings_when_one_session_raises_unexpectedly() -> None:
+    # A guardrails or database fault inside one group is still confined to that
+    # group: the sibling batches own unsettled canonical calls of their own.
+    class _FaultyRecovery(_RecordingToolRecovery):
+        async def _recover_tool_call_group(self, **kwargs: Any) -> None:
+            await super()._recover_tool_call_group(**kwargs)
+            if kwargs["session_id"] == "sess-parent":
+                raise httpx.ConnectError("guardrails unreachable")
+
+    recovery = _FaultyRecovery()
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-parent",
+                    "turn_id": "turn-parent",
+                    "tool_calls": [_dispatch_descriptor("call-parent")],
+                },
+                {
+                    "session_id": "sess-child",
+                    "turn_id": "turn-child",
+                    "tool_calls": [_dispatch_descriptor("call-child")],
+                },
+            ]
+        }
+    )
+
+    with pytest.raises(ToolRecoveryPersistenceError, match="guardrails unreachable") as failure:
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, row),
+            cast(Any, None),
+        )
+
+    assert failure.value.ambiguous is True
+    assert [entry[0] for entry in recovery.recovered] == ["sess-parent", "sess-child"]
+    assert recovery.invalidated == ["sess-child", "sess-parent"]
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_does_not_swallow_cancellation() -> None:
+    class _CancelledRecovery(_RecordingToolRecovery):
+        async def _recover_tool_call_group(self, **kwargs: Any) -> None:
+            await super()._recover_tool_call_group(**kwargs)
+            raise asyncio.CancelledError
+
+    recovery = _CancelledRecovery()
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-parent",
+                    "turn_id": "turn-parent",
+                    "tool_calls": [_dispatch_descriptor("call-parent")],
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await TurnScheduler._recover_interrupted_tool_calls(
+            cast(Any, recovery),
+            cast(Any, row),
+            cast(Any, None),
+        )

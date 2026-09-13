@@ -43,7 +43,11 @@ ANTHROPIC_REQUIRED_BETAS = (
 ANTHROPIC_EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 CLAUDE_CODE_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 CLAUDE_CODE_IDENTITY_BRIDGE = "The operative agent identity follows."
-CLAUDE_CODE_VERSION = "2.1.87"
+# Must match `cognis.providers.llm.anthropic.contracts.CLAUDE_CODE_VERSION`.
+# Anthropic rejects a request outright when the reported client version is
+# older than the model requires. `test_integration.py` asserts both modules
+# produce the same user agent, so a partial bump fails the suite.
+CLAUDE_CODE_VERSION = "2.1.270"
 CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 CCH_SALT = "59cf53e54c78"
@@ -268,9 +272,33 @@ def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
         },
         {
             **common,
+            "model_id": "claude-fable-5-1",
+            "name": "Claude Fable 5.1",
+            "display_name": "Claude Fable 5.1",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 10.0,
+            "output_cost_per_mtok": 50.0,
+        },
+        {
+            **common,
             "model_id": "claude-opus-4-8",
             "name": "Claude Opus 4.8",
             "display_name": "Claude Opus 4.8",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 5.0,
+            "output_cost_per_mtok": 25.0,
+        },
+        {
+            **common,
+            "model_id": "claude-opus-5",
+            "name": "Claude Opus 5",
+            "display_name": "Claude Opus 5",
             "context_window": 1_000_000,
             "max_context_window": 1_000_000,
             "max_input_tokens": 872_000,
@@ -402,6 +430,12 @@ def _auth_record_from_token_response(data: Any, *, require_refresh_token: bool) 
     if isinstance(expires_in, int | float) and expires_in > 0:
         record["expires_at"] = time.time() + float(expires_in)
     return record
+
+
+def oauth_request_headers(access_token: str) -> dict[str, str]:
+    """Return the headers Claude subscription OAuth endpoints expect."""
+
+    return _oauth_headers(access_token)
 
 
 def _oauth_headers(
@@ -537,8 +571,16 @@ def _content_to_blocks(content: Any) -> list[dict[str, Any]]:
                     blocks.append(dict(item))
                 elif block_type == "image_url":
                     image_block = _image_url_to_anthropic_block(item.get("image_url"))
-                    if image_block is not None:
-                        blocks.append(image_block)
+                    # Never drop an image silently: the model would answer as if
+                    # the user had attached nothing.
+                    blocks.append(
+                        image_block
+                        if image_block is not None
+                        else {
+                            "type": "text",
+                            "text": _UNREADABLE_IMAGE_NOTICE,
+                        }
+                    )
                 elif block_type in {"thinking", "redacted_thinking"}:
                     blocks.extend(_content_to_anthropic_thinking_blocks([item]))
                 else:
@@ -558,6 +600,12 @@ def _copy_cache_control(source: dict[str, Any], target: dict[str, Any]) -> None:
         if isinstance(ttl, str) and ttl.strip():
             copied["ttl"] = ttl.strip().lower()
         target["cache_control"] = copied
+
+
+_UNREADABLE_IMAGE_NOTICE = (
+    "[An image attachment could not be projected into this request. "
+    "Use artifact_read if its content matters.]"
+)
 
 
 def _image_url_to_anthropic_block(raw: Any) -> dict[str, Any] | None:

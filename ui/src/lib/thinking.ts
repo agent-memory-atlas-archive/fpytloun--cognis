@@ -10,7 +10,8 @@ export const GENERIC_THINKING_EFFORTS = [
 ] as const;
 
 export function thinkingEffortLabel(value: string): string {
-  if (value === 'default') return 'Default';
+  if (value === 'default') return 'Provider default';
+  if (value === 'none') return 'Disabled';
   if (value === 'xhigh') return 'XHigh';
   return value.charAt(0).toUpperCase() + value.slice(1);
 }

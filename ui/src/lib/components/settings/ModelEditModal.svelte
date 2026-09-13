@@ -2,12 +2,15 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
+  import ModelRegistryDrift from './ModelRegistryDrift.svelte';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
 
-  let { model, onclose, onsave } = $props<{
+  let { model, onclose, onsave, registry = null, registryChecked = false } = $props<{
     model: ModelEntry;
     onclose: () => void;
     onsave: (updated: ModelEntry) => void;
+    registry?: ModelEntry | null;
+    registryChecked?: boolean;
   }>();
 
   function cloneModel(source: ModelEntry): ModelEntry {
@@ -46,11 +49,26 @@
 
   const tiers = ['nano', 'mini', 'standard', 'premium'];
 
+  function applyRegistryReset(updated: ModelEntry): void {
+    draft = cloneModel(updated);
+    maxInputTokens = String(updated.max_input_tokens ?? '');
+    inputCost = String(updated.input_cost_per_mtok ?? '');
+    outputCost = String(updated.output_cost_per_mtok ?? '');
+  }
+
+  const comparisonDraft = $derived({
+    ...draft,
+    max_input_tokens: maxInputTokens === '' ? undefined : Number(maxInputTokens),
+    input_cost_per_mtok: inputCost === '' ? undefined : Number(inputCost),
+    output_cost_per_mtok: outputCost === '' ? undefined : Number(outputCost),
+  });
+
   const capabilities: { key: keyof ModelEntry; label: string }[] = [
     { key: 'supports_tools', label: 'Tools' },
     { key: 'supports_vision', label: 'Vision' },
     { key: 'supports_streaming', label: 'Streaming' },
     { key: 'supports_reasoning', label: 'Reasoning' },
+    { key: 'supports_fast_mode', label: 'Fast mode (account access not confirmed)' },
     { key: 'supports_audio_input', label: 'Audio input' },
     { key: 'supports_pdf_input', label: 'PDF input' },
     { key: 'supports_file_input', label: 'File input' },
@@ -71,7 +89,10 @@
     const ic = parseFloat(inputCost);
     const oc = parseFloat(outputCost);
     result.max_input_tokens = Number.isFinite(maxInput) && maxInput > 0 ? maxInput : undefined;
-    result.max_context_window = result.context_window;
+    if (draft.context_window !== model.context_window &&
+        draft.max_context_window === model.max_context_window) {
+      result.max_context_window = result.context_window;
+    }
     result.input_cost_per_mtok = Number.isFinite(ic) ? ic : undefined;
     result.output_cost_per_mtok = Number.isFinite(oc) ? oc : undefined;
     onsave(result);
@@ -81,6 +102,7 @@
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const obj = draft as any;
     obj[key] = !obj[key];
+    draft._configuredFields = [...new Set([...(draft._configuredFields || []), key])];
   }
 </script>
 
@@ -94,6 +116,9 @@
 
   {#snippet children()}
     <div class="space-y-5 pr-1">
+      {#if registryChecked}
+        <ModelRegistryDrift model={comparisonDraft} {registry} onreset={applyRegistryReset} />
+      {/if}
       <!-- Display name -->
       <div class="space-y-1">
         <label for="model-display-name" class="text-sm font-medium text-slate-200">Display name</label>

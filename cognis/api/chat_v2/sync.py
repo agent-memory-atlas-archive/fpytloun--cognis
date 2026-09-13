@@ -624,6 +624,16 @@ async def runtime_input_from_scheduler(
             "chat_mode_source": running.get("chat_mode_source"),
             "started_at": running.get("started_at"),
             "updated_at": running.get("updated_at"),
+            **(
+                {
+                    "retry_at": running.get("retry_at"),
+                    "retry_reason": running.get("retry_reason"),
+                    "provider_id": running.get("provider_id"),
+                    "model": running.get("model"),
+                }
+                if running.get("retry_at") is not None
+                else {}
+            ),
         }
     return RuntimeOverlayInput(
         runtime_epoch=runtime_epoch_for(scope_key or f"conversation:{conversation_id}"),

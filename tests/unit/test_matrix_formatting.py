@@ -49,16 +49,41 @@ def test_matrix_markdown_supports_gfm_strikethrough_and_two_space_nested_lists()
     assert html.count("<ul>") == 2
 
 
-def test_matrix_compact_rich_markdown_avoids_margin_heavy_paragraphs_and_lists() -> None:
+def test_matrix_rich_markdown_preserves_semantic_block_spacing() -> None:
     html = markdown_to_matrix_html(
-        "# Brief\n\nFirst paragraph.\n\nSecond paragraph.\n\n- one\n- two",
-        compact=True,
+        "# Brief\n\nFirst paragraph.\n\nSecond paragraph.\n\n- one\n- two"
     )
 
     assert "<h1>Brief</h1>" in html
-    assert "<p>" not in html
-    assert "<ul>" not in html
-    assert "• one<br/>" in html
+    assert "<p>First paragraph.</p>" in html
+    assert "<p>Second paragraph.</p>" in html
+    assert "<ul>" in html
+    assert "<li>one</li>" in html
+
+
+def test_matrix_rich_markdown_keeps_portable_document_hierarchy() -> None:
+    html = markdown_to_matrix_html(
+        "# Daily brief\n\n"
+        "_Friday · 11 September_\n\n"
+        "## Today\n\n"
+        "A focused morning.\n\n"
+        "> Protect the first work block.\n\n"
+        "---\n\n"
+        "### Plan\n\n"
+        "1. Finish the report.\n"
+        "2. Review the result."
+    )
+
+    assert html.startswith("<h1>Daily brief</h1>")
+    assert "<p><em>Friday · 11 September</em></p>" in html
+    assert "<h2>Today</h2>" in html
+    assert "<p>A focused morning.</p>" in html
+    assert "<blockquote>" in html
+    assert "<p>Protect the first work block.</p>" in html
+    assert "<hr/>" in html
+    assert "<h3>Plan</h3>" in html
+    assert "<ol>" in html
+    assert "<li>Finish the report.</li>" in html
 
 
 def test_matrix_markdown_sanitizes_unsafe_html_and_links() -> None:

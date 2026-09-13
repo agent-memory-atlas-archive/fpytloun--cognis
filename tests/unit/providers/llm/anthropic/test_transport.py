@@ -13,6 +13,7 @@ from cognis.models.config import ModelInfo
 from cognis.providers.llm import retry as controller_llm_retry
 from cognis.providers.llm.anthropic import (
     AnthropicAuthPolicy,
+    AnthropicContinuationStatus,
     AnthropicLocation,
     AnthropicNativeEnvelope,
     AnthropicProtocol,
@@ -27,6 +28,8 @@ from cognis.providers.llm.anthropic import (
     decode_sse,
 )
 from cognis.providers.llm.anthropic.transport import (
+    UNBOUND_ANTHROPIC_TOOL_ARGUMENT,
+    UNBOUND_ANTHROPIC_TOOL_NAME,
     AnthropicMessagesClient,
     _chat_response,
     _compat_usage,
@@ -1206,3 +1209,194 @@ def test_non_streaming_deferred_server_result_can_arrive_in_later_response() -> 
         thinking_fingerprint="thinking",
     )
     assert envelope.native_blocks[0]["tool_use_id"] == "srvtoolu_prior_response"
+
+
+def test_unknown_wire_tool_streams_a_rejectable_call_instead_of_failing() -> None:
+    decoder = _decoder()
+    decoder.feed({"type": "message_start", "message": {"id": "msg_1", "usage": {}}})
+    decoder.feed(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "not_frozen"},
+        }
+    )
+    chunks = decoder.feed({"type": "content_block_stop", "index": 0})
+
+    tool_call = chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == UNBOUND_ANTHROPIC_TOOL_NAME
+    assert tool_call["id"] == "toolu_1"
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        UNBOUND_ANTHROPIC_TOOL_ARGUMENT: "not_frozen"
+    }
+    assert decoder.unbound_wire_names == ["not_frozen"]
+
+
+def test_unknown_wire_tool_makes_the_envelope_non_continuable() -> None:
+    decoder = _decoder()
+    decoder.feed({"type": "message_start", "message": {"id": "msg_1", "usage": {}}})
+    decoder.feed(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "not_frozen"},
+        }
+    )
+    decoder.feed({"type": "content_block_stop", "index": 0})
+    decoder.feed({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}})
+    decoder.feed({"type": "message_stop"})
+
+    envelope = decoder.envelope()
+    assert envelope.continuation_status is AnthropicContinuationStatus.NON_CONTINUABLE
+    # The raw block is preserved for audit but must never be replayed.
+    assert envelope.native_blocks[0]["name"] == "not_frozen"
+    with pytest.raises(ValueError, match="not continuable"):
+        envelope.assert_matches(
+            bundle_fingerprint=envelope.bundle_fingerprint,
+            provider_fingerprint="provider",
+            model_fingerprint="model",
+            thinking_fingerprint="thinking",
+        )
+
+
+def test_known_wire_tool_stays_continuable() -> None:
+    decoder = _decoder()
+    decoder.feed({"type": "message_start", "message": {"id": "msg_1", "usage": {}}})
+    decoder.feed(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "mcp_very_exact_name",
+            },
+        }
+    )
+    decoder.feed({"type": "content_block_stop", "index": 0})
+    decoder.feed({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}})
+    decoder.feed({"type": "message_stop"})
+
+    envelope = decoder.envelope()
+    assert envelope.continuation_status is AnthropicContinuationStatus.CONTINUABLE
+    assert decoder.unbound_wire_names == []
+
+
+def test_non_streaming_unknown_wire_tool_is_rejectable_and_non_continuable() -> None:
+    message = {
+        "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "not_frozen", "input": {"a": 1}},
+        ],
+        "stop_reason": "tool_use",
+    }
+    bundle = _bundle()
+
+    envelope = _envelope_from_message(
+        message,
+        bundle=bundle,
+        provider_fingerprint="provider",
+        model_fingerprint="model",
+        thinking_fingerprint="thinking",
+    )
+    assert envelope.continuation_status is AnthropicContinuationStatus.NON_CONTINUABLE
+
+    response = _chat_response({"id": "msg_1"}, "claude", envelope, bundle)
+    tool_call = response["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == UNBOUND_ANTHROPIC_TOOL_NAME
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        UNBOUND_ANTHROPIC_TOOL_ARGUMENT: "not_frozen"
+    }
+
+
+def test_unfrozen_server_tool_remains_a_protocol_error() -> None:
+    decoder = AnthropicStreamDecoder(
+        bundle=_bundle(server_tools=()),
+        provider_fingerprint="provider",
+        model_fingerprint="model",
+        thinking_fingerprint="thinking",
+    )
+    decoder.feed({"type": "message_start", "message": {"id": "msg_1", "usage": {}}})
+
+    with pytest.raises(AnthropicTransportError) as exc_info:
+        decoder.feed(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "tool_search_tool_regex",
+                },
+            }
+        )
+
+    assert exc_info.value.to_payload()["category"] == "protocol"
+
+
+def test_truncated_stream_is_a_connection_error() -> None:
+    decoder = _decoder()
+    decoder.feed({"type": "message_start", "message": {"id": "msg_1", "usage": {}}})
+
+    with pytest.raises(AnthropicTransportError) as exc_info:
+        decoder.envelope()
+
+    assert exc_info.value.to_payload()["category"] == "connection"
+
+
+@pytest.mark.asyncio
+async def test_response_headers_callback_receives_rate_limit_headers_on_success_and_429() -> None:
+    statuses = iter([429, 200])
+    observed: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        headers = {
+            "anthropic-ratelimit-requests-limit": "1000",
+            "anthropic-ratelimit-requests-remaining": "0" if status == 429 else "999",
+        }
+        if status == 429:
+            return httpx.Response(
+                429,
+                headers={**headers, "retry-after": "7"},
+                json={"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}},
+            )
+        return httpx.Response(
+            200,
+            headers=headers,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = AnthropicMessagesClient(
+            _resolved_credential,
+            http_client=http_client,
+            on_response_headers=observed.append,
+        )
+        context = _context(AnthropicAuthPolicy.API_KEY)
+        request = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+        with pytest.raises(AnthropicTransportError):
+            await client.complete(
+                context,
+                request,
+                _bundle(),
+                provider_fingerprint="provider",
+                model_fingerprint="model",
+            )
+        await client.complete(
+            context,
+            request,
+            _bundle(),
+            provider_fingerprint="provider",
+            model_fingerprint="model",
+        )
+
+    assert [entry["anthropic-ratelimit-requests-remaining"] for entry in observed] == ["0", "999"]
+    assert observed[0]["retry-after"] == "7"

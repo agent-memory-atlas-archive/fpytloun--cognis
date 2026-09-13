@@ -288,7 +288,7 @@ Workflow step objectives and controller completion contracts override this skill
 # Tool Use
 
 - Prefer `read`, `grep`, and `glob` for code inspection.
-- Use `lsp` for semantic navigation such as definitions, references, hover, and symbols when available.
+- When `lsp` is available, use it before `grep` for semantic questions: `goToDefinition` for an imported or re-exported symbol, `findReferences` or `incomingCalls` before renaming or changing a signature, `documentSymbol` or `outline` before reading a large file or package, `hover` for a type or docstring. Use `grep` for text patterns, strings, config files, and languages without a server. If `lsp` reports `unsupported` or no results, fall back to `grep` and `read`.
 - Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `sed`, or `echo` separators for file/code inspection when structured tools such as `read`, `grep`, `glob`, or `list_directory` are visible.
 - Do not chain file inspection commands with `&&`, `;`, or separator output. Use independent structured tool calls in parallel instead.
 - Prefer the dedicated file editing tools exposed for the current model. Use `apply_patch` when that is the visible edit tool; otherwise use `edit`, `multiedit`, and `write` for file-content changes.
@@ -759,6 +759,7 @@ Use this skill when the user asks the current primary agent to manage agents own
 - Inspect before mutating. Use `manage_agents` with `action="list"` or `action="get"` before editing an existing agent.
 - For tool changes, prefer explicit CRUD over raw settings: inspect the current assignment with `tools_get`, use `search_tools`/`describe_tool` for authorized tool IDs and semantics, optionally check a proposed mutation with `validate_tool_call`, then use `tools_set`, `tools_add`, or `tools_remove`.
 - Prefer curated `tool_groups` for normal access and use `allow_tools` / `deny_tools` only for granular exceptions. Do not invent tool or group IDs.
+- Manage per-agent skills with `skills_get`, `skills_set`, `skills_add`, `skills_update`, and `skills_remove`. `auto_load_instructions` loads that assigned skill's full instructions and linked tools at turn start; it does not change the skill-wide `attach_to_all_agents` policy.
 - Manage knowledgebase data access separately with `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove`; tool assignment controls what the agent can do, knowledgebase assignment controls which KBs it can access.
 - Do not confuse tool exposure (`tool_groups`, `allow_tools`, `deny_tools`) with guardrail permissions (`tool_permissions`).
 - Self reads are allowed only within existing owner-authorized management permissions.
@@ -775,6 +776,7 @@ Use this skill when the user asks the current primary agent to manage agents own
 - `create` for new agents. Include full profile fields when the user provided them.
 - `update` for targeted edits to profile, tools, permissions, skills, LLM config, execution, and avatar fields.
 - `tools_get`, `tools_set`, `tools_add`, and `tools_remove` for explicit tool assignment CRUD; `describe_tool` and `validate_tool_call` are the unified discovery and preflight path.
+- `skills_get`, `skills_set`, `skills_add`, `skills_update`, and `skills_remove` for per-agent skill assignment, enablement, and instruction autoload behavior.
 - `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove` for explicit assigned knowledgebase CRUD.
 - `bindings_get` and `bindings_set` for primary-to-secondary agent bindings.
 - `shares_list`, `share_create`, `share_update`, and `share_revoke` for owner-only share management.

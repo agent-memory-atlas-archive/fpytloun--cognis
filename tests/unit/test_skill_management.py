@@ -14,6 +14,7 @@ from cognis.tools.builtin.skill_management import (
     _handle_skill_load,
     _handle_skill_patch,
     _handle_skill_write,
+    materialize_loaded_skill_context,
 )
 from cognis.tools.skill_service import load_skill_asset_refs, resolve_current_skill_version
 
@@ -127,6 +128,42 @@ async def test_skill_load_accepts_claude_native_skill_argument_by_name(tmp_path)
     assert payload["skill_id"] == "skill_lumilens_alertmanager_ops"
 
     await engine.dispose()
+
+
+def test_loaded_skill_context_excludes_tools_and_saved_decomposition() -> None:
+    result, metadata = materialize_loaded_skill_context(
+        skill_id="bounded-skill",
+        name="Bounded Skill",
+        description="Use for one bounded task.",
+        instructions="Follow the bounded procedure.",
+        tools=[
+            {
+                "name": "run",
+                "description": "Run the procedure.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        templates={"default": "Use this template."},
+        asset_refs=[],
+        steps=[{"name": "plan", "type": "run", "prompt": "Plan the task."}],
+        tags=["bounded"],
+        linked_tool_ids=["builtin:read"],
+    )
+
+    protected_context = metadata["protected_context"]
+    assert "<instructions>" in protected_context
+    assert "<prompt_templates>" in protected_context
+    assert "<tool_summaries>" not in protected_context
+    assert "<available_skill_tools>" not in protected_context
+    assert "<workflow_steps>" not in protected_context
+    assert "available_skill_tools" not in result
+    assert "linked_tool_ids" not in result
+    assert metadata["discovered_tool_ids"] == [
+        "builtin:read",
+        "skill:bounded-skill:run",
+    ]
+    assert result["tool_count"] == 1
+    assert result["step_count"] == 1
 
 
 @pytest.mark.asyncio

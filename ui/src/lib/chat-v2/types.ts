@@ -682,6 +682,10 @@ export interface RuntimeActiveTurn {
   chat_mode_source?: string | null;
   started_at?: string | null;
   updated_at?: string | null;
+  retry_at?: string | null;
+  retry_reason?: string | null;
+  provider_id?: string | null;
+  model?: string | null;
 }
 
 export interface BoundaryReceipt {

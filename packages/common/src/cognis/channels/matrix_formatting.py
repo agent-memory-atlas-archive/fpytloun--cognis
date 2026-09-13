@@ -1,8 +1,9 @@
-"""Matrix-safe rich text formatting.
+"""Portable rich-text formatting for Matrix clients.
 
 Matrix clients render the ``formatted_body`` field using a restricted HTML
-subset.  This module converts assistant Markdown into that subset and strips
-anything that should not be sent to a Matrix room.
+subset. This module keeps semantic block elements that provide readable
+document structure in Element Web and Element X, while removing markup that
+is unsafe or inconsistently supported.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ _ALLOWED_TAGS = {
 _SAFE_LINK_SCHEMES = {"http", "https", "matrix", "mailto"}
 
 
-def markdown_to_matrix_html(value: str, *, compact: bool = False) -> str:
+def markdown_to_matrix_html(value: str) -> str:
     """Render Markdown to sanitized Matrix-compatible HTML."""
 
     if not value:
@@ -58,8 +59,7 @@ def markdown_to_matrix_html(value: str, *, compact: bool = False) -> str:
         extensions=list(_MARKDOWN_EXTENSIONS),
         output_format="html",
     )
-    sanitized = _sanitize_matrix_html(rendered)
-    return _compact_matrix_html(sanitized) if compact else sanitized
+    return _sanitize_matrix_html(rendered)
 
 
 def _sanitize_matrix_html(rendered: str) -> str:
@@ -103,22 +103,6 @@ def _linearize_tables(soup: BeautifulSoup) -> None:
                 )
             )
         table.replace_with(replacement)
-
-
-def _compact_matrix_html(rendered: str) -> str:
-    """Remove client-defined paragraph/list margins from rich document messages."""
-
-    soup = BeautifulSoup(rendered, "html.parser")
-    for paragraph in list(soup.find_all("p")):
-        paragraph.append(soup.new_tag("br"))
-        paragraph.unwrap()
-    for list_item in list(soup.find_all("li")):
-        list_item.insert(0, NavigableString("• "))
-        list_item.append(soup.new_tag("br"))
-        list_item.unwrap()
-    for container in list(soup.find_all(["ul", "ol"])):
-        container.unwrap()
-    return str(soup)
 
 
 def _sanitize_tag(tag: Tag) -> None:

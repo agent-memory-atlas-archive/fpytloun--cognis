@@ -90,6 +90,11 @@ _BASE_SCHEMA: dict[str, Any] = {
                 "tools_set",
                 "tools_add",
                 "tools_remove",
+                "skills_get",
+                "skills_set",
+                "skills_add",
+                "skills_update",
+                "skills_remove",
                 "knowledgebases_get",
                 "knowledgebases_set",
                 "knowledgebases_add",
@@ -151,6 +156,20 @@ _BASE_SCHEMA: dict[str, Any] = {
         "allow_tools": {"type": "array", "items": {"type": "string"}},
         "deny_tools": {"type": "array", "items": {"type": "string"}},
         "knowledgebase_ids": {"type": "array", "items": {"type": "string"}},
+        "skill_ids": {"type": "array", "items": {"type": "string"}},
+        "skill_assignments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "skill_id": {"type": "string", "minLength": 1},
+                    "enabled": {"type": "boolean"},
+                    "auto_load_instructions": {"type": "boolean"},
+                },
+                "required": ["skill_id"],
+            },
+        },
         "assigned_knowledgebases": {"type": "array", "items": {"type": "string"}},
         "avatar_image_id": {"type": "string"},
         "agent_type": {"type": "string", "enum": ["primary", "secondary"]},
@@ -231,6 +250,7 @@ def _operation(
 
 _AGENT_ID = ("agent_id",)
 _TOOL_FIELDS = ("agent_id", "tool_groups", "allow_tools", "deny_tools")
+_SKILL_FIELDS = ("agent_id", "skill_assignments")
 _KNOWLEDGEBASE_FIELDS = ("agent_id", "knowledgebase_ids")
 _PROFILE_ID_FIELDS = ("agent_id", "profile_id")
 _PROFILE_MUTATION_FIELDS = ("agent_id", "profile_id", "profile", "expected_updated_at")
@@ -412,6 +432,58 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
             )
             for action in ("tools_set", "tools_add", "tools_remove")
         ],
+        _operation(
+            "skills_get",
+            kind=ToolMutationKind.READ,
+            fields=_AGENT_ID,
+            required=_AGENT_ID,
+            example={"action": "skills_get", "agent_id": "current-agent"},
+        ),
+        *[
+            _operation(
+                action,
+                kind=ToolMutationKind.UPDATE,
+                fields=_SKILL_FIELDS,
+                required=_SKILL_FIELDS,
+                example={
+                    "action": action,
+                    "agent_id": "managed-agent",
+                    "skill_assignments": [
+                        {
+                            "skill_id": "cognis-coding",
+                            "enabled": True,
+                            "auto_load_instructions": True,
+                        }
+                    ],
+                },
+                semantics=(_MUTATION_SEMANTICS if action == "skills_set" else _PATCH_SEMANTICS),
+                dynamic_options=[
+                    ToolDynamicOption(
+                        path="$.skill_assignments[*].skill_id",
+                        source="agent_management.available_skills",
+                    )
+                ],
+            )
+            for action in ("skills_set", "skills_add", "skills_update")
+        ],
+        _operation(
+            "skills_remove",
+            kind=ToolMutationKind.UPDATE,
+            fields=("agent_id", "skill_ids"),
+            required=("agent_id", "skill_ids"),
+            example={
+                "action": "skills_remove",
+                "agent_id": "managed-agent",
+                "skill_ids": ["cognis-coding"],
+            },
+            semantics=_PATCH_SEMANTICS,
+            dynamic_options=[
+                ToolDynamicOption(
+                    path="$.skill_ids",
+                    source="agent_management.available_skills",
+                )
+            ],
+        ),
         _operation(
             "knowledgebases_get",
             kind=ToolMutationKind.READ,

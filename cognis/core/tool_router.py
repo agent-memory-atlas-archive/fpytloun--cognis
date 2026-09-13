@@ -35,6 +35,7 @@ from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
 )
+from cognis.core.lsp_telemetry import record_lsp_tool_result
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.core.memory_aliases import MemoryAliasState
 from cognis.core.session import executor_home_from_workspace_root
@@ -2237,6 +2238,9 @@ class ToolRouter:
         session: SessionModel,
     ) -> ToolResult:
         metadata = result.metadata if isinstance(result.metadata, dict) else None
+        # Executor LSP facts are counted here, before presentation rewrites
+        # ``truncated`` and other metadata for the model-facing result.
+        record_lsp_tool_result(tool_call.name, metadata, result.duration_ms)
         if tool_call.name != "read" or metadata is None:
             return result
         request = metadata.get("attachment_analysis_request")

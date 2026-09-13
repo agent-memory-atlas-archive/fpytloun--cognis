@@ -852,6 +852,16 @@ def _frame_contains_turn_activity(
     return visit(frame.get("ops"))
 
 
+def _missing_live_chat_llm_credential(env: dict[str, str]) -> str | None:
+    llm_model = env.get("COGNIS_TEST_LLM_MODEL", "gpt-4.1-nano").strip().lower()
+    uses_openai = llm_model.startswith(("gpt-", "chatgpt-", "openai/")) or (
+        len(llm_model) > 1 and llm_model[0] == "o" and llm_model[1].isdigit()
+    )
+    if uses_openai and not env.get("OPENAI_API_KEY", "").strip():
+        return f"live chat with {llm_model} requires a non-empty OPENAI_API_KEY"
+    return None
+
+
 def live_chat_ws(
     live: LiveStack,
     conversation_id: str,
@@ -860,6 +870,10 @@ def live_chat_ws(
     timeout: float = 90,
 ) -> list[dict[str, Any]]:
     """Submit a Chat v2 message and collect realtime frames through completion."""
+    missing_credential = _missing_live_chat_llm_credential(live.clean_env)
+    if missing_credential is not None:
+        pytest.skip(missing_credential)
+
     import json
 
     import websockets.sync.client as wsc

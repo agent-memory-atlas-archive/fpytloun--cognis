@@ -14,15 +14,19 @@ The backend uses Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.x, and
 
 1. Read this file.
 2. Inspect the current implementation and tests for the area that will change.
-3. Read the relevant specification from `docs/specs/README.md`.
-4. Read user-facing guides when behavior or configuration changes.
+3. Use `docs/specs/README.md` to locate a specification when the change affects
+   an architecture or contract documented there.
+4. Read the affected user-facing guide when behavior, configuration, or
+   contributor workflow changes.
 
 Current code and user guides are product truth. Some specifications describe
 future or partially shipped work. Do not implement an old plan because it
 appears in a specification.
 
 This file defines stable boundaries and repository rules. It is not an
-exhaustive file inventory.
+exhaustive file inventory. Load documentation that informs the current
+decision; do not read unrelated specifications or guides as a routine
+prerequisite.
 
 ## Repository and Package Boundaries
 
@@ -256,8 +260,13 @@ uv sync --all-packages --all-extras
 uv run python -m cognis serve
 ```
 
-Before each commit, run focused tests for the changed behavior and the required
-repository checks:
+Before each commit, run focused tests and checks for the changed behavior.
+Expand validation when the affected surface, integration risk, repository
+policy, or release scope requires it. Report checks not run and why.
+
+The commands below are the canonical repository check inventory, not a
+mandatory checklist for every commit. Run the checks that own or cover the
+changed boundary:
 
 ```bash
 uv run ruff check cognis/ packages/common/src/ packages/executor/src/ tests/
@@ -268,6 +277,12 @@ MYPYPATH=.:packages/common/src:packages/executor/src uv run --package cognis-exe
 make test
 cd ui && npm test -- --run && npm run check && npm run build:standalone
 ```
+
+Use path-scoped Ruff and focused pytest selections for bounded backend changes.
+Run mypy for each affected Python package. Run the relevant frontend test,
+check, and build commands for UI changes. Run `make test` and the broader
+package matrix for cross-cutting changes, release candidates, or when focused
+checks cannot establish the affected invariants.
 
 Do not weaken tests, add broad type suppressions, or reduce validation to make
 a change pass.

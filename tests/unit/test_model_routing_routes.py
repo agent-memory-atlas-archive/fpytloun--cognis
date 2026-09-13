@@ -1135,3 +1135,62 @@ def test_model_routing_put_rejects_invalid_reasoning_effort_value(
 
         assert response.status_code == 422
         assert "is invalid" in response.json()["error"]["message"]
+
+
+def test_provider_usage_route_returns_anthropic_usage_for_visible_provider(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        requested: list[str] = []
+
+        async def _fake_usage(provider_id: str) -> dict[str, object]:
+            requested.append(provider_id)
+            return {
+                "ok": True,
+                "source": "anthropic_subscription_usage",
+                "usage_url": "https://claude.ai/settings/usage",
+                "fetched_at": "2026-09-12T08:00:00+00:00",
+                "primary": {"used_percent": 84.0, "window_duration_mins": 300},
+                "secondary": {"used_percent": 7.0, "window_duration_mins": 10080},
+                "additional_rate_limits": [],
+                "rate_limit_headers": {"anthropic-ratelimit-requests-remaining": "999"},
+                "allowed": True,
+                "limit_reached": False,
+            }
+
+        app.state.providers.llm.get_provider_usage = _fake_usage
+
+        async def _seed() -> None:
+            await _seed_user(app, "owner@example.com", "user")
+            async with app.state.session_factory() as session:
+                await create_llm_provider(
+                    session,
+                    provider_id="anthropic-owner",
+                    display_name="Owner Claude",
+                    location="controller",
+                    backend="litellm",
+                    owner_email="owner@example.com",
+                    config={
+                        "preset": "anthropic",
+                        "auth_config": {"mode": "oauth", "provider": "anthropic_subscription"},
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
+        headers = _auth_headers(app, email="owner@example.com", role="user")
+
+        response = client.get("/api/v1/llm-providers/anthropic-owner/usage", headers=headers)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["provider_id"] == "anthropic-owner"
+        assert body["source"] == "anthropic_subscription_usage"
+        assert body["primary"]["used_percent"] == 84.0
+        assert body["rate_limit_headers"] == {"anthropic-ratelimit-requests-remaining": "999"}
+        assert requested == ["anthropic-owner"]
+
+        missing = client.get("/api/v1/llm-providers/nope/usage", headers=headers)
+        assert missing.status_code == 404

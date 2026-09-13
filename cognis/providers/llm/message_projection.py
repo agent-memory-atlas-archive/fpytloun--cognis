@@ -100,11 +100,16 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
         messages, explicit_controller_notice_present
     )
 
+    leading_prefix = True
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
+        if message.get("role") in {"user", "assistant", "tool"}:
+            leading_prefix = False
         if _should_project_as_hidden_user_notice(
-            message, terminal_system=index == terminal_system_index
+            message,
+            terminal_system=index == terminal_system_index,
+            leading_prefix=leading_prefix,
         ):
             converted += 1
             if message.get("role") == "developer":
@@ -113,7 +118,7 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
                 controller_converted += 1
             notice_text = _system_notice_content(message)
             hashes.append(_short_hash(notice_text))
-            projected.append({"role": "user", "content": notice_text})
+            projected.append(_hidden_user_notice_message(message, notice_text))
             continue
         projected.append(dict(message))
 
@@ -171,10 +176,39 @@ def _should_project_as_hidden_user_notice(
     message: dict[str, Any],
     *,
     terminal_system: bool = False,
+    leading_prefix: bool = True,
 ) -> bool:
     if message.get("role") == "developer":
         return True
+    if message.get("role") != "system":
+        return False
+    if not leading_prefix and message.get("_immutable_prefix") is not True:
+        # Anthropic renders top-level ``system`` ahead of every message, so a
+        # system message injected after the conversation started must stay in
+        # transcript position or it invalidates the cached history each cycle.
+        return True
     return terminal_system or _is_controller_turn_notice(message)
+
+
+def _hidden_user_notice_message(message: dict[str, Any], notice_text: str) -> dict[str, Any]:
+    """Wrap a notice as a user turn without losing its cache breakpoint."""
+
+    cache_control = message.get("_cache_control")
+    if not isinstance(cache_control, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                    cache_control = block["cache_control"]
+                    break
+    if isinstance(cache_control, dict):
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": notice_text, "cache_control": dict(cache_control)}
+            ],
+        }
+    return {"role": "user", "content": notice_text}
 
 
 def _is_controller_turn_notice(message: dict[str, Any]) -> bool:

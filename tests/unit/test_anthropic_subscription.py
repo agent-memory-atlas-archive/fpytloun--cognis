@@ -26,8 +26,10 @@ def test_bundled_anthropic_model_catalog_includes_current_aliases() -> None:
     ids = {entry["model_id"] for entry in entries}
 
     assert "claude-fable-5" in ids
+    assert "claude-fable-5-1" in ids
     assert "claude-mythos-5" in ids
     assert "claude-opus-4-8" in ids
+    assert "claude-opus-5" in ids
     assert "claude-sonnet-5" in ids
     assert "claude-haiku-4-5" in ids
     assert all(entry["supports_strict_tools"] is True for entry in entries)

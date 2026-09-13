@@ -21,7 +21,7 @@ import math
 import os
 import re
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +32,7 @@ from urllib.parse import unquote, urlparse
 from prometheus_client import Counter, Histogram
 from pydantic import ValidationError
 
+from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.agent_profiles import (
     ResolvedAgentProfile,
@@ -312,6 +313,10 @@ from cognis.providers.llm.anthropic.integration import (
     NATIVE_CONTINUATION_REQUIRED_KWARG,
     NATIVE_REQUEST_CONTEXT_KWARG,
     NATIVE_TOOL_BUNDLE_KWARG,
+)
+from cognis.providers.llm.anthropic.transport import (
+    UNBOUND_ANTHROPIC_TOOL_ARGUMENT,
+    UNBOUND_ANTHROPIC_TOOL_NAME,
 )
 from cognis.providers.llm.errors import (
     FastModeFallbackRequired,
@@ -965,6 +970,15 @@ LLM_MID_STREAM_ERRORS_TOTAL = Counter(
     "cognis_llm_mid_stream_errors_total",
     "LLM mid-stream failures grouped by stable error category.",
     labelnames=("provider_id", "model", "category"),
+)
+LLM_STREAM_FAILURE_OUTCOMES_TOTAL = Counter(
+    "cognis_llm_stream_failure_outcomes_total",
+    (
+        "Exhausted LLM stream failures grouped by category and the recovery "
+        "strategy chosen. A rising 'terminal' outcome means requests are being "
+        "rejected deterministically rather than recovering."
+    ),
+    labelnames=("provider_id", "model", "category", "recovery_strategy"),
 )
 LLM_TOOL_ARGUMENT_PARSE_FAILURES_TOTAL = Counter(
     "cognis_llm_tool_argument_parse_failures_total",
@@ -1813,47 +1827,124 @@ def _artifact_fetch_failure_notice(failures: list[_ArtifactFetchFailure]) -> str
     )
 
 
+def _disabled_artifact_refs(ctx: StepContext) -> tuple[set[str], set[str]]:
+    """Return artifact URLs and IDs that must not be sent as native model input.
+
+    ``ctx.runtime_info`` is the single source of truth and is deliberately
+    turn-local: a refusal is a property of (artifact, model), and the model is
+    resolved only after context assembly.
+    """
+
+    raw_urls = ctx.runtime_info.get("disabled_artifact_urls")
+    raw_ids = ctx.runtime_info.get("disabled_artifact_ids")
+    urls = (
+        {url for url in raw_urls if isinstance(url, str)} if isinstance(raw_urls, list) else set()
+    )
+    ids = (
+        {artifact_id for artifact_id in raw_ids if isinstance(artifact_id, str)}
+        if isinstance(raw_ids, list)
+        else set()
+    )
+    return urls, ids
+
+
+def _ctx_native_attachment_blocks(
+    ctx: StepContext,
+    attachments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Project attachments as native model input for the current turn.
+
+    Every in-turn projection must go through here. A projection that ignores
+    the disabled sets re-injects an artifact the provider already rejected,
+    which restarts the failed-attachment retry loop.
+    """
+
+    disabled_urls, disabled_ids = _disabled_artifact_refs(ctx)
+    return _native_attachment_blocks(
+        attachments,
+        ctx.current_model_info,
+        disabled_urls,
+        disabled_ids,
+    )
+
+
+def _attachment_part_identity(part: Any) -> tuple[str | None, str | None]:
+    """Return the (url, artifact_id) a prompt content part refers to."""
+
+    if not isinstance(part, dict):
+        return (None, None)
+    file_part = part.get("file")
+    image_part = part.get("image_url")
+    url: Any = None
+    metadata: Any = None
+    if isinstance(file_part, dict):
+        url = file_part.get("file_url")
+        metadata = file_part.get("cognis_artifact")
+    elif isinstance(image_part, dict):
+        url = image_part.get("url")
+        metadata = image_part.get("cognis_artifact")
+    elif isinstance(image_part, str):
+        url = image_part
+    artifact_id = metadata.get("artifact_id") if isinstance(metadata, dict) else None
+    return (
+        url if isinstance(url, str) else None,
+        artifact_id if isinstance(artifact_id, str) else None,
+    )
+
+
+def _part_is_disabled_artifact(
+    part: Any,
+    disabled_urls: set[str],
+    disabled_ids: set[str],
+) -> bool:
+    url, artifact_id = _attachment_part_identity(part)
+    return (url is not None and url in disabled_urls) or (
+        artifact_id is not None and artifact_id in disabled_ids
+    )
+
+
+def _messages_reference_disabled_artifacts(
+    messages: list[dict[str, Any]],
+    disabled_urls: set[str],
+    disabled_ids: set[str],
+) -> bool:
+    """Return whether any prompt part still carries a rejected attachment."""
+
+    return any(
+        _part_is_disabled_artifact(part, disabled_urls, disabled_ids)
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    )
+
+
 def _strip_disabled_artifact_urls_from_messages(
     messages: list[dict[str, Any]],
     disabled_urls: set[str],
     disabled_ids: set[str] | None = None,
-) -> None:
-    """Remove failed provider-fetch artifact URLs from already assembled prompt messages."""
+) -> bool:
+    """Remove failed artifact attachments from already assembled prompt messages.
+
+    Returns whether anything was actually removed.
+    """
 
     disabled_ids = disabled_ids or set()
     if not disabled_urls and not disabled_ids:
-        return
+        return False
+    removed_any = False
     for message in messages:
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        replacement: list[Any] = []
-        for part in content:
-            if not isinstance(part, dict):
-                replacement.append(part)
-                continue
-            file_part = part.get("file")
-            image_part = part.get("image_url")
-            url = None
-            if isinstance(file_part, dict):
-                url = file_part.get("file_url")
-                metadata = file_part.get("cognis_artifact")
-            elif isinstance(image_part, dict):
-                url = image_part.get("url")
-                metadata = image_part.get("cognis_artifact")
-            elif isinstance(image_part, str):
-                url = image_part
-                metadata = None
-            else:
-                metadata = None
-            artifact_id = metadata.get("artifact_id") if isinstance(metadata, dict) else None
-            if (isinstance(url, str) and url in disabled_urls) or (
-                isinstance(artifact_id, str) and artifact_id in disabled_ids
-            ):
-                continue
-            replacement.append(part)
+        replacement = [
+            part
+            for part in content
+            if not _part_is_disabled_artifact(part, disabled_urls, disabled_ids)
+        ]
         if len(replacement) != len(content):
             message["content"] = replacement
+            removed_any = True
+    return removed_any
 
 
 def _llm_stream_chunk_has_activity(chunk: dict[str, Any]) -> bool:
@@ -2165,13 +2256,6 @@ def _is_llm_idle_timeout_error(message: str) -> bool:
     )
 
 
-def _should_auto_continue_after_mid_stream_failure(message: str) -> bool:
-    """Return whether an exhausted mid-stream failure should start a new cycle."""
-
-    del message
-    return True
-
-
 _MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS = 2
 _MAX_LLM_CYCLES_PER_TURN = 150
 _MANAGED_DRAINING_RECOVERY_TIMEOUT_SECONDS = 300.0
@@ -2182,19 +2266,48 @@ _IDLE_TIMEOUT_CATEGORIES = {
     MidStreamErrorCategory.IDLE_TIMEOUT_ACTIVITY.value,
     MidStreamErrorCategory.IDLE_TIMEOUT_REASONING.value,
 }
-_RECOVERY_RETRYABLE_CATEGORIES = {
-    MidStreamErrorCategory.ARTIFACT_FETCH.value,
-    MidStreamErrorCategory.ATTACHMENT_INPUT.value,
-    MidStreamErrorCategory.RATE_LIMIT.value,
-    MidStreamErrorCategory.PROVIDER_5XX.value,
-    MidStreamErrorCategory.CONNECTION.value,
-    *_IDLE_TIMEOUT_CATEGORIES,
-}
+# Categories whose failure is deterministic for an identical request. They
+# consume neither the in-turn retry budget nor an automatic successor turn,
+# because replaying the same prompt only re-bills it and hides the cause.
+# Unclassified failures stay recoverable: they include Cognis-internal faults
+# where continuing from saved work preserves real user work.
 _RECOVERY_NON_RETRYABLE_CATEGORIES = {
     MidStreamErrorCategory.CONTENT_POLICY.value,
     MidStreamErrorCategory.CONTEXT_OVERFLOW.value,
     MidStreamErrorCategory.QUOTA_EXHAUSTED.value,
+    # Provider rejections such as an unsupported model, an unsupported client
+    # version, or malformed input cannot succeed on replay.
+    MidStreamErrorCategory.INVALID_REQUEST.value,
+    # Strict decoder rejections are deterministic for the same payload;
+    # replaying the identical request only re-bills the full prompt.
+    MidStreamErrorCategory.PROTOCOL.value,
 }
+# Categories that are only retryable because recovery mutates the transcript
+# first. Without that progress a retry replays the identical rejected request.
+_TRANSCRIPT_PROGRESS_REQUIRED_CATEGORIES = {
+    MidStreamErrorCategory.ARTIFACT_FETCH.value,
+    MidStreamErrorCategory.ATTACHMENT_INPUT.value,
+}
+
+
+def _anthropic_exposure_fingerprint(
+    exposure: Any,
+    server_tools: Any,
+) -> str:
+    """Fingerprint the tool surface a native Anthropic chain is frozen from."""
+
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "tools": list(getattr(exposure, "tools", None) or []),
+                "alias_map": dict(getattr(exposure, "alias_map", None) or {}),
+                "argument_alias_map": dict(getattr(exposure, "argument_alias_map", None) or {}),
+                "server_tools": list(server_tools or []),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _mid_stream_reason_class(
@@ -2297,11 +2410,27 @@ def _mid_stream_provider_message(
     details: dict[str, Any] | MidStreamErrorPayload | None,
     error: str,
 ) -> str:
+    """Return a sanitized provider failure message safe to surface to a user.
+
+    Provider text is untrusted and can echo credentials, signed URLs, or
+    request content. This is the single point where that text enters
+    user-facing notices, durable turn errors, and recovery metadata, so it is
+    sanitized here rather than at each sink.
+    """
+
+    raw_message = ""
     if isinstance(details, dict):
-        raw_message = details.get("message")
-        if isinstance(raw_message, str) and raw_message.strip():
-            return raw_message.strip()
-    return error.strip()
+        candidate = details.get("message")
+        if isinstance(candidate, str) and candidate.strip():
+            raw_message = candidate
+    if not raw_message:
+        raw_message = error
+    if not raw_message.strip():
+        return ""
+    # Keep the provider diagnostic complete. It often carries the only
+    # actionable instruction (an unsupported model, a required client version),
+    # and the durable sinks apply their own length limits.
+    return sanitize_client_error_detail(raw_message, fallback="", max_length=None)
 
 
 def _mid_stream_detail_text(
@@ -2411,13 +2540,17 @@ def _system_notice_data(
 
 
 def _should_continue_after_exhausted_mid_stream_failure(
-    message: str,
     details: dict[str, Any] | MidStreamErrorPayload | None,
 ) -> bool:
-    if not _should_auto_continue_after_mid_stream_failure(message):
-        return False
-    reason_class = _mid_stream_reason_class(details, "other")
-    return reason_class not in _RECOVERY_NON_RETRYABLE_CATEGORIES
+    """Return whether an exhausted mid-stream failure may start a successor turn.
+
+    Transcript progress gates an immediate retry, which replays the same
+    request, but not a continuation. A continuation appends a continuation
+    prompt and any attachment failure notice, so it is never an identical
+    replay, and it is separately bounded by the continuation ceiling.
+    """
+
+    return _mid_stream_reason_class(details, "other") not in _RECOVERY_NON_RETRYABLE_CATEGORIES
 
 
 _TODO_ECHO_CONTENT_MAX = 280
@@ -3468,6 +3601,55 @@ def _anthropic_pause_turn_envelope(
     return envelope if envelope.stop_reason == "pause_turn" else None
 
 
+def _anthropic_envelope_is_non_continuable(value: Any) -> bool:
+    """Report whether a decoded envelope opted out of native chain replay."""
+
+    if not isinstance(value, Mapping):
+        return False
+    return value.get("continuation_status") == AnthropicContinuationStatus.NON_CONTINUABLE.value
+
+
+def _unbound_anthropic_tool_names(raw_tool_calls: Sequence[Any]) -> set[str]:
+    """Return the wire tool names the model named outside the frozen bundle.
+
+    The names are untrusted model output. They are used only for diagnostics and
+    for the synthetic rejection reported back to the model.
+    """
+
+    names: set[str] = set()
+    for call in raw_tool_calls:
+        if getattr(call, "name", None) != UNBOUND_ANTHROPIC_TOOL_NAME:
+            continue
+        arguments = getattr(call, "arguments", None)
+        requested = (
+            arguments.get(UNBOUND_ANTHROPIC_TOOL_ARGUMENT)
+            if isinstance(arguments, Mapping)
+            else None
+        )
+        if isinstance(requested, str) and requested:
+            names.add(requested)
+    return names
+
+
+def _unbound_anthropic_tool_rejection(tc: ToolCall) -> str:
+    """Build the correctable rejection payload for an unbound tool name."""
+
+    requested = tc.arguments.get(UNBOUND_ANTHROPIC_TOOL_ARGUMENT)
+    requested_name = requested if isinstance(requested, str) and requested else "unknown"
+    return json.dumps(
+        {
+            "status": "rejected",
+            "reason": "tool_not_available",
+            "requested_tool": requested_name,
+            "message": (
+                f"{requested_name!r} is not an available tool in this turn. "
+                "Use search_tools to find the tool, then call_tool to invoke it."
+            ),
+        },
+        separators=(",", ":"),
+    )
+
+
 def _validate_anthropic_native_tool_search_blocks(
     envelope: AnthropicNativeEnvelope,
     bundle: CompiledAnthropicToolBundle,
@@ -3502,6 +3684,13 @@ def _attach_anthropic_native_envelope(
 ) -> None:
     envelope = _anthropic_native_envelope_for_persistence(value)
     if envelope is None:
+        return
+    if not durable and _anthropic_envelope_is_non_continuable(envelope):
+        # The internal field exists only to replay a frozen native chain. A
+        # non-continuable envelope must not reach that replay path: the next
+        # cycle would reject its unbound client tool reference instead of
+        # delivering the corrective tool result. The compatibility projection
+        # carries the turn forward, and the durable field keeps the audit trail.
         return
     target[
         ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD
@@ -5633,6 +5822,9 @@ class ContextPressureSnapshot:
     exceeded: bool
     reason: str
     reserve_clamped: bool = False
+    raw_prompt_tokens: int | None = None
+    estimator_identity: str | None = None
+    calibration: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -7883,6 +8075,11 @@ class AgentLoop:
         on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
         """Core step execution loop."""
+        if not ctx.runtime_info.get("_session_runtime_metadata_hydrated"):
+            ensure_runtime_metadata = getattr(self.session_cache, "ensure_runtime_metadata", None)
+            if callable(ensure_runtime_metadata):
+                await ensure_runtime_metadata(ctx.session)
+            ctx.runtime_info["_session_runtime_metadata_hydrated"] = True
         new_loaded_skill_snapshots = self._initialize_loaded_skill_snapshots(ctx)
         # Guard: compaction recursion depth.  Each successful compaction+rotation
         # that re-enters _execute_step increments ctx.compaction_recursion_depth.
@@ -8312,6 +8509,7 @@ class AgentLoop:
             reminder = plan_mode_reminder(source=ctx.chat_mode.source)
             routing_reminder = f"{reminder}\n\n{routing_reminder}" if routing_reminder else reminder
 
+        assembly_disabled_urls, assembly_disabled_ids = _disabled_artifact_refs(ctx)
         try:
             context_result = await self.context_assembler.assemble(
                 session=ctx.session,
@@ -8350,8 +8548,8 @@ class AgentLoop:
                     getattr(ctx, "active_executor_id", None)
                     or getattr(ctx.conversation, "active_executor_id", None)
                 ),
-                disabled_artifact_urls=set(ctx.runtime_info.get("disabled_artifact_urls", [])),
-                disabled_artifact_ids=set(ctx.runtime_info.get("disabled_artifact_ids", [])),
+                disabled_artifact_urls=assembly_disabled_urls,
+                disabled_artifact_ids=assembly_disabled_ids,
                 tool_schema_tokens_override=(
                     (self.session_cache.get_tool_runtime_info(ctx.session.session_id) or {}).get(
                         "tool_schema_tokens"
@@ -8699,6 +8897,7 @@ class AgentLoop:
         background_shell_reminder_signature: str | None = None
         context_pressure_thresholds_emitted: set[int] = set()
         anthropic_native_chain: dict[str, Any] | None = None
+        anthropic_native_chain_fingerprint: str | None = None
         anthropic_native_continuation_required = False
         # Anthropic documents pause_turn as a provider continuation boundary.
         # Keep automatic replay deliberately small and detect identical native
@@ -8973,8 +9172,8 @@ class AgentLoop:
             llm_kwargs: dict[str, Any] = {}
             if reasoning_effort:
                 llm_kwargs["reasoning_effort"] = reasoning_effort
-            if fast_mode:
-                llm_kwargs["fast_mode"] = True
+            if fast_mode is not None:
+                llm_kwargs["fast_mode"] = fast_mode
             if ctx.agent.llm_config:
                 if ctx.agent.llm_config.temperature is not None:
                     llm_kwargs["temperature"] = ctx.agent.llm_config.temperature
@@ -9191,7 +9390,35 @@ class AgentLoop:
                 "prepare_anthropic_native_chain",
                 None,
             )
-            if anthropic_native_chain is None and callable(prepare_anthropic_chain):
+            exposure_fingerprint = (
+                _anthropic_exposure_fingerprint(
+                    exposure, llm_kwargs.get("cognis_anthropic_server_tools")
+                )
+                if callable(prepare_anthropic_chain)
+                else None
+            )
+            if callable(prepare_anthropic_chain) and (
+                anthropic_native_chain is None
+                or anthropic_native_chain_fingerprint != exposure_fingerprint
+            ):
+                if anthropic_native_chain is not None:
+                    # Tool discovery or skill activation changed the exposed
+                    # tools mid-turn. The frozen bundle would keep sending the
+                    # stale inventory, so the model could only reach promoted
+                    # tools by guessing names the strict decoder rejects.
+                    logger.info(
+                        "agent: refreezing Anthropic native chain after tool exposure change",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "turn_id": ctx.turn_id,
+                                "provider_id": current_provider_id,
+                                "model": current_model,
+                                "visible_tool_count": len(exposure.tools),
+                            }
+                        },
+                    )
+                    anthropic_native_continuation_required = False
                 stable_id_map: dict[str, str] = {}
                 for tool_schema in exposure.tools:
                     function = (
@@ -9216,6 +9443,9 @@ class AgentLoop:
                     argument_alias_map=dict(exposure.argument_alias_map),
                     thinking=llm_kwargs.get("thinking"),
                     request_kwargs=dict(llm_kwargs),
+                )
+                anthropic_native_chain_fingerprint = (
+                    exposure_fingerprint if anthropic_native_chain is not None else None
                 )
             update_tool_runtime_info = getattr(
                 self.session_cache,
@@ -9681,10 +9911,37 @@ class AgentLoop:
                     }
                 },
             )
+            update_calibration = getattr(
+                self.session_cache, "update_prompt_token_calibration", None
+            )
+            request_raw_prompt_tokens = 0
+            request_estimator_identity = ""
             try:
                 # In force-summary mode (delegation budget exhausted) strip all
                 # executor tools so the model can only write a text response.
                 _effective_tools = [] if _force_summary_mode else exposure.tools
+                if callable(update_calibration):
+                    try:
+                        (
+                            request_raw_prompt_tokens,
+                            request_estimator_identity,
+                        ) = self._raw_prompt_token_estimate(
+                            messages=model_messages,
+                            tool_schemas=_effective_tools,
+                            model=ctx.current_model,
+                        )
+                    except (AttributeError, NotImplementedError):
+                        logger.debug(
+                            "agent: prompt token calibration unavailable",
+                            extra={
+                                "extra_data": {
+                                    "session_id": ctx.session.session_id,
+                                    "llm_request_id": llm_request_id,
+                                    "provider_id": current_provider_id,
+                                    "model": current_model,
+                                }
+                            },
+                        )
                 llm_call_kwargs = dict(llm_kwargs)
                 llm_call_kwargs["max_retries"] = 0
                 if anthropic_native_chain is not None:
@@ -9982,13 +10239,11 @@ class AgentLoop:
                     )
                     break
                 transcript_mutated_for_retry = False
+                error_category = _mid_stream_reason_class(mid_stream_error_details, "other")
                 artifact_fetch_failures = _artifact_failures_from_error_payload(
                     mid_stream_error_details
                 ) or _artifact_failures_from_provider_fetch_error(mid_stream_error)
-                if _mid_stream_reason_class(mid_stream_error_details) in {
-                    MidStreamErrorCategory.ARTIFACT_FETCH.value,
-                    MidStreamErrorCategory.ATTACHMENT_INPUT.value,
-                }:
+                if error_category in _TRANSCRIPT_PROGRESS_REQUIRED_CATEGORIES:
                     payload_artifact_ids = {
                         failure.artifact_id
                         for failure in artifact_fetch_failures
@@ -10007,7 +10262,6 @@ class AgentLoop:
                         if (failure.url, failure.artifact_id) not in existing
                     )
                 if artifact_fetch_failures:
-                    transcript_mutated_for_retry = True
                     artifact_fetch_failure_urls = {
                         failure.url for failure in artifact_fetch_failures if failure.url
                     }
@@ -10016,16 +10270,25 @@ class AgentLoop:
                         for failure in artifact_fetch_failures
                         if failure.artifact_id
                     }
+                    newly_disabled = False
                     disabled_urls = ctx.runtime_info.setdefault("disabled_artifact_urls", [])
                     if isinstance(disabled_urls, list):
                         for url in sorted(artifact_fetch_failure_urls):
                             if url not in disabled_urls:
                                 disabled_urls.append(url)
+                                newly_disabled = True
                     disabled_ids = ctx.runtime_info.setdefault("disabled_artifact_ids", [])
                     if isinstance(disabled_ids, list):
                         for artifact_id in sorted(artifact_fetch_failure_ids):
                             if artifact_id not in disabled_ids:
                                 disabled_ids.append(artifact_id)
+                                newly_disabled = True
+                    # Recovery state stays turn-local on purpose. A refusal is a
+                    # property of (artifact, model), not of the artifact alone,
+                    # and the model is resolved after context assembly, so a
+                    # session-wide set would silently suppress an attachment
+                    # after the user switches to a model that can read it. A
+                    # later turn re-learns the refusal in one attempt.
                     failure_notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
                     if failure_notice:
                         disabled_notices = ctx.runtime_info.setdefault(
@@ -10036,7 +10299,20 @@ class AgentLoop:
                             and failure_notice not in disabled_notices
                         ):
                             disabled_notices.append(failure_notice)
-                    _strip_disabled_artifact_urls_from_messages(
+                    removed_any = _strip_disabled_artifact_urls_from_messages(
+                        messages,
+                        artifact_fetch_failure_urls,
+                        artifact_fetch_failure_ids,
+                    )
+                    # The next attempt must differ from the rejected one. That
+                    # holds when this turn learned something new (a removal, or
+                    # a first-time refusal that adds the notice below) and no
+                    # rejected attachment is still in the prompt. Repeating the
+                    # same refusal with the payload unchanged makes no progress
+                    # and would replay the identical rejected request.
+                    transcript_mutated_for_retry = (
+                        removed_any or newly_disabled
+                    ) and not _messages_reference_disabled_artifacts(
                         messages,
                         artifact_fetch_failure_urls,
                         artifact_fetch_failure_ids,
@@ -10044,8 +10320,13 @@ class AgentLoop:
                     failure_notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
                     if failure_notice:
                         messages.append({"role": "system", "content": failure_notice})
-                error_category = _mid_stream_reason_class(mid_stream_error_details, "other")
-                if error_category in _RECOVERY_NON_RETRYABLE_CATEGORIES:
+                if error_category in _RECOVERY_NON_RETRYABLE_CATEGORIES or (
+                    error_category in _TRANSCRIPT_PROGRESS_REQUIRED_CATEGORIES
+                    and not transcript_mutated_for_retry
+                ):
+                    # Without transcript progress the retry would replay the
+                    # identical rejected attachment payload. Recovery only makes
+                    # progress when at least one artifact was newly disabled.
                     llm_stream_max_retries_for_error = 0
                 provider_retry_after_seconds = _mid_stream_provider_retry_after_seconds(
                     mid_stream_error_details
@@ -10206,9 +10487,7 @@ class AgentLoop:
                     and provider_retry_after_seconds > _MAX_RETRY_AFTER_SLEEP_SECONDS
                 )
                 successor_eligible = (
-                    _should_continue_after_exhausted_mid_stream_failure(
-                        mid_stream_error, mid_stream_error_details
-                    )
+                    _should_continue_after_exhausted_mid_stream_failure(mid_stream_error_details)
                     and not retry_after_exceeds_inline_cap
                 )
                 if successor_eligible and continuation_count < max_continuations:
@@ -10309,10 +10588,17 @@ class AgentLoop:
                     idle_timeout_seconds=llm_stream_idle_timeout_seconds,
                     provider_retry_after_seconds=provider_retry_after_seconds,
                 )
+                provider_cause = _mid_stream_provider_message(
+                    mid_stream_error_details, mid_stream_error
+                )
                 if successor_eligible:
+                    # Keep the cause: without it the only trace of why the turn
+                    # restarted is a log line, and a repeated failure looks
+                    # identical to a transient one in the transcript.
                     error_notice = (
                         "Model stream recovery exhausted within this turn. "
                         "Requesting a bounded successor turn from saved state."
+                        + (f" Cause: {provider_cause}" if provider_cause else "")
                     )
                 events_to_record.append(
                     SessionEvent(
@@ -10339,6 +10625,19 @@ class AgentLoop:
                         ),
                     )
                 )
+                recovery_strategy = (
+                    "durable_delayed_retry"
+                    if retry_after_exceeds_inline_cap
+                    else "automatic_continuation"
+                    if successor_eligible
+                    else "terminal"
+                )
+                LLM_STREAM_FAILURE_OUTCOMES_TOTAL.labels(
+                    provider_id=notice_provider_id or "default",
+                    model=notice_model or "unknown",
+                    category=reason_class,
+                    recovery_strategy=recovery_strategy,
+                ).inc()
                 if events_to_record:
                     queue_terminal_attachment_event()
                     await self._flush_events_incremental(
@@ -10369,6 +10668,10 @@ class AgentLoop:
                             "provider_id": notice_provider_id,
                             "model": notice_model,
                             "reason_class": reason_class,
+                            # The sanitized provider cause travels with the
+                            # failure so durable history can name it instead of
+                            # reporting a generic execution failure.
+                            "message": provider_cause or None,
                             "attempts": total_attempts,
                             "continuation_attempts": continuation_count,
                             "tool_results_saved": True,
@@ -10380,13 +10683,7 @@ class AgentLoop:
                             "transient": retry_after_exceeds_inline_cap
                             and reason_class not in _RECOVERY_NON_RETRYABLE_CATEGORIES,
                             "retry_after_seconds": provider_retry_after_seconds,
-                            "recovery_strategy": (
-                                "durable_delayed_retry"
-                                if retry_after_exceeds_inline_cap
-                                else "automatic_continuation"
-                                if successor_eligible
-                                else "terminal"
-                            ),
+                            "recovery_strategy": recovery_strategy,
                         },
                     },
                     attachments=list(collected_attachments),
@@ -10400,6 +10697,44 @@ class AgentLoop:
                     ctx.session.session_id,
                     accumulator.usage,
                 )
+            actual_prompt_tokens = int(
+                (accumulator.usage or {}).get("prompt_tokens")
+                or (accumulator.usage or {}).get("input_tokens")
+                or 0
+            )
+            if (
+                callable(update_calibration)
+                and llm_status == "success"
+                and request_raw_prompt_tokens > 0
+                and request_estimator_identity
+                and actual_prompt_tokens > 0
+            ):
+                calibration = update_calibration(
+                    ctx.session.session_id,
+                    provider_id=current_provider_id,
+                    model=current_model,
+                    estimator_identity=request_estimator_identity,
+                    raw_prompt_tokens=request_raw_prompt_tokens,
+                    actual_prompt_tokens=actual_prompt_tokens,
+                    source_request_id=llm_request_id,
+                )
+                if calibration is not None:
+                    logger.info(
+                        "agent: prompt token calibration refreshed",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "turn_id": ctx.turn_id,
+                                "llm_request_id": llm_request_id,
+                                "provider_id": current_provider_id,
+                                "model": current_model,
+                                "raw_prompt_tokens": request_raw_prompt_tokens,
+                                "actual_prompt_tokens": actual_prompt_tokens,
+                                "ratio": calibration["applied_ratio"],
+                                "estimator_identity": request_estimator_identity,
+                            }
+                        },
+                    )
             if hasattr(self.session_cache, "update_last_generation_performance"):
                 self.session_cache.update_last_generation_performance(
                     ctx.session.session_id,
@@ -10489,8 +10824,32 @@ class AgentLoop:
             anthropic_native_envelope = accumulator.get_anthropic_native_envelope()
             anthropic_native_continuation_required = False
             anthropic_native_pause_turn: AnthropicNativeEnvelope | None = None
-            if anthropic_native_chain is not None and (
-                raw_tool_calls or isinstance(anthropic_native_envelope, Mapping)
+            # The model named a tool outside the frozen bundle. That turn cannot
+            # be replayed as a native chain, so fall back to the compatibility
+            # projection exactly like a mid-turn bundle refreeze instead of
+            # failing the turn.
+            anthropic_native_unbound_tools = _anthropic_envelope_is_non_continuable(
+                anthropic_native_envelope
+            )
+            if anthropic_native_unbound_tools:
+                logger.info(
+                    "agent: skipping Anthropic native continuation for unbound tool names",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
+                            "provider_id": current_provider_id,
+                            "model": current_model,
+                            "unbound_tool_names": sorted(
+                                _unbound_anthropic_tool_names(raw_tool_calls)
+                            ),
+                        }
+                    },
+                )
+            if (
+                anthropic_native_chain is not None
+                and not anthropic_native_unbound_tools
+                and (raw_tool_calls or isinstance(anthropic_native_envelope, Mapping))
             ):
                 try:
                     anthropic_native_envelope = _validated_anthropic_continuation_envelope(
@@ -14705,6 +15064,39 @@ class AgentLoop:
                         ctx,
                         events_to_record,
                         reason=f"tool_result:call_tool:{reason}",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, payload, True, None, None)
+                    continue
+
+                elif tc.name == UNBOUND_ANTHROPIC_TOOL_NAME:
+                    # The model named a tool outside the frozen Anthropic wire
+                    # bundle. Reject it like any unavailable target so the model
+                    # can recover, and never resolve the raw name against the
+                    # registry: that would bypass the exposure contract.
+                    _append_tool_call_event(
+                        events_to_record,
+                        tc,
+                        tool_id,
+                        visible_name=tool_call_visible_names.get(tc.call_id),
+                    )
+                    payload = _unbound_anthropic_tool_rejection(tc)
+                    messages.append(
+                        _tool_result_message(tc, payload, protected=True, is_error=True)
+                    )
+                    _append_tool_result_event(
+                        events_to_record,
+                        tc,
+                        payload,
+                        True,
+                        tool_id=tool_id,
+                        protect_from_pruning=True,
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:anthropic_unbound_tool",
                         on_token=on_token,
                     )
                     if on_tool_result:
@@ -22591,9 +22983,10 @@ class AgentLoop:
                     event.type == "tool_call" and not event.data.get("canonical_recovery_boundary")
                     for event in batch
                 ):
-                    await ctx.execution_fence.checkpoint(
-                        "tool_in_flight",
-                        tool_calls=[
+                    await ctx.execution_fence.record_tool_dispatch(
+                        session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                        turn_id=ctx.turn_id,
+                        descriptors=[
                             {
                                 "call_id": event.data.get("call_id"),
                                 "tool_name": event.data.get("name"),
@@ -22607,8 +23000,6 @@ class AgentLoop:
                             and isinstance(event.data.get("call_id"), str)
                             and isinstance(event.data.get("name"), str)
                         ],
-                        session_id=ctx.session.intaris_session_id or ctx.session.session_id,
-                        turn_id=ctx.turn_id,
                     )
                 # Delete only the snapshotted prefix: the Intaris append (and
                 # a potentially minutes-long recovery wait) may have allowed
@@ -23060,9 +23451,7 @@ class AgentLoop:
                 await ctx.on_absorbed_persisted(durable_request_id)
 
         normalized_attachments = attachment_refs_to_dicts(attachments)
-        attachment_blocks, unsupported = _native_attachment_blocks(
-            normalized_attachments, ctx.current_model_info
-        )
+        attachment_blocks, unsupported = _ctx_native_attachment_blocks(ctx, normalized_attachments)
         if attachment_blocks:
             blocks: list[dict[str, Any]] = []
             visible_content = merge_content_and_attachment_note(
@@ -23947,6 +24336,8 @@ class AgentLoop:
                 call_id,
                 executor_id,
                 executor_instance_id,
+                session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                turn_id=ctx.turn_id,
                 dispatch_state=dispatch_state,
             )
         elif dispatch_state == "dispatching":
@@ -25626,7 +26017,7 @@ class AgentLoop:
             return None
         normalized = normalize_attachment_refs(attachments)
         if ctx.current_model_info is not None:
-            blocks, unsupported = _native_attachment_blocks(normalized, ctx.current_model_info)
+            blocks, unsupported = _ctx_native_attachment_blocks(ctx, normalized)
             if blocks:
                 content_blocks: list[dict[str, Any]] = [
                     {
@@ -26173,14 +26564,28 @@ class AgentLoop:
             ),
         )
         try:
-            prompt_tokens = self.providers.llm.count_messages_tokens(messages, ctx.current_model)
-            if tool_schemas:
-                prompt_tokens += self.providers.llm.count_tokens(
-                    json.dumps(tool_schemas, sort_keys=True),
-                    ctx.current_model,
-                )
+            raw_prompt_tokens, estimator_identity = self._raw_prompt_token_estimate(
+                messages=messages,
+                tool_schemas=tool_schemas,
+                model=ctx.current_model,
+            )
         except Exception:
             return None
+        prompt_tokens = raw_prompt_tokens
+        calibration: dict[str, Any] | None = None
+        apply_calibration = getattr(
+            getattr(self, "session_cache", None),
+            "apply_prompt_token_calibration",
+            None,
+        )
+        if callable(apply_calibration):
+            prompt_tokens, calibration = apply_calibration(
+                ctx.session.session_id,
+                raw_prompt_tokens=raw_prompt_tokens,
+                provider_id=ctx.current_provider_id,
+                model=ctx.current_model,
+                estimator_identity=estimator_identity,
+            )
         available_prompt_tokens = budget.available_prompt_tokens
         if available_prompt_tokens <= 0:
             return ContextPressureSnapshot(
@@ -26194,6 +26599,9 @@ class AgentLoop:
                 exceeded=True,
                 reason="no_budget",
                 reserve_clamped=budget.reserve_clamped,
+                raw_prompt_tokens=raw_prompt_tokens,
+                estimator_identity=estimator_identity,
+                calibration=calibration,
             )
         threshold_prompt_tokens = int(available_prompt_tokens * LOOP_PRESSURE_THRESHOLD_RATIO)
         return ContextPressureSnapshot(
@@ -26207,7 +26615,29 @@ class AgentLoop:
             exceeded=prompt_tokens >= threshold_prompt_tokens,
             reason="over_threshold",
             reserve_clamped=budget.reserve_clamped,
+            raw_prompt_tokens=raw_prompt_tokens,
+            estimator_identity=estimator_identity,
+            calibration=calibration,
         )
+
+    def _raw_prompt_token_estimate(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        model: str,
+    ) -> tuple[int, str]:
+        raw_prompt_tokens = self.providers.llm.count_messages_tokens(messages, model)
+        if tool_schemas:
+            raw_prompt_tokens += self.providers.llm.count_tokens(
+                json.dumps(tool_schemas, sort_keys=True),
+                model,
+            )
+        estimator_identity_fn = getattr(self.providers.llm, "token_estimator_identity", None)
+        estimator_identity = (
+            str(estimator_identity_fn(model)) if callable(estimator_identity_fn) else "unknown:v1"
+        )
+        return raw_prompt_tokens, estimator_identity
 
     async def _store_context_usage_snapshot(
         self,
@@ -26246,6 +26676,9 @@ class AgentLoop:
                     if ctx.last_projection_policy is not None
                     else None
                 ),
+                raw_prompt_tokens=snapshot.raw_prompt_tokens,
+                estimator_identity=snapshot.estimator_identity,
+                prompt_token_calibration=snapshot.calibration,
                 turn_id=ctx.turn_id,
                 runtime_selection_revision=ctx.session.runtime_override_revision,
             )
@@ -26515,11 +26948,10 @@ class AgentLoop:
                             **snapshot,
                         }
                     )
-                await ctx.execution_fence.checkpoint(
-                    "tool_in_flight",
-                    tool_calls=descriptors,
+                await ctx.execution_fence.record_tool_dispatch(
                     session_id=ctx.session.intaris_session_id or ctx.session.session_id,
                     turn_id=ctx.turn_id,
+                    descriptors=descriptors,
                 )
 
             try:
@@ -26647,8 +27079,9 @@ class AgentLoop:
                     on_tool_result=on_tool_result,
                 )
             if ctx.execution_fence is not None:
-                await ctx.execution_fence.checkpoint(
-                    "tool_result_persisted",
+                await ctx.execution_fence.complete_tool_dispatch(
+                    session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                    turn_id=ctx.turn_id,
                     call_ids=[item.tool_call.call_id for item in group],
                 )
 
@@ -30136,6 +30569,7 @@ class AgentLoop:
             list_visible_agents,
             list_workflows,
         )
+        from cognis.tools.skills import is_agent_assignable_skill
 
         def _provider_models(provider: Any) -> list[str]:
             config = provider.config if isinstance(provider.config, dict) else {}
@@ -30217,6 +30651,15 @@ class AgentLoop:
                 }
                 for row in knowledgebases
                 if allowed_knowledgebases is None or row.knowledgebase_id in allowed_knowledgebases
+            ]
+            values["agent_management.available_skills"] = [
+                {
+                    "skill_id": skill.skill_id,
+                    "name": skill.name,
+                    "attach_to_all_agents": bool(skill.auto_load),
+                }
+                for skill in skills
+                if is_agent_assignable_skill(skill.skill_id)
             ]
             values["agent_management.settings_schema"] = [
                 {

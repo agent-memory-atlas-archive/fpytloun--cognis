@@ -24,7 +24,7 @@ vi.mock('$lib/chat-v2/api', () => ({
 vi.mock('$lib/api/client', () => ({
   api: {
     sessions: { intarisDetail: mocks.intarisDetail },
-    llmProviders: { codexUsage: vi.fn() },
+    llmProviders: { providerUsage: vi.fn() },
   },
 }));
 

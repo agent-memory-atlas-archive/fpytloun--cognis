@@ -37,7 +37,6 @@ from cognis.core.runtime_selection import (
 )
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.config import NORMALIZED_REASONING_LEVELS
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
@@ -427,7 +426,14 @@ class CommandDispatcher:
                 limit=bounded_limit,
             )
         if command == "/thinking":
-            return await self._suggest_thinking_levels(session, partial, limit=bounded_limit)
+            return await self._suggest_thinking_levels(
+                session,
+                partial,
+                conversation=conversation,
+                agent=agent,
+                user_email=user_email,
+                limit=bounded_limit,
+            )
         if command == "/fast":
             return [
                 SlashCommandSuggestion(
@@ -551,30 +557,47 @@ class CommandDispatcher:
         session: SessionModel | None,
         partial: str,
         *,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str | None,
         limit: int,
     ) -> list[SlashCommandSuggestion]:
-        current_model = self._current_model_id(session) or ""
+        selection = resolve_runtime_selection(agent, session, conversation) if session else None
+        current_model = selection.model if selection else None
+        provider_id = selection.provider_id if selection else None
         try:
+            if not current_model or not provider_id:
+                current_model, provider_id = await self._providers.llm.resolve_model_target(
+                    explicit_model=current_model,
+                    explicit_provider_id=provider_id,
+                    acting_user_email=user_email,
+                )
             if current_model:
-                model_info = await self._providers.llm.get_model_info(current_model)
+                model_info = await self._providers.llm.get_model_info(
+                    current_model,
+                    provider_id=provider_id,
+                    acting_user_email=user_email,
+                )
                 available = list(model_info.reasoning_efforts or [])
             else:
                 available = []
         except Exception:
             available = []
-        if not available and current_model:
-            available = _infer_reasoning_efforts(current_model)
-        levels = list(dict.fromkeys(["default", "off", *available, *NORMALIZED_REASONING_LEVELS]))
+        levels = list(dict.fromkeys(["clear", "reset", "inherit", "default", *available]))
         current_effort = session.reasoning_effort_override if session is not None else None
         matches = [level for level in levels if _matches_suggestion(partial, level)]
         matches = _ranked(matches, partial, lambda item: item, lambda item: item)
         suggestions: list[SlashCommandSuggestion] = []
         for level in matches[:limit]:
-            is_current = (
-                not current_effort and level in {"default", "off"}
-            ) or level == current_effort
+            is_current = (current_effort is None and level == "clear") or level == current_effort
             description = (
-                "Reset to default" if level in {"default", "off"} else "Set reasoning effort"
+                "Inherit profile or agent configuration"
+                if level in {"clear", "reset", "inherit"}
+                else "Use provider default; do not inherit an effort hint"
+                if level == "default"
+                else "Disable thinking"
+                if level == "none"
+                else "Set reasoning effort"
             )
             suggestions.append(
                 SlashCommandSuggestion(
@@ -896,7 +919,12 @@ class CommandDispatcher:
             arg = stripped[9:].strip() if len(stripped) > 9 else ""
             return self._mark_command_result(
                 await self._handle_thinking(
-                    conversation, session, agent, arg, runtime_plan=runtime_plan
+                    conversation,
+                    session,
+                    agent,
+                    arg,
+                    user_email=user_email,
+                    runtime_plan=runtime_plan,
                 ),
                 "/thinking",
             )
@@ -1788,7 +1816,7 @@ class CommandDispatcher:
         )
         lines.append(
             "Selected thinking effort: "
-            f"{runtime_selection.reasoning_effort or 'default'} "
+            f"{runtime_selection.reasoning_effort or 'inherit routing/provider configuration'} "
             f"({runtime_selection.reasoning_effort_source})"
         )
         lines.append(
@@ -2260,57 +2288,15 @@ class CommandDispatcher:
         agent: AgentDefinition,
         arg: str,
         *,
+        user_email: str | None = None,
         runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult:
         """Handle /thinking [level] — list or switch reasoning effort."""
         # Determine current model for effort level inference
         selection = resolve_runtime_selection(agent, session, conversation)
-        usage = self._session_cache.get_context_usage(session.session_id)
-        current_model = selection.model or str((usage or {}).get("model") or "")
-
-        # Get supported effort levels
-        capability_lookup_succeeded = False
-        try:
-            if current_model:
-                model_info = await self._providers.llm.get_model_info(current_model)
-                available = model_info.reasoning_efforts if model_info.reasoning_efforts else []
-                capability_lookup_succeeded = True
-            else:
-                available = []
-        except Exception:
-            available = []
-
-        if not available and current_model and not capability_lookup_succeeded:
-            available = _infer_reasoning_efforts(current_model)
-
-        current_effort = session.reasoning_effort_override
-
-        if not arg:
-            lines = []
-            if current_effort:
-                lines.append(f"Current thinking effort: {current_effort}")
-            else:
-                lines.append("Thinking effort: default (not set)")
-            if available:
-                lines.append(f"Available levels: {', '.join(available)}")
-            else:
-                lines.append("No thinking effort levels available for current model.")
-            lines.append("Usage: /thinking <level>  (use 'off' to reset to default)")
-            return CommandResult(type="system_message", text="\n".join(lines))
-
-        normalized_arg = normalize_reasoning_effort(arg)
-        if normalized_arg is None:
-            return CommandResult(
-                type="system_message",
-                text=(
-                    f"Unsupported level: {arg}\nAvailable: {', '.join(available)}"
-                    if available
-                    else "Unsupported thinking effort."
-                ),
-            )
-
-        # Reset
-        if normalized_arg == "default":
+        current_model = selection.model
+        command = arg.strip().lower()
+        if command in {"clear", "reset", "inherit"}:
             await persist_runtime_selection(
                 session_factory=self._session_factory,
                 session_cache=self._session_cache,
@@ -2322,11 +2308,101 @@ class CommandDispatcher:
             selection = resolve_runtime_selection(agent, session, conversation)
             return CommandResult(
                 type="system_message",
-                text="Thinking effort reset to default.",
+                text=(
+                    "Session thinking override cleared.\n"
+                    f"Effective effort: {selection.reasoning_effort or 'inherit routing/provider configuration'} "
+                    f"({selection.reasoning_effort_source}).\nTakes effect on next message."
+                ),
                 data={"runtime_selection": selection.as_dict()},
             )
 
-        if current_model and capability_lookup_succeeded and not available:
+        # Get supported effort levels
+        capability_lookup_succeeded = False
+        provider_id = selection.provider_id
+        try:
+            if not current_model or not provider_id:
+                current_model, provider_id = await self._providers.llm.resolve_model_target(
+                    explicit_model=current_model,
+                    explicit_provider_id=provider_id,
+                    acting_user_email=user_email,
+                )
+            if current_model:
+                model_info = await self._providers.llm.get_model_info(
+                    current_model,
+                    provider_id=provider_id,
+                    acting_user_email=user_email,
+                )
+                available = model_info.reasoning_efforts if model_info.reasoning_efforts else []
+                capability_lookup_succeeded = getattr(model_info, "model_id", None) != "unknown"
+            else:
+                available = []
+        except Exception:
+            available = []
+
+        current_effort = session.reasoning_effort_override
+
+        if not arg:
+            lines = []
+            if current_effort:
+                lines.append(f"Session thinking override: {current_effort}")
+            else:
+                lines.append("Session thinking override: Inherit")
+            lines.append(
+                f"Effective effort: {selection.reasoning_effort or 'inherit routing/provider configuration'} "
+                f"({selection.reasoning_effort_source})"
+            )
+            lines.append(f"Model: {current_model or 'unresolved'}")
+            lines.append(f"Provider: {provider_id or 'unresolved'}")
+            if available:
+                lines.append(f"Available levels: {', '.join(available)}")
+            else:
+                lines.append(
+                    "No thinking effort levels available for current model."
+                    if capability_lookup_succeeded
+                    else "Thinking capabilities unavailable."
+                )
+            lines.append(
+                "Usage: /thinking <level|default|clear> (reset/inherit = clear; off = none)"
+            )
+            return CommandResult(type="system_message", text="\n".join(lines))
+
+        normalized_arg = normalize_reasoning_effort("none" if command == "off" else command)
+        if normalized_arg is None:
+            return CommandResult(
+                type="system_message",
+                text=(
+                    f"Unsupported level: {arg}\nAvailable: {', '.join(available)}"
+                    if available
+                    else "Unsupported thinking effort."
+                ),
+            )
+
+        # Provider default is an explicit selection, not inheritance.
+        if normalized_arg == "default":
+            await persist_runtime_selection(
+                session_factory=self._session_factory,
+                session_cache=self._session_cache,
+                conversation=conversation,
+                session=session,
+                reasoning_effort_override="default",
+                runtime_plan=runtime_plan,
+            )
+            selection = resolve_runtime_selection(agent, session, conversation)
+            return CommandResult(
+                type="system_message",
+                text="Thinking effort set to provider default; no inherited effort hint.\n"
+                "Adaptive Claude models use adaptive thinking without an effort hint.\n"
+                "Takes effect on next message.",
+                data={"runtime_selection": selection.as_dict()},
+            )
+
+        if not capability_lookup_succeeded:
+            return CommandResult(
+                type="system_message",
+                text="Thinking capabilities unavailable. No change was saved. "
+                "Use /thinking clear to inherit or retry after metadata is available.",
+            )
+        if current_model and not available:
             return CommandResult(
                 type="system_message",
                 text=f"Current model {current_model!r} does not support thinking effort overrides.",
@@ -2363,48 +2439,13 @@ class CommandDispatcher:
         user_email: str | None,
         runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult:
-        """Handle /fast [on|off|default] for the current session model."""
+        """Handle /fast [on|off|clear] for the next request's resolved target."""
         session_id = session.session_id
         selection = resolve_runtime_selection(agent, session, conversation)
         current_model = selection.model
-        usage = self._session_cache.get_context_usage(session_id)
-        if not current_model:
-            current_model = str((usage or {}).get("model") or "")
-        provider_id = selection.provider_id or (str((usage or {}).get("provider_id") or "") or None)
-
-        supports_fast_mode = False
-        if current_model and self._providers is not None and getattr(self._providers, "llm", None):
-            try:
-                try:
-                    model_info = await self._providers.llm.get_model_info(
-                        current_model,
-                        provider_id=provider_id,
-                        acting_user_email=user_email,
-                    )
-                except TypeError:
-                    model_info = await self._providers.llm.get_model_info(current_model)
-                supports_fast_mode = bool(getattr(model_info, "supports_fast_mode", False))
-            except Exception:
-                logger.debug(
-                    "Failed to resolve fast-mode capability",
-                    extra={"extra_data": {"session_id": session_id, "model": current_model}},
-                    exc_info=True,
-                )
-
-        current = session.fast_mode_override
-        if not arg:
-            state = "default" if current is None else ("on" if current else "off")
-            support = "supported" if supports_fast_mode else "not supported"
-            return CommandResult(
-                type="system_message",
-                text=(
-                    f"Fast mode: {state} ({support} for {current_model or 'the current model'}).\n"
-                    "Usage: /fast <on|off|default>"
-                ),
-            )
-
+        provider_id = selection.provider_id
         normalized = arg.strip().lower()
-        if normalized in {"default", "reset"}:
+        if normalized in {"clear", "inherit", "default", "reset"}:
             await persist_runtime_selection(
                 session_factory=self._session_factory,
                 session_cache=self._session_cache,
@@ -2416,15 +2457,73 @@ class CommandDispatcher:
             selection = resolve_runtime_selection(agent, session, conversation)
             return CommandResult(
                 type="system_message",
-                text="Fast mode reset to the agent/profile default.",
+                text="Fast mode override cleared; inherits agent/profile configuration.\n"
+                "Takes effect on next message.",
                 data={"runtime_selection": selection.as_dict()},
             )
+
+        supports_fast_mode = False
+        capability_known = False
+        if self._providers is not None and getattr(self._providers, "llm", None):
+            try:
+                if not current_model or not provider_id:
+                    current_model, provider_id = await self._providers.llm.resolve_model_target(
+                        explicit_model=current_model,
+                        explicit_provider_id=provider_id,
+                        acting_user_email=user_email,
+                    )
+                model_info = await self._providers.llm.get_model_info(
+                    current_model,
+                    provider_id=provider_id,
+                    acting_user_email=user_email,
+                )
+                capability_known = getattr(model_info, "model_id", None) != "unknown"
+                supports_fast_mode = bool(getattr(model_info, "supports_fast_mode", False))
+            except Exception:
+                logger.debug(
+                    "Failed to resolve fast-mode capability",
+                    extra={"extra_data": {"session_id": session_id, "model": current_model}},
+                    exc_info=True,
+                )
+
+        current = session.fast_mode_override
+        if not arg:
+            state = "inherit" if current is None else ("on" if current else "off")
+            support = (
+                "supported; account access and higher pricing can apply"
+                if supports_fast_mode
+                else "not supported"
+                if capability_known
+                else "capabilities unavailable"
+            )
+            effective = (
+                "inherit provider configuration"
+                if selection.fast_mode is None
+                else "on"
+                if selection.fast_mode
+                else "off"
+            )
+            return CommandResult(
+                type="system_message",
+                text=(
+                    f"Fast mode: {state} ({support} for {current_model or 'the current model'}).\n"
+                    f"Selected request: {effective} ({selection.fast_mode_source}).\n"
+                    f"Provider: {provider_id or 'unresolved'}.\n"
+                    "This selection does not confirm the speed of a completed request.\n"
+                    "Usage: /fast <on|off|clear> (default/reset/inherit = clear)"
+                ),
+            )
+
         if normalized not in {"on", "off"}:
-            return CommandResult(type="system_message", text="Usage: /fast <on|off|default>")
+            return CommandResult(type="system_message", text="Usage: /fast <on|off|clear>")
         if normalized == "on" and not supports_fast_mode:
             return CommandResult(
                 type="system_message",
-                text=f"Current model {current_model!r} does not support fast mode.",
+                text=(
+                    f"Current model {current_model!r} does not support fast mode."
+                    if capability_known
+                    else "Fast-mode capabilities unavailable. No change saved."
+                ),
             )
         await persist_runtime_selection(
             session_factory=self._session_factory,

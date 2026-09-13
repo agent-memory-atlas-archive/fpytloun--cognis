@@ -16,6 +16,7 @@ from cognis.store.direct_turns import (
     DirectTurnStore,
     MaterializedDirectTurnPayload,
     PermanentDirectTurnPayloadError,
+    ToolDispatchMergeStatus,
     conversation_lease_key,
 )
 from cognis.store.models import DirectTurnRequestRow
@@ -32,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 class StaleDirectTurnOwner(RuntimeError):
     """Raised when a turn loses its distributed execution fence."""
+
+
+class UnboundToolDispatch(RuntimeError):
+    """A tool reached its executor send without a durable dispatch descriptor.
+
+    The fence is still held, so this is not a lost turn. It means restart
+    recovery has no record of the call, which is only safe to tolerate after
+    the call was already sent.
+    """
 
 
 class PermanentDirectTurnControllerError(PermanentDirectTurnPayloadError):
@@ -89,26 +99,114 @@ class DirectTurnExecutionFence:
         if row.cancel_requested_at is not None:
             raise asyncio.CancelledError
 
+    def _tool_dispatch_metadata(self) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if self.user_append_phase is not None:
+            metadata["user_append_phase"] = self.user_append_phase
+        if self.user_append_session_id is not None:
+            metadata["user_append_session_id"] = self.user_append_session_id
+        return metadata
+
+    async def record_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        descriptors: list[dict[str, Any]],
+    ) -> None:
+        """Record this session's in-flight tool batch on the shared turn."""
+        self.last_phase = "tool_in_flight"
+        metadata = self._tool_dispatch_metadata()
+        self.last_metadata = {
+            **metadata,
+            "session_id": session_id,
+            "turn_id": turn_id,
+        }
+        row = await self.store.record_tool_dispatch(
+            self.request_id,
+            lease=self.lease,
+            session_id=session_id,
+            turn_id=turn_id,
+            descriptors=descriptors,
+            metadata=self.last_metadata,
+        )
+        if row is None:
+            raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
+        if row.cancel_requested_at is not None:
+            raise asyncio.CancelledError
+
+    async def complete_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        call_ids: list[str],
+    ) -> None:
+        """Release this session's settled tool batch from the shared turn."""
+        metadata = self._tool_dispatch_metadata()
+        row = await self.store.complete_tool_dispatch(
+            self.request_id,
+            lease=self.lease,
+            session_id=session_id,
+            turn_id=turn_id,
+            call_ids=call_ids,
+            metadata=metadata,
+        )
+        if row is None:
+            raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        self.last_phase = str(outcome.get("phase") or "tool_result_persisted")
+        self.last_metadata = {**metadata, "call_ids": list(call_ids)}
+        if row.cancel_requested_at is not None:
+            raise asyncio.CancelledError
+
     async def bind_tool_dispatch(
         self,
         call_id: str,
         executor_id: str,
         executor_instance_id: str | None,
         *,
+        session_id: str,
+        turn_id: str | None,
         dispatch_state: Literal["dispatching", "sent"],
     ) -> None:
         if dispatch_state not in {"dispatching", "sent"}:
             raise ValueError("invalid tool dispatch state")
-        row = await self.store.merge_tool_dispatch(
+        result = await self.store.merge_tool_dispatch(
             self.request_id,
             lease=self.lease,
+            session_id=session_id,
+            turn_id=turn_id,
             call_id=call_id,
             executor_id=executor_id,
             executor_instance_id=executor_instance_id,
             dispatch_state=dispatch_state,
         )
-        if row is None:
-            raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
+        if result.fence_held:
+            if result.status is ToolDispatchMergeStatus.UNKNOWN_CALL:
+                # The fence is still ours; only the descriptor is missing. Before
+                # the send that means the call is about to run with nothing for
+                # restart recovery to settle, so it must fail closed. After the
+                # send the call already left, and refusing it here would not
+                # undo the effect, so only recovery precision is lost.
+                logger.warning(
+                    "direct turn: tool dispatch binding has no in-flight descriptor",
+                    extra={
+                        "extra_data": {
+                            "request_id": self.request_id,
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                            "call_id": call_id,
+                            "dispatch_state": dispatch_state,
+                        }
+                    },
+                )
+                if dispatch_state == "dispatching":
+                    raise UnboundToolDispatch(
+                        f"Tool call {call_id} has no durable dispatch descriptor"
+                    )
+            return
+        raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
 
 
 ExecuteClaimedTurn = Callable[
@@ -198,6 +296,12 @@ class DurableDirectTurnRuntime:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def wake(self) -> None:
+        self._signal_wake()
+
+    async def expedite(self, request_id: str) -> None:
+        """Discard process-local throttling after durable retry invalidation."""
+
+        self._retry_after.pop(request_id, None)
         self._signal_wake()
 
     def _signal_wake(self) -> None:
@@ -653,9 +757,19 @@ class DurableDirectTurnRuntime:
                                     if isinstance(recovery_row.outcome, dict)
                                     else {}
                                 ).items()
-                                if key not in {"phase", "phase_started_at"}
+                                if key
+                                not in {
+                                    "phase",
+                                    "phase_started_at",
+                                    "deferred_phase",
+                                    "tool_dispatch_groups",
+                                    "tool_calls",
+                                }
                             },
                         },
+                        # Every group has been settled above, so the turn must
+                        # leave tool_in_flight instead of pinning itself there.
+                        clear_tool_dispatch=True,
                     )
                     if checkpointed is None:
                         raise StaleDirectTurnOwner(row.request_id)

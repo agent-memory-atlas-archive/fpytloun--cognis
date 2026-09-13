@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 import cognis.core.direct_turn_runtime as direct_turn_runtime_module
 from cognis.bootstrap import run_schema_bootstrap
@@ -17,6 +18,7 @@ from cognis.core.direct_turn_runtime import (
     DirectTurnExecutionFence,
     DurableDirectTurnRuntime,
     StaleDirectTurnOwner,
+    UnboundToolDispatch,
 )
 from cognis.core.executor_recovery import (
     EXECUTOR_RECOVERY_WINDOW_SECONDS,
@@ -30,11 +32,14 @@ from cognis.providers.executor.websocket import WebSocketExecutorConnection
 from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.direct_turns import (
+    TOOL_DISPATCH_DESCRIPTOR_LIMIT,
     DirectTurnStatus,
     DirectTurnStore,
     PermanentDirectTurnPayloadError,
     conversation_lease_key,
+    read_tool_dispatch_groups,
 )
+from cognis.store.models import DirectTurnRequestRow
 from cognis.store.queries import (
     create_agent,
     create_artifact_record,
@@ -775,20 +780,19 @@ async def test_tool_dispatch_binding_is_fenced_and_merged_before_send(tmp_path: 
         incarnation_id="boot",
     )
     assert await store.mark_running(admitted.request.request_id, lease=lease)
-    assert await store.checkpoint(
+    assert await store.record_tool_dispatch(
         admitted.request.request_id,
         lease=lease,
-        phase="tool_in_flight",
-        metadata={
-            "tool_calls": [
-                {
-                    "call_id": "call-1",
-                    "tool_name": "bash",
-                    "frozen": True,
-                    "dispatch_state": "pending",
-                }
-            ]
-        },
+        session_id="sess-a",
+        turn_id="turn-a",
+        descriptors=[
+            {
+                "call_id": "call-1",
+                "tool_name": "bash",
+                "frozen": True,
+                "dispatch_state": "pending",
+            }
+        ],
     )
     fence = DirectTurnExecutionFence(
         store=store,
@@ -800,19 +804,27 @@ async def test_tool_dispatch_binding_is_fenced_and_merged_before_send(tmp_path: 
         "call-1",
         "executor-1",
         "instance-1",
+        session_id="sess-a",
+        turn_id="turn-a",
         dispatch_state="dispatching",
     )
 
     row = await store.get(admitted.request.request_id)
     assert row is not None
-    assert row.outcome["tool_calls"] == [
+    assert row.outcome["tool_dispatch_groups"] == [
         {
-            "call_id": "call-1",
-            "tool_name": "bash",
-            "frozen": True,
-            "dispatch_state": "dispatching",
-            "executor_id": "executor-1",
-            "executor_instance_id": "instance-1",
+            "session_id": "sess-a",
+            "turn_id": "turn-a",
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "frozen": True,
+                    "dispatch_state": "dispatching",
+                    "executor_id": "executor-1",
+                    "executor_instance_id": "instance-1",
+                }
+            ],
         }
     ]
     await engine.dispose()
@@ -835,20 +847,19 @@ async def test_cancel_immediately_before_binding_aborts_tool_frame(tmp_path: Pat
         incarnation_id="boot",
     )
     assert await store.mark_running(admitted.request.request_id, lease=lease)
-    assert await store.checkpoint(
+    assert await store.record_tool_dispatch(
         admitted.request.request_id,
         lease=lease,
-        phase="tool_in_flight",
-        metadata={
-            "tool_calls": [
-                {
-                    "call_id": "call-1",
-                    "tool_name": "bash",
-                    "frozen": False,
-                    "dispatch_state": "pending",
-                }
-            ]
-        },
+        session_id="sess-a",
+        turn_id="turn-a",
+        descriptors=[
+            {
+                "call_id": "call-1",
+                "tool_name": "bash",
+                "frozen": False,
+                "dispatch_state": "pending",
+            }
+        ],
     )
     fence = DirectTurnExecutionFence(
         store=store,
@@ -869,6 +880,8 @@ async def test_cancel_immediately_before_binding_aborts_tool_frame(tmp_path: Pat
             "call-1",
             executor_id,
             instance_id,
+            session_id="sess-a",
+            turn_id="turn-a",
             dispatch_state="dispatching",
         )
 
@@ -2031,3 +2044,400 @@ async def test_scheduler_queue_projection_types_durable_automatic_continuations(
         assert queue[0]["continuation_reason"] == "llm_cycle_ceiling_reached"
     finally:
         await engine.dispose()
+
+
+async def _running_tool_turn(store: DirectTurnStore, leases: DatabaseLeaseStore, key: str):
+    """Admit, claim, and start one direct turn ready to record tool batches."""
+    admitted = await _admit(store, key, "tool")
+    lease = await leases.acquire(
+        conversation_lease_key("conv-a"),
+        "controller:boot",
+        ttl_seconds=60,
+    )
+    assert lease is not None
+    assert await store.claim(
+        admitted.request.request_id,
+        lease=lease,
+        controller_id="controller",
+        incarnation_id="boot",
+    )
+    assert await store.mark_running(admitted.request.request_id, lease=lease)
+    return admitted.request.request_id, lease
+
+
+def _pending_descriptor(call_id: str) -> dict[str, Any]:
+    return {
+        "call_id": call_id,
+        "tool_name": "bash",
+        "frozen": True,
+        "dispatch_state": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sibling_session_batch_does_not_evict_in_flight_dispatch(tmp_path: Path) -> None:
+    # A delegate child shares the parent turn's fence. Recording the child's
+    # batch must not strip the parent's descriptors, which previously made the
+    # parent's own dispatch binding look like a lost fence.
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "sibling-batches")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+    await fence.record_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        descriptors=[_pending_descriptor("call-child")],
+    )
+
+    await fence.bind_tool_dispatch(
+        "call-parent",
+        "executor-1",
+        "instance-1",
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        dispatch_state="dispatching",
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["phase"] == "tool_in_flight"
+    groups = {
+        (group["session_id"], group["turn_id"]): group["tool_calls"]
+        for group in row.outcome["tool_dispatch_groups"]
+    }
+    assert groups[("sess-parent", "turn-parent")][0]["dispatch_state"] == "dispatching"
+    assert groups[("sess-child", "turn-child")][0]["dispatch_state"] == "pending"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_turn_leaves_tool_in_flight_only_after_last_session_settles(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "sibling-settle")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+    await fence.record_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        descriptors=[_pending_descriptor("call-child")],
+    )
+
+    await fence.complete_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        call_ids=["call-child"],
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    # The parent batch is still live, so restart recovery must still see it.
+    assert row.outcome["phase"] == "tool_in_flight"
+    assert [group["session_id"] for group in row.outcome["tool_dispatch_groups"]] == ["sess-parent"]
+
+    await fence.complete_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        call_ids=["call-parent"],
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["phase"] == "tool_result_persisted"
+    assert "tool_dispatch_groups" not in row.outcome
+    assert row.outcome["call_ids"] == ["call-parent"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_dispatch_binding_does_not_abort_a_held_fence(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "unknown-binding")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+
+    # A binding for a call this turn never recorded is not evidence of a lost
+    # fence. Before the send it still has to fail closed, because executing it
+    # would leave restart recovery with nothing to settle.
+    for session_id, turn_id in (("sess-parent", "turn-parent"), ("sess-other", "turn-other")):
+        with pytest.raises(UnboundToolDispatch):
+            await fence.bind_tool_dispatch(
+                "call-unknown",
+                "executor-1",
+                "instance-1",
+                session_id=session_id,
+                turn_id=turn_id,
+                dispatch_state="dispatching",
+            )
+
+    # After the send the call already left, so refusing it would not undo the
+    # effect and the frame continues with reduced recovery precision.
+    await fence.bind_tool_dispatch(
+        "call-unknown",
+        "executor-1",
+        "instance-1",
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        dispatch_state="sent",
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["tool_dispatch_groups"][0]["tool_calls"] == [
+        _pending_descriptor("call-parent")
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_binding_still_fails_when_the_fence_is_lost(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "lost-fence-binding")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+    assert await leases.release(lease)
+
+    with pytest.raises(StaleDirectTurnOwner):
+        await fence.bind_tool_dispatch(
+            "call-parent",
+            "executor-1",
+            "instance-1",
+            session_id="sess-parent",
+            turn_id="turn-parent",
+            dispatch_state="dispatching",
+        )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_without_a_caller_turn_falls_back_to_the_request_turn(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "turnless-dispatch")
+    request = await store.get(request_id)
+    assert request is not None
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id=None,
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+    await fence.bind_tool_dispatch(
+        "call-parent",
+        "executor-1",
+        "instance-1",
+        session_id="sess-parent",
+        turn_id=None,
+        dispatch_state="sent",
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    group = row.outcome["tool_dispatch_groups"][0]
+    assert group["turn_id"] == request.turn_id
+    assert group["tool_calls"][0]["dispatch_state"] == "sent"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_phase_checkpoint_preserves_sibling_dispatch(tmp_path: Path) -> None:
+    # Every session flushing events checkpoints its own phase through the shared
+    # fence. That boundary must not erase a sibling's in-flight batch, and the
+    # turn must stay recoverable while those calls can still be settled.
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "phase-preserves")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    await fence.record_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        descriptors=[_pending_descriptor("call-child")],
+    )
+
+    await fence.checkpoint("intaris_append", session_id="sess-parent")
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["phase"] == "tool_in_flight"
+    assert row.outcome["deferred_phase"] == "intaris_append"
+    assert row.outcome["tool_dispatch_groups"][0]["tool_calls"] == [
+        _pending_descriptor("call-child")
+    ]
+
+    # The binding the parent-owned checkpoint used to invalidate still resolves.
+    await fence.bind_tool_dispatch(
+        "call-child",
+        "executor-1",
+        "instance-1",
+        session_id="sess-child",
+        turn_id="turn-child",
+        dispatch_state="sent",
+    )
+
+    await fence.complete_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        call_ids=["call-child"],
+    )
+    await fence.checkpoint("model_wait", session_id="sess-parent")
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["phase"] == "model_wait"
+    assert "deferred_phase" not in row.outcome
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_can_release_the_phase_after_recovery(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "phase-release")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    await fence.record_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        descriptors=[_pending_descriptor("call-child")],
+    )
+
+    assert await store.checkpoint(
+        request_id,
+        lease=lease,
+        phase="tool_recovery_result_persisted",
+        clear_tool_dispatch=True,
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert row.outcome["phase"] == "tool_recovery_result_persisted"
+    assert "tool_dispatch_groups" not in row.outcome
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_groups_are_never_dropped_by_a_read_bound(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "many-groups")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    for index in range(70):
+        await fence.record_tool_dispatch(
+            session_id=f"sess-{index}",
+            turn_id=f"turn-{index}",
+            descriptors=[_pending_descriptor(f"call-{index}")],
+        )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert len(row.outcome["tool_dispatch_groups"]) == 70
+    # The earliest group must still be bindable and settleable.
+    await fence.bind_tool_dispatch(
+        "call-0",
+        "executor-1",
+        "instance-1",
+        session_id="sess-0",
+        turn_id="turn-0",
+        dispatch_state="sent",
+    )
+    row = await store.get(request_id)
+    assert row is not None
+    first = next(
+        group for group in row.outcome["tool_dispatch_groups"] if group["session_id"] == "sess-0"
+    )
+    assert first["tool_calls"][0]["dispatch_state"] == "sent"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sibling_writers_preserve_an_unreadable_dispatch_group(tmp_path: Path) -> None:
+    # A batch recorded without a resolvable turn cannot be read back as a group.
+    # It still represents dispatched calls, so no sibling write may erase it and
+    # the turn must stay in tool_in_flight until recovery reports it.
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "unreadable-group")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    async with store._session_factory() as session:  # noqa: SLF001
+        row = (
+            await session.execute(
+                select(DirectTurnRequestRow).where(DirectTurnRequestRow.request_id == request_id)
+            )
+        ).scalar_one_or_none()
+        assert row is not None
+        row.outcome = {
+            "phase": "tool_in_flight",
+            "tool_dispatch_groups": [
+                {"session_id": "sess-orphan", "tool_calls": [_pending_descriptor("call-orphan")]}
+            ],
+        }
+        await session.commit()
+
+    await fence.record_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        descriptors=[_pending_descriptor("call-parent")],
+    )
+    await fence.bind_tool_dispatch(
+        "call-parent",
+        "executor-1",
+        "instance-1",
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        dispatch_state="sent",
+    )
+    await fence.checkpoint("model_wait", session_id="sess-parent")
+    await fence.complete_tool_dispatch(
+        session_id="sess-parent",
+        turn_id="turn-parent",
+        call_ids=["call-parent"],
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    assert {group.get("session_id") for group in row.outcome["tool_dispatch_groups"]} == {
+        "sess-orphan"
+    }
+    assert row.outcome["phase"] == "tool_in_flight"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_oversized_batch_is_recorded_whole_rather_than_truncated(tmp_path: Path) -> None:
+    # Silently dropping the tail of a batch would leave those dispatched calls
+    # invisible to restart recovery. Tool recovery reports the overflow instead.
+    engine, store, leases = await _stores(tmp_path)
+    request_id, lease = await _running_tool_turn(store, leases, "oversized-batch")
+    fence = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+    oversized = [
+        _pending_descriptor(f"call-{index}") for index in range(TOOL_DISPATCH_DESCRIPTOR_LIMIT + 1)
+    ]
+
+    await fence.record_tool_dispatch(
+        session_id="sess-child",
+        turn_id="turn-child",
+        descriptors=oversized,
+    )
+
+    row = await store.get(request_id)
+    assert row is not None
+    groups = read_tool_dispatch_groups(row.outcome)
+    assert len(groups) == 1
+    assert len(groups[0].tool_calls) == TOOL_DISPATCH_DESCRIPTOR_LIMIT + 1
+    assert groups[0].tool_calls[-1]["call_id"] == f"call-{TOOL_DISPATCH_DESCRIPTOR_LIMIT}"
+    await engine.dispose()

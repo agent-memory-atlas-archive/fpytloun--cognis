@@ -36,6 +36,12 @@ _SAFE_SKILL_TOOL_SEGMENT = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_SKILL_TOOL_NAME_LENGTH = 64
 
 
+def is_agent_assignable_skill(skill_id: str) -> bool:
+    """Return whether a visible skill may be explicitly assigned to an agent."""
+
+    return skill_id not in _SCOPED_SYSTEM_SKILL_IDS
+
+
 # ---------------------------------------------------------------------------
 # Legacy MVP loader (backward compatibility)
 # ---------------------------------------------------------------------------
@@ -162,7 +168,7 @@ async def resolve_skills_for_agent(
     all_skills = {
         row.skill_id: row
         for row in result.scalars().all()
-        if include_scoped_system_skills or row.skill_id not in _SCOPED_SYSTEM_SKILL_IDS
+        if include_scoped_system_skills or is_agent_assignable_skill(row.skill_id)
     }
 
     # Build ordered list: attached first, then globally attached, then discoverable.
@@ -357,8 +363,6 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         ),
     )
     for skill in ordered_skills:
-        tool_names = ", ".join(t.name for t in skill.tools) if skill.tools else ""
-        linked_tool_names = ", ".join(skill.linked_tool_ids) if skill.linked_tool_ids else ""
         lines.append("  <skill>")
         lines.append(f"    <name>{skill.name}</name>")
         lines.append(f"    <skill_id>{skill.skill_id}</skill_id>")
@@ -374,10 +378,6 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         else:
             desc = f"Skill {skill.name}. Use skill_load for details."
         lines.append(f"    <description>{desc}</description>")
-        if tool_names:
-            lines.append(f"    <tools>{tool_names}</tools>")
-        if linked_tool_names:
-            lines.append(f"    <linked_tools>{linked_tool_names}</linked_tools>")
         if skill.attached:
             lines.append("    <attached>true</attached>")
         if skill.auto_load_instructions:

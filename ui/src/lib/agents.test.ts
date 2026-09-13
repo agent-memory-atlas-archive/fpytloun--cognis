@@ -12,6 +12,22 @@ import {
 } from '$lib/agents';
 
 describe('agent payload mapping', () => {
+  it.each(['default', 'none', 'low', ''])('round-trips thinking state %s through JSON', (effort) => {
+    const form = agentToFormState({
+      agent_id: 'agent-1', name: 'Agent', agent_type: 'primary',
+      llm_config: { reasoning_effort: effort || null },
+      agent_profiles: { developer: { reasoning_effort: effort || null } }
+    } as never);
+    expect(form.reasoningEffort).toBe(effort);
+    expect(form.agentProfiles[0].reasoningEffort).toBe(effort);
+    const payload = JSON.parse(JSON.stringify(formStateToPayload(form)));
+    expect(payload.llm_config.reasoning_effort).toBe(effort || undefined);
+    expect(payload.agent_profiles.developer.reasoning_effort).toBe(effort || null);
+    const loaded = agentToFormState(payload);
+    expect(loaded.reasoningEffort).toBe(effort);
+    expect(loaded.agentProfiles[0].reasoningEffort).toBe(effort);
+  });
+
   it('preserves existing tool configuration when MCP settings are updated', () => {
     const form = createEmptyAgentForm();
     form.agentId = 'agent-1';

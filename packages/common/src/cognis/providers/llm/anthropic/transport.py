@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cognis.providers.llm.anthropic.contracts import (
+    CLAUDE_CODE_VERSION,
     AnthropicAuthPolicy,
     AnthropicContinuationStatus,
     AnthropicNativeEnvelope,
@@ -27,15 +28,24 @@ from cognis.providers.llm.errors import (
     MidStreamErrorCategory,
     MidStreamErrorPayload,
     classify_llm_exception,
+    is_deterministic_client_error_status,
     retry_after_seconds_from_headers,
 )
 from cognis.tools.argument_aliases import reverse_tool_argument_aliases
 
 CredentialResolver = Callable[[str], Awaitable[str]]
+# A model-chosen tool name is model output, not a transport protocol violation.
+# An unbound client tool name decodes into this reserved canonical name so the
+# agent loop can reject the call and let the model correct it. The name cannot
+# collide with a registered tool because it is not a valid wire tool name.
+UNBOUND_ANTHROPIC_TOOL_NAME = "anthropic.unbound_tool"
+UNBOUND_ANTHROPIC_TOOL_ARGUMENT = "requested_tool_name"
 _OFFICIAL_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_REQUIRED_BETAS = ("oauth-2025-04-20", "interleaved-thinking-2025-05-14")
 ANTHROPIC_EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
-CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.87 (external, cli)"
+# Derived, never inlined: an independently hard-coded version here silently
+# drifts from the declared client version and Anthropic then rejects the model.
+CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 _REQUIRED_BLOCK_TYPES = frozenset(
     {
         "text",
@@ -64,7 +74,13 @@ _SUPPORTED_STOP_REASONS = frozenset(
 
 
 class AnthropicTransportError(LLMStreamProviderError):
-    """A safe, normalized native Messages protocol or HTTP error."""
+    """A safe, normalized native Messages protocol or HTTP error.
+
+    Errors raised without an explicit payload are protocol violations detected
+    by this transport's strict decoder.  They are deterministic for a given
+    response, so callers must not replay the identical request.  Truncated or
+    undecodable streams are classified as connection failures instead.
+    """
 
     def __init__(
         self,
@@ -72,8 +88,11 @@ class AnthropicTransportError(LLMStreamProviderError):
         *,
         payload: MidStreamErrorPayload | None = None,
         status_code: int | None = None,
+        category: MidStreamErrorCategory = MidStreamErrorCategory.PROTOCOL,
     ) -> None:
         self.status_code = status_code
+        if payload is None:
+            payload = {"category": category.value, "message": message}
         super().__init__(message, payload=payload)
 
 
@@ -310,10 +329,16 @@ def _provider_error(
     category = MidStreamErrorCategory.OTHER.value
     if "rate" in lowered and "limit" in lowered:
         category = MidStreamErrorCategory.RATE_LIMIT.value
-    elif "overloaded" in lowered or "server" in lowered:
-        category = MidStreamErrorCategory.PROVIDER_5XX.value
     elif "context" in lowered and "window" in lowered:
         category = MidStreamErrorCategory.CONTEXT_OVERFLOW.value
+    elif is_deterministic_client_error_status(status_code) or code == "invalid_request_error":
+        # Rejections such as an unsupported model or client version are
+        # deterministic; retrying the identical request only wastes budget. The
+        # response status outranks message markers, so a 4xx body mentioning
+        # "server" is not mistaken for a transient provider fault.
+        category = MidStreamErrorCategory.INVALID_REQUEST.value
+    elif "overloaded" in lowered or "server" in lowered:
+        category = MidStreamErrorCategory.PROVIDER_5XX.value
     payload: MidStreamErrorPayload = {
         "category": category,
         "code": str(code) if code else None,
@@ -340,19 +365,10 @@ async def decode_sse(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, Any]]
                 except json.JSONDecodeError as exc:
                     raise AnthropicTransportError(
                         "Malformed Anthropic SSE JSON",
-                        payload={
-                            "category": MidStreamErrorCategory.OTHER.value,
-                            "message": str(exc),
-                        },
+                        category=MidStreamErrorCategory.CONNECTION,
                     ) from exc
                 if not isinstance(event, dict):
-                    raise AnthropicTransportError(
-                        "Anthropic SSE event must be an object",
-                        payload={
-                            "category": MidStreamErrorCategory.OTHER.value,
-                            "message": "invalid event",
-                        },
-                    )
+                    raise AnthropicTransportError("Anthropic SSE event must be an object")
                 if event_name and "type" not in event:
                     event["type"] = event_name
                 elif event_name and event.get("type") != event_name:
@@ -377,7 +393,10 @@ async def decode_sse(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, Any]]
         try:
             event = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise AnthropicTransportError("Malformed trailing Anthropic SSE JSON") from exc
+            raise AnthropicTransportError(
+                "Malformed trailing Anthropic SSE JSON",
+                category=MidStreamErrorCategory.CONNECTION,
+            ) from exc
         if not isinstance(event, dict):
             raise AnthropicTransportError("Anthropic SSE event must be an object")
         if event_name and "type" not in event:
@@ -422,6 +441,9 @@ class AnthropicStreamDecoder:
         self._final_blocks: dict[int, dict[str, Any]] = {}
         self._tool_use_ids: set[str] = set()
         self._server_result_ids: set[str] = set()
+        # Unbound client tool names make this assistant turn unsafe to replay as
+        # a frozen native chain, because the bundle never contained them.
+        self.unbound_wire_names: list[str] = []
 
     def feed(self, event: Mapping[str, Any]) -> list[dict[str, Any]]:
         event_type = event.get("type")
@@ -518,7 +540,8 @@ class AnthropicStreamDecoder:
             ):
                 raise AnthropicTransportError(f"Anthropic {kind} references an unknown tool name")
             if kind == "tool_use":
-                _binding_for_wire_name(self.bundle, name)
+                if _optional_binding_for_wire_name(self.bundle, name) is None:
+                    self.unbound_wire_names.append(name)
             elif not any(tool.get("name") == name for tool in self.bundle.server_tools):
                 raise AnthropicTransportError(
                     "Anthropic server_tool_use references an unfrozen server tool"
@@ -616,7 +639,10 @@ class AnthropicStreamDecoder:
                 {"choices": [{"index": 0, "delta": {"provider_thinking_blocks": [block.value]}}]}
             ]
         if block.kind == "tool_use":
-            binding = _binding_for_wire_name(self.bundle, str(block.value["name"]))
+            wire_name = str(block.value["name"])
+            binding = _optional_binding_for_wire_name(self.bundle, wire_name)
+            if binding is None:
+                return [_unbound_tool_chunk(self.tool_indices[index], block.value, wire_name)]
             canonical_input = _decode_argument_aliases(
                 block.value["input"], binding.reverse_argument_aliases
             )
@@ -638,7 +664,10 @@ class AnthropicStreamDecoder:
 
     def envelope(self) -> AnthropicNativeEnvelope:
         if not self.stopped:
-            raise AnthropicTransportError("Anthropic stream ended before message_stop")
+            raise AnthropicTransportError(
+                "Anthropic stream ended before message_stop",
+                category=MidStreamErrorCategory.CONNECTION,
+            )
         if self.failed:
             raise AnthropicTransportError("Anthropic stream cannot succeed after an in-band error")
         blocks = tuple(self._ordered_blocks())
@@ -653,7 +682,11 @@ class AnthropicStreamDecoder:
             provider_fingerprint=self.provider_fingerprint,
             model_fingerprint=self.model_fingerprint,
             thinking_fingerprint=self.thinking_fingerprint,
-            continuation_status=AnthropicContinuationStatus.CONTINUABLE,
+            continuation_status=(
+                AnthropicContinuationStatus.NON_CONTINUABLE
+                if self.unbound_wire_names
+                else AnthropicContinuationStatus.CONTINUABLE
+            ),
         )
 
     def _ordered_blocks(self) -> list[dict[str, Any]]:
@@ -726,12 +759,18 @@ def _compat_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _binding_for_wire_name(bundle: CompiledAnthropicToolBundle, wire_name: str) -> Any:
+def _optional_binding_for_wire_name(bundle: CompiledAnthropicToolBundle, wire_name: str) -> Any:
+    """Return the frozen binding for a wire name, or ``None`` when unbound.
+
+    ``CompiledAnthropicToolBundle`` already enforces unique wire names, so a
+    missing match is the only possible failure. An unbound name means the model
+    named a tool outside the frozen bundle, which is correctable model output
+    rather than a protocol violation.
+    """
+
     matches = [binding for binding in bundle.bindings if binding.wire_name == wire_name]
-    if len(matches) != 1:
-        raise AnthropicTransportError(
-            "Anthropic tool_use references an unknown or ambiguous wire tool name"
-        )
+    if not matches:
+        return None
     binding = matches[0]
     if not all((binding.wire_name, binding.canonical_name, binding.stable_id)):
         raise AnthropicTransportError("Anthropic tool binding is incomplete")
@@ -745,6 +784,25 @@ def _decode_argument_aliases(value: Any, aliases: Mapping[str, Any]) -> Any:
         raise AnthropicTransportError(
             "Anthropic argument aliases are invalid or ambiguous"
         ) from exc
+
+
+def _unbound_tool_chunk(index: int, block: Mapping[str, Any], wire_name: str) -> dict[str, Any]:
+    """Project an unbound client tool call into a rejectable synthetic call.
+
+    The raw name is untrusted model output. It is echoed only as an argument so
+    the agent loop can report it, and is never resolved against the registry.
+    """
+
+    return _tool_chunk(
+        index,
+        block,
+        json.dumps(
+            {UNBOUND_ANTHROPIC_TOOL_ARGUMENT: wire_name},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        canonical_name=UNBOUND_ANTHROPIC_TOOL_NAME,
+    )
 
 
 def _tool_chunk(
@@ -775,11 +833,13 @@ class AnthropicMessagesClient:
         timeout: float = 120.0,
         http_client: Any | None = None,
         close_http_client: bool = False,
+        on_response_headers: Callable[[Mapping[str, str]], None] | None = None,
     ) -> None:
         self._credential_resolver = credential_resolver
         self._timeout = timeout
         self._http_client = http_client
         self._close_http_client = close_http_client
+        self._on_response_headers = on_response_headers
 
     async def complete(
         self,
@@ -875,6 +935,10 @@ class AnthropicMessagesClient:
                 "POST", _request_endpoint(context), headers=headers, json=payload
             )
             response = await client.send(http_request, stream=True)
+            if self._on_response_headers is not None:
+                # Rate-limit headers are non-secret and arrive on every
+                # response, including 429s, so report them before raising.
+                self._on_response_headers(dict(response.headers))
             if response.status_code >= 400:
                 body: dict[str, Any] = {}
                 try:
@@ -915,6 +979,7 @@ def _envelope_from_message(
     content = message.get("content")
     if not isinstance(content, list) or not all(isinstance(block, Mapping) for block in content):
         raise AnthropicTransportError("Anthropic response has invalid content blocks")
+    unbound_wire_names: list[str] = []
     for block in content:
         if block.get("type") not in _REQUIRED_BLOCK_TYPES:
             raise AnthropicTransportError(
@@ -925,7 +990,8 @@ def _envelope_from_message(
             input_value = block.get("input")
             if not isinstance(name, str) or not isinstance(input_value, Mapping):
                 raise AnthropicTransportError("Anthropic tool_use has incomplete binding or input")
-            _binding_for_wire_name(bundle, name)
+            if _optional_binding_for_wire_name(bundle, name) is None:
+                unbound_wire_names.append(name)
         elif block.get("type") == "server_tool_use":
             name = block.get("name")
             if not isinstance(name, str) or not any(
@@ -954,6 +1020,11 @@ def _envelope_from_message(
         provider_fingerprint=provider_fingerprint,
         model_fingerprint=model_fingerprint,
         thinking_fingerprint=thinking_fingerprint,
+        continuation_status=(
+            AnthropicContinuationStatus.NON_CONTINUABLE
+            if unbound_wire_names
+            else AnthropicContinuationStatus.CONTINUABLE
+        ),
     )
     seen_server_result_ids: set[str] = set()
     for block in envelope.native_blocks:
@@ -979,10 +1050,27 @@ def _chat_response(
     for block in envelope.native_blocks:
         if block.get("type") != "tool_use":
             continue
-        binding = _binding_for_wire_name(bundle, str(block["name"]))
+        wire_name = str(block["name"])
+        binding = _optional_binding_for_wire_name(bundle, wire_name)
         input_value = block.get("input")
         if not isinstance(input_value, Mapping):
             raise AnthropicTransportError("Anthropic tool_use input must be an object")
+        if binding is None:
+            tool_calls.append(
+                {
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {
+                        "name": UNBOUND_ANTHROPIC_TOOL_NAME,
+                        "arguments": json.dumps(
+                            {UNBOUND_ANTHROPIC_TOOL_ARGUMENT: wire_name},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                }
+            )
+            continue
         tool_calls.append(
             {
                 "id": block["id"],

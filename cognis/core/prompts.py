@@ -117,7 +117,8 @@ _TOOL_GUIDANCE_TEMPLATE = """\
 - Use the most direct tool for the operation.
 - For file/code inspection, prefer dedicated tools: `read` for file contents, \
   `grep` for content search, `glob` for path discovery, and `list_directory` \
-  for directory listings.
+  for directory listings. When `lsp` is visible and the question is about \
+  definitions, references, callers, or code structure, use it before `grep`.
 - Use `bash` only when shell execution itself is needed: git, \
   build/test/package-manager commands, process control, permissions, background \
   processes, or atomic filesystem operations.

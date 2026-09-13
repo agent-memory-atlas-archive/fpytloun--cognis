@@ -1185,6 +1185,72 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
 
 
 @pytest.mark.asyncio
+async def test_session_cache_calibrates_latest_compatible_prompt_estimate() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    assert cache.apply_prompt_token_calibration(
+        session.session_id,
+        raw_prompt_tokens=1_000,
+        provider_id="anthropic",
+        model="claude-opus-5",
+        estimator_identity="litellm:1.82.6:anthropic:litellm_native:v1",
+    ) == (1_000, None)
+
+    calibration = cache.update_prompt_token_calibration(
+        session.session_id,
+        provider_id="anthropic",
+        model="claude-opus-5",
+        estimator_identity="litellm:1.82.6:anthropic:litellm_native:v1",
+        raw_prompt_tokens=1_000,
+        actual_prompt_tokens=1_560,
+        source_request_id="llmr_123",
+    )
+
+    assert calibration is not None
+    assert calibration["observed_ratio"] == 1.56
+    assert (
+        cache.apply_prompt_token_calibration(
+            session.session_id,
+            raw_prompt_tokens=2_000,
+            provider_id="anthropic",
+            model="claude-opus-5",
+            estimator_identity="litellm:1.82.6:anthropic:litellm_native:v1",
+        )[0]
+        == 3_120
+    )
+    assert cache.apply_prompt_token_calibration(
+        session.session_id,
+        raw_prompt_tokens=2_000,
+        provider_id="codex",
+        model="gpt-5.6-sol",
+        estimator_identity="litellm:1.82.6:openai:tiktoken:v1",
+    ) == (2_000, None)
+
+    cache.update_prompt_token_calibration(
+        session.session_id,
+        provider_id="codex",
+        model="gpt-5.6-sol",
+        estimator_identity="litellm:1.82.6:openai:tiktoken:v1",
+        raw_prompt_tokens=1_100,
+        actual_prompt_tokens=1_000,
+        source_request_id="llmr_456",
+    )
+    calibrated, latest = cache.apply_prompt_token_calibration(
+        session.session_id,
+        raw_prompt_tokens=2_000,
+        provider_id="codex",
+        model="gpt-5.6-sol",
+        estimator_identity="litellm:1.82.6:openai:tiktoken:v1",
+    )
+    assert calibrated == 2_000
+    assert latest is not None
+    assert latest["observed_ratio"] < 1
+    assert latest["applied_ratio"] == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_diagnostics_write_through_and_hydrate_from_redis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1228,6 +1294,15 @@ async def test_runtime_diagnostics_write_through_and_hydrate_from_redis(
         session.session_id,
         {"prompt_tokens": 1_500, "completion_tokens": 200, "total_tokens": 1_700},
     )
+    writer.update_prompt_token_calibration(
+        session.session_id,
+        provider_id="proxy",
+        model="gpt-5.6-luna",
+        estimator_identity="litellm:1.82.6:openai:litellm_native:v1",
+        raw_prompt_tokens=1_000,
+        actual_prompt_tokens=1_500,
+        source_request_id="llmr_cross_replica",
+    )
     await writer.persist_runtime_metadata(session.session_id)
 
     assert redis_eval.await_count == 3
@@ -1245,6 +1320,16 @@ async def test_runtime_diagnostics_write_through_and_hydrate_from_redis(
     assert usage["max_context_tokens"] == 8_000
     assert usage["model"] == "gpt-5.6-luna"
     assert usage["last_llm_usage"]["total_tokens"] == 1_700
+    calibrated, calibration = reader.apply_prompt_token_calibration(
+        session.session_id,
+        raw_prompt_tokens=2_000,
+        provider_id="proxy",
+        model="gpt-5.6-luna",
+        estimator_identity="litellm:1.82.6:openai:litellm_native:v1",
+    )
+    assert calibrated == 3_000
+    assert calibration is not None
+    assert calibration["source_request_id"] == "llmr_cross_replica"
 
 
 @pytest.mark.asyncio

@@ -1613,6 +1613,7 @@ class ExecutorRunner:
                 "lsp_diagnostics_timeout_ms": effective_lsp_config.diagnostics_timeout_ms,
                 "lsp_idle_timeout_seconds": effective_lsp_config.idle_timeout_seconds,
                 "lsp_max_concurrent_servers": effective_lsp_config.max_concurrent_servers,
+                "lsp_python_type_diagnostics": effective_lsp_config.python_type_diagnostics,
                 "web_backend": web_config_raw.get("web_backend", "direct"),
                 "web_search_backend": web_config_raw.get("web_search_backend", "direct"),
                 "web_fetch_backend": web_config_raw.get("web_fetch_backend", "direct"),

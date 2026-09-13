@@ -19,6 +19,8 @@ import asyncio
 import contextlib
 import os
 import shutil
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Any
@@ -26,8 +28,22 @@ from typing import Any
 from prometheus_client import Counter, Gauge, Histogram
 
 from cognis.logging import get_logger
-from cognis.tools.executor.lsp.client import LSPClient, file_uri, uri_to_path
+from cognis.tools.executor.lsp.client import (
+    MAX_RESPONSE_ITEMS,
+    BoundedResultList,
+    LSPClient,
+    _normalize_lsp_result_list,
+    file_uri,
+    uri_to_path,
+)
+from cognis.tools.executor.lsp.hierarchy import (
+    Direction,
+    HierarchyLimits,
+    HierarchyResult,
+    traverse_call_hierarchy,
+)
 from cognis.tools.executor.lsp.install import get_cache_dir, resolve_command
+from cognis.tools.executor.lsp.query import QueryOutcome, QueryStatus
 from cognis.tools.executor.lsp.servers import LSPServerDefinition, get_servers_for_extension
 from cognis.tools.executor.lsp.types import (
     Diagnostic,
@@ -86,6 +102,33 @@ _BROKEN_RETRY_SECONDS = 300.0
 _SCRATCH_ROOTS = ("/tmp", "/var/tmp")
 _SCRATCH_DISABLED_SERVERS = frozenset({"pyright"})
 
+# After spawning a server, the first explicit query waits briefly for the
+# server's project-loading progress so it is not answered from a partial
+# program.  Servers that report no progress cost only the grace period once.
+_COLD_START_PROGRESS_GRACE_S = 0.3
+_COLD_START_PROGRESS_TIMEOUT_S = 8.0
+
+# Server responses are untrusted; the client inspects a bounded prefix and
+# the manager reports truncation from the raw length (see MAX_RESPONSE_ITEMS).
+_MAX_RESPONSE_ITEMS = MAX_RESPONSE_ITEMS
+
+# Explicit query requests are bounded separately from diagnostics waits.
+_DEFAULT_QUERY_TIMEOUT_S = 8.0
+
+# Bound on cached document symbol answers (one entry per absolute path).
+SYMBOL_CACHE_MAX_ENTRIES = 512
+
+
+@dataclass(slots=True, frozen=True)
+class PreparedClient:
+    """A live client with the target document synchronized."""
+
+    client: LSPClient
+    client_key: str
+    uri: str
+    language_id: str
+    version: int
+
 
 class LSPManager:
     """Manages LSP client lifecycle, file routing, and diagnostics aggregation."""
@@ -99,12 +142,14 @@ class LSPManager:
         idle_timeout_seconds: int = 600,
         max_concurrent_servers: int = 8,
         cache_dir: Path | None = None,
+        python_type_diagnostics: bool = False,
     ) -> None:
         self.enabled = enabled
         self.auto_install = auto_install
         self.diagnostics_timeout_ms = diagnostics_timeout_ms
         self.idle_timeout_seconds = idle_timeout_seconds
         self.max_concurrent_servers = max_concurrent_servers
+        self.python_type_diagnostics = python_type_diagnostics
         self.cache_dir = cache_dir or get_cache_dir()
 
         # Active clients keyed by "{server_id}:{root_path}"
@@ -116,6 +161,10 @@ class LSPManager:
         # Dedup concurrent spawns
         self._spawning: dict[str, asyncio.Task[LSPClient | None]] = {}
 
+        # Clients spawned by a query path that have not yet had their
+        # cold-start progress wait.
+        self._cold_clients: set[str] = set()
+
         # File version tracking for didChange, per client and URI.
         self._file_versions: dict[tuple[str, str], int] = {}
 
@@ -124,6 +173,10 @@ class LSPManager:
 
         # Last access time per client for idle timeout
         self._last_access: dict[str, float] = {}
+
+        # Document symbol cache keyed by absolute path; value carries the
+        # on-disk freshness key the outcomes were computed for.
+        self._symbol_cache: dict[str, tuple[tuple[int, int], list[QueryOutcome]]] = {}
 
         # Background idle check task
         self._idle_check_task: asyncio.Task[None] | None = None
@@ -155,20 +208,94 @@ class LSPManager:
         if not self.enabled:
             return DiagnosticCollection()
 
+        prepared = await self._sync_file(file_path, purpose=purpose, wait_spawn=wait, save=save)
+        if not wait:
+            return DiagnosticCollection()
+
+        # Wait for diagnostics from all notified clients concurrently
+        wait_results: list[DiagnosticWaitResult] = []
+        if prepared:
+            results = await asyncio.gather(
+                *(self._wait_client_diagnostics(p.client, p.uri, p.version) for p in prepared),
+                return_exceptions=True,
+            )
+            wait_results = [
+                result for result in results if isinstance(result, DiagnosticWaitResult)
+            ]
+        snapshots_by_path: dict[str, list[DiagnosticSnapshot]] = {}
+        for wait_result in wait_results:
+            if wait_result.snapshot is None:
+                continue
+            path = uri_to_path(wait_result.snapshot.uri)
+            snapshots_by_path.setdefault(path, []).append(wait_result.snapshot)
+        return DiagnosticCollection(
+            waits=wait_results,
+            snapshots_by_path=snapshots_by_path,
+        )
+
+    async def prepare_file(self, file_path: str) -> list[PreparedClient]:
+        """Prepare semantic clients for a file without waiting for diagnostics.
+
+        Spawns or reuses every semantic server for the file extension, waits
+        for initialization, and synchronizes the current document text.
+        Diagnostics are not awaited: explicit queries only need the server
+        to know the latest document version.
+        """
+        if not self.enabled:
+            return []
+        prepared = await self._sync_file(file_path, purpose="semantic", wait_spawn=True, save=False)
+        # A freshly spawned server may still be loading its project (tsserver
+        # answers from an inferred single-file project until then).  Wait
+        # once, bounded, for its work-done progress to settle.
+        for entry in prepared:
+            if entry.client_key not in self._cold_clients:
+                continue
+            # Concurrent first queries all wait; the key is released afterwards.
+            idle = await entry.client.wait_for_progress_idle(
+                grace_s=_COLD_START_PROGRESS_GRACE_S, timeout_s=_COLD_START_PROGRESS_TIMEOUT_S
+            )
+            self._cold_clients.discard(entry.client_key)
+            if not idle:
+                logger.info(
+                    "lsp: server still loading after cold-start wait",
+                    extra={"extra_data": {"server_id": entry.client.server_id}},
+                )
+        return prepared
+
+    async def _sync_file(
+        self,
+        file_path: str,
+        *,
+        purpose: str,
+        wait_spawn: bool,
+        save: bool,
+    ) -> list[PreparedClient]:
+        """Route a file to its servers and send didOpen/didChange.
+
+        Returns the clients that received the notification.  Servers that
+        are broken, over the concurrency limit, or still spawning when
+        ``wait_spawn`` is False are skipped.
+        """
         abs_path = os.path.abspath(file_path)
         ext = os.path.splitext(abs_path)[1].lower()
         if not ext:
-            return DiagnosticCollection()
+            return []
+        if purpose == "diagnostics":
+            # An edit went through: cached structure for this file is stale
+            # even if the on-disk freshness key happens to collide.
+            self._symbol_cache.pop(abs_path, None)
 
         servers = get_servers_for_extension(
-            ext, purpose="diagnostics" if purpose == "diagnostics" else "semantic"
+            ext,
+            purpose="diagnostics" if purpose == "diagnostics" else "semantic",
+            python_type_diagnostics=self.python_type_diagnostics,
         )
         if not servers:
             logger.debug(
                 "lsp: no server for extension",
                 extra={"extra_data": {"extension": ext}},
             )
-            return DiagnosticCollection()
+            return []
 
         # Start idle check task if not running
         if self._idle_check_task is None or self._idle_check_task.done():
@@ -176,7 +303,7 @@ class LSPManager:
                 self._idle_check_loop(), name="lsp-idle-check"
             )
 
-        clients_to_wait: list[tuple[LSPClient, str, int | None]] = []
+        prepared: list[PreparedClient] = []
 
         for server_def in servers:
             root_path = _find_project_root(abs_path, server_def.root_markers)
@@ -243,7 +370,7 @@ class LSPManager:
                     )
                     self._spawning[client_key] = spawn_task
 
-                if wait:
+                if wait_spawn:
                     try:
                         client = await asyncio.wait_for(spawn_task, timeout=15.0)
                     except (TimeoutError, Exception):
@@ -287,29 +414,17 @@ class LSPManager:
                 LSP_ERRORS_TOTAL.labels(error_type="notification").inc()
                 continue
 
-            if wait:
-                clients_to_wait.append((client, uri, version))
-
-        # Wait for diagnostics from all notified clients concurrently
-        wait_results: list[DiagnosticWaitResult] = []
-        if clients_to_wait:
-            results = await asyncio.gather(
-                *(self._wait_client_diagnostics(c, u, v) for c, u, v in clients_to_wait),
-                return_exceptions=True,
+            prepared.append(
+                PreparedClient(
+                    client=client,
+                    client_key=client_key,
+                    uri=uri,
+                    language_id=language_id,
+                    version=version,
+                )
             )
-            wait_results = [
-                result for result in results if isinstance(result, DiagnosticWaitResult)
-            ]
-        snapshots_by_path: dict[str, list[DiagnosticSnapshot]] = {}
-        for wait_result in wait_results:
-            if wait_result.snapshot is None:
-                continue
-            path = uri_to_path(wait_result.snapshot.uri)
-            snapshots_by_path.setdefault(path, []).append(wait_result.snapshot)
-        return DiagnosticCollection(
-            waits=wait_results,
-            snapshots_by_path=snapshots_by_path,
-        )
+
+        return prepared
 
     async def _wait_client_diagnostics(
         self, client: LSPClient, uri: str, target_version: int | None
@@ -558,59 +673,258 @@ class LSPManager:
         return results
 
     async def has_clients(self, file_path: str) -> bool:
-        """Return whether any active or spawnable client exists for a file."""
+        """Return whether any active or spawnable semantic server exists for a file.
 
-        return bool(await self._clients_for_file(file_path, wait=False))
+        This checks server definitions and scratch-path policy only; it does
+        not spawn, and it does not consult the broken-server backoff because
+        callers use it to decide whether an LSP attempt is meaningful at all.
+        """
+        if not self.enabled:
+            return False
+        abs_path = os.path.abspath(file_path)
+        ext = os.path.splitext(abs_path)[1].lower()
+        if not ext:
+            return False
+        for server_def in get_servers_for_extension(ext, purpose="semantic"):
+            root_path = _find_project_root(abs_path, server_def.root_markers)
+            if not _should_skip_server_for_path(server_def.server_id, abs_path, root_path):
+                return True
+        return False
 
-    async def definition(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+    async def query(
+        self,
+        prepared: list[PreparedClient],
+        method: str,
+        invoke: Callable[[LSPClient], Awaitable[Any]],
+        *,
+        timeout_s: float = _DEFAULT_QUERY_TIMEOUT_S,
+    ) -> list[QueryOutcome]:
+        """Run one request against every prepared client with capability gating.
+
+        ``invoke`` receives a client and performs the actual request.  Each
+        server produces exactly one :class:`QueryOutcome`; clients that did
+        not negotiate ``method`` are reported as unsupported without a call.
+        """
+        if not prepared:
+            return []
+
+        async def run(entry: PreparedClient) -> QueryOutcome:
+            client = entry.client
+            if not client.supports(method, uri=entry.uri, language_id=entry.language_id):
+                return QueryOutcome(
+                    server_id=client.server_id,
+                    status=QueryStatus.UNSUPPORTED,
+                    message="method not negotiated",
+                )
+            start = perf_counter()
+            try:
+                result = await asyncio.wait_for(invoke(client), timeout=timeout_s)
+            except TimeoutError:
+                return QueryOutcome(
+                    server_id=client.server_id,
+                    status=QueryStatus.TIMEOUT,
+                    duration_ms=int((perf_counter() - start) * 1000),
+                    message=f"no response within {timeout_s:g}s",
+                )
+            except Exception:
+                LSP_ERRORS_TOTAL.labels(error_type="query").inc()
+                logger.debug(
+                    "lsp: query failed",
+                    extra={"extra_data": {"server_id": client.server_id, "method": method}},
+                    exc_info=True,
+                )
+                return QueryOutcome(
+                    server_id=client.server_id,
+                    status=QueryStatus.FAILED,
+                    duration_ms=int((perf_counter() - start) * 1000),
+                    message="request failed" if client.is_alive else "server exited",
+                )
+            duration_ms = int((perf_counter() - start) * 1000)
+            items = _as_item_list(result)
+            # Truncation is decided on the raw reply length, carried by the
+            # client normalization, so a malformed entry cannot mask it.
+            if items.truncated or len(items) > _MAX_RESPONSE_ITEMS:
+                return QueryOutcome(
+                    server_id=client.server_id,
+                    status=QueryStatus.PARTIAL,
+                    items=items[:_MAX_RESPONSE_ITEMS],
+                    duration_ms=duration_ms,
+                    message=f"response truncated to {_MAX_RESPONSE_ITEMS} items",
+                )
+            return QueryOutcome(
+                server_id=client.server_id,
+                status=QueryStatus.OK if items else QueryStatus.EMPTY,
+                items=items,
+                duration_ms=duration_ms,
+            )
+
+        outcomes = await asyncio.gather(*(run(entry) for entry in prepared))
+        for entry in prepared:
+            self._last_access[entry.client_key] = monotonic()
+        return list(outcomes)
+
+    async def definition(self, file_path: str, line: int, character: int) -> list[QueryOutcome]:
         """Return LSP definitions for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        return await self._fanout_query(clients, "definition", file_path, line, character)
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/definition",
+            lambda client: client.definition(file_path, line, character),
+        )
 
-    async def references(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+    async def references(self, file_path: str, line: int, character: int) -> list[QueryOutcome]:
         """Return LSP references for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        return await self._fanout_query(clients, "references", file_path, line, character)
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/references",
+            lambda client: client.references(file_path, line, character),
+        )
 
-    async def hover(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
+    async def hover(self, file_path: str, line: int, character: int) -> list[QueryOutcome]:
         """Return hover information for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        results = await asyncio.gather(
-            *(client.hover(file_path, line, character) for client in clients),
-            return_exceptions=True,
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/hover",
+            lambda client: client.hover(file_path, line, character),
         )
-        return [result for result in results if isinstance(result, dict)]
 
-    async def document_symbol(self, file_path: str) -> list[dict[str, Any]]:
+    async def document_symbol(self, file_path: str) -> list[QueryOutcome]:
         """Return document symbols for a file."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        results = await asyncio.gather(
-            *(client.document_symbol(file_path) for client in clients),
-            return_exceptions=True,
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/documentSymbol",
+            lambda client: client.document_symbol(file_path),
         )
-        return [item for result in results if isinstance(result, list) for item in result]
 
-    async def workspace_symbol(self, file_path: str, query: str) -> list[dict[str, Any]]:
+    async def document_symbol_cached(self, file_path: str) -> tuple[list[QueryOutcome], bool]:
+        """Return document symbols, reusing a cached answer while the file is unchanged.
+
+        The freshness key is ``(mtime_ns, size)`` of the file on disk; any
+        edit through the executor also evicts the entry.  Answers with a
+        transient failure (timeout, failed, partial) are not cached so they
+        are retried on the next call; ``unsupported`` is a stable per-server
+        fact and does not block caching.  Returns the
+        outcomes and whether they came from the cache.
+        """
+        abs_path = os.path.abspath(file_path)
+        try:
+            stat = os.stat(abs_path)
+        except OSError:
+            return await self.document_symbol(abs_path), False
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._symbol_cache.get(abs_path)
+        if cached is not None and cached[0] == key:
+            return cached[1], True
+        outcomes = await self.document_symbol(abs_path)
+        if outcomes and all(
+            outcome.status in (QueryStatus.OK, QueryStatus.EMPTY, QueryStatus.UNSUPPORTED)
+            for outcome in outcomes
+        ):
+            if len(self._symbol_cache) >= SYMBOL_CACHE_MAX_ENTRIES:
+                oldest = next(iter(self._symbol_cache))
+                del self._symbol_cache[oldest]
+            self._symbol_cache[abs_path] = (key, outcomes)
+        return outcomes, False
+
+    async def workspace_symbol(self, file_path: str, query: str) -> list[QueryOutcome]:
         """Return workspace symbols from relevant clients."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        results = await asyncio.gather(
-            *(client.workspace_symbol(query) for client in clients),
-            return_exceptions=True,
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "workspace/symbol",
+            lambda client: client.workspace_symbol(query),
         )
-        return [item for result in results if isinstance(result, list) for item in result]
 
-    async def implementation(
-        self, file_path: str, line: int, character: int
-    ) -> list[dict[str, Any]]:
+    async def implementation(self, file_path: str, line: int, character: int) -> list[QueryOutcome]:
         """Return implementations for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
-        return await self._fanout_query(clients, "implementation", file_path, line, character)
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/implementation",
+            lambda client: client.implementation(file_path, line, character),
+        )
+
+    async def type_definition(
+        self, file_path: str, line: int, character: int
+    ) -> list[QueryOutcome]:
+        """Return type definitions for a file position."""
+
+        prepared = await self.prepare_file(file_path)
+        return await self.query(
+            prepared,
+            "textDocument/typeDefinition",
+            lambda client: client.type_definition(file_path, line, character),
+        )
+
+    async def call_hierarchy(
+        self,
+        file_path: str,
+        line: int,
+        character: int,
+        *,
+        direction: Direction,
+        limits: HierarchyLimits | None = None,
+        cwd: str | None = None,
+    ) -> tuple[list[QueryOutcome], HierarchyResult | None]:
+        """Run a bounded call hierarchy traversal on one capable server.
+
+        The first prepared client that negotiated call hierarchy owns the
+        whole traversal; other servers are reported as unsupported.  Items
+        are never routed across clients.
+        """
+        prepared = await self.prepare_file(file_path)
+        outcomes: list[QueryOutcome] = []
+        chosen: PreparedClient | None = None
+        for entry in prepared:
+            if chosen is None and entry.client.supports(
+                "textDocument/prepareCallHierarchy",
+                uri=entry.uri,
+                language_id=entry.language_id,
+            ):
+                chosen = entry
+                continue
+            outcomes.append(
+                QueryOutcome(
+                    server_id=entry.client.server_id,
+                    status=QueryStatus.UNSUPPORTED,
+                    message="method not negotiated",
+                )
+            )
+        if chosen is None:
+            return outcomes, None
+
+        result = await traverse_call_hierarchy(
+            chosen.client,
+            file_path,
+            line,
+            character,
+            direction=direction,
+            limits=limits or HierarchyLimits(),
+            cwd=cwd,
+        )
+        self._last_access[chosen.client_key] = monotonic()
+        if result.status is QueryStatus.FAILED:
+            LSP_ERRORS_TOTAL.labels(error_type="query").inc()
+        outcomes.insert(
+            0,
+            QueryOutcome(
+                server_id=chosen.client.server_id,
+                status=result.status,
+                items=[root.to_metadata() for root in result.roots],
+                duration_ms=result.duration_ms,
+                message=result.stop_reason,
+            ),
+        )
+        return outcomes, result
 
     async def cleanup(self) -> None:
         """Shutdown all LSP clients and cancel background tasks."""
@@ -654,61 +968,6 @@ class LSPManager:
                 }
             },
         )
-
-    async def _clients_for_file(
-        self, file_path: str, *, wait: bool, purpose: str = "semantic"
-    ) -> list[LSPClient]:
-        abs_path = os.path.abspath(file_path)
-        ext = os.path.splitext(abs_path)[1].lower()
-        if not ext:
-            return []
-        servers = get_servers_for_extension(
-            ext, purpose="diagnostics" if purpose == "diagnostics" else "semantic"
-        )
-        if not servers:
-            return []
-        clients: list[LSPClient] = []
-        for server_def in servers:
-            root_path = _find_project_root(abs_path, server_def.root_markers)
-            client_key = f"{server_def.server_id}:{root_path}"
-            if _should_skip_server_for_path(server_def.server_id, abs_path, root_path):
-                continue
-            client = self._clients.get(client_key)
-            if client is None or not client.is_alive:
-                if not wait:
-                    continue
-                client = await self._spawn_or_reuse_client(server_def, root_path, client_key)
-            if client is not None:
-                self._last_access[client_key] = monotonic()
-                clients.append(client)
-        return clients
-
-    async def _spawn_or_reuse_client(
-        self, server_def: LSPServerDefinition, root_path: str, client_key: str
-    ) -> LSPClient | None:
-        if client_key in self._spawning:
-            spawn_task = self._spawning[client_key]
-        else:
-            spawn_task = asyncio.create_task(self._spawn_client(server_def, root_path, client_key))
-            self._spawning[client_key] = spawn_task
-        try:
-            return await asyncio.wait_for(spawn_task, timeout=15.0)
-        except (TimeoutError, Exception):
-            return None
-
-    async def _fanout_query(
-        self,
-        clients: list[LSPClient],
-        method_name: str,
-        file_path: str,
-        line: int,
-        character: int,
-    ) -> list[dict[str, Any]]:
-        results = await asyncio.gather(
-            *(getattr(client, method_name)(file_path, line, character) for client in clients),
-            return_exceptions=True,
-        )
-        return [item for result in results if isinstance(result, list) for item in result]
 
     # ------------------------------------------------------------------
     # Internal
@@ -786,10 +1045,21 @@ class LSPManager:
                 init_options=server_def.initialization_options_for(root_path),
                 workspace_configuration=server_def.workspace_configuration_for(root_path),
             )
-            await client.start()
+            try:
+                await client.start()
+            except asyncio.CancelledError:
+                # A caller deadline (outline, tool timeout) cancelled the
+                # spawn mid-handshake: the process exists but is not yet
+                # registered, so nothing else would ever close it.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(client.close())
+                raise
 
-            # Register client
+            # Register client.  Whichever path spawned it (a non-waiting read
+            # warm-up included), the first explicit query must wait for
+            # project loading.
             self._clients[client_key] = client
+            self._cold_clients.add(client_key)
             self._last_access[client_key] = monotonic()
             LSP_ACTIVE_SERVERS.inc()
 
@@ -847,6 +1117,10 @@ class LSPManager:
         client = self._clients.pop(client_key, None)
         self._opened_files.pop(client_key, None)
         self._last_access.pop(client_key, None)
+        self._cold_clients.discard(client_key)
+        # Cached outlines carry this client's provenance; drop them so the
+        # replacement server is consulted instead of a stale answer.
+        self._symbol_cache.clear()
         if client is not None:
             LSP_ACTIVE_SERVERS.dec()
             with contextlib.suppress(Exception):
@@ -879,6 +1153,19 @@ class LSPManager:
                     await self._remove_client(key)
         except asyncio.CancelledError:
             raise
+
+
+def _as_item_list(result: Any) -> BoundedResultList:
+    """Normalize a query result to a bounded list of items.
+
+    Client query methods already return a ``BoundedResultList`` carrying the
+    raw truncation flag; it is passed through unchanged.  Other lists are
+    normalized here.  A single dict (for example a ``Hover``) becomes a
+    one-item list.  ``None`` and scalars yield no items.
+    """
+    if isinstance(result, BoundedResultList):
+        return result
+    return _normalize_lsp_result_list(result if isinstance(result, (list, dict)) else None)
 
 
 def _find_project_root(file_path: str, root_markers: tuple[str, ...]) -> str:

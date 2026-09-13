@@ -16,13 +16,18 @@ from PIL import Image, UnidentifiedImageError
 
 from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.artifact import ArtifactKind, ArtifactStatus
+from cognis.providers.llm.errors import MidStreamErrorCategory
 from cognis.store.queries import get_artifact_records
 
 MAX_CODEX_IMAGE_DIMENSION = 2048
 MAX_CODEX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_CODEX_ENCODED_IMAGE_BYTES = 28 * 1024 * 1024
 DEFAULT_CODEX_IMAGE_CACHE_BYTES = 64 * 1024 * 1024
+# Still-image formats direct Codex accepts on the wire. Anything else that
+# Pillow can decode is converted to _CONVERSION_FORMAT instead of rejected.
 _SUPPORTED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+_CONVERSION_FORMAT = "PNG"
+_PNG_SAFE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA"})
 _FORMAT_MIME_TYPES = {
     "JPEG": "image/jpeg",
     "PNG": "image/png",
@@ -31,20 +36,20 @@ _FORMAT_MIME_TYPES = {
 
 
 class CodexArtifactError(ValueError):
-    """An image artifact cannot be safely sent to direct Codex."""
+    """An image artifact cannot be safely sent to direct Codex.
 
-    def __init__(self, message: str, *, artifact_ids: list[str] | None = None) -> None:
-        self.artifact_ids = list(artifact_ids or [])
-        super().__init__(message)
+    Per-artifact problems are handled by degrading that attachment, so this
+    error only escapes materialization for a deterministic request-level
+    precondition. Replaying the identical request cannot fix it.
+    """
 
     def to_payload(self) -> dict[str, Any]:
-        """Return a safe attachment failure for agent-loop recovery."""
+        """Return a safe, non-retryable failure payload for agent-loop recovery."""
 
         return {
-            "category": "attachment_input",
+            "category": MidStreamErrorCategory.INVALID_REQUEST.value,
             "code": type(self).__name__,
             "message": str(self),
-            "artifact_ids": self.artifact_ids,
         }
 
 
@@ -122,33 +127,33 @@ async def materialize_codex_artifact_images(
                 records[record.artifact_id] = record
 
     data_urls: dict[str, str] = {}
+    # Artifacts that cannot be sent, mapped to a short model-facing reason.
+    # Materialization degrades per artifact: one unreadable image must not
+    # fail a whole request, because the identical retry would fail again.
+    undeliverable: dict[str, str] = {}
     encoded_total = 0
     now = datetime.now(UTC)
     for artifact_id in sorted(artifact_ids):
         selected_record: Any | None = records.get(artifact_id)
         if not _record_is_available(selected_record, now=now):
-            raise CodexArtifactError(
-                f"Image artifact is unavailable: {artifact_id}", artifact_ids=[artifact_id]
-            )
+            undeliverable[artifact_id] = "it is unavailable"
+            continue
         assert selected_record is not None
         if selected_record.kind != ArtifactKind.IMAGE:
-            raise CodexArtifactError(
-                f"Artifact is not an image: {artifact_id}", artifact_ids=[artifact_id]
-            )
+            undeliverable[artifact_id] = "it is not an image"
+            continue
         if selected_record.size_bytes > MAX_CODEX_IMAGE_BYTES:
-            raise CodexArtifactError(
-                f"Image artifact is too large: {artifact_id}", artifact_ids=[artifact_id]
-            )
+            undeliverable[artifact_id] = "it is too large"
+            continue
         try:
             content, _stored_type = await artifact_store.async_load(
                 selected_record.namespace,
                 selected_record.object_id,
                 selected_record.filename,
             )
-        except Exception as exc:
-            raise CodexArtifactError(
-                f"Image artifact is unavailable: {artifact_id}", artifact_ids=[artifact_id]
-            ) from exc
+        except Exception:
+            undeliverable[artifact_id] = "it is unavailable"
+            continue
         try:
             if normalization_cache is None:
                 data_url = await asyncio.to_thread(
@@ -161,13 +166,14 @@ async def materialize_codex_artifact_images(
                     content,
                     artifact_id=artifact_id,
                 )
-        except CodexArtifactError as exc:
-            if exc.artifact_ids:
-                raise
-            raise CodexArtifactError(str(exc), artifact_ids=[artifact_id]) from exc
-        encoded_total += len(data_url) * reference_counts[artifact_id]
-        if encoded_total > MAX_CODEX_ENCODED_IMAGE_BYTES:
-            raise CodexArtifactError("Encoded image payload exceeds the direct Codex limit")
+        except CodexArtifactError:
+            undeliverable[artifact_id] = "the provider cannot read this image"
+            continue
+        projected_total = encoded_total + len(data_url) * reference_counts[artifact_id]
+        if projected_total > MAX_CODEX_ENCODED_IMAGE_BYTES:
+            undeliverable[artifact_id] = "the request image payload limit was reached"
+            continue
+        encoded_total = projected_total
         data_urls[artifact_id] = data_url
 
     materialized = copy.deepcopy(messages)
@@ -175,19 +181,57 @@ async def materialize_codex_artifact_images(
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        for part in content:
-            if not isinstance(part, dict) or part.get("type") != "image_url":
-                continue
-            image_url = part.get("image_url")
-            if not isinstance(image_url, dict):
-                continue
-            metadata = image_url.pop("cognis_artifact", None)
-            if not isinstance(metadata, dict):
-                continue
-            metadata_artifact_id = metadata.get("artifact_id")
-            if isinstance(metadata_artifact_id, str) and metadata_artifact_id in data_urls:
-                image_url["url"] = data_urls[metadata_artifact_id]
+        message["content"] = _rewrite_image_parts(
+            content,
+            data_urls=data_urls,
+            undeliverable=undeliverable,
+        )
     return materialized
+
+
+def _rewrite_image_parts(
+    content: list[Any],
+    *,
+    data_urls: dict[str, str],
+    undeliverable: dict[str, str],
+) -> list[Any]:
+    """Replace artifact image parts with data URLs or a model-facing notice."""
+
+    rewritten: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            rewritten.append(part)
+            continue
+        image_url = part.get("image_url")
+        if not isinstance(image_url, dict):
+            rewritten.append(part)
+            continue
+        metadata = image_url.pop("cognis_artifact", None)
+        artifact_id = metadata.get("artifact_id") if isinstance(metadata, dict) else None
+        if not isinstance(artifact_id, str):
+            rewritten.append(part)
+            continue
+        if artifact_id in data_urls:
+            image_url["url"] = data_urls[artifact_id]
+            rewritten.append(part)
+            continue
+        reason = undeliverable.get(artifact_id)
+        if reason is None:
+            rewritten.append(part)
+            continue
+        filename = metadata.get("filename") if isinstance(metadata, dict) else None
+        label = filename if isinstance(filename, str) and filename else artifact_id
+        rewritten.append(
+            {
+                "type": "text",
+                "text": (
+                    f'[Image "{label}" (artifact_id="{artifact_id}") was not sent to the '
+                    f"model because {reason}. Use artifact_read with that artifact_id if "
+                    "its content matters.]"
+                ),
+            }
+        )
+    return rewritten
 
 
 def strip_cognis_artifact_metadata(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -249,24 +293,30 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
             with Image.open(io.BytesIO(content)) as image:
                 image.verify()
             with Image.open(io.BytesIO(content)) as image:
-                if image.format not in _SUPPORTED_FORMATS:
-                    raise CodexArtifactError(f"Unsupported image format: {artifact_id}")
-                if (
+                source_format = str(image.format or "")
+                animated = (
                     bool(getattr(image, "is_animated", False))
                     or int(getattr(image, "n_frames", 1)) != 1
-                ):
-                    raise CodexArtifactError(f"Animated image is not supported: {artifact_id}")
-                image.load()
-                target_format = image.format
-                if max(image.size) <= MAX_CODEX_IMAGE_DIMENSION:
-                    return content, _FORMAT_MIME_TYPES[target_format]
-                image.thumbnail(
-                    (MAX_CODEX_IMAGE_DIMENSION, MAX_CODEX_IMAGE_DIMENSION),
-                    Image.Resampling.LANCZOS,
                 )
+                image.load()
+                # Direct Codex accepts a narrow set of still formats. Convert
+                # anything else, including the first frame of an animation,
+                # rather than refusing an image the model could otherwise read.
+                needs_conversion = animated or source_format not in _SUPPORTED_FORMATS
+                target_format = _CONVERSION_FORMAT if needs_conversion else source_format
+                oversized = max(image.size) > MAX_CODEX_IMAGE_DIMENSION
+                if not needs_conversion and not oversized:
+                    return content, _FORMAT_MIME_TYPES[target_format]
                 normalized_image: Image.Image = image
-                if target_format == "JPEG" and image.mode not in {"RGB", "L"}:
-                    normalized_image = image.convert("RGB")
+                if oversized:
+                    normalized_image.thumbnail(
+                        (MAX_CODEX_IMAGE_DIMENSION, MAX_CODEX_IMAGE_DIMENSION),
+                        Image.Resampling.LANCZOS,
+                    )
+                if target_format == "JPEG" and normalized_image.mode not in {"RGB", "L"}:
+                    normalized_image = normalized_image.convert("RGB")
+                elif target_format == "PNG" and normalized_image.mode not in _PNG_SAFE_MODES:
+                    normalized_image = normalized_image.convert("RGBA")
                 output = io.BytesIO()
                 normalized_image.save(output, format=target_format)
                 return output.getvalue(), _FORMAT_MIME_TYPES[target_format]

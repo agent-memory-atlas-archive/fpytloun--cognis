@@ -1297,7 +1297,7 @@ def create_app(
         )
         app.state.cluster_signals = cluster_signals
         notification_service.cluster_signals = cluster_signals
-        task_queue.cluster_signals = cluster_signals  # type: ignore[attr-defined]
+        task_queue.cluster_signals = cluster_signals
         workflow_engine.cluster_signals = cluster_signals  # type: ignore[attr-defined]
         turn_scheduler.cluster_signals = cluster_signals  # type: ignore[attr-defined]
         executor_pin_notice_dispatcher.cluster_signals = cluster_signals  # type: ignore[attr-defined]
@@ -1741,7 +1741,7 @@ def create_app(
         await engine.dispose()
         controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.14.2", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.15.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths

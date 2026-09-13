@@ -30,6 +30,7 @@ from cognis.api.models import (
     ModelRoutingEntry,
     ModelRoutingResponse,
     ModelRoutingUpdateRequest,
+    ProviderUsageResponse,
     SettingResponse,
     SettingsCategoryResponse,
     SettingUpdateRequest,
@@ -1564,6 +1565,26 @@ async def llm_provider_codex_usage(request: Request, provider_id: str) -> CodexU
             502, "provider_error", f"Failed to fetch Codex usage: {exc!s}"[:300]
         ) from exc
     return CodexUsageResponse(provider_id=provider_id, **usage)
+
+
+@router.get("/api/v1/llm-providers/{provider_id}/usage", response_model=ProviderUsageResponse)
+async def llm_provider_usage(request: Request, provider_id: str) -> ProviderUsageResponse:
+    """Return hosted usage windows for any visible provider that reports them."""
+
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        provider = await get_visible_llm_provider(session, provider_id, user.email)
+    if provider is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    try:
+        usage = await request.app.state.providers.llm.get_provider_usage(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(
+            502, "provider_error", f"Failed to fetch provider usage: {exc!s}"[:300]
+        ) from exc
+    return ProviderUsageResponse(provider_id=provider_id, **usage)
 
 
 @router.post("/api/v1/llm-providers/discover-models-preview")

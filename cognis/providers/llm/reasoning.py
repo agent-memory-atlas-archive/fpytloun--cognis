@@ -15,11 +15,13 @@ _MIN_ANTHROPIC_MAX_TOKENS = 2048
 _ANTHROPIC_ADAPTIVE_MODEL_KEYS = frozenset(
     {
         "fable-5",
+        "fable-5-1",
         "mythos-5",
         "mythos-preview",
         "opus-4-6",
         "opus-4-7",
         "opus-4-8",
+        "opus-5",
         "sonnet-4-6",
         "sonnet-5",
     }
@@ -37,8 +39,10 @@ _ANTHROPIC_LEGACY_MODEL_KEYS = frozenset(
         "sonnet-4-5",
     }
 )
-_ANTHROPIC_ALWAYS_ON_MODEL_KEYS = frozenset({"fable-5", "mythos-5", "mythos-preview"})
-_ANTHROPIC_XHIGH_MODEL_KEYS = frozenset({"fable-5", "mythos-5", "opus-4-7", "opus-4-8", "sonnet-5"})
+_ANTHROPIC_ALWAYS_ON_MODEL_KEYS = frozenset({"fable-5", "fable-5-1", "mythos-5", "mythos-preview"})
+_ANTHROPIC_XHIGH_MODEL_KEYS = frozenset(
+    {"fable-5", "fable-5-1", "mythos-5", "opus-4-7", "opus-4-8", "opus-5", "sonnet-5"}
+)
 _THINKING_EFFORT_ORDER: tuple[str, ...] = (
     "none",
     "low",

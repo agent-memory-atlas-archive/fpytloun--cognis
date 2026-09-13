@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -87,6 +87,7 @@ class ModelInfo(BaseModel):
     supports_reasoning: bool = False
     supports_fast_mode: bool = False
     fast_mode_tier: str | None = None
+    fast_mode_parameter: Literal["speed", "service_tier"] | None = None
     supported_image_mime_types: list[str] = Field(default_factory=list)
     reasoning_efforts: list[str] = Field(default_factory=list)
     reasoning_summary_format: str | None = None

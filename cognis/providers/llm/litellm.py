@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
@@ -85,6 +86,18 @@ from cognis.providers.llm.anthropic_subscription import (
 from cognis.providers.llm.anthropic_subscription import (
     refresh_authorized_record as _refresh_anthropic_authorized_record,
 )
+from cognis.providers.llm.anthropic_usage import (
+    fetch_subscription_usage as _fetch_anthropic_subscription_usage,
+)
+from cognis.providers.llm.anthropic_usage import (
+    rate_limit_snapshot_from_headers as _anthropic_rate_limit_snapshot_from_headers,
+)
+from cognis.providers.llm.anthropic_usage import (
+    rate_limit_usage_from_snapshot as _anthropic_rate_limit_usage_from_snapshot,
+)
+from cognis.providers.llm.anthropic_usage import (
+    unsupported_usage as _unsupported_provider_usage,
+)
 from cognis.providers.llm.chatgpt_oauth import (
     CHATGPT_OAUTH_AUTH_FILE,
 )
@@ -129,6 +142,7 @@ from cognis.providers.llm.errors import (
     classify_llm_exception,
     reasoning_summary_rejected,
 )
+from cognis.providers.llm.fast_mode import enrich_fast_mode, prepare_fast_mode
 from cognis.providers.llm.message_projection import project_messages_for_provider
 from cognis.providers.llm.ollama import (
     discover_ollama_models,
@@ -143,6 +157,7 @@ from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
     auxiliary_reasoning_effort_for_model,
+    enrich_model_entry,
     looks_like_anthropic_reasoning_model,
     looks_like_embedding_model,
     reasoning_efforts_for_model,
@@ -347,6 +362,11 @@ LLM_ANTHROPIC_DEFER_LOADING_REJECTED_TOTAL = Counter(
     "Chat-completions requests where Anthropic defer_loading/tool-search beta was rejected.",
     labelnames=("provider_id", "model", "reason"),
 )
+
+try:
+    _LITELLM_DISTRIBUTION_VERSION = importlib.metadata.version("litellm")
+except importlib.metadata.PackageNotFoundError:
+    _LITELLM_DISTRIBUTION_VERSION = "unknown"
 
 _PROMPT_CACHE_KEY_VERSION = "v1"
 _DEFAULT_CAPABILITY_FALLBACK_TTL_SECONDS = 3600.0
@@ -1180,7 +1200,7 @@ def _fast_mode_rejection_reason(exc: BaseException, request_kwargs: dict[str, An
     if "service_tier" not in request_kwargs:
         return None
     status_code = getattr(exc, "status_code", None)
-    if not isinstance(status_code, int) or status_code < 400 or status_code >= 500:
+    if status_code not in {400, 403, 422}:
         return None
     message = str(exc).lower()
     if "service_tier" in message or "service tier" in message:
@@ -1531,6 +1551,12 @@ def _normalize_cache_breakpoints(value: Any) -> list[dict[str, Any]]:
 def _apply_cache_control_to_message(message: dict[str, Any], *, ttl: str) -> bool:
     cache_control = {"type": "ephemeral", "ttl": ttl}
     content = message.get("content")
+    if content is None and message.get("tool_calls"):
+        # Tool-only assistant turns carry no content blocks. Record the
+        # breakpoint on the message so the native converter can place it on
+        # the final tool_use block instead of silently dropping it.
+        message["_cache_control"] = cache_control
+        return True
     if isinstance(content, str):
         message["content"] = [{"type": "text", "text": content, "cache_control": cache_control}]
         return True
@@ -1564,9 +1590,11 @@ def _value_uses_extended_cache_ttl(value: Any) -> bool:
 def _request_uses_extended_cache_ttl(
     messages: list[dict[str, Any]], request_kwargs: dict[str, Any]
 ) -> bool:
-    return any(_value_uses_extended_cache_ttl(message.get("content")) for message in messages) or (
-        _value_uses_extended_cache_ttl(request_kwargs.get("tools"))
-    )
+    return any(
+        _value_uses_extended_cache_ttl(message.get("content"))
+        or _value_uses_extended_cache_ttl({"cache_control": message.get("_cache_control")})
+        for message in messages
+    ) or _value_uses_extended_cache_ttl(request_kwargs.get("tools"))
 
 
 def _ensure_anthropic_extended_cache_ttl_beta(request_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1586,6 +1614,14 @@ def _merge_request_kwargs(
     base_kwargs: dict[str, Any], override_kwargs: dict[str, Any]
 ) -> dict[str, Any]:
     merged = dict(base_kwargs)
+    if override_kwargs.get("reasoning_effort") is not None:
+        # A caller's selection outranks provider defaults, not caller-native options.
+        merged.pop("thinking", None)
+        output_config = merged.get("output_config")
+        if isinstance(output_config, dict):
+            merged["output_config"] = {
+                key: value for key, value in output_config.items() if key != "effort"
+            }
     for key, value in override_kwargs.items():
         if key == "extra_headers":
             base_headers = merged.get("extra_headers") or {}
@@ -2206,6 +2242,9 @@ class LiteLLMProvider:
         self._litellm_transport = LiteLLMTransport()
         self._direct_codex_transports: dict[str, DirectCodexTransport] = {}
         self._anthropic_http_clients: dict[tuple[str, float], httpx.AsyncClient] = {}
+        # Latest anthropic-ratelimit-* headers per provider. Replica-local by
+        # design: it is a live capacity hint, not durable state.
+        self._anthropic_rate_limit_snapshots: dict[str, dict[str, Any]] = {}
         self._cache_lock = asyncio.Lock()
         self._oauth_env_lock = asyncio.Lock()
         self._oauth_locks_lock = asyncio.Lock()
@@ -2616,6 +2655,11 @@ class LiteLLMProvider:
         if http_client is None or http_client.is_closed:
             http_client = httpx.AsyncClient(timeout=timeout)
             self._anthropic_http_clients[client_key] = http_client
+        provider_id = provider.provider_id
+
+        def record_rate_limit_headers(headers: Mapping[str, str]) -> None:
+            self._record_anthropic_rate_limit_headers(provider_id, headers)
+
         if is_subscription:
 
             async def resolve_oauth(_ref: str) -> str:
@@ -2626,6 +2670,7 @@ class LiteLLMProvider:
                     resolve_oauth,
                     timeout=timeout,
                     http_client=http_client,
+                    on_response_headers=record_rate_limit_headers,
                 ),
                 "$credential:anthropic-oauth",
             )
@@ -2640,9 +2685,17 @@ class LiteLLMProvider:
                 resolve_api_key,
                 timeout=timeout,
                 http_client=http_client,
+                on_response_headers=record_rate_limit_headers,
             ),
             "$credential:anthropic-api-key",
         )
+
+    def _record_anthropic_rate_limit_headers(
+        self, provider_id: str, headers: Mapping[str, str]
+    ) -> None:
+        snapshot = _anthropic_rate_limit_snapshot_from_headers(headers)
+        if snapshot is not None:
+            self._anthropic_rate_limit_snapshots[provider_id] = snapshot
 
     async def _native_anthropic_generate(
         self,
@@ -3233,6 +3286,8 @@ class LiteLLMProvider:
                 raise ValueError(f"LLM provider {explicit_provider_id!r} not found")
             if not _provider_visible_to_user(provider, acting_user_email):
                 raise ValueError(f"LLM provider {explicit_provider_id!r} is not visible")
+            if provider.status != "active":
+                raise ValueError(f"LLM provider {explicit_provider_id!r} is not active")
             if explicit_model is not None:
                 return explicit_model, provider
             default_model = dict(provider.config).get("default_model")
@@ -3370,87 +3425,50 @@ class LiteLLMProvider:
         provider_id: str | None = None,
         acting_user_email: str | None = None,
     ) -> ModelInfo:
-        cache_provider_key = provider_id
-        if cache_provider_key is None:
-            cache_provider_key = f"scope:{_owner_scope_cache_key(acting_user_email)}"
-        cache_key = self._model_info_cache_key(model_id, cache_provider_key)
+        if provider_id is None:
+            try:
+                model_id, provider = await self._resolve_model_target(
+                    model_id,
+                    acting_user_email=acting_user_email,
+                )
+            except ValueError:
+                provider = None
+        else:
+            async with self.session_factory() as session:
+                provider = await session.get(LLMProviderRow, provider_id)
+        if provider is None or not _provider_visible_to_user(provider, acting_user_email):
+            return DEFAULT_MODEL_INFO
+
+        # Check visibility and configuration before cache access. Revision-specific
+        # keys fence late results and work across controllers without cache broadcasts.
+        # Release the database session before credentials or remote metadata I/O.
+        config = dict(provider.config)
+        revision = hashlib.sha256(
+            json.dumps(config, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        cache_key = self._model_info_cache_key(
+            model_id,
+            f"{provider.provider_id}:{_owner_scope_cache_key(acting_user_email)}:{revision}",
+        )
         cached_model_info = await self._get_cached_model_info(cache_key)
         if cached_model_info is not None:
             return cached_model_info
-
-        async with self.session_factory() as session:
-            provider = await session.get(LLMProviderRow, provider_id) if provider_id else None
-            if provider_id is not None and provider is None:
-                logger.warning(
-                    "Requested model metadata for missing provider",
-                    extra={"extra_data": {"provider_id": provider_id, "model_id": model_id}},
-                )
-                await self._set_cached_model_info(cache_key, DEFAULT_MODEL_INFO)
-                return DEFAULT_MODEL_INFO
-            if provider is not None and not _provider_visible_to_user(provider, acting_user_email):
-                logger.warning(
-                    "Requested model metadata for provider outside actor visibility",
-                    extra={"extra_data": {"provider_id": provider_id, "model_id": model_id}},
-                )
-                await self._set_cached_model_info(cache_key, DEFAULT_MODEL_INFO)
-                return DEFAULT_MODEL_INFO
-            if provider is not None:
-                config = dict(provider.config)
-                row_models = config.get("models", [])
-                if isinstance(row_models, list):
-                    for model in row_models:
-                        if isinstance(model, dict) and model.get("model_id") == model_id:
-                            model_info = await self._merge_litellm_model_info(
-                                model_id, provider, model
-                            )
-                            await self._set_cached_model_info(cache_key, model_info)
-                            return model_info
-                model_info = await self._merge_litellm_model_info(model_id, provider, {})
-                await self._set_cached_model_info(cache_key, model_info)
-                return model_info
-            visible_owners = [SYSTEM_USER_EMAIL]
-            if acting_user_email and acting_user_email != SYSTEM_USER_EMAIL:
-                visible_owners.insert(0, acting_user_email)
-            rows = (
+        row_models = config.get("models", [])
+        configured = (
+            next(
                 (
-                    await session.execute(
-                        select(LLMProviderRow).where(LLMProviderRow.owner_email.in_(visible_owners))
-                    )
-                )
-                .scalars()
-                .all()
+                    entry
+                    for entry in row_models
+                    if isinstance(entry, dict) and entry.get("model_id") == model_id
+                ),
+                {},
             )
-            for row in rows:
-                if provider_id is not None and row.provider_id != provider_id:
-                    continue
-                config = dict(row.config)
-                row_models = config.get("models", [])
-                if not isinstance(row_models, list):
-                    continue
-                for model in row_models:
-                    if not isinstance(model, dict):
-                        continue
-                    if model.get("model_id") != model_id:
-                        continue
-                    model_info = await self._merge_litellm_model_info(model_id, row, model)
-                    await self._set_cached_model_info(cache_key, model_info)
-                    return model_info
-
-            if provider is None:
-                provider = await self._find_provider_for_model(
-                    session, model_id, acting_user_email=acting_user_email
-                )
-            if provider is not None:
-                model_info = await self._merge_litellm_model_info(model_id, provider, {})
-                await self._set_cached_model_info(cache_key, model_info)
-                return model_info
-
-        logger.warning(
-            "LLM model metadata missing; using conservative defaults",
-            extra={"extra_data": {"model_id": model_id}},
+            if isinstance(row_models, list)
+            else {}
         )
-        await self._set_cached_model_info(cache_key, DEFAULT_MODEL_INFO)
-        return DEFAULT_MODEL_INFO
+        model_info = await self._merge_litellm_model_info(model_id, provider, configured)
+        await self._set_cached_model_info(cache_key, model_info)
+        return model_info
 
     async def transcribe(
         self,
@@ -4086,6 +4104,11 @@ class LiteLLMProvider:
                         }
                     },
                 )
+        # Known reasoning capabilities outrank stale LiteLLM metadata.
+        # Explicit configured restrictions still win.
+        if _looks_like_extended_thinking_model(model_id, preset):
+            merged["supports_reasoning"] = True
+            merged["supports_extended_thinking"] = True
         merged.update(configured)
         merged["model_id"] = model_id
         if preset == "ollama":
@@ -4142,6 +4165,11 @@ class LiteLLMProvider:
                 model_info=profile_preview,
                 supports_reasoning=bool(merged.get("supports_reasoning")),
             )
+        if preset == "anthropic" and "supports_fast_mode" not in configured:
+            merged.pop("supports_fast_mode", None)
+        merged = enrich_fast_mode(
+            merged, preset, dict(provider.config) if provider is not None else None
+        )
         return ModelInfo.model_validate(merged)
 
     def _infer_model_capabilities(
@@ -4580,6 +4608,10 @@ class LiteLLMProvider:
         self.invalidate_openai_tool_search_cache_for_provider(provider_id)
         self.invalidate_hosted_instruction_drift_cache_for_provider(provider_id)
         self.invalidate_prompt_cache_key_broken_for_provider(provider_id)
+        self._model_info_cache.clear()
+        self._model_provider_cache.clear()
+        self._anthropic_subscription_model_cache.clear()
+        self._codex_model_cache.clear()
 
     def invalidate_prompt_cache_key_broken_for_provider(self, provider_id: str) -> None:
         """Clear cached prompt-cache-key rejection entries for a provider."""
@@ -5044,7 +5076,6 @@ class LiteLLMProvider:
         model_info: ModelInfo,
     ) -> dict[str, Any]:
         request_kwargs = dict(request_kwargs)
-        fast_mode = bool(request_kwargs.pop("fast_mode", False))
         request_kwargs.pop("max_retries", None)
         request_kwargs.pop("num_retries", None)
         if model_info.openai_apply_patch_tool_type:
@@ -5053,19 +5084,18 @@ class LiteLLMProvider:
                 model_info.openai_apply_patch_tool_type,
             )
         provider_preset = str(dict(provider.config).get("preset", "")).lower() if provider else ""
-        if (
-            fast_mode
+        request_kwargs = prepare_fast_mode(
+            request_kwargs,
+            model_info,
+            unavailable=request_kwargs.get("fast_mode") is True
             and provider is not None
-            and model_info.supports_fast_mode
-            and model_info.fast_mode_tier
-            and not self._capability_is_broken(
+            and self._capability_is_broken(
                 self._fast_mode_broken_keys,
                 (provider.provider_id, model_id),
                 marker_name="fast_mode",
                 provider=provider,
-            )
-        ):
-            request_kwargs["service_tier"] = model_info.fast_mode_tier
+            ),
+        )
         if provider_preset == "ollama" and "num_ctx" not in request_kwargs:
             num_ctx = _coerce_positive_int(model_info.runtime_metadata.get("num_ctx"))
             max_num_ctx = _coerce_positive_int(model_info.max_context_window)
@@ -5132,11 +5162,7 @@ class LiteLLMProvider:
             if isinstance(request_kwargs.get("reasoning_effort"), str)
             else None
         )
-        if (
-            model is None
-            and explicit_provider_id is None
-            and existing_reasoning in {None, "default"}
-        ):
+        if model is None and explicit_provider_id is None and existing_reasoning is None:
             routed_reasoning = await self._get_route_reasoning_effort(
                 task_type, acting_user_email=acting_user_email
             )
@@ -5678,11 +5704,7 @@ class LiteLLMProvider:
             if isinstance(request_kwargs.get("reasoning_effort"), str)
             else None
         )
-        if (
-            model is None
-            and explicit_provider_id is None
-            and existing_reasoning in {None, "default"}
-        ):
+        if model is None and explicit_provider_id is None and existing_reasoning is None:
             phase_started_at = monotonic()
             routed_reasoning = await self._get_route_reasoning_effort(
                 task_type, acting_user_email=acting_user_email
@@ -6444,14 +6466,24 @@ class LiteLLMProvider:
         return max(1, len(text) // 4)
 
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int:
+        family = self._tokenizer_family(model)
         try:
-            return int(litellm.token_counter(model=model, messages=messages))
+            count = int(litellm.token_counter(model=model, messages=messages))
+            self._record_tokenizer_backend(model, family, "litellm_native")
+            return count
         except Exception:
             serialized = "\n".join(
                 f"{message.get('role', 'unknown')}: {message.get('content', '')}"
                 for message in messages
             )
             return int(self.count_tokens(serialized, model) * 1.1)
+
+    def token_estimator_identity(self, model: str) -> str:
+        """Return a deployment-stable identity for session-local calibration."""
+
+        family = self._tokenizer_family(model)
+        cached_family, backend = self._tokenizer_backend_cache.get(model, (family, "unobserved"))
+        return f"litellm:{_LITELLM_DISTRIBUTION_VERSION}:{cached_family}:{backend}:v1"
 
     async def list_models(self) -> list[dict[str, Any]]:
         async with self.session_factory() as session:
@@ -6484,6 +6516,9 @@ class LiteLLMProvider:
         the OpenAI-compatible ``/v1/models`` endpoint.  For Ollama,
         calls ``/api/tags`` instead.
         """
+        # Explicit discovery refreshes registry snapshots, never saved model overrides.
+        self._codex_model_cache.clear()
+        self._anthropic_subscription_model_cache.clear()
         async with self.session_factory() as session:
             provider = await session.get(LLMProviderRow, provider_id)
         if provider is None:
@@ -6517,7 +6552,10 @@ class LiteLLMProvider:
         if _looks_like_anthropic_subscription_provider(provider):
             return await self._discover_anthropic_subscription_models(provider)
 
-        return await self._discover_models_remote(preset, base_url, api_key)
+        return [
+            enrich_fast_mode(enrich_model_entry(entry, provider_preset=preset), preset, config)
+            for entry in await self._discover_models_remote(preset, base_url, api_key)
+        ]
 
     async def discover_models_preview(
         self,
@@ -6553,7 +6591,12 @@ class LiteLLMProvider:
             )
         if preset == "chatgpt":
             return bundled_codex_model_entries()
-        return await self._discover_models_remote(preset, base_url, resolved_key)
+        return [
+            enrich_fast_mode(
+                enrich_model_entry(entry, provider_preset=preset), preset, {"base_url": base_url}
+            )
+            for entry in await self._discover_models_remote(preset, base_url, resolved_key)
+        ]
 
     async def _discover_models_via_executor(
         self,
@@ -6586,9 +6629,7 @@ class LiteLLMProvider:
         return [cast(dict[str, Any], item) for item in models if isinstance(item, dict)]
 
     async def _discover_codex_models(self, provider: LLMProviderRow) -> list[dict[str, Any]]:
-        config = dict(provider.config)
-        configured_models = [m for m in config.get("models", []) if isinstance(m, dict)]
-        fallback_entries = bundled_codex_model_entries(configured_models)
+        fallback_entries = bundled_codex_model_entries()
         cache_key = provider.provider_id
         now = monotonic()
         cached = self._codex_model_cache.get(cache_key)
@@ -6617,13 +6658,11 @@ class LiteLLMProvider:
         self, provider: LLMProviderRow
     ) -> list[dict[str, Any]]:
         config = dict(provider.config)
-        configured_models = [m for m in config.get("models", []) if isinstance(m, dict)]
         fallback_entries = bundled_anthropic_model_entries()
-        for entry in configured_models:
-            model_id = entry.get("model_id")
-            if isinstance(model_id, str) and model_id:
-                fallback_entries.append(dict(entry))
-        cache_key = provider.provider_id
+        revision = hashlib.sha256(
+            json.dumps(config, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        cache_key = f"{provider.provider_id}:{revision}"
         now = monotonic()
         cached = self._anthropic_subscription_model_cache.get(cache_key)
         if cached is not None and now < cached[1]:
@@ -6637,8 +6676,18 @@ class LiteLLMProvider:
                 extra={"extra_data": {"provider_id": provider.provider_id}},
                 exc_info=True,
             )
-            return self._merge_model_discovery_entries(fallback_entries, [])
-        entries = self._merge_model_discovery_entries(fallback_entries, remote_entries)
+            return [
+                enrich_fast_mode(
+                    enrich_model_entry(entry, provider_preset="anthropic"), "anthropic", config
+                )
+                for entry in self._merge_model_discovery_entries(fallback_entries, [])
+            ]
+        entries = [
+            enrich_fast_mode(
+                enrich_model_entry(entry, provider_preset="anthropic"), "anthropic", config
+            )
+            for entry in self._merge_model_discovery_entries(fallback_entries, remote_entries)
+        ]
         self._anthropic_subscription_model_cache[cache_key] = (
             entries,
             now + CODEX_MODEL_CACHE_TTL_SECONDS,
@@ -6666,6 +6715,40 @@ class LiteLLMProvider:
             raise ValueError("Codex usage is only available for ChatGPT OAuth providers")
         auth = await self._chatgpt_codex_auth(provider)
         return await fetch_codex_usage(auth)
+
+    async def get_provider_usage(self, provider_id: str) -> dict[str, Any]:
+        """Return hosted usage and limit windows for any provider that reports them.
+
+        ChatGPT OAuth providers read the Codex usage endpoint. Claude
+        subscription providers read the OAuth usage endpoint and attach the
+        latest rate-limit headers. API-key Anthropic providers only have the
+        header snapshot. Every other provider reports ``ok: False`` instead of
+        failing, so callers can hide the panel without special-casing errors.
+        """
+
+        async with self.session_factory() as session:
+            provider = await session.get(LLMProviderRow, provider_id)
+        if provider is None:
+            raise ValueError("LLM provider not found")
+        if _looks_like_chatgpt_oauth_provider(provider):
+            auth = await self._chatgpt_codex_auth(provider)
+            return await fetch_codex_usage(auth)
+        if not is_anthropic_native_provider(provider):
+            return _unsupported_provider_usage()
+        rate_limits = _anthropic_rate_limit_usage_from_snapshot(
+            self._anthropic_rate_limit_snapshots.get(provider_id)
+        )
+        if not _looks_like_anthropic_subscription_provider(provider):
+            return rate_limits
+        anthropic_auth = await self._anthropic_subscription_auth(provider)
+        usage = await _fetch_anthropic_subscription_usage(anthropic_auth)
+        usage["additional_rate_limits"] = [
+            *usage.get("additional_rate_limits", []),
+            *rate_limits.get("additional_rate_limits", []),
+        ]
+        usage["rate_limit_headers"] = rate_limits.get("rate_limit_headers")
+        usage["observed_at"] = rate_limits.get("observed_at")
+        return usage
 
     async def _discover_models_remote(
         self, preset: str, base_url: str, api_key: str

@@ -88,6 +88,7 @@ import type {
   LLMProvider,
   LLMProviderOAuthStatus,
   CodexUsage,
+  ProviderUsage,
   ModelEntry,
   MCPServerConfigResponse,
   MCPServerCreateRequest,
@@ -2090,6 +2091,10 @@ export const api = {
 
     codexUsage(providerId: string): Promise<CodexUsage> {
       return request<CodexUsage>(`/api/v1/llm-providers/${providerId}/codex/usage`);
+    },
+
+    providerUsage(providerId: string): Promise<ProviderUsage> {
+      return request<ProviderUsage>(`/api/v1/llm-providers/${providerId}/usage`);
     },
 
     clearChatgptOAuth(providerId: string): Promise<{ ok: boolean }> {

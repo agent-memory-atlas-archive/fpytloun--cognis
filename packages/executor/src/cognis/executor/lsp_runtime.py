@@ -19,6 +19,7 @@ from cognis.tools.executor.lsp.runtime import (
     LSPStatusConfig,
     LSPStatusState,
     LSPStatusTotals,
+    resolve_python_type_diagnostics,
 )
 from cognis.tools.executor.lsp.runtime import (
     LSPStatusReport as LSPStatusReport,
@@ -64,6 +65,7 @@ def resolve_lsp_runtime_config(source: Mapping[str, Any] | None = None) -> LSPRu
         max_concurrent_servers=int(
             max_concurrent_servers or os.environ.get("COGNIS_LSP_MAX_CONCURRENT_SERVERS", "8")
         ),
+        python_type_diagnostics=resolve_python_type_diagnostics(data),
     )
 
 
@@ -78,6 +80,7 @@ def build_lsp_manager(source: Mapping[str, Any] | None = None) -> LSPManager | N
         diagnostics_timeout_ms=config.diagnostics_timeout_ms,
         idle_timeout_seconds=config.idle_timeout_seconds,
         max_concurrent_servers=config.max_concurrent_servers,
+        python_type_diagnostics=config.python_type_diagnostics,
     )
 
 
@@ -114,6 +117,7 @@ async def build_lsp_status_report(
         diagnostics_timeout_ms=runtime_config.diagnostics_timeout_ms,
         idle_timeout_seconds=runtime_config.idle_timeout_seconds,
         max_concurrent_servers=runtime_config.max_concurrent_servers,
+        python_type_diagnostics=runtime_config.python_type_diagnostics,
     )
     report_state: LSPStatusState = state or ("ready" if manager is not None else "disabled")
     combined_warnings = list(warnings or [])
@@ -203,6 +207,7 @@ def build_lsp_unavailable_report(
         diagnostics_timeout_ms=runtime_config.diagnostics_timeout_ms,
         idle_timeout_seconds=runtime_config.idle_timeout_seconds,
         max_concurrent_servers=runtime_config.max_concurrent_servers,
+        python_type_diagnostics=runtime_config.python_type_diagnostics,
     )
     return LSPStatusReport(
         supported=supported,

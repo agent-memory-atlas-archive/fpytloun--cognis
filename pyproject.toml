@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.14.2"
+version = "0.15.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }
@@ -59,7 +59,7 @@ dependencies = [
     "psutil>=6.1.0",
     "youtube-transcript-api>=1.2.0",
     "pyotp>=2.9.0",
-    "cognis-common==0.14.2",
+    "cognis-common==0.15.0",
 ]
 
 [project.optional-dependencies]
@@ -127,6 +127,7 @@ markers = [
     "integration: marks tests that require live Mnemory + Intaris (started via uvx)",
     "live_server: marks tests that require a running Cognis server (not TestClient) for WebSocket/LLM flows",
     "e2e: marks tests that require the full e2e stack (live_stack + mock-llm)",
+    "lsp_real: marks tests that spawn real language servers from PATH or the LSP cache",
 ]
 
 [tool.ruff]

@@ -62,7 +62,8 @@ DIRECT_WORKFLOW = Workflow(
             name="execute",
             type="run",
             prompt="{user_message}",
-            reasoning_effort="default",
+            # Direct chat inherits the selected profile/agent effort.
+            reasoning_effort=None,
             step_profile_id="system:direct-default",
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=False),

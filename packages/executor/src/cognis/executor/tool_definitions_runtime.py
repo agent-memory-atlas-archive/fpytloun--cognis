@@ -293,8 +293,15 @@ LIST_DIRECTORY_TOOL = ToolDefinition(
 LSP_TOOL = ToolDefinition(
     name="lsp",
     description=(
-        "Query language-server features like definition, references, hover, and symbols. "
-        "Position-based operations require line and character. workspaceSymbol requires a non-empty query."
+        "Semantic code navigation through the language server. Prefer this over grep when "
+        "the relationship matters: where an imported or re-exported symbol is defined, every "
+        "reference of a method with a common name, the outline of a file or package, or the type behind "
+        "a value. Results are compact: relative paths, 1-based line:column, deduplicated and "
+        "sorted, capped by limit with an explicit truncation note. Use grep for text patterns, "
+        "strings, config files, or languages without a server; use capabilities to check what "
+        "the server supports. Position operations require line and character; workspaceSymbol "
+        "requires query; diagnostics runs all analyzers for the file and returns fresh "
+        "errors and warnings."
     ),
     parameters={
         "type": "object",
@@ -303,29 +310,64 @@ LSP_TOOL = ToolDefinition(
                 "type": "string",
                 "enum": [
                     "goToDefinition",
+                    "typeDefinition",
+                    "goToImplementation",
                     "findReferences",
                     "hover",
                     "documentSymbol",
                     "workspaceSymbol",
-                    "goToImplementation",
+                    "incomingCalls",
+                    "outgoingCalls",
+                    "outline",
+                    "capabilities",
+                    "diagnostics",
                 ],
-                "description": "The LSP operation to perform.",
+                "description": (
+                    "goToDefinition: where the symbol at the position is defined. "
+                    "typeDefinition: the definition of the symbol's type. "
+                    "goToImplementation: concrete implementations of an interface or abstract member. "
+                    "findReferences: every use of the symbol, grouped by file with the source line. "
+                    "hover: signature and documentation. "
+                    "documentSymbol: hierarchical outline of file_path. "
+                    "workspaceSymbol: symbols matching query across the workspace. "
+                    "incomingCalls: who calls the function at the position, as a bounded tree "
+                    "(default depth 3). outgoingCalls: what the function at the position calls. "
+                    "outline: compact structure of a directory (classes and functions with "
+                    "signatures per file, limit = files, default 25) or of one file. "
+                    "capabilities: which operations the servers for file_path support. "
+                    "diagnostics: fresh errors and warnings for file_path from all analyzers."
+                ),
             },
             "file_path": {
                 "type": "string",
-                "description": "Absolute path to the file. Use ~ for home directory.",
+                "description": (
+                    "Path to the file (absolute or relative to the working directory). "
+                    "Also selects the language server for workspaceSymbol. "
+                    "outline also accepts a directory."
+                ),
             },
             "line": {
                 "type": "integer",
-                "description": "1-based line number for position-based operations like definition, references, hover, and implementation.",
+                "description": "1-based line of the symbol for position operations.",
             },
             "character": {
                 "type": "integer",
-                "description": "1-based character offset for position-based operations like definition, references, hover, and implementation.",
+                "description": "1-based column of the symbol for position operations.",
             },
             "query": {
                 "type": "string",
-                "description": "Required non-empty workspace symbol query. Used only for workspaceSymbol.",
+                "description": "Symbol name or prefix for workspaceSymbol.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum results to return (default 50, max 200); for outline the "
+                    "maximum number of files (default 25, max 100)."
+                ),
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Traversal depth for incomingCalls/outgoingCalls (default 3, max 5).",
             },
         },
         "required": ["operation", "file_path"],

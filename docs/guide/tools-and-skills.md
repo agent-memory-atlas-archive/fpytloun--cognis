@@ -84,9 +84,9 @@ In the UI you can:
 
 Skills use a hybrid lazy-loading model for token efficiency:
 
-1. **Compact metadata in the system prompt** -- visible skills are announced in the immutable prompt prefix with compact summaries. Attached skills are marked so the agent knows which ones are preferred defaults.
-2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions are loaded into the mutable context, not the cached prefix.
-3. **Deferred tool exposure** -- linked runtime tools and bundled executable skill tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools after the agent loads the skill.
+1. **Compact metadata in the system prompt** -- visible skills are announced in the immutable prompt prefix with an ID, name, short description, and attachment/loading state. Tool inventories are omitted. Attached skills are marked so the agent knows which ones are preferred defaults.
+2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions, prompt templates, and asset references are loaded into the mutable context, not the cached prefix. Saved workflow decomposition and tool summaries stay out of the model context.
+3. **Deferred tool exposure** -- linked runtime tools and bundled executable skill tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools through the normal tool runtime after the agent loads the skill, without duplicating their schemas in the skill context.
 
 This means:
 - adding or removing skills does not invalidate the entire prompt cache

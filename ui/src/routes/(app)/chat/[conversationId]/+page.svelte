@@ -324,7 +324,7 @@ import X from 'lucide-svelte/icons/x';
     activityOverviewInvalidationScopeKeys,
     rootOverviewForConversation,
     canonicalWorkstreamSessionId,
-    selectedWorkSubtreeScope,
+    resolvedWorkSubtreeScope,
     structuralParentSessionId,
     treeSessionNavigation,
     traverseInspectorSession,
@@ -519,11 +519,17 @@ import X from 'lucide-svelte/icons/x';
     rootActivityOverview,
     currentConversation?.conversation_id,
   ));
+  let explicitFocusedIdentity = $state<WorkstreamRef | null>(null);
   let requestedInspectorScope = $derived(
     currentConversation
       ? childView
         ? childViewScope(childView)
-        : selectedWorkSubtreeScope(currentConversation.conversation_id, focusedSessionId)
+        : resolvedWorkSubtreeScope(
+            currentConversation.conversation_id,
+            focusedSessionId,
+            scopedRootActivityOverview?.workstreams ?? [],
+            explicitFocusedIdentity,
+          )
       : null,
   );
   let scopedActivityOverview = $derived(
@@ -562,7 +568,6 @@ import X from 'lucide-svelte/icons/x';
           ],
     );
   });
-  let explicitFocusedIdentity = $state<WorkstreamRef | null>(null);
   let directManagedWorkstream = $derived(
     currentConversation?.managed_agent
       ? renderedActivityOverview?.workstreams.find(
@@ -657,7 +662,7 @@ import X from 'lucide-svelte/icons/x';
   $effect(() => {
     const sessionId = focusedWorkstream?.session_id ?? null;
     const scope = sessionId
-      ? sessionTimelineScope(sessionId, currentConversation?.conversation_id ?? null)
+      ? sessionTimelineScope(sessionId, focusedWorkstream?.conversation_id ?? null)
       : null;
     const visible = browserVisible
       && conversationInfoDrawer.open
@@ -769,6 +774,12 @@ import X from 'lucide-svelte/icons/x';
   let cancelTurnPendingConversationId = $state<string | null>(null);
   let cancelTurnPending = $derived(
     currentConversation?.conversation_id === cancelTurnPendingConversationId
+  );
+  let retryWaitingTurn = $derived(
+    chatV2Store.snapshot.runtime?.active_turn?.status === 'waiting'
+      && Boolean(chatV2Store.snapshot.runtime?.active_turn?.retry_at)
+      ? chatV2Store.snapshot.runtime.active_turn
+      : null
   );
   // Track the turn_id of the most recently settled/cancelled turn.
   let lastSettledTurnId = $state<string | null>(null);
@@ -1419,7 +1430,7 @@ import X from 'lucide-svelte/icons/x';
     const projection = deriveChatV2ViewProjection(chatV2Store.snapshot);
     queuedMessages = visibleQueuedMessages(
       chatV2Store.visibleQueue.messages as QueuedMessage[]
-    );
+    ).filter((message) => !(retryWaitingTurn && message.status === 'recoverable'));
     queuedCount = queuedMessages.length;
     turnInProgress = projection.turnInProgress;
     awaitingAssistantStart = projection.awaitingAssistantStart;
@@ -2062,7 +2073,7 @@ import X from 'lucide-svelte/icons/x';
     currentConversation
       ? childView
         ? childViewScope(childView)
-        : selectedWorkSubtreeScope(currentConversation.conversation_id, canonicalFocusedSessionId)
+        : requestedInspectorScope
       : null
    );
    const canManageInspectorConversationLifecycle = $derived(
@@ -2358,6 +2369,9 @@ import X from 'lucide-svelte/icons/x';
   function openInspectorWork(category: WorkCategory = 'files', sessionId?: string, focus?: WorkInitialFocus): void {
     cancelActivityOverviewDemand();
     if (sessionId) {
+      explicitFocusedIdentity = workstreamForSession(
+        renderedActivityOverview?.workstreams ?? [], sessionId,
+      );
       focusedSessionId = canonicalWorkstreamSessionId(
         renderedActivityOverview?.workstreams ?? [],
         sessionId,
@@ -2375,9 +2389,11 @@ import X from 'lucide-svelte/icons/x';
       renderedActivityOverview?.workstreams ?? [],
       sessionId,
     ) ?? sessionId;
+    explicitFocusedIdentity = workstreamForSession(
+      renderedActivityOverview?.workstreams ?? [], canonicalSessionId,
+    );
     focusedSessionId = canonicalSessionId;
-    explicitFocusedIdentity = null;
-    if (!workstreamForSession(renderedActivityOverview?.workstreams ?? [], canonicalSessionId)) {
+    if (!explicitFocusedIdentity) {
       void focusedSessionIdentityLoader.resolve(canonicalSessionId)
         .then((identity) => {
           if (!identity || focusedSessionId !== canonicalSessionId) return;
@@ -2391,8 +2407,17 @@ import X from 'lucide-svelte/icons/x';
           // exact transcript and authoritative tree reconcile independently.
         });
     }
-    const conversationId = scopeOverride?.conversation_id ?? currentConversation?.conversation_id;
-    const nextScope = scopeOverride ?? sessionTimelineScope(canonicalSessionId, conversationId);
+    const nextScope = scopeOverride ?? resolvedWorkSubtreeScope(
+      currentConversation?.conversation_id ?? '',
+      canonicalSessionId,
+      scopedRootActivityOverview?.workstreams ?? [],
+      explicitFocusedIdentity,
+    );
+    if (!nextScope) {
+      cancelActivityOverviewLoad();
+      activityOverview = null;
+      return;
+    }
     if (
       !activityOverviewReadState.focused.pending
       || activityOverviewReadState.focused.scopeKey !== nextScope.key
@@ -2400,6 +2425,7 @@ import X from 'lucide-svelte/icons/x';
       cancelActivityOverviewLoad();
     }
     activityOverview = getActivityOverview(nextScope);
+    const conversationId = nextScope.conversation_id;
     sessionInfo = conversationId ? getSessionInfo(conversationId, canonicalSessionId) : null;
     applyCachedSessionDiagnostics(canonicalSessionId, sessionInfo);
     void tick().then(() => loadVisibleActivityOverview());
@@ -10936,6 +10962,18 @@ import X from 'lucide-svelte/icons/x';
                 </button>
               </div>
             </div>
+          </div>
+        {/if}
+
+        {#if retryWaitingTurn}
+          <div class="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+            <p>
+              Waiting to retry at {new Date(retryWaitingTurn.retry_at ?? '').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              because {retryWaitingTurn.retry_reason === 'rate_limit' ? 'the provider rate-limited this turn' : 'the provider requested a retry'}.
+              {#if queuedCount > 0}
+                {queuedCount} later message{queuedCount === 1 ? ' is' : 's are'} queued behind it.
+              {/if}
+            </p>
           </div>
         {/if}
 

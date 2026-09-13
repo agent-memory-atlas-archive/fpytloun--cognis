@@ -585,7 +585,21 @@ Filesystem edit tools may append executor-local LSP diagnostics after a file is
 changed. This is best-effort feedback from the selected executor runtime: the
 edit still succeeds if LSP is disabled, unavailable, or times out during first
 server startup. `read` may warm LSP in the background, but it does not block on
-diagnostics.
+diagnostics. Edit results carry bounded `lsp_diagnostics` metadata (status,
+injection outcome, counts, bytes) that the controller counts into
+`cognis_lsp_edit_*` metrics at the tool routing boundary.
+
+The executor-local `lsp` tool offers deliberate semantic navigation:
+`goToDefinition`, `typeDefinition`, `goToImplementation`, `findReferences`,
+`hover`, `documentSymbol`, `workspaceSymbol`, `incomingCalls`,
+`outgoingCalls`, `outline`, `capabilities`, and `diagnostics`. Operations are
+gated on capabilities negotiated with each running server, output is compact
+text with workspace-relative paths and 1-based coordinates, and results are
+bounded by `limit` and a byte budget with an explicit `truncated` flag. Result
+metadata records `operation`, `status`, `result_count`, `output_bytes`,
+`truncated`, and per-server outcomes; the controller counts these into
+`cognis_lsp_tool_*` metrics. See `docs/guide/executors.md` for the operation
+table.
 
 The `apply_patch` tool accepts strict text-only patches in two forms:
 - full apply_patch envelope syntax for `Add File`, `Update File`, `Delete File`, and `Move to`

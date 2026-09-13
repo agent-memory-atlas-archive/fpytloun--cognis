@@ -15,12 +15,10 @@ import json
 import os
 import re
 import secrets
-import socket
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from ipaddress import ip_address
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -28,6 +26,7 @@ import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.core.mcp_oauth_network import OAuthDestinationTransport, resolve_oauth_destination
 from cognis.core.notifications import NotificationService, NotificationType
 from cognis.logging import get_logger
 from cognis.models.tool import effective_mcp_auth_config
@@ -312,46 +311,10 @@ def _parse_oauth_json_response(response: httpx.Response, *, operation: str) -> d
 
 
 def _safe_url(url: str, *, allow_http_localhost: bool = True) -> str:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"https", "http"}:
-        raise MCPOAuthError("OAuth endpoints must use https")
-    host = parsed.hostname
-    if not host:
-        raise MCPOAuthError("OAuth endpoint host is required")
-    localhost = host in {"localhost", "127.0.0.1", "::1"}
-    if parsed.scheme != "https" and not (allow_http_localhost and localhost):
-        raise MCPOAuthError("OAuth endpoints must use https except localhost development URLs")
-    resolved_ips = []
     try:
-        ip = ip_address(host)
-    except ValueError:
-        ip = None
-        if not localhost:
-            try:
-                resolved_ips = [
-                    ip_address(info[4][0])
-                    for info in socket.getaddrinfo(
-                        host, parsed.port or 443, type=socket.SOCK_STREAM
-                    )
-                ]
-            except OSError as exc:
-                raise MCPOAuthError("OAuth endpoint host could not be resolved") from exc
-    else:
-        assert ip is not None
-        resolved_ips = [ip]
-    if any(
-        not candidate.is_loopback
-        and (
-            candidate.is_private
-            or candidate.is_link_local
-            or candidate.is_reserved
-            or candidate.is_multicast
-        )
-        for candidate in resolved_ips
-    ):
-        raise MCPOAuthError("OAuth endpoints cannot target private or link-local addresses")
-    if any(candidate.is_loopback for candidate in resolved_ips) and not localhost:
-        raise MCPOAuthError("OAuth endpoints cannot target loopback aliases")
+        resolve_oauth_destination(url, allow_http_localhost=allow_http_localhost)
+    except ValueError as exc:
+        raise MCPOAuthError(str(exc)) from exc
     return url
 
 
@@ -817,7 +780,11 @@ class MCPOAuthService:
                 )
 
         async with httpx.AsyncClient(
-            timeout=_METADATA_TIMEOUT, follow_redirects=False, max_redirects=2
+            timeout=_METADATA_TIMEOUT,
+            follow_redirects=False,
+            max_redirects=2,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
         ) as client:
             response = await client.get(safe_resource_url)
         discovered_challenge = parse_www_authenticate(response.headers.get("www-authenticate"))
@@ -843,7 +810,12 @@ class MCPOAuthService:
 
     async def _fetch_json(self, url: str, *, missing_ok: bool = False) -> dict[str, Any] | None:
         current_url = _safe_url(url)
-        async with httpx.AsyncClient(timeout=_METADATA_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_METADATA_TIMEOUT,
+            follow_redirects=False,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
+        ) as client:
             for _ in range(3):
                 response = await client.get(current_url)
                 if response.status_code not in {301, 302, 303, 307, 308}:
@@ -931,7 +903,12 @@ class MCPOAuthService:
             omitted_redirects_payload = dict(payload)
             omitted_redirects_payload.pop("redirect_uris", None)
             device_fallback_payloads.append(omitted_redirects_payload)
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_TOKEN_TIMEOUT,
+            follow_redirects=False,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(
                 _safe_url(registration_endpoint),
                 json=payload,
@@ -2072,7 +2049,12 @@ class MCPOAuthService:
             data["scope"] = " ".join(scopes)
         if resource:
             data["resource"] = resource
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_TOKEN_TIMEOUT,
+            follow_redirects=False,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(device_endpoint, data=data)
         if response.status_code >= 400:
             raise MCPOAuthError(
@@ -2102,7 +2084,12 @@ class MCPOAuthService:
             data["client_secret"] = client_secret
         if resource:
             data["resource"] = resource
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_TOKEN_TIMEOUT,
+            follow_redirects=False,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(token_endpoint, data=data)
         if response.status_code >= 400:
             error_value = None
@@ -2545,7 +2532,12 @@ class MCPOAuthService:
             data["client_secret"] = client_secret
         if resource:
             data["resource"] = resource
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_TOKEN_TIMEOUT,
+            follow_redirects=False,
+            transport=OAuthDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(token_endpoint, data=data)
         if response.status_code >= 400:
             raise MCPOAuthError("OAuth token exchange failed")
@@ -2575,7 +2567,12 @@ class MCPOAuthService:
         try:
             timeout = httpx.Timeout(self._refresh_timeout_seconds)
             async with asyncio.timeout(self._refresh_timeout_seconds):
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    transport=OAuthDestinationTransport(),
+                    trust_env=False,
+                ) as client:
                     response = await client.post(token_endpoint, data=data)
         except (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError) as exc:
             raise MCPOAuthError(

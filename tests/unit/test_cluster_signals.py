@@ -21,6 +21,7 @@ from cognis.core.cluster_signals import (
     ClusterSignalService,
 )
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.queue_wakeup import publish_queue_wakeup
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 from cognis.store import queries
 from cognis.store.database import create_engine, create_session_factory
@@ -54,6 +55,43 @@ class _FakeTransport:
     async def close(self) -> None:
         self.closed = True
         self.connection.closed = True
+
+
+@pytest.mark.asyncio
+async def test_queue_wakeup_crosses_real_signal_dispatch_boundary() -> None:
+    callbacks: list[Any] = []
+    buses = [EventBus(), EventBus()]
+    signals = [
+        ClusterSignalService(
+            database_url="postgresql+asyncpg://localhost/cognis",
+            controller_id=f"controller-{index}",
+            session_factory=None,
+            event_bus=bus,
+            scope_provider=lambda: [],
+            transport=_FakeTransport(callbacks),
+        )
+        for index, bus in enumerate(buses)
+    ]
+    wakes = [asyncio.Event(), asyncio.Event()]
+
+    for bus, wake in zip(buses, wakes, strict=True):
+
+        async def handler(event: Event, wake: asyncio.Event = wake) -> None:
+            if event.data.get("kind") == ClusterSignalKind.TASK_QUEUE_CHANGED:
+                wake.set()
+
+        bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, handler)
+    try:
+        for service in signals:
+            await service.start()
+        async with asyncio.timeout(1):
+            while len(callbacks) != 2:
+                await asyncio.sleep(0.001)
+        await publish_queue_wakeup(buses[0], signals[0])
+        await asyncio.wait_for(asyncio.gather(*(wake.wait() for wake in wakes)), 1)
+    finally:
+        for service in signals:
+            await service.stop()
 
 
 class _SessionContext:

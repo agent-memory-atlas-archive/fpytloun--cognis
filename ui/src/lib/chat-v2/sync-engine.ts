@@ -1034,6 +1034,18 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
       )
     : null;
 
+  const canonicalAssistantPhases = new Map<string, number>();
+  if (runtimeItems.length > 0) {
+    for (const item of state.timelineItems) {
+      if (item.kind === 'message' && item.role === 'assistant' && item.message_id && item.status === 'complete') {
+        canonicalAssistantPhases.set(
+          item.message_id,
+          Math.max(canonicalAssistantPhases.get(item.message_id) ?? -1, item.assistant_phase_index ?? 0)
+        );
+      }
+    }
+  }
+
   const visible = [...baseItems];
   const visibleById = baseItems === state.timelineItems
     ? new Map(derived.timelineById)
@@ -1060,7 +1072,10 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
       item.kind === 'message'
       && item.role === 'assistant'
       && item.message_id
-      && canonicalAssistantContents?.has(`${item.message_id}\u0000${item.content}`)
+      && (
+        canonicalAssistantContents?.has(`${item.message_id}\u0000${item.content}`)
+        || (canonicalAssistantPhases.get(item.message_id) ?? -1) >= (item.assistant_phase_index ?? 0)
+      )
     ) {
       continue;
     }
