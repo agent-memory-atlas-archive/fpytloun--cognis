@@ -144,6 +144,7 @@ class _FakeSessionManager:
         compaction_summary: str | None = None,
         compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
+        fences: list[Any] | None = None,
     ) -> SessionModel:
         del compaction_summary, tail_events
         self.rotations.append(
@@ -154,6 +155,7 @@ class _FakeSessionManager:
                 "completion_reason": completion_reason,
                 "transition": transition,
                 "compaction_summary_event_data": compaction_summary_event_data,
+                "fences": list(fences or []),
             }
         )
         if self._fail:
@@ -841,3 +843,228 @@ async def test_idle_checkpoint_skips_below_min_events() -> None:
     assert new_session is None
     assert compaction.calls == []
     assert session_mgr.rotations == []
+
+
+class _FakeLeaseStore:
+    """In-memory stand-in for DatabaseLeaseStore with a takeover switch."""
+
+    def __init__(self) -> None:
+        self.acquired: list[str] = []
+        self.released: list[str] = []
+        self.taken_over: set[str] = set()
+        self.busy: set[str] = set()
+
+    async def acquire(self, resource_key: str, owner_id: str, *, ttl_seconds: float) -> Any:
+        from datetime import UTC, datetime
+
+        from cognis.store.coordination import Lease
+
+        del ttl_seconds
+        if resource_key in self.busy:
+            return None
+        self.acquired.append(resource_key)
+        return Lease(
+            resource_key=resource_key,
+            owner_id=owner_id,
+            fencing_token=7,
+            lease_expires_at=datetime.now(UTC),
+        )
+
+    async def is_current(self, lease: Any) -> bool:
+        return lease.resource_key not in self.taken_over
+
+    async def release(self, lease: Any) -> bool:
+        self.released.append(lease.resource_key)
+        return True
+
+
+def _fenced_loop(
+    lease_store: _FakeLeaseStore,
+    *,
+    compaction: _FakeCompactionStrategy | None = None,
+    session_manager: _FakeSessionManager | None = None,
+) -> AgentLoop:
+    loop = _minimal_agent_loop(
+        compaction=compaction,
+        session_manager=session_manager,
+        session_cache=_FakeSessionCache(entry=_cache_entry_with_events(5)),
+    )
+    loop._session_factory = object()
+    loop._compaction_leases = lease_store
+    loop._controller_runtime = type(
+        "Runtime", (), {"controller_id": "controller-a", "incarnation_id": "boot-a"}
+    )()
+    return loop
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_skips_when_another_controller_holds_the_lease() -> None:
+    compaction = _FakeCompactionStrategy()
+    leases = _FakeLeaseStore()
+    leases.busy.add("compaction:session:session-1")
+    loop = _fenced_loop(leases, compaction=compaction)
+
+    result = await loop._auto_compact(_step_context())
+
+    assert result is None
+    assert compaction.calls == [], "no LLM compaction while another owner compacts"
+    assert leases.released == []
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_holds_lease_through_rotation_and_fences_it() -> None:
+    compaction = _FakeCompactionStrategy()
+    session_mgr = _FakeSessionManager()
+    leases = _FakeLeaseStore()
+    loop = _fenced_loop(leases, compaction=compaction, session_manager=session_mgr)
+    ctx = _step_context()
+
+    result = await loop._auto_compact(ctx)
+    assert result is not None and result.compacted
+    assert leases.acquired == ["compaction:session:session-1"]
+    assert ctx.compaction_lease is not None, "lease must survive until rotation"
+    assert leases.released == []
+
+    new_session = await loop._rotate_after_compaction(ctx, result, trigger="automatic")
+    assert new_session is not None
+    assert [lease.resource_key for lease in session_mgr.rotations[0]["fences"]] == [
+        "compaction:session:session-1"
+    ]
+    assert ctx.compaction_lease is None
+    assert leases.released == ["compaction:session:session-1"]
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_releases_lease_when_nothing_is_compacted() -> None:
+    compaction = _FakeCompactionStrategy(
+        result=CompactionResult(compacted=False, method="no_compactable_history")
+    )
+    leases = _FakeLeaseStore()
+    loop = _fenced_loop(leases, compaction=compaction)
+    ctx = _step_context()
+
+    result = await loop._auto_compact(ctx)
+    assert result is not None and not result.compacted
+    assert ctx.compaction_lease is None
+    assert leases.released == ["compaction:session:session-1"]
+
+
+@pytest.mark.asyncio
+async def test_rotation_refuses_after_takeover_between_check_and_commit() -> None:
+    from cognis.core.compaction.publication import CompactionOwnershipLost
+
+    compaction = _FakeCompactionStrategy()
+    session_mgr = _FakeSessionManager()
+    leases = _FakeLeaseStore()
+    loop = _fenced_loop(leases, compaction=compaction, session_manager=session_mgr)
+    ctx = _step_context()
+    result = await loop._auto_compact(ctx)
+    assert result is not None and result.compacted
+
+    # Ownership changes after the entry check passed.
+    leases.taken_over.add("compaction:session:session-1")
+    with pytest.raises(CompactionOwnershipLost):
+        await loop._rotate_after_compaction(ctx, result, trigger="automatic")
+    assert session_mgr.rotations == [], "a stale owner must not rotate"
+    assert ctx.compaction_lease is None
+    assert leases.released == ["compaction:session:session-1"]
+
+
+@pytest.mark.asyncio
+async def test_lost_direct_turn_fence_stops_compaction_before_any_work() -> None:
+    from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
+
+    compaction = _FakeCompactionStrategy()
+    leases = _FakeLeaseStore()
+    loop = _fenced_loop(leases, compaction=compaction)
+    ctx = _step_context()
+
+    class _LostFence:
+        lease = None
+
+        async def assert_current(self) -> None:
+            raise StaleDirectTurnOwner("lost")
+
+    ctx.execution_fence = _LostFence()
+    with pytest.raises(StaleDirectTurnOwner):
+        await loop._auto_compact(ctx)
+    assert compaction.calls == []
+    assert leases.acquired == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_publication_guard_gates_the_intaris_append() -> None:
+    from cognis.core.compaction.publication import (
+        CompactionOwnershipLost,
+        CompactionPublicationGuard,
+        compaction_publication_guard,
+    )
+    from cognis.core.compaction.strategy import CompactionStrategy
+
+    recorded: list[tuple[str, str | None]] = []
+
+    class _Guardrails:
+        async def record_events(self, *, session_id: str, events: Any, idempotency_key: str) -> Any:
+            recorded.append((session_id, idempotency_key))
+            return type("Append", (), {"ok": True, "last_seq": 42})()
+
+    class _Cache:
+        async def apply_compaction(self, *_: Any, **__: Any) -> None:
+            return None
+
+    strategy = CompactionStrategy.__new__(CompactionStrategy)
+    strategy.guardrails = _Guardrails()
+    strategy.session_cache = _Cache()
+    strategy.llm = type("LLM", (), {"count_tokens": lambda self, text, model: len(text) // 4})()
+    session = SessionModel(
+        session_id="session-1",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intaris_session_id="session-1",
+    )
+    older = [
+        CachedEvent(seq=i, type="user_message", data={"content": f"m{i}"}) for i in range(1, 4)
+    ]
+
+    async def _lost() -> None:
+        raise CompactionOwnershipLost("gone")
+
+    token = compaction_publication_guard.set(
+        CompactionPublicationGuard(token="fence7", check=_lost)
+    )
+    try:
+        with pytest.raises(CompactionOwnershipLost):
+            await strategy._record_compaction(
+                session=session,
+                summary="summary",
+                formatted_input="input",
+                older_events=older,
+                preserved_tail_events=[],
+                method="llm",
+                resolved_model="test-model",
+                compaction_id="compact_1",
+            )
+    finally:
+        compaction_publication_guard.reset(token)
+    assert recorded == [], "no compaction_summary may be appended by a stale owner"
+
+    async def _ok() -> None:
+        return None
+
+    token = compaction_publication_guard.set(CompactionPublicationGuard(token="fence7", check=_ok))
+    try:
+        result = await strategy._record_compaction(
+            session=session,
+            summary="summary",
+            formatted_input="input",
+            older_events=older,
+            preserved_tail_events=[],
+            method="llm",
+            resolved_model="test-model",
+            compaction_id="compact_1",
+        )
+    finally:
+        compaction_publication_guard.reset(token)
+    assert result.compaction_seq == 42
+    assert recorded == [("session-1", "session-1:compaction:llm:3:fence7")]

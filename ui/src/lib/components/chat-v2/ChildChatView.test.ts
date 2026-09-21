@@ -25,7 +25,7 @@ describe('ChildChatView', () => {
     const onClose = vi.fn();
     const onToggleInspector = vi.fn();
     render(ChildChatView, {
-      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      view: { kind: 'delegate', conversationId: 'root', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
       node,
       preferences: DEFAULT_USER_PREFERENCES,
       inspectorOpen: true,
@@ -82,7 +82,7 @@ describe('ChildChatView', () => {
   it('forwards runtime activity and clears it on unmount', async () => {
     const onRuntimeActiveChange = vi.fn();
     const { unmount } = render(ChildChatView, {
-      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      view: { kind: 'delegate', conversationId: 'root', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
       node: { ...node, status: 'active', activity_state: 'active' },
       preferences: DEFAULT_USER_PREFERENCES,
       inspectorOpen: true,
@@ -126,7 +126,7 @@ describe('ChildChatView', () => {
     ['completed', 'Completed'],
   ] as const)('uses canonical %s state instead of old session completion', (executionState, label) => {
     render(ChildChatView, {
-      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      view: { kind: 'delegate', conversationId: 'root', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
       node: { ...node, execution_state: executionState },
       preferences: DEFAULT_USER_PREFERENCES,
       inspectorOpen: true,
@@ -146,7 +146,7 @@ describe('ChildChatView', () => {
 
   it('renders terminated as closed without live-follow state', () => {
     render(ChildChatView, {
-      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      view: { kind: 'delegate', conversationId: 'root', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
       node: { ...node, status: 'terminated', activity_state: 'ongoing' },
       preferences: DEFAULT_USER_PREFERENCES,
       inspectorOpen: true,
@@ -192,6 +192,7 @@ describe('ChildChatView', () => {
     render(ChildChatView, {
       view: {
         kind: 'delegate',
+        conversationId: 'root',
         sessionId: 'session-child',
         controllerRootConversationId: 'root',
         nodeKey: 'child',

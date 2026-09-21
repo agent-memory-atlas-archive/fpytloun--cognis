@@ -703,9 +703,11 @@ class WorkMaterializer:
                 self._append_outcome("coalesced")
                 return True
             item.retry_count = active.retry_count
-            self._enqueue_append_repair(key, item)
-            self._append_outcome("coalesced")
-            return True
+            predecessor = self._append_pending.get(key, active)
+            if predecessor.repair_required or item.first_seq != predecessor.last_seq + 1:
+                self._enqueue_append_repair(key, item)
+                self._append_outcome("coalesced")
+                return True
         if (
             item.retained_events > self._append_max_session_events
             or item.payload_bytes > self._append_max_session_bytes
@@ -852,6 +854,9 @@ class WorkMaterializer:
             if row is None:
                 raise RuntimeError("Work append source session is not available")
             state = await self._ensure_state(db, row, item.target_seq)
+            if item.target_seq <= state.covered_through_seq:
+                await db.commit()
+                return
             now = datetime.now(UTC)
             if _has_unexpired_projection_lease(state, now=now):
                 _advance_projection_target(state, item.target_seq, now=now)
@@ -1342,10 +1347,10 @@ class WorkMaterializer:
                 state.next_head_check_at = None
             return
         expected = state.covered_through_seq + 1
-        if raw_events[0].seq != expected:
-            raise ValueError(
-                f"Work materialization gap: expected {expected}, got {raw_events[0].seq}"
-            )
+        for event in raw_events:
+            if event.seq != expected:
+                raise ValueError(f"Work materialization gap: expected {expected}, got {event.seq}")
+            expected += 1
         timeline = project_timeline(normalize_session_events(raw_events).events).timeline
         definitions = self._tool_definitions()
         file_facts_changed = False

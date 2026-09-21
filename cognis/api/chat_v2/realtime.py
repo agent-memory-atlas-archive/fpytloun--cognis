@@ -42,6 +42,7 @@ def scope_accepts_runtime(
     *,
     conversation_id: str,
     active_session_id: str | None,
+    session_ids: frozenset[str] | None = None,
 ) -> bool:
     """Return whether runtime from a conversation belongs to a subscribed scope."""
 
@@ -51,7 +52,10 @@ def scope_accepts_runtime(
         return False
     if scope.kind == "conversation":
         return True
-    return bool(scope.session_id and scope.session_id == active_session_id)
+    if scope.session_id is None:
+        return False
+    allowed = session_ids if session_ids is not None else frozenset([scope.session_id])
+    return bool(active_session_id and active_session_id in allowed)
 
 
 def runtime_overlay_from_items(

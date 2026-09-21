@@ -160,6 +160,28 @@ _RICH_MEDIA_INPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+_KEY_VALUE_ITEMS_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "key": {"type": "string"},
+                    "name": {"type": "string"},
+                    "value": {},
+                    "tone": {
+                        "type": "string",
+                        "enum": ["neutral", "positive", "warning", "critical", "info"],
+                    },
+                },
+            },
+        },
+        {"type": "object"},
+    ]
+}
+
 _GENERIC_RICH_BLOCK_SCHEMA = {
     "type": "object",
     "properties": {
@@ -215,6 +237,111 @@ _GENERIC_RICH_BLOCK_SCHEMA = {
     "if": {"properties": {"type": {"const": "chart"}}, "required": ["type"]},
     "then": CANONICAL_CHART_BLOCK_SCHEMA,
     "allOf": [
+        {
+            "if": {"properties": {"type": {"const": "hero"}}, "required": ["type"]},
+            "then": {
+                "properties": {
+                    "badges": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                    "pattern": "\\S",
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                            "pattern": "\\S",
+                                        },
+                                        "tone": {
+                                            "type": "string",
+                                            "enum": [
+                                                "neutral",
+                                                "info",
+                                                "success",
+                                                "warning",
+                                                "danger",
+                                            ],
+                                        },
+                                    },
+                                    "required": ["label"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
+                    },
+                    "tags": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                    "pattern": "\\S",
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 80,
+                                            "pattern": "\\S",
+                                        },
+                                        "tone": {
+                                            "type": "string",
+                                            "enum": [
+                                                "neutral",
+                                                "info",
+                                                "success",
+                                                "warning",
+                                                "danger",
+                                            ],
+                                        },
+                                    },
+                                    "required": ["label"],
+                                    "additionalProperties": False,
+                                },
+                            ]
+                        },
+                    },
+                }
+            },
+        },
+        {
+            "if": {
+                "properties": {"type": {"enum": ["kv", "key_value"]}},
+                "required": ["type"],
+            },
+            "then": {
+                "properties": {
+                    "variant": {"type": "string", "enum": ["summary"]},
+                    "items": copy.deepcopy(_KEY_VALUE_ITEMS_SCHEMA),
+                    "data": copy.deepcopy(_KEY_VALUE_ITEMS_SCHEMA),
+                    "steps": copy.deepcopy(_KEY_VALUE_ITEMS_SCHEMA),
+                },
+                "not": {
+                    "anyOf": [
+                        {"required": ["columns"]},
+                        {"required": ["width"]},
+                        {"required": ["widths"]},
+                        {"required": ["items", "data"]},
+                        {"required": ["items", "steps"]},
+                        {"required": ["data", "steps"]},
+                    ],
+                },
+            },
+        },
         {
             "if": {"properties": {"type": {"const": "markdown"}}, "required": ["type"]},
             "then": {
@@ -278,6 +405,9 @@ _PAYLOAD_ARTIFACT_SCHEMA = {
             "pattern": "^art_[0-9a-f]{32}$",
             "description": (
                 "Immutable application/json artifact produced by artifact_publish. "
+                "Prefer this source for substantial payloads: create an editable local JSON "
+                "file with the available file-editing tool, publish it as application/json, "
+                "then validate and write using the returned art_ ID. "
                 "Local paths, URLs, content refs, base64, and artifact value refs are not accepted."
             ),
         }
@@ -335,7 +465,61 @@ _GENERIC_RICH_PAYLOAD_SCHEMA = {
         "outputs": {"type": "object"},
         "metadata": {
             "type": "object",
-            "properties": {"presentation": False},
+            "properties": {
+                "presentation": False,
+                "viewer_identity": {
+                    "oneOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 64,
+                                    "pattern": "\\S",
+                                },
+                                "icon": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {
+                                            "type": "string",
+                                            "enum": [
+                                                "activity",
+                                                "alert",
+                                                "arrow_up_right",
+                                                "calendar",
+                                                "check",
+                                                "clock",
+                                                "external",
+                                                "info",
+                                                "trend_down",
+                                                "trend_up",
+                                            ],
+                                        },
+                                        "alt": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 64,
+                                            "pattern": "\\S",
+                                        },
+                                    },
+                                    "required": ["name"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "anyOf": [{"required": ["label"]}, {"required": ["icon"]}],
+                            "allOf": [
+                                {
+                                    "if": {"not": {"required": ["label"]}},
+                                    "then": {"properties": {"icon": {"required": ["name", "alt"]}}},
+                                }
+                            ],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
         },
     },
     "required": ["title", "blocks"],
@@ -396,13 +580,20 @@ _WRITE_DELIVERABLE_DESCRIPTION = (
     "expects a deliverable, write it after validation/review and before "
     "step_complete. Workflow/task deliverables remain scoped to that task. "
     "In direct chat, the deliverable is published for the owner, so other "
-    "conversations owned by the same user can search and use it. Use this only "
+    "conversations owned by the same user can search and use it. Each direct-chat "
+    "call creates an independent output; all are presented at turn completion. "
+    "Repeated workflow-step calls instead revise the canonical step output. Use this only "
     "when the turn should produce "
     "a durable/rendered/shareable artifact such as a report, spec, dashboard, "
     "or rich document; do not use it for normal answers, intermediate progress, "
     "drafts, notes, or status updates. Ordinary text needs only content. Rich "
     "authoring uses one canonical payload or payload_artifact source, and Cognis "
-    "derives its Markdown fallback.\n\n"
+    "derives its Markdown fallback. For a substantial Rich payload that would be "
+    "difficult to inspect or retry inline, create an editable local JSON file with "
+    "the available file-editing tool, publish it as application/json with "
+    "artifact_publish, and use payload_artifact. Call validate_tool_call with the "
+    "complete write_deliverable arguments, then call write_deliverable with those "
+    "exact unchanged arguments.\n\n"
     "Decision tree before authoring: (1) Is this a normal conversational answer, "
     "a status update, or intermediate progress? Answer inline in the assistant "
     "message; do not call this tool. (2) Does the reader only need prose "

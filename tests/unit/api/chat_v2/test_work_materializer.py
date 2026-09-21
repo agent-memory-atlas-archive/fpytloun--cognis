@@ -1509,7 +1509,7 @@ async def test_stale_caught_up_lag_is_claimed_and_converges_without_refresh(
 
 
 @pytest.mark.asyncio
-async def test_append_queue_coalesces_active_batches_to_max_target_repair(
+async def test_append_queue_retains_contiguous_batches_behind_active_append(
     tmp_path: Path,
 ) -> None:
     engine, factory = await _database(tmp_path)
@@ -1554,12 +1554,12 @@ async def test_append_queue_coalesces_active_batches_to_max_target_repair(
     assert materializer._append_repair_pending == {}
     assert materializer.enqueue_append(notification(2))
     assert materializer.enqueue_append(notification(3))
-    pending = next(iter(materializer._append_repair_pending.values()))
+    pending = next(iter(materializer._append_pending.values()))
     assert (pending.first_seq, pending.last_seq, pending.target_seq) == (2, 3, 3)
-    assert pending.retained_events == 0
-    assert pending.payload_bytes == 0
-    assert materializer._append_pending == {}
-    assert materializer._append_pending_events == 1
+    assert pending.retained_events == 2
+    assert pending.payload_bytes > 0
+    assert materializer._append_repair_pending == {}
+    assert materializer._append_pending_events == 3
     assert materializer._append_pending_bytes <= materializer._append_max_pending_bytes
 
     release.set()
@@ -2247,6 +2247,69 @@ async def test_payload_append_with_missing_session_retains_repair_intent(
     assert WORK_APPEND_PENDING._value.get() == 0
     assert WORK_APPEND_PENDING_BYTES._value.get() == 0
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sequences", [(1, 3), (1, 1), (1, 2, 1)])
+async def test_internal_sequence_discontinuity_does_not_advance_coverage(
+    tmp_path: Path, sequences: tuple[int, ...]
+) -> None:
+    engine, factory = await _database(tmp_path)
+    materializer = WorkMaterializer(
+        session_factory=factory, event_store=AuthorityStore({}), tool_definitions=lambda: {}
+    )
+    try:
+        async with factory() as db:
+            row = await db.get(Session, "session-alice")
+            assert row is not None
+            state = await materializer._ensure_state(db, row, max(sequences))
+            events = [
+                _event("intaris-alice", seq, "user_message", {"content": "hello"})
+                for seq in sequences
+            ]
+            with pytest.raises(ValueError, match="Work materialization gap"):
+                await materializer._materialize_batch(
+                    db, row=row, state=state, raw_events=events, target_seq=max(sequences)
+                )
+            assert state.covered_through_seq == 0
+            assert await db.scalar(select(func.count()).select_from(WorkRecordRow)) == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_retired_projection_cleanup_is_explicit_bounded_and_preserves_current(tmp_path):
+    from scripts.cleanup_work_projections import cleanup
+
+    engine, factory = await _database(tmp_path)
+    try:
+        async with factory() as db:
+            for index, version in enumerate(
+                ["retired-work-1", "retired-work-2", WORK_MATERIALIZER_VERSION]
+            ):
+                db.add(
+                    WorkSessionProjectionRow(
+                        projection_id=f"retention-{index}",
+                        owner_email="alice@example.com",
+                        session_id="session-alice",
+                        source_session_id="intaris-alice",
+                        materializer_version=version,
+                    )
+                )
+            await db.commit()
+        versions = ["retired-work-1", "retired-work-2"]
+        report = await cleanup(factory, versions=versions)
+        assert report["work_session_projections"] == {"eligible": 2, "deleted": 0}
+        report = await cleanup(factory, versions=versions, apply=True, batch_size=1)
+        assert report["work_session_projections"]["deleted"] == 1
+        report = await cleanup(factory, versions=versions)
+        assert report["work_session_projections"]["eligible"] == 1
+        with pytest.raises(ValueError, match="current version"):
+            await cleanup(factory, versions=[WORK_MATERIALIZER_VERSION], apply=True)
+        async with factory() as db:
+            assert await db.get(WorkSessionProjectionRow, "retention-2") is not None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -6538,11 +6601,17 @@ async def test_category_pages_are_independent_and_files_are_complete(tmp_path: P
                 tool_definitions=definitions,
             )
 
-        overview_query_count = 0
+        overview_queries: list[str] = []
 
-        def count_overview_query(*_args: Any) -> None:
-            nonlocal overview_query_count
-            overview_query_count += 1
+        def count_overview_query(
+            _connection: Any,
+            _cursor: Any,
+            statement: str,
+            _parameters: Any,
+            _context: Any,
+            _executemany: Any,
+        ) -> None:
+            overview_queries.append(statement)
 
         row.delegation_metadata = {"reasoning_effort": "low", "model": "delegated-model"}
         overview_agent = await db.get(Agent, row.agent_id)
@@ -6585,9 +6654,13 @@ async def test_category_pages_are_independent_and_files_are_complete(tmp_path: P
         assert overview.workstreams[0].agent_display_name == "Alice Display"
         assert overview.workstreams[0].agent_avatar_url == "https://example.test/alice.png"
         assert len(overview.recent["commands"]) == 10
-        assert overview.recent["commands"][0].id == "tool:category-1006"
+        assert [item.id for item in overview.recent["commands"]] == [
+            f"tool:category-{seq}" for seq in range(1006, 996, -1)
+        ]
         assert len(overview.recent_work.commands) == 10
-        assert overview.recent_work.commands[0].command == "printf 1006"
+        assert [item.command for item in overview.recent_work.commands] == [
+            f"printf {seq}" for seq in range(1006, 996, -1)
+        ]
         assert overview.recent_work.commands[0].source_workstream is not None
         assert overview.recent_work.commands[0].source_workstream.session_id == row.session_id
         assert overview.recent_work.commands[0].arguments == {}
@@ -6596,7 +6669,8 @@ async def test_category_pages_are_independent_and_files_are_complete(tmp_path: P
             for mutation in overview.recent_work.files
             for diff in mutation.file_diffs
         )
-        assert overview_query_count <= 16
+        assert len(overview_queries) <= 12
+        assert sum("recent_activity_ranked" in statement for statement in overview_queries) == 1
         db.add(
             DirectTurnRequestRow(
                 request_id="dtr-overview-old-profile",
@@ -6699,7 +6773,7 @@ async def test_category_pages_are_independent_and_files_are_complete(tmp_path: P
         )
         sa_event.remove(engine.sync_engine, "before_cursor_execute", count_many_query)
         assert len(many_overview.workstreams) == 200
-        assert many_query_count == overview_query_count
+        assert many_query_count == len(overview_queries)
         for workstream in many_overview.workstreams[:3]:
             assert workstream.agent_profile_id is None
             assert workstream.reasoning_effort is None

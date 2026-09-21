@@ -240,6 +240,39 @@ class AgentDefinition(BaseModel):
         return "\n".join(lines) if lines else None
 
 
+class PrimaryDelegationPolicy(BaseModel):
+    """Primary-agent delegation controls."""
+
+    enabled: bool = True
+    max_managed_depth: int = Field(default=1, ge=0, le=2)
+    allowed_controller_agent_ids: list[str] | None = None
+
+    @field_validator("allowed_controller_agent_ids")
+    @classmethod
+    def _validate_controller_ids(cls, value: list[str] | None) -> list[str] | None:
+        return _normalized_agent_ids(value)
+
+
+class SystemDelegationPolicy(BaseModel):
+    """Bounded system-specialist delegation controls."""
+
+    enabled: bool = True
+
+
+class AgentDelegationPolicy(BaseModel):
+    """Authoritative outbound and inbound agent delegation policy."""
+
+    enabled: bool = True
+    allowed_agent_ids: list[str] | None = None
+    primary: PrimaryDelegationPolicy = Field(default_factory=PrimaryDelegationPolicy)
+    system: SystemDelegationPolicy = Field(default_factory=SystemDelegationPolicy)
+
+    @field_validator("allowed_agent_ids")
+    @classmethod
+    def _validate_target_ids(cls, value: list[str] | None) -> list[str] | None:
+        return _normalized_agent_ids(value)
+
+
 class AgentPermissions(BaseModel):
     """Agent permission configuration."""
 
@@ -249,6 +282,8 @@ class AgentPermissions(BaseModel):
     allowed_secrets: list[str] = Field(default_factory=list)
     allowed_credentials: list[str] = Field(default_factory=list)
     allowed_knowledgebases: list[str] = Field(default_factory=list)
+    delegation: AgentDelegationPolicy | None = None
+    # Retained for compatibility with the legacy automatic decision engine.
     max_delegation_depth: int = 5
     can_delegate: bool = True
 
@@ -383,6 +418,19 @@ def _matches_any(tool_name: str, patterns: list[str] | None) -> bool:
     if "*" in patterns:
         return True
     return any(fnmatchcase(tool_name, pattern) for pattern in patterns)
+
+
+def _normalized_agent_ids(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    normalized: list[str] = []
+    for agent_id in value:
+        stripped = agent_id.strip()
+        if not stripped or stripped != agent_id:
+            raise ValueError("agent IDs must be non-empty and trimmed")
+        if stripped not in normalized:
+            normalized.append(stripped)
+    return normalized
 
 
 def _resolve_from_map(tool_permissions: dict[str, Permission], tool_name: str) -> Permission:

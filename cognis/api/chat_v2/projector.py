@@ -1030,6 +1030,12 @@ def _message_item_id(event: NormalizedChatEvent, *, role: str, message_id: str) 
         client_txn_id = _str_or_none(data.get("client_txn_id"))
         if client_txn_id:
             return f"user-txn:{client_txn_id}"
+        # Older scheduler admissions omitted queue identity. Only this explicit
+        # admission source can use the turn as its identity; absorbed/context
+        # messages must retain their independent event identities.
+        turn_id = _str_or_none(data.get("turn_id"))
+        if data.get("source") == "user_input" and turn_id and not data.get("message_id"):
+            return f"user:admitted-turn:{turn_id}"
         return f"user:{message_id}"
     if role == "assistant":
         # Phase-aware id so a multi-phase turn (text → tool_call → text …) keeps

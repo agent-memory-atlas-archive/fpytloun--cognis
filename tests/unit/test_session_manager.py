@@ -2595,3 +2595,52 @@ async def test_child_session_uses_explicit_delegation_workdir(tmp_path) -> None:
     )
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_refuses_when_a_fence_lease_is_lost(tmp_path) -> None:
+    from cognis.store.coordination import DatabaseLeaseStore
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Fenced rotation",
+    )
+    leases = DatabaseLeaseStore(session_factory)
+    turn_lease = await leases.acquire("direct-turn:conversation:x", "a:1", ttl_seconds=60)
+    compaction_lease = await leases.acquire("compaction:session:x", "a:1", ttl_seconds=60)
+    assert turn_lease is not None and compaction_lease is not None
+
+    # Simulate a takeover after the caller's entry check: another owner now
+    # holds the direct-turn lease. The rotation transaction must refuse.
+    stolen = await leases.takeover("direct-turn:conversation:x", "b:2", ttl_seconds=60)
+    assert stolen.fencing_token > turn_lease.fencing_token
+    with pytest.raises(SessionRotationConflictError, match="lost during rotation"):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root_session,
+            intention="Continued after compaction",
+            compaction_summary="Summary.",
+            fences=[turn_lease, compaction_lease],
+        )
+    async with session_factory() as db:
+        old_row = await db.get(Session, root_session.session_id)
+        assert old_row is not None and old_row.status != "completed"
+        convo = await db.get(Conversation, conversation.conversation_id)
+        assert convo is not None and convo.active_session_id == root_session.session_id
+
+    # With every fence still held the rotation commits exactly once.
+    new_session = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Continued after compaction",
+        compaction_summary="Summary.",
+        fences=[stolen, compaction_lease],
+    )
+    assert new_session.session_id != root_session.session_id
+    await engine.dispose()

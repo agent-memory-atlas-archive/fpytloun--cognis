@@ -38,6 +38,8 @@ export interface UserDisplayPreferences {
   theme: UserThemePreference;
   language: string;
   dashboard_workspace_windows: boolean;
+  conversation_sidebar_sections: boolean;
+  conversation_sidebar_dense: boolean;
 }
 
 export interface UserChatPreferences {
@@ -323,6 +325,7 @@ export interface Conversation {
     active_executor_source: string | null;
     active_session_status: string | null;
     active_session_completion_reason: string | null;
+    active_session_updated_at?: string | null;
     active_turn_chat_mode: ChatMode | null;
     active_turn_chat_mode_source: ChatModeSource | null;
     pending_notification_types: string[];
@@ -3688,6 +3691,7 @@ export interface WebSocketConversationUpdatedEvent {
   active_turn_chat_mode_source?: ChatModeSource | null;
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
+  active_session_updated_at?: string | null;
   pending_notification_types?: string[];
   last_read_at?: string | null;
   last_message_at?: string | null;

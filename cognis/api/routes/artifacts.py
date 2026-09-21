@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Literal
 from urllib.parse import quote
 
@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
+from cognis.artifacts import preview as artifact_preview
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.content_refs import (
     build_deliverable_public_url,
@@ -21,6 +22,7 @@ from cognis.core.content_refs import (
     is_deliverable_ref,
 )
 from cognis.models.artifact import ArtifactKind
+from cognis.rendering.deliverables import DeliverableRenderError, render_standalone_shell
 from cognis.store.queries import (
     create_artifact_record,
     get_artifact_record,
@@ -30,48 +32,12 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
 
 ArtifactURLMode = Literal["download", "view"]
-TEXT_PREVIEW_MAX_BYTES = 512 * 1024
-TEXT_PREVIEW_EXTENSIONS = {
-    ".c",
-    ".conf",
-    ".cpp",
-    ".css",
-    ".csv",
-    ".go",
-    ".h",
-    ".hpp",
-    ".html",
-    ".ini",
-    ".java",
-    ".js",
-    ".json",
-    ".jsonl",
-    ".log",
-    ".md",
-    ".py",
-    ".rb",
-    ".rs",
-    ".sh",
-    ".sql",
-    ".svelte",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".txt",
-    ".xml",
-    ".yaml",
-    ".yml",
-}
-TEXT_PREVIEW_MIME_TYPES = {
-    "application/javascript",
-    "application/json",
-    "application/sql",
-    "application/toml",
-    "application/xml",
-    "application/x-ndjson",
-    "application/x-sh",
-    "application/yaml",
-}
+TEXT_PREVIEW_MAX_BYTES = artifact_preview.TEXT_PREVIEW_MAX_BYTES
+ARTIFACT_VIEWER_CSP = (
+    "sandbox allow-scripts allow-same-origin allow-downloads; default-src 'none'; "
+    "script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+    "img-src 'self' data:; font-src 'self' data:; media-src 'self' data:"
+)
 
 
 def _kind_for_content_type(content_type: str) -> ArtifactKind:
@@ -105,48 +71,72 @@ def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> in
     return max(60, min(requested_ttl_seconds, remaining_seconds))
 
 
-def _is_html_content_type(content_type: str) -> bool:
-    return content_type.split(";", 1)[0].strip().lower() == "text/html"
-
-
-def _is_text_preview_supported(filename: str, content_type: str) -> bool:
-    media_type = content_type.split(";", 1)[0].strip().lower()
-    return (
-        media_type.startswith("text/")
-        or media_type in TEXT_PREVIEW_MIME_TYPES
-        or Path(filename).suffix.lower() in TEXT_PREVIEW_EXTENSIONS
+def _text_preview_payload(*, filename: str, content_type: str, content: bytes) -> dict[str, object]:
+    return artifact_preview.artifact_preview_payload(
+        filename=filename, content_type=content_type, content=content
     )
 
 
-def _text_preview_payload(*, filename: str, content_type: str, content: bytes) -> dict[str, object]:
-    if not _is_text_preview_supported(filename, content_type):
-        raise api_exception(415, "unsupported_media_type", "Artifact cannot be previewed as text")
-    preview_bytes = content[:TEXT_PREVIEW_MAX_BYTES]
-    if b"\x00" in preview_bytes:
-        raise api_exception(415, "unsupported_media_type", "Artifact cannot be previewed as text")
-    try:
-        text = preview_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        if len(content) > TEXT_PREVIEW_MAX_BYTES and exc.reason == "unexpected end of data":
-            text = preview_bytes[: exc.start].decode("utf-8")
-        else:
-            raise api_exception(
-                415, "unsupported_media_type", "Artifact is not valid UTF-8 text"
-            ) from exc
-    return {
-        "filename": filename,
-        "mime_type": content_type,
-        "size_bytes": len(content),
-        "content": text,
-        "truncated": len(content) > TEXT_PREVIEW_MAX_BYTES,
-    }
+def _assert_view_allowed(filename: str, content_type: str) -> None:
+    if not artifact_preview.supports_artifact_view(filename, content_type):
+        raise api_exception(415, "unsupported_media_type", "Artifact cannot be previewed")
 
 
-def _assert_view_allowed(content_type: str) -> None:
-    if not _is_html_content_type(content_type):
-        raise api_exception(
-            415, "unsupported_media_type", "Artifact view is only supported for HTML"
+def _artifact_viewer_response(
+    *,
+    artifact_id: str,
+    filename: str,
+    content_type: str,
+    content: bytes,
+    standalone_url: str,
+) -> Response:
+    kind = artifact_preview.classify_artifact_preview(filename, content_type)
+    if kind not in {"csv", "markdown", "mermaid", "text"}:
+        effective_content_type = (
+            "text/html" if kind == "html" else "application/pdf" if kind == "pdf" else content_type
         )
+        headers = _artifact_response_headers(
+            filename=filename,
+            content_type=effective_content_type,
+            content_length=len(content),
+            mode="view",
+        )
+        return Response(content=content, media_type=effective_content_type, headers=headers)
+    payload = artifact_preview.artifact_preview_payload(
+        filename=filename,
+        content_type=content_type,
+        content=content,
+    )
+    row = SimpleNamespace(
+        content=str(payload.get("content") or ""),
+        deliverable_id=artifact_id,
+        format="rich",
+        rich_payload=artifact_preview.artifact_preview_rich_payload(payload),
+        title=filename,
+    )
+    try:
+        document = render_standalone_shell(
+            row,
+            media_base="",
+            standalone_url=standalone_url,
+            pdf_url="",
+        ).encode()
+    except DeliverableRenderError as exc:
+        raise api_exception(
+            503, "preview_unavailable", "Artifact preview assets are unavailable"
+        ) from exc
+    return Response(
+        content=document,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Cache-Control": "private, max-age=60",
+            "Content-Length": str(len(document)),
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename, safe='')}",
+            "Content-Security-Policy": ARTIFACT_VIEWER_CSP,
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _artifact_response_headers(
@@ -162,18 +152,20 @@ def _artifact_response_headers(
         "X-Content-Type-Options": "nosniff",
     }
     if mode == "view":
-        _assert_view_allowed(content_type)
+        _assert_view_allowed(filename, content_type)
         headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(filename, safe='')}"
-        headers["Content-Security-Policy"] = (
-            "sandbox allow-scripts; "
-            "default-src 'none'; "
-            "connect-src 'none'; "
-            "img-src data: blob:; "
-            "style-src 'unsafe-inline'; "
-            "script-src 'unsafe-inline'; "
-            "font-src data:; "
-            "media-src data: blob:;"
-        )
+        headers["Referrer-Policy"] = "no-referrer"
+        if artifact_preview.classify_artifact_preview(filename, content_type) == "html":
+            headers["Content-Security-Policy"] = (
+                "sandbox allow-scripts; "
+                "default-src 'none'; "
+                "connect-src 'none'; "
+                "img-src data: blob:; "
+                "style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; "
+                "font-src data:; "
+                "media-src data: blob:;"
+            )
         return headers
     if not content_type.startswith("image/"):
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
@@ -261,7 +253,7 @@ async def get_signed_url(
         if ref is None:
             raise api_exception(404, "not_found", "Artifact not found")
         if mode == "view":
-            _assert_view_allowed(ref.mime_type)
+            _assert_view_allowed(ref.filename, ref.mime_type)
         url = build_deliverable_public_url(
             artifact_store,
             ref,
@@ -287,7 +279,7 @@ async def get_signed_url(
     if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
         raise api_exception(404, "not_found", "Artifact not found")
     if mode == "view":
-        _assert_view_allowed(row.mime_type)
+        _assert_view_allowed(row.filename, row.mime_type)
     ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
     url = await artifact_store.async_get_public_url(
         row.namespace,
@@ -402,17 +394,21 @@ async def _serve_signed_deliverable(
         ref = await get_deliverable_ref_unscoped(session, artifact_store, deliverable_id)
     if ref is None or ref.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
+    if mode == "view":
+        return _artifact_viewer_response(
+            artifact_id=deliverable_id,
+            filename=ref.filename,
+            content_type=ref.mime_type,
+            content=ref.content_bytes,
+            standalone_url=str(request.url),
+        )
     headers = _artifact_response_headers(
         filename=ref.filename,
         content_type=ref.mime_type,
         content_length=ref.size_bytes,
         mode=mode,
     )
-    return Response(
-        content=ref.content_bytes,
-        media_type=ref.mime_type,
-        headers=headers,
-    )
+    return Response(content=ref.content_bytes, media_type=ref.mime_type, headers=headers)
 
 
 @router.get("/content/{namespace}/{object_id}/{filename:path}")
@@ -498,6 +494,14 @@ async def _serve_signed_artifact(
     if row.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
     content, content_type = await artifact_store.async_load(namespace, object_id, filename)
+    if mode == "view":
+        return _artifact_viewer_response(
+            artifact_id=object_id,
+            filename=filename,
+            content_type=content_type,
+            content=content,
+            standalone_url=str(request.url),
+        )
     headers = _artifact_response_headers(
         filename=filename,
         content_type=content_type,

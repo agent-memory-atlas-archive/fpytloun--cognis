@@ -82,6 +82,11 @@ planned maintenance windows.
 The system should not be fully down when a single dependency is unavailable.
 Degradation should be explicit and visible to users.
 
+The internal metrics exporter may use canonical user email labels. It must
+remain reachable only through the internal observability network boundary:
+the public ingress must not expose `/api/metrics`, and scrape targets must be
+restricted to the private controller pod network.
+
 | Dependency Down | Impact | Behavior |
 |----------------|--------|----------|
 | **Mnemory** | No memory recall or remember | Chat continues without memory context; responses carry internal `degraded_context` flag; remember queue buffers writes for retry; user sees "memory unavailable" indicator |
@@ -130,6 +135,35 @@ Circuit breaker state should be visible at `/api/health` per provider.
 ## Observability
 
 ### Metrics (Prometheus)
+
+The approved controller inventory families are:
+
+```text
+cognis_users{status}
+cognis_users_active{window,user}
+cognis_agents{user,agent,type,status}
+cognis_agents_active{window,user,agent,type}
+cognis_conversations{user,agent,profile,origin,status}
+cognis_sessions{user,agent,provider,model,profile,origin,status}
+cognis_turn_requests{user,agent,provider,model,profile,origin,status}
+cognis_turns_active{user,agent,provider,model,profile,origin,status}
+cognis_tasks{user,agent,profile,origin,status}
+cognis_executions_active{user,agent,provider,model,profile,origin,type,status}
+cognis_channel_accounts{user,agent,profile,channel,status}
+cognis_channel_deliveries{user,agent,channel,status}
+cognis_executors{user,type,status}
+cognis_executor_state{user,executor,type,status}
+cognis_lsp_state{user,executor,executor_type,state}
+cognis_lsp_servers_active{user,executor,executor_type}
+cognis_lsp_files_tracked{user,executor,executor_type}
+cognis_lsp_diagnostics{user,executor,executor_type,severity}
+cognis_lsp_spawns_pending{user,executor,executor_type}
+cognis_lsp_snapshot_timestamp_seconds{user,executor,executor_type}
+```
+
+For session and turn families, `provider` and `model` are configured override
+selections, or `inherit` when no override is configured. They are not asserted
+to be the effective runtime provider or model.
 
 Runtime observability requirements for first-class runtimes:
 
@@ -215,9 +249,12 @@ cognis_event_read_cache_entries
 cognis_event_read_cache_bytes
 ```
 
-Do not add user, conversation, session, agent, controller, Redis key/channel, or
-other identity labels. Diagnostics expose safe configured/available/connected
-booleans only. Redis is excluded from `/api/readyz`.
+Aggregate and attributed observability families may use canonical user email and
+bounded configured agent/provider/model/profile/origin/status labels. Never use
+conversation, session, controller, executor UUID, Redis key/channel, prompt,
+message content, tool arguments, or secret labels. Diagnostics expose safe
+configured/available/connected booleans only. Redis is excluded from
+`/api/readyz`.
 
 #### Task Queue (Phase 2)
 

@@ -59,7 +59,7 @@
   data-testid="child-chat-view"
 >
   <header
-    class="flex shrink-0 items-center gap-2 border-b border-slate-800/80 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 sm:gap-3 sm:px-4 sm:pt-[calc(0.75rem+env(safe-area-inset-top))] sm:pb-3"
+    class="app-keyboard-stable-header chat-header-shell relative z-20 flex shrink-0 items-center gap-2 border-b border-slate-800/80 px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3"
     style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));"
     data-testid="child-header"
   >

@@ -36,6 +36,7 @@ from cognis.tools.classification import (
 
 logger = get_logger(__name__)
 _ENQUEUE_MAX_ATTEMPTS = 3
+_CLASSIFICATION_MAX_ATTEMPTS = 3
 
 
 def _utcnow() -> datetime:
@@ -65,7 +66,7 @@ class _ClaimedClassification:
 
 
 class ToolClassificationQueue:
-    """Durable background classifier with infinite exponential backoff."""
+    """Durable, best-effort classifier with a bounded retry budget per fingerprint."""
 
     def __init__(
         self,
@@ -169,7 +170,7 @@ class ToolClassificationQueue:
                 fingerprint_changed = row is not None and row.fingerprint != fingerprint
                 if (
                     row is not None
-                    and row.status in {"pending", "running"}
+                    and row.status in {"pending", "running", "failed"}
                     and not fingerprint_changed
                 ):
                     continue
@@ -354,9 +355,6 @@ class ToolClassificationQueue:
                         tools,
                         llm=self._llm_provider,
                         acting_user_email=items[0].owner_email,
-                        allow_soft_profile_group_mismatch_for={
-                            item.tool_id for item in items if item.attempts > 0
-                        },
                         retry_context={
                             item.tool_id: item.last_error
                             for item in items
@@ -388,15 +386,21 @@ class ToolClassificationQueue:
                                 )
                                 continue
                             attempts = item.attempts + 1
-                            backoff_seconds = min(2**attempts, self._backoff_max)
-                            retry_delays.append(backoff_seconds)
+                            exhausted = attempts >= _CLASSIFICATION_MAX_ATTEMPTS
+                            backoff_seconds = min(2 ** min(attempts, 16), self._backoff_max)
+                            if not exhausted:
+                                retry_delays.append(backoff_seconds)
                             await self._settle_claim(
                                 session,
                                 item,
-                                status="pending",
+                                status="failed" if exhausted else "pending",
                                 attempts=attempts,
                                 last_error=rejected.get(item.tool_id, "no_classification_result"),
-                                next_retry_at=_utcnow() + timedelta(seconds=backoff_seconds),
+                                next_retry_at=(
+                                    None
+                                    if exhausted
+                                    else _utcnow() + timedelta(seconds=backoff_seconds)
+                                ),
                             )
                         await session.commit()
                     if retry_delays:
@@ -410,7 +414,7 @@ class ToolClassificationQueue:
                             for tool_id, reason in rejected.items()
                         }
                         logger.warning(
-                            "Tool classification batch completed with retries scheduled",
+                            "Tool classification batch completed with rejected results",
                             extra={
                                 "extra_data": {
                                     "batch_size": len(items),
@@ -437,15 +441,21 @@ class ToolClassificationQueue:
                         retry_delays = []
                         for item in items:
                             attempts = item.attempts + 1
-                            backoff_seconds = min(2**attempts, self._backoff_max)
-                            retry_delays.append(backoff_seconds)
+                            exhausted = attempts >= _CLASSIFICATION_MAX_ATTEMPTS
+                            backoff_seconds = min(2 ** min(attempts, 16), self._backoff_max)
+                            if not exhausted:
+                                retry_delays.append(backoff_seconds)
                             await self._settle_claim(
                                 session,
                                 item,
-                                status="pending",
+                                status="failed" if exhausted else "pending",
                                 attempts=attempts,
                                 last_error=error_text,
-                                next_retry_at=_utcnow() + timedelta(seconds=backoff_seconds),
+                                next_retry_at=(
+                                    None
+                                    if exhausted
+                                    else _utcnow() + timedelta(seconds=backoff_seconds)
+                                ),
                             )
                         await session.commit()
                     if retry_delays:

@@ -849,7 +849,12 @@ async def test_reconciliation_keeps_assistant_on_first_canonical_replay(
             TRUSTED_EVIDENCE_ADMISSION_KEY: ADMISSION,
         }
     )
-    await queue.reconcile_trusted_evidence()
+    async with factory() as session:
+        row = await session.get(RememberQueueRow, preexisting_id)
+        row.status = "unavailable"
+        await session.commit()
+    await queue.start()
+    await queue.stop()
 
     async with factory() as session:
         evidence_rows = (
@@ -861,7 +866,7 @@ async def test_reconciliation_keeps_assistant_on_first_canonical_replay(
         ).scalars()
         evidence = list(evidence_rows)
         assert [row.item_id for row in evidence] == [preexisting_id]
-        assert evidence[0].payload["ordinary_work_needed"] is True
+        assert evidence[0].payload.get("ordinary_work_needed", False) is False
         assert (
             await session.scalar(
                 sa.select(sa.func.count())
@@ -873,7 +878,8 @@ async def test_reconciliation_keeps_assistant_on_first_canonical_replay(
         evidence[0].status = "unavailable"
         await session.commit()
 
-    await queue.reconcile_trusted_evidence()
+    await queue.start()
+    await queue.stop()
     async with factory() as session:
         ordinary_user = (
             await session.execute(
@@ -881,22 +887,8 @@ async def test_reconciliation_keeps_assistant_on_first_canonical_replay(
                     RememberQueueRow.payload["queue_kind"].as_string() == ORDINARY_USER_QUEUE_KIND
                 )
             )
-        ).scalar_one()
-        assert ordinary_user.status == "pending"
-        ordinary_user.status = "completed"
-        await session.commit()
-
-    await queue.reconcile_trusted_evidence()
-    async with factory() as session:
-        assistant = (
-            await session.execute(
-                sa.select(RememberQueueRow).where(
-                    RememberQueueRow.payload["queue_kind"].as_string() == "ordinary_assistant"
-                )
-            )
-        ).scalar_one()
-        assert assistant.status == "pending"
-        assert assistant.payload["depends_on"] == preexisting_id
+        ).scalar_one_or_none()
+        assert ordinary_user is None
     await engine.dispose()
 
 
@@ -1183,7 +1175,24 @@ async def test_capacity_fallback_deselection_reconciles_and_completes_ordinary_m
 
     restarted_queue._resolve_evidence_body = resolve_body  # type: ignore[method-assign]
     restarted_queue._revalidate_evidence_signing_inputs = revalidate  # type: ignore[method-assign]
-    await restarted_queue.reconcile_trusted_evidence()
+    # Explicit producer replay can retry a previously capacity-limited handoff;
+    # startup no longer scans history to invent missing work.
+    await restarted_queue.enqueue_after_user_append(
+        session=SimpleNamespace(
+            session_id="session-1",
+            intaris_session_id="intaris-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_profile_id=None,
+        ),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        conversation_id="conversation-1",
+        turn_id="turn-1",
+        event_seq=7,
+        event_hash_value=event_hash_value,
+        owner_email="owner@example.com",
+        evidence_admission=ADMISSION,
+    )
 
     async with factory() as session:
         evidence = await session.get(RememberQueueRow, evidence_id)

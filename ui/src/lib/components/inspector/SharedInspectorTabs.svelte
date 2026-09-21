@@ -188,7 +188,7 @@
   });
 </script>
 
-<div class="bg-slate-950" data-testid="shared-inspector-tabs">
+<div class="bg-transparent" data-testid="shared-inspector-tabs">
   <AccessibleTabs
     tabs={[{ id: 'overview', label: 'Overview' }, { id: 'work', label: 'Work' }, { id: 'session', label: 'Session' }]}
     activeId={activeTab}

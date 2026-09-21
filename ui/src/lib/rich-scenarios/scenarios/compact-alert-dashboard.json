@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "id": "compact-alert-dashboard",
+  "title": "Compact alert operator",
+  "description": "Operational dashboard regression: long identifiers, hero dek, plain metrics, tables, statuses and checkpoint.",
+  "group": "Operations",
+  "sort_key": 25,
+  "visibility": ["gallery"],
+  "content": "# Alert operator\n\nZero unsuppressed. All active alerts have bounded coverage.",
+  "payload": {
+    "title": "Alert Operator — hourly review",
+    "metadata": {"presentation": "dashboard", "canvas": "wide", "density": "compact"},
+    "blocks": [
+      {
+        "type": "hero",
+        "title": "Zero unsuppressed — recurring relay errors re-contained",
+        "dek": "Hourly pass after a fifth rollout; the same self-healing signature was re-silenced. All other alerts remain stable under bounded silences.",
+        "badges": [
+          {"label": "unsuppressed = 0", "tone": "success"},
+          {"label": "contained_stable", "tone": "info"},
+          {"label": "lock idle", "tone": "success"}
+        ]
+      },
+      {"type": "grid", "layout": "equal", "blocks": [
+        {"type": "metric", "label": "Active alerts", "value": "13"},
+        {"type": "metric", "label": "Suppressed", "value": "13"},
+        {"type": "metric", "label": "Inhibited", "value": "1"},
+        {"type": "metric", "label": "Unsuppressed", "value": "0"}
+      ]},
+      {"type": "section_header", "eyebrow": "This pass", "title": "Processed items", "subtitle": "Hourly trigger at 21:00 UTC"},
+      {"type": "table", "title": "Processed this pass", "columns": ["Identity", "Classification", "Action", "Disposition"], "rows": [
+        {"Identity": "RelayPublishOrDropErrors relay-0 (cc39812a2d654d2d)", "Classification": "stable (19th+ window, 5th rollout)", "Action": "Bounded silence, expires 22:00 UTC", "Disposition": "bounded_silenced"},
+        {"Identity": "RelayPublishOrDropErrors relay-1 (31ec045c889d3dc4)", "Classification": "stable (19th+ window, 5th rollout)", "Action": "Bounded silence, expires 22:00 UTC", "Disposition": "bounded_silenced"}
+      ]},
+      {"type": "section_header", "eyebrow": "Standing coverage", "title": "Reused silences", "subtitle": "No cadence due this pass"},
+      {"type": "table", "columns": ["Item", "Silence", "Expiry / Review"], "rows": [
+        {"Item": "Dead sensor nodes + battery (7 identities)", "Silence": "Standing coverage", "Expiry / Review": "2026-11-20"},
+        {"Item": "LinkMarginLow (client + AP)", "Silence": "Paired coverage", "Expiry / Review": "review 2026-10-11 14:00 UTC"},
+        {"Item": "HostRequiresReboot", "Silence": "Maintenance coverage", "Expiry / Review": "review 2026-10-11 14:00 UTC"},
+        {"Item": "InventoryOwnerInvalid / SnapshotStale", "Silence": "Bounded application coverage", "Expiry / Review": "2026-09-16 04:00 UTC"},
+        {"Item": "HostOutOfDiskSpace (unowned, pre-existing)", "Silence": "Standing coverage", "Expiry / Review": "2026-11-26"}
+      ]},
+      {"type": "status_grid", "title": "Cluster and delivery health", "items": [
+        {"label": "API /readyz", "status": "ok", "tone": "success"},
+        {"label": "Nodes Ready", "status": "7/7", "tone": "success"},
+        {"label": "Notification routing", "status": "critical-only, unchanged", "tone": "success"},
+        {"label": "Deployment exceptions", "status": "only pre-existing applications OutOfSync + service Unknown quirk", "tone": "neutral"}
+      ]},
+      {"type": "callout", "tone": "info", "title": "Non-blocking escalations (carried forward, not due for FYI)", "content": "Relay/inventory application defect family: 19th+ consecutive observation window, now spanning five CI-driven rollouts. Self-healing; root cause requires application engineering.\n\nCache maxmemory: nine occurrences over approximately 47 hours. Standing capacity recommendation is outside this operator's bounded remediation authority; it did not recur this pass."},
+      {"type": "key_value", "title": "Checkpoint", "items": [
+        {"label": "Next review", "value": "2026-09-15T22:00:00Z (silence expiry)"},
+        {"label": "Next full review", "value": "2026-09-16T00:00:00Z"},
+        {"label": "Maintenance lock", "value": "idle, verified", "tone": "positive"},
+        {"label": "Owner", "value": "operator/sfire_d94aa121107c506b85299e4d6ca329c2"}
+      ]}
+    ]
+  }
+}

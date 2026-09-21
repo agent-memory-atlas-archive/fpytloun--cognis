@@ -28,6 +28,37 @@ Session **content** (messages, tool calls, events) is in Intaris event store.
 Intaris-derived state (event seq, compaction summary, intention) is in the
 **session cache** (in-memory / Redis) — NOT in Cognis DB.
 
+### Context integrity boundary
+
+`SessionCache.get_context_snapshot()` owns the synchronous, detached capture of
+canonical history, immutable prefix, summary, and watermarks for one assembly or
+compaction. It refuses uninitialized or stale entries. The capture does not
+yield; consumers do not retain a cache lock across provider I/O. Later cache
+invalidation cannot mutate an already captured snapshot. Stale refreshes rebuild
+from the complete durable stream, not from the highest cached event sequence.
+
+`canonical_history.read_complete_history()` owns pagination and availability
+checks for context reconstruction, forks, and history rebasing. Partial pages,
+missing streams, and reported gaps are errors, not empty history. Cancellation
+propagates without publishing partial read state. Profile continuation additionally
+requires the recorded current turn and its switch call/result/notice boundary.
+The agent loop surfaces integrity failures and stops before further inference.
+
+Forks always read durable history, even if the source cache appears healthy:
+cache health alone does not establish a cross-controller completeness watermark.
+Only the latest immutable-prefix snapshot is inherited. Full-history workflow
+inputs fail rather than silently falling back to a structured summary when
+copying fails.
+
+Fork copying uses target-local `history_copy_started` and
+`history_copy_completed` lifecycle events in Intaris. History batches and prefix
+writes use stable target-scoped idempotency keys. Cache publication follows
+acknowledgement of the complete copy; no Cognis database transaction spans this
+I/O. An interrupted copy remains detectably incomplete after restart and cannot
+be used for inference or as a fork source. Copy markers are not inherited by
+derived forks or undo histories. Existing sessions without these additive
+markers remain readable. This cannot retroactively detect old partial forks.
+
 Mnemory records shown to a model use compact aliases such as `m1`. Each alias
 identifies one exact memory revision within one Intaris session. Alias deltas
 are stored in existing recalled-memory developer-message and memory tool-result

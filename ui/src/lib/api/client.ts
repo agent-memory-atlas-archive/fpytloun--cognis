@@ -851,7 +851,17 @@ export const api = {
       return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`);
     },
 
-    textPreview(artifactId: string): Promise<{ artifact_id: string; filename: string; mime_type: string; size_bytes: number; content: string; truncated: boolean }> {
+    textPreview(artifactId: string): Promise<{
+      artifact_id: string;
+      filename: string;
+      mime_type: string;
+      size_bytes: number;
+      content: string;
+      truncated: boolean;
+      preview_kind: 'csv' | 'markdown' | 'mermaid' | 'text';
+      table?: { headers: string[]; rows: string[][] };
+      rich_payload: unknown;
+    }> {
       return request(`/api/v1/artifacts/${artifactId}/text-preview`);
     }
   },
@@ -2362,6 +2372,13 @@ export async function safeRequest<T>(run: () => Promise<T>, fallback: T): Promis
 export function asApiError(error: unknown): ApiError {
   if (error instanceof ApiError) {
     return error;
+  }
+  if (isRecord(error) && typeof error.status === 'number') {
+    return new ApiError(toErrorMessage(error), {
+      code: typeof error.code === 'string' ? error.code : undefined,
+      status: error.status,
+      details: isRecord(error.details) ? error.details : null
+    });
   }
 
   return new ApiError(toErrorMessage(error), { status: 500 });

@@ -126,6 +126,8 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
         default_response = client.get("/api/v1/user-preferences", headers=headers)
         assert default_response.status_code == 200
         assert default_response.json()["display"]["dashboard_workspace_windows"] is True
+        assert default_response.json()["display"]["conversation_sidebar_sections"] is True
+        assert default_response.json()["display"]["conversation_sidebar_dense"] is False
         assert default_response.json()["chat"] == {
             "enter_to_send": True,
             "show_thinking_blocks": False,
@@ -139,6 +141,8 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
                 "theme": "system",
                 "language": "cs-CZ",
                 "dashboard_workspace_windows": True,
+                "conversation_sidebar_sections": False,
+                "conversation_sidebar_dense": True,
             },
             "chat": {
                 "enter_to_send": False,
@@ -205,6 +209,8 @@ def test_user_preferences_adds_default_for_legacy_persisted_state(
 
         assert response.status_code == 200
         assert response.json()["display"]["dashboard_workspace_windows"] is True
+        assert response.json()["display"]["conversation_sidebar_sections"] is True
+        assert response.json()["display"]["conversation_sidebar_dense"] is False
         assert response.json()["chat"]["enter_to_send"] is True
         assert response.json()["chat"]["keep_assistant_messages_separate"] is False
 

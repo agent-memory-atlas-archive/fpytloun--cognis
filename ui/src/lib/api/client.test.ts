@@ -1,9 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { api } from '$lib/api/client';
+import { ApiError, api, asApiError } from '$lib/api/client';
 import { auth } from '$lib/stores/auth';
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
+
+describe('asApiError', () => {
+  it('preserves structured errors from specialized API clients', () => {
+    const source = Object.assign(new Error('Session event store is temporarily unavailable'), {
+      code: 'event_store_unavailable',
+      status: 503,
+      details: { retryable: true }
+    });
+
+    expect(asApiError(source)).toEqual(expect.objectContaining({
+      message: source.message,
+      code: source.code,
+      status: source.status,
+      details: source.details
+    }));
+  });
+
+  it('returns existing ApiError instances unchanged', () => {
+    const source = new ApiError('Not found', { code: 'not_found', status: 404 });
+
+    expect(asApiError(source)).toBe(source);
+  });
+});
 
 describe('api client session handling', () => {
   const originalFetch = global.fetch;

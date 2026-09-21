@@ -289,7 +289,18 @@ describe('agent payload mapping', () => {
         allowed_credentials: [],
         allowed_knowledgebases: [],
         can_delegate: true,
-        max_delegation_depth: 3
+        delegation: {
+          enabled: true,
+          allowed_agent_ids: null,
+          primary: {
+            enabled: true,
+            max_managed_depth: 1,
+            allowed_controller_agent_ids: null
+          },
+          system: {
+            enabled: true
+          }
+        }
       },
       execution: {
         executor_id: undefined,

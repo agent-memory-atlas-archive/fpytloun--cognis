@@ -31,6 +31,7 @@
   let knowledgebases = $state<KnowledgebaseModel[]>([]);
   let skills = $state<Skill[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
+  let agents = $state<Agent[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
   let secondaryBindings = $state<string[]>([]);
   let shares = $state<AgentGrant[]>([]);
@@ -181,7 +182,7 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, workflows, secrets, credentials, knowledgebases, skills, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
+      [agent, workflows, secrets, credentials, knowledgebases, skills, intarisMcpServers, agents, secondaryBindings] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.workflows.listAll(),
         api.secrets.list(),
@@ -189,9 +190,10 @@
         api.knowledgebases.list().catch(() => []),
         api.skills.list().catch(() => []),
         api.tools.intarisMcpServers().catch(() => []),
-        api.agents.listAll({ agent_type: 'secondary' }),
+        api.agents.listAll().catch(() => []),
         api.agents.listBindings(agentIdFromRoute()).catch(() => []),
       ]);
+      secondaryAgents = agents.filter((candidate: Agent) => candidate.agent_type === 'secondary');
       try {
         executors = await api.executor.list();
       } catch {
@@ -616,6 +618,7 @@
       {knowledgebases}
       {skills}
       {intarisMcpServers}
+      {agents}
       {secondaryAgents}
       {secondaryBindings}
       {saving}

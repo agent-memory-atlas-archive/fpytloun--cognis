@@ -1531,6 +1531,49 @@ async def test_deterministic_controller_failure_is_bounded_and_releases_fifo(
 
 
 @pytest.mark.asyncio
+async def test_local_turn_busy_deferral_does_not_exhaust_controller_retry_budget(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "local-turn-busy", "hello")
+    completed = asyncio.Event()
+    attempts = 0
+
+    async def execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= direct_turn_runtime_module.DIRECT_TURN_CONTROLLER_MAX_ATTEMPTS:
+            raise direct_turn_runtime_module.LocalDirectTurnBusy(row.request_id)
+        assert await store.mark_running(row.request_id, lease=fence.lease)
+        assert await store.mark_terminal(
+            row.request_id,
+            lease=fence.lease,
+            status=DirectTurnStatus.COMPLETED,
+        )
+        completed.set()
+
+    runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-a",
+        incarnation_id="boot-a",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        simple_mode=False,
+    )
+    try:
+        await runtime.start()
+        await asyncio.wait_for(completed.wait(), timeout=5)
+        row = await store.get(admitted.request.request_id)
+        assert row is not None
+        assert row.status == DirectTurnStatus.COMPLETED.value
+        assert attempts == direct_turn_runtime_module.DIRECT_TURN_CONTROLLER_MAX_ATTEMPTS + 1
+    finally:
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_simple_mode_wake_claims_without_poll_delay(tmp_path: Path) -> None:
     engine, store, leases = await _stores(tmp_path)
     executed = asyncio.Event()
@@ -1896,7 +1939,9 @@ async def test_durable_cancel_watch_interrupts_owner_without_cluster_signal(
 ) -> None:
     row = SimpleNamespace(cancel_requested_at=datetime.now(UTC))
     runtime = object.__new__(DurableDirectTurnRuntime)
-    runtime.store = SimpleNamespace(get=AsyncMock(return_value=row))
+    runtime.store = SimpleNamespace(
+        get_cancel_state=AsyncMock(return_value=("running", row.cancel_requested_at))
+    )
     monkeypatch.setattr(
         direct_turn_runtime_module,
         "DIRECT_TURN_CANCELLATION_POLL_SECONDS",

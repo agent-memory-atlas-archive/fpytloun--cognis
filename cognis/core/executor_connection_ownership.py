@@ -12,8 +12,13 @@ from typing import Any
 from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now_expression
-from cognis.store.models import CoordinationLeaseRow, ExecutorRow
+from cognis.store.coordination import (
+    LEASE_RENEWAL_DELAY_SECONDS,
+    DatabaseLeaseStore,
+    Lease,
+    database_now_expression,
+)
+from cognis.store.models import CoordinationLeaseRow, ExecutorRow, executor_observed_tools_deferred
 
 EXECUTOR_CONNECTION_LEASE_TTL_SECONDS = 45.0
 EXECUTOR_HEARTBEAT_FRESHNESS_SECONDS = 30.0
@@ -100,7 +105,12 @@ class ExecutorConnectionOwnership:
             if heartbeat_received_at.tzinfo is None
             else heartbeat_received_at.astimezone(UTC)
         )
-        if (datetime.now(UTC) - received_at).total_seconds() > EXECUTOR_HEARTBEAT_FRESHNESS_SECONDS:
+        heartbeat_age = (datetime.now(UTC) - received_at).total_seconds()
+        # Age of the heartbeat frame when the loop finally processes it.
+        LEASE_RENEWAL_DELAY_SECONDS.labels(lease="executor_connection").observe(
+            max(0.0, heartbeat_age)
+        )
+        if heartbeat_age > EXECUTOR_HEARTBEAT_FRESHNESS_SECONDS:
             return False
         renewed = await self._lease_store.renew(
             owner.lease,
@@ -229,4 +239,8 @@ class ExecutorConnectionOwnership:
             .values(**filtered_values)
             .returning(ExecutorRow)
         )
+        if "observed_tools" not in filtered_values:
+            # Heartbeat-driven updates never touch the multi-megabyte tool
+            # catalog; keep it out of RETURNING so asyncpg does not decode it.
+            statement = statement.options(executor_observed_tools_deferred())
         return (await session.execute(statement)).scalar_one_or_none()

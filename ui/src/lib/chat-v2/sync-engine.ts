@@ -422,16 +422,17 @@ export function applySendResponse(state: ChatV2ClientState, response: SendMessag
   const currentAdmissionSettled = state.admissionPlacements[response.client_message_id]?.status === 'complete';
   const canonicalConfirmed = canonicalUserClientMessageIds(state.timelineItems).has(
     response.client_message_id
-  );
+  ) || canonicalUserClientMessageIds(state.runtime?.volatile_items ?? []).has(response.client_message_id)
+    || Boolean(matchingLocalItem && itemTurnIdOf(matchingLocalItem));
   const admissionPlacements = matchingLocalItem
     ? {
         ...state.admissionPlacements,
         [response.client_message_id]: {
           ...state.admissionPlacements[response.client_message_id],
-          placement: currentPlacement === 'deleted'
-            || canonicalConfirmed
-            || (currentPlacement === 'timeline' && currentAdmissionSettled)
-            ? currentPlacement ?? 'timeline'
+          placement: currentPlacement === 'deleted' ? 'deleted'
+            : canonicalConfirmed ? 'timeline'
+            : (currentPlacement === 'timeline' && currentAdmissionSettled)
+            ? 'timeline'
             : isQueuedAdmission
               ? 'queue'
               : 'timeline',
@@ -466,7 +467,7 @@ export function addOptimisticUserMessage(
   }
   const createdAt = input.createdAt ?? new Date().toISOString();
   const item: TimelineItem = {
-    id: `local-user:${input.clientMessageId}`,
+    id: `user:${input.clientMessageId}`,
     kind: 'message',
     sort_key: nextLocalSortKey(state),
     source_refs: [],
@@ -503,8 +504,12 @@ export function markOptimisticUserMessageFailed(
   state: ChatV2ClientState,
   clientMessageId: string,
 ): ChatV2ClientState {
+  if (state.admissionPlacements[clientMessageId]?.status === 'complete'
+    || state.localItems.some((item) => item.kind === 'message'
+      && item.client_message_id === clientMessageId && item.status === 'complete')
+    || canonicalUserClientMessageIds(state.timelineItems).has(clientMessageId)) return state;
   const localItems = state.localItems.map((item) => (
-    item.kind === 'message' && item.client_message_id === clientMessageId
+    item.kind === 'message' && item.client_message_id === clientMessageId && item.status !== 'complete'
       ? { ...item, status: 'failed' as const, stable: true, updated_at: new Date().toISOString() }
       : item
   ));
@@ -1020,6 +1025,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   ));
   const runtimeItems = state.runtime?.has_active_turn ? state.runtime.volatile_items : [];
   const canonicalClientMessageIds = canonicalUserClientMessageIds(state.timelineItems);
+  const canonicalIds = new Set(state.timelineItems.map((item) => item.id));
   if (state.localItems.length === 0 && runtimeItems.length === 0) {
     derived.visibleItems = baseItems;
     return baseItems;
@@ -1059,7 +1065,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
       && item.role === 'user'
       && item.client_message_id
       && (
-        state.admissionPlacements[item.client_message_id]?.placement === 'queue'
+        (state.admissionPlacements[item.client_message_id]?.placement === 'queue' && !itemTurnIdOf(item))
         || canonicalClientMessageIds.has(item.client_message_id)
       )
     ) {
@@ -1068,6 +1074,14 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
     upsertVisibleTimelineItem(visible, visibleById, item);
   }
   for (const item of runtimeItems) {
+    if (isConfirmedLegacyAdmission(item, canonicalIds)) continue;
+    if (item.kind === 'message' && item.role === 'user' && item.client_message_id) {
+      if (canonicalClientMessageIds.has(item.client_message_id)) continue;
+      // Older controllers marked admitted input pending; only authoritative
+      // runtime input, not a local send, proves server acknowledgement.
+      upsertVisibleTimelineItem(visible, visibleById, { ...item, status: 'complete' });
+      continue;
+    }
     if (
       item.kind === 'message'
       && item.role === 'assistant'
@@ -1086,8 +1100,22 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   return visible;
 }
 
+function isConfirmedLegacyAdmission(item: TimelineItem, canonicalIds: Set<string>): boolean {
+  // Only server admissions lacking browser identity qualify. The projector
+  // explicitly marks old user_input events; never match arbitrary user text.
+  return item.kind === 'message' && item.role === 'user'
+    && !item.client_message_id && !item.client_txn_id
+    && Boolean(item.turn_id) && item.message_id.startsWith('queue:')
+    && item.id === `user:${item.message_id.slice('queue:'.length)}`
+    && canonicalIds.has(`user:admitted-turn:${item.turn_id}`);
+}
+
 export function visibleQueueMessages(state: ChatV2ClientState): QueueState {
-  const canonicalTimelineClientIds = canonicalUserClientMessageIds(state.timelineItems);
+  const canonicalTimelineClientIds = canonicalUserClientMessageIds([
+    ...state.timelineItems,
+    ...(state.runtime?.volatile_items ?? []),
+    ...state.localItems.filter((item) => Boolean(itemTurnIdOf(item)))
+  ]);
   const localByClientId = new Map(
     state.localItems.flatMap((item) =>
       item.kind === 'message' && item.role === 'user' && item.client_message_id
@@ -1256,6 +1284,9 @@ function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): Time
     if (existing.role === 'assistant' && existing.status === 'complete' && incoming.status === 'running') {
       return existing;
     }
+    if (existing.role === 'user' && existing.status === 'complete' && incoming.status === 'pending') {
+      return existing;
+    }
     return {
       ...existing,
       ...incoming,
@@ -1269,6 +1300,9 @@ function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): Time
 }
 
 function terminalizeSettledItem(item: TimelineItem): TimelineItem {
+  if (item.kind === 'message' && item.role === 'user' && item.client_message_id) {
+    return { ...item, status: 'complete' };
+  }
   if (item.kind === 'thinking') {
     const needsTerminalStatus = item.status !== 'complete';
     const needsBlockStatus = item.blocks.some((block) => block.status !== 'complete');
@@ -1510,7 +1544,8 @@ function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: Timelin
     }
   }
   const reconciled = localItems.filter((item) => {
-    if (canonicalIds.has(item.id)) return false;
+    if (isConfirmedLegacyAdmission(item, canonicalIds)) return false;
+    if (canonicalIds.has(item.id) && !(item.kind === 'message' && item.role === 'user' && item.client_message_id)) return false;
     if (item.kind === 'message' && item.role === 'system' && canonicalSystemIds.has(item.id)) {
       return false;
     }
@@ -1540,7 +1575,16 @@ function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: Timelin
     // if a delayed HA snapshot temporarily omits that echo.
     return true;
   });
-  return reconciled.length === localItems.length ? localItems : reconciled;
+  const confirmed = canonicalUserClientMessageIds(canonicalItems);
+  const acknowledged = reconciled.map((item) =>
+    item.kind === 'message' && item.role === 'user' && item.client_message_id
+      && confirmed.has(item.client_message_id) && item.status !== 'complete'
+      ? { ...item, status: 'complete' as const }
+      : item
+  );
+  return acknowledged.length === localItems.length
+    && acknowledged.every((item, index) => item === localItems[index])
+    ? localItems : acknowledged;
 }
 
 function reconcileAdmissionPlacements(
@@ -1610,7 +1654,35 @@ function carrySettledRuntimeItems(
   incomingRuntime: RuntimeOverlaySnapshot | null
 ): TimelineItem[] {
   if (!incomingRuntime) return localItems;
-  if (!currentRuntime || currentRuntime.volatile_items.length === 0) return localItems;
+  // Settle the old turn before admitting the new one, so its user item does
+  // not get moved into the previous turn's carried ordering band.
+  localItems = carryPriorRuntimeItems(localItems, currentRuntime, incomingRuntime);
+  // Remember authoritative admission even if HTTP acknowledgement is delayed
+  // or lost and a later complete overlay no longer includes this user item.
+  const admitted = incomingRuntime.volatile_items.filter(
+    (item) => item.kind === 'message' && item.role === 'user' && item.client_message_id
+  );
+  if (admitted.length) {
+    const byId = new Map(localItems.map((item) => [item.id, item]));
+    for (const item of admitted) {
+      if (item.kind !== 'message') continue;
+      const existing = byId.get(item.id);
+      const acknowledged = { ...item, status: 'complete' as const };
+      byId.set(item.id, existing ? mergeTimelineItem(existing, acknowledged) : acknowledged);
+    }
+    localItems = sortTimelineItems([...byId.values()]);
+  }
+  return localItems;
+}
+
+function carryPriorRuntimeItems(
+  localItems: TimelineItem[],
+  currentRuntime: RuntimeOverlaySnapshot | null,
+  incomingRuntime: RuntimeOverlaySnapshot
+): TimelineItem[] {
+  // A claimed turn can be cancelled before its first runtime item. Its local
+  // admission still belongs to the settled turn and must leave the active band.
+  if (!currentRuntime) return localItems;
   // Carry when the accepted overlay no longer represents the current active
   // turn: either the turn settled (inactive) or a DIFFERENT turn's active
   // overlay replaced it wholesale. The active→active transition matters for

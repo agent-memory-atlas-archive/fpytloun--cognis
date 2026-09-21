@@ -10,6 +10,10 @@ design illustration.
 Purpose: establish the document's focal message. Use once, when the reader
 needs a clear title and orientation.
 
+Hero `badges`/`tags` can be plain text or `{label, tone?}`. Use at most eight.
+Tone is semantic (`neutral`, `info`, `success`, `warning`, or `danger`); text
+must remain meaningful without color.
+
 ![Hero block](../assets/screenshots/rich-deliverables/hero.png)
 
 ### Section
@@ -130,6 +134,10 @@ incident checklist is intended for operational response.
 ### Key-value blocks
 Purpose: list compact facts. `kv` and `key_value` are supported aliases; use
 `key_value` in new payloads.
+
+Use `variant: "summary"` for an ordered summary strip. The renderer controls
+responsive and print layout. Optional item `tone` communicates semantic state;
+do not provide columns or widths.
 
 ![KV block](../assets/screenshots/rich-deliverables/kv.png)
 ![Key-value block](../assets/screenshots/rich-deliverables/key_value.png)

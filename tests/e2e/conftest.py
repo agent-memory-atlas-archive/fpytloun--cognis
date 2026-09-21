@@ -163,6 +163,7 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     cognis_port = _free_port()
     mnemory_port = _free_port()
     intaris_port = _free_port()
+    intaris_metrics_port = _free_port()
     mock_llm_port = _free_port()
 
     cognis_url = f"http://127.0.0.1:{cognis_port}"
@@ -266,6 +267,8 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
                 "DATA_DIR": str(intaris_dir),
                 "INTARIS_HOST": "127.0.0.1",
                 "INTARIS_PORT": str(intaris_port),
+                "METRICS_HOST": "127.0.0.1",
+                "METRICS_PORT": str(intaris_metrics_port),
                 "INTARIS_JWT_PUBLIC_KEY": public_key_path,
                 "LLM_API_KEY": "mock-key",
                 "LLM_BASE_URL": f"{mock_llm_url}/v1",

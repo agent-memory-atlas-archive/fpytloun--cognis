@@ -18,9 +18,21 @@ function node(overrides: Partial<WorkstreamRef>): WorkstreamRef {
 }
 
 describe('child view navigation', () => {
-  it('canonicalizes delegate backing identity once and uses session scope', () => {
-    const view = canonicalChildView([node({})], 'old-session', 'root-conversation');
+  it('canonicalizes delegate backing identity once and uses its owning conversation', () => {
+    const view = canonicalChildView([node({
+      conversation_id: 'owning-conversation',
+    })], 'old-session', 'root-conversation');
     expect(view).toMatchObject({ kind: 'delegate', sessionId: 'canonical-session', nodeKey: 'delegate' });
+    expect(childViewScope(view!)).toEqual({
+      key: 'session:canonical-session', kind: 'session',
+      session_id: 'canonical-session', conversation_id: 'owning-conversation',
+    });
+  });
+
+  it('falls back to the controller root for delegates without an owning conversation', () => {
+    const view = canonicalChildView([node({
+      conversation_id: null,
+    })], 'old-session', 'root-conversation');
     expect(childViewScope(view!)).toEqual({
       key: 'session:canonical-session', kind: 'session',
       session_id: 'canonical-session', conversation_id: 'root-conversation',

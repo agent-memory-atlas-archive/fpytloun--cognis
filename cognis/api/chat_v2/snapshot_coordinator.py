@@ -149,6 +149,8 @@ async def _hydrate_runtime_input(
     envelope = await hydrate(conversation_id, authority)
     if envelope is None:
         return runtime_input
+    volatile_items = {item.id: item for item in runtime_input.volatile_items}
+    volatile_items.update({item.id: item for item in envelope.volatile_items})
     return runtime_input.model_copy(
         update={
             "authority": envelope.authority or authority,
@@ -157,7 +159,7 @@ async def _hydrate_runtime_input(
                 if envelope.active_turn is not None
                 else None
             ),
-            "volatile_items": list(envelope.volatile_items),
+            "volatile_items": list(volatile_items.values()),
             "volatile_items_complete": envelope.volatile_items_complete,
         }
     )

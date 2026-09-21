@@ -212,7 +212,7 @@ def test_sidebar_projects_active_background_command(
         assert conversations_routes._background_shell_timestamp(float("inf")) is None
 
 
-def test_mark_read_emits_user_wide_unread_clear_once(
+def test_mark_read_always_emits_authoritative_acknowledgement(
     monkeypatch: object,
     tmp_path: Path,
 ) -> None:
@@ -281,9 +281,19 @@ def test_mark_read_emits_user_wide_unread_clear_once(
         response = client.post(f"/api/v1/conversations/{conversation_id}/read", headers=headers)
 
         assert response.status_code == 200
-        send_to_user.assert_awaited_once()
+        assert send_to_user.await_count == 2
+        second_payload = send_to_user.await_args.args[1]  # type: ignore[union-attr]
+        assert second_payload["type"] == "conversation_updated"
+        assert second_payload["conversation_id"] == conversation_id
+        assert second_payload["has_unread"] is False
+        assert datetime.fromisoformat(second_payload["last_read_at"]) >= datetime.fromisoformat(
+            payload["last_read_at"]
+        )
 
-        assert send_to_user.await_args_list == [call("user@example.com", payload)]
+        assert send_to_user.await_args_list == [
+            call("user@example.com", payload),
+            call("user@example.com", second_payload),
+        ]
 
 
 def test_create_conversation_emits_sidebar_upsert(monkeypatch: object, tmp_path: Path) -> None:

@@ -87,6 +87,9 @@ def resolve_message_projection_policy(*, provider: Any | None, llm_api: str) -> 
 
 def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjectionResult:
     projected: list[dict[str, Any]] = []
+    deferred_notices: list[dict[str, Any]] = []
+    pending_tool_result_ids: set[str] = set()
+    deferred_notice_count = 0
     converted = 0
     developer_converted = 0
     controller_converted = 0
@@ -118,9 +121,27 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
                 controller_converted += 1
             notice_text = _system_notice_content(message)
             hashes.append(_short_hash(notice_text))
-            projected.append(_hidden_user_notice_message(message, notice_text))
+            notice = _hidden_user_notice_message(message, notice_text)
+            if pending_tool_result_ids:
+                deferred_notices.append(notice)
+                deferred_notice_count += 1
+            else:
+                projected.append(notice)
             continue
-        projected.append(dict(message))
+        projected_message = dict(message)
+        projected.append(projected_message)
+        if projected_message.get("role") == "assistant":
+            pending_tool_result_ids = _assistant_tool_call_ids(projected_message)
+        elif projected_message.get("role") == "tool" and pending_tool_result_ids:
+            tool_call_id = projected_message.get("tool_call_id")
+            if isinstance(tool_call_id, str):
+                pending_tool_result_ids.discard(tool_call_id)
+            if not pending_tool_result_ids and deferred_notices:
+                projected.extend(deferred_notices)
+                deferred_notices.clear()
+
+    if deferred_notices:
+        projected.extend(deferred_notices)
 
     if converted:
         projected = _insert_system_notice_instruction(projected)
@@ -133,6 +154,7 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
         controller_notices_converted=controller_converted,
         hidden_system_notice_count=converted,
         hidden_system_notice_hashes=hashes[:8],
+        tool_boundary_notices_deferred=deferred_notice_count,
     )
     return MessageProjectionResult(messages=projected, diagnostics=diagnostics)
 
@@ -209,6 +231,19 @@ def _hidden_user_notice_message(message: dict[str, Any], notice_text: str) -> di
             ],
         }
     return {"role": "user", "content": notice_text}
+
+
+def _assistant_tool_call_ids(message: dict[str, Any]) -> set[str]:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return set()
+    return {
+        call_id
+        for tool_call in tool_calls
+        if isinstance(tool_call, dict)
+        and isinstance((call_id := tool_call.get("id")), str)
+        and call_id
+    }
 
 
 def _is_controller_turn_notice(message: dict[str, Any]) -> bool:
@@ -300,6 +335,7 @@ def _projection_diagnostics(
     controller_notices_converted: int = 0,
     hidden_system_notice_count: int = 0,
     hidden_system_notice_hashes: list[str] | None = None,
+    tool_boundary_notices_deferred: int = 0,
 ) -> dict[str, Any]:
     final_non_system_role = None
     for message in reversed(projected):
@@ -314,6 +350,7 @@ def _projection_diagnostics(
         "developer_messages_converted": developer_messages_converted,
         "controller_notices_converted": controller_notices_converted,
         "hidden_system_notice_count": hidden_system_notice_count,
+        "tool_boundary_notices_deferred": tool_boundary_notices_deferred,
         "follow_up_context_present_before_projection": any(
             isinstance(message, dict)
             and (

@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, defer
 
 from cognis.core.trusted_evidence import (
     TRUSTED_EVIDENCE_ADMISSION_KEY,
@@ -621,6 +621,33 @@ class DirectTurnStore:
                 )
             ).scalar_one_or_none()
 
+    @staticmethod
+    def _payload_deferred() -> Any:
+        """Skip the durable ``payload`` JSON on reads that only need ownership state.
+
+        asyncpg decodes JSON columns on the event loop; the payload is only
+        needed by ``materialize_claimed_payload`` and the terminal handlers.
+        ``raiseload`` turns an accidental read into an explicit error.
+        """
+
+        return defer(DirectTurnRequestRow.payload, raiseload=True)
+
+    async def get_cancel_state(self, request_id: str) -> tuple[str, datetime | None] | None:
+        """Return ``(status, cancel_requested_at)`` without loading the payload."""
+
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(
+                        DirectTurnRequestRow.status,
+                        DirectTurnRequestRow.cancel_requested_at,
+                    ).where(DirectTurnRequestRow.request_id == request_id)
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            return str(row[0]), row[1]
+
     async def list_claimable_heads(self, *, limit: int = 100) -> list[DirectTurnRequestRow]:
         """Return FIFO conversation heads that are eligible for ownership."""
         earlier = aliased(DirectTurnRequestRow)
@@ -628,6 +655,7 @@ class DirectTurnStore:
             now = await database_now(session)
             result = await session.execute(
                 select(DirectTurnRequestRow)
+                .options(self._payload_deferred())
                 .where(
                     DirectTurnRequestRow.status.in_(
                         [status.value for status in CLAIMABLE_STATUSES]
@@ -669,6 +697,7 @@ class DirectTurnStore:
         conversation_id: str,
         *,
         session: AsyncSession | None = None,
+        include_recoverable: bool = False,
     ) -> DirectTurnRequestRow | None:
         """Return the authoritative active durable turn for a conversation."""
 
@@ -677,12 +706,16 @@ class DirectTurnStore:
                 return await self.get_conversation_active(
                     conversation_id,
                     session=owned_session,
+                    include_recoverable=include_recoverable,
                 )
         result = await session.execute(
             select(DirectTurnRequestRow)
             .where(
                 DirectTurnRequestRow.conversation_id == conversation_id,
-                DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
+                DirectTurnRequestRow.status.in_(
+                    [status.value for status in ACTIVE_STATUSES]
+                    + ([DirectTurnStatus.RECOVERABLE.value] if include_recoverable else [])
+                ),
             )
             .order_by(DirectTurnRequestRow.admission_order)
             .limit(1)
@@ -732,6 +765,7 @@ class DirectTurnStore:
         conversation_ids: list[str],
         *,
         session: AsyncSession | None = None,
+        include_recoverable: bool = False,
     ) -> dict[str, DirectTurnRequestRow]:
         """Return one authoritative active durable turn per requested conversation."""
 
@@ -742,12 +776,16 @@ class DirectTurnStore:
                 return await self.list_conversations_active(
                     conversation_ids,
                     session=owned_session,
+                    include_recoverable=include_recoverable,
                 )
         result = await session.execute(
             select(DirectTurnRequestRow)
             .where(
                 DirectTurnRequestRow.conversation_id.in_(conversation_ids),
-                DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
+                DirectTurnRequestRow.status.in_(
+                    [status.value for status in ACTIVE_STATUSES]
+                    + ([DirectTurnStatus.RECOVERABLE.value] if include_recoverable else [])
+                ),
             )
             .order_by(DirectTurnRequestRow.conversation_id, DirectTurnRequestRow.admission_order)
         )
@@ -1473,6 +1511,7 @@ class DirectTurnStore:
             request = (
                 await session.execute(
                     select(DirectTurnRequestRow)
+                    .options(self._payload_deferred())
                     .where(DirectTurnRequestRow.request_id == request_id)
                     .with_for_update()
                 )
@@ -1538,6 +1577,7 @@ class DirectTurnStore:
             request = (
                 await session.execute(
                     select(DirectTurnRequestRow)
+                    .options(self._payload_deferred())
                     .where(DirectTurnRequestRow.request_id == request_id)
                     .with_for_update()
                 )
@@ -1602,6 +1642,7 @@ class DirectTurnStore:
             request = (
                 await session.execute(
                     select(DirectTurnRequestRow)
+                    .options(self._payload_deferred())
                     .where(DirectTurnRequestRow.request_id == request_id)
                     .with_for_update()
                 )
@@ -1675,6 +1716,7 @@ class DirectTurnStore:
             request = (
                 await session.execute(
                     select(DirectTurnRequestRow)
+                    .options(self._payload_deferred())
                     .where(DirectTurnRequestRow.request_id == request_id)
                     .with_for_update()
                 )
@@ -2597,29 +2639,26 @@ class DirectTurnStore:
         )
 
     async def has_fence(self, request_id: str, *, lease: Lease) -> bool:
+        """Check the exact ownership tuple in one indexed EXISTS (no payload decode).
+
+        The owner and resource comparisons run in SQL: a NULL owner column makes
+        the concatenation NULL, so the comparison is false exactly where the
+        previous Python ``is None`` guards returned ``False``.
+        """
+
         async with self._session_factory() as session:
-            request = (
-                await session.execute(
-                    select(DirectTurnRequestRow).where(
-                        DirectTurnRequestRow.request_id == request_id
-                    )
-                )
-            ).scalar_one_or_none()
-            if (
-                request is None
-                or request.owner_controller_id is None
-                or request.owner_incarnation_id is None
-                or lease.owner_id
-                != _owner_id(request.owner_controller_id, request.owner_incarnation_id)
-                or lease.resource_key != conversation_lease_key(request.conversation_id)
-            ):
-                return False
             statement = select(
                 exists(
                     select(1).where(
                         DirectTurnRequestRow.request_id == request_id,
-                        DirectTurnRequestRow.owner_controller_id == request.owner_controller_id,
-                        DirectTurnRequestRow.owner_incarnation_id == request.owner_incarnation_id,
+                        (
+                            DirectTurnRequestRow.owner_controller_id
+                            + ":"
+                            + DirectTurnRequestRow.owner_incarnation_id
+                        )
+                        == lease.owner_id,
+                        ("direct-turn:conversation:" + DirectTurnRequestRow.conversation_id)
+                        == lease.resource_key,
                         DirectTurnRequestRow.fencing_token == lease.fencing_token,
                         DirectTurnRequestRow.status.in_(
                             [status.value for status in ACTIVE_STATUSES]

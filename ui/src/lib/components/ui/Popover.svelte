@@ -23,9 +23,16 @@
     children: Snippet;
     class?: string;
     placement?: 'top' | 'bottom' | 'left' | 'right';
+    showOnTouch?: boolean;
   }
 
-  let { text, children, class: className = '', placement = 'top' }: Props = $props();
+  let {
+    text,
+    children,
+    class: className = '',
+    placement = 'top',
+    showOnTouch = true,
+  }: Props = $props();
 
   let open = $state(false);
   let root = $state<HTMLSpanElement | null>(null);
@@ -47,7 +54,7 @@
   }
 
   function onFocusIn(): void {
-    open = true;
+    if (hoverCapable || showOnTouch) open = true;
   }
 
   function onFocusOut(event: FocusEvent): void {
@@ -59,6 +66,7 @@
   function onPointerDown(event: PointerEvent): void {
     // Only handle touch/pen pointer types here; mouse is covered by hover.
     if (event.pointerType === 'mouse') return;
+    if (!showOnTouch) return;
     // Toggle on tap. The child may itself be a button that handles the tap
     // separately — the popover just reveals; it does not steal the click.
     open = !open;

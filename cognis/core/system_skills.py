@@ -924,6 +924,8 @@ tags:
   - rich
 linked_tool_ids:
   - builtin:describe_tool
+  - builtin:validate_tool_call
+  - builtin:artifact_publish
   - builtin:write_deliverable
 ---
 
@@ -947,6 +949,12 @@ Compose for a reader, not a form. One clear focal point per deliverable. Prose s
 - **Reference and code**: `code`, `kv`/`key_value`, `source_list`, `link`/`link_preview`.
 - **Emphasis, sparingly**: `callout` for exactly one true highlight per deliverable (not every fact), `action` for a single explicit next step (not a menu), `divider` to separate real sections (not decoration).
 - **Containers**: `tabs`, `accordion`, `modal` for progressive disclosure once there is genuinely more than one story or detail to browse.
+
+# Portable semantics
+
+- Set `metadata.viewer_identity` only when the deliverable provides an explicit opening-header identity. It accepts plain `label` and/or a registered semantic `icon: {name, alt?}`. Never infer it; icon-only identity requires `alt`.
+- Hero `badges`/`tags` accept legacy text or `{label, tone?}`. Use tone only for meaning; visible label text is required.
+- Use `key_value` with `variant: "summary"` for an ordered compact fact strip. Item tone is semantic. Do not author columns, widths, colors, HTML, CSS, SVG, or placement.
 
 # Archetype Recipes
 
@@ -974,9 +982,10 @@ Compose for a reader, not a form. One clear focal point per deliverable. Prose s
 1. Identify the archetype (or the closest match) from the recipes above; if none fit, let the content shape the layout rather than forcing a recipe.
 2. Call `describe_tool` for `write_deliverable` if you need the full block schema, the composition guide, or a worked example.
 3. Compose blocks following the block-family guidance, keeping one clear focal point.
-4. Put the complete document title and blocks in `payload`. Do not author `metadata.presentation`.
-5. Call `validate_tool_call` with the complete arguments.
-6. Select `action='rich'`, `action='rich:dashboard'`, or `action='rich:pulse'` for the intended presentation. Supply exactly one of `payload` or `payload_artifact`. Cognis derives the Markdown fallback.
+4. For a substantial payload that would be difficult to inspect or retry inline, create an editable local JSON file with the available file-editing tool, publish it as `application/json` with `artifact_publish`, and use the returned immutable `art_*` ID as `payload_artifact`. Otherwise put the complete document title and blocks inline in `payload`. Do not author `metadata.presentation`.
+5. Select `action='rich'`, `action='rich:dashboard'`, or `action='rich:pulse'` for the intended presentation and supply exactly one of `payload` or `payload_artifact`.
+6. Call `validate_tool_call` with the complete proposed `write_deliverable` arguments.
+7. Call `write_deliverable` with those exact unchanged validated arguments. Cognis derives the Markdown fallback.
 
 # Safety
 

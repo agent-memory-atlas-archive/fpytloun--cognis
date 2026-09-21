@@ -68,10 +68,8 @@
     break-inside: avoid;
     border: 1px solid var(--rich-line);
     border-radius: var(--rich-radius-lg);
-    background:
-      linear-gradient(145deg, var(--rich-surface), var(--rich-surface-solid)),
-      radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--rich-tone-danger-fg) 14%, transparent), transparent 34%);
-    box-shadow: 0 20px 60px var(--rich-shadow-lg), inset 0 1px 0 var(--rich-inset-highlight);
+    background: var(--rich-surface);
+    box-shadow: none;
     padding: clamp(1rem, 2vw, 1.45rem);
   }
 

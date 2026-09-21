@@ -58,7 +58,9 @@ describe('standalone client', () => {
     // would just reopen this same page.
     expect(mount.mock.calls[0][1].props.standaloneUrl).toBeUndefined();
     expect(mount.mock.calls[0][1].props.mediaUrlFor('media_abc')).toBe('/api/media/media_abc');
-    expect(document.documentElement.dataset.resolvedTheme).toBe('dark');
+    // The viewer owns theme selection; bootstrap must not force dark over it.
+    expect(document.documentElement.dataset.resolvedTheme).toBeUndefined();
+    expect(document.documentElement.style.colorScheme).toBe('');
 
     const link = document.createElement('a');
     link.target = '_blank';
@@ -72,7 +74,7 @@ describe('standalone client', () => {
   it('uses the full available width for the standalone deliverable root', async () => {
     const stylesheet = await readFile(path.resolve(process.cwd(), 'src', 'standalone.css'), 'utf8');
 
-    expect(stylesheet).toMatch(/#cognis-deliverable-root\s*\{\s*width:\s*100%;\s*\}/);
+    expect(stylesheet).toMatch(/#cognis-deliverable-root\s*\{\s*width:\s*100%;\s*min-height:\s*100dvh;\s*\}/);
     expect(stylesheet).not.toContain('width: min(100%, 90rem)');
   });
 });

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -50,7 +52,11 @@ from cognis.core.prompts import (
     build_system_instructions,
 )
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
-from cognis.core.session_cache import CachedEvent
+from cognis.core.session_cache import (
+    CachedEvent,
+    CanonicalContextSnapshot,
+    CanonicalHistoryUnavailable,
+)
 from cognis.core.step_profiles import (
     resolve_step_profile,
     step_profile_allows_tool,
@@ -84,6 +90,75 @@ class _CacheEntry:
         self.last_event_seq = 0
         self.memory_policy_fingerprint: str | None = None
         self.memory_policy_mode: str | None = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+@pytest.mark.parametrize("invalidation_phase", ["before_snapshot", "after_snapshot"])
+async def test_assembly_never_silently_loses_invalidated_history(
+    skip_memory: bool,
+    invalidation_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cognis.core.context as context_module
+
+    cache = _SessionCache()
+    cache.history_events = [
+        {
+            "seq": 1,
+            "type": "user_message",
+            "data": {"content": "Implement the approved fix", "turn_id": "current-turn"},
+        }
+    ]
+    original_refresh = cache.refresh
+    original_run = context_module.run_cpu_bound
+
+    def invalidate() -> None:
+        cache.history_events.clear()
+        cache.prefix_entries.clear()
+        cache.entry.canonical_stale = True
+
+    async def refresh(session: SessionModel) -> object:
+        result = await original_refresh(session)
+        if invalidation_phase == "before_snapshot":
+            invalidate()
+        return result
+
+    async def run(function: object, *args: object, **kwargs: object) -> object:
+        if getattr(function, "__name__", "") == "_prepare_prefix_budget":
+            invalidate()
+        return await original_run(function, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "refresh", refresh)
+    if invalidation_phase == "after_snapshot":
+        monkeypatch.setattr(context_module, "run_cpu_bound", run)
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    kwargs = dict(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Implement the approved fix",
+        skip_memory=skip_memory,
+        required_turn_id="current-turn",
+        require_user_event=True,
+    )
+    if invalidation_phase == "before_snapshot":
+        with pytest.raises(CanonicalHistoryUnavailable):
+            await assembler.assemble(**kwargs)
+    else:
+        result = await assembler.assemble(**kwargs)
+        assert any(
+            "Implement the approved fix" in str(message.get("content"))
+            for message in result.messages
+        )
+        assert result.degraded is False
 
 
 class _SessionCache:
@@ -126,6 +201,34 @@ class _SessionCache:
     def get_entry(self, session_id: str) -> object | None:
         del session_id
         return self.entry
+
+    def get_context_snapshot(self, session_id: str) -> CanonicalContextSnapshot:
+        from copy import deepcopy
+
+        if (
+            self.entry is None
+            or not self.entry.initialized
+            or getattr(self.entry, "canonical_stale", False)
+        ):
+            raise CanonicalHistoryUnavailable("Canonical context is stale")
+        events = [
+            CachedEvent(
+                seq=int(event.get("seq", 0)),
+                type=str(event["type"]),
+                data=deepcopy(event.get("data", {})),
+            )
+            if isinstance(event, dict)
+            else deepcopy(event)
+            for event in self.get_events_since_compaction(session_id)
+        ]
+        return CanonicalContextSnapshot(
+            events=events,
+            prefix_entries=deepcopy(self.prefix_entries),
+            last_compaction_summary=self.entry.last_compaction_summary,
+            last_event_seq=self.entry.last_event_seq,
+            last_compaction_seq=0,
+            projection_revision=0,
+        )
 
     def get_memory_aliases(self, session_id: str) -> MemoryAliasState:
         del session_id
@@ -2168,6 +2271,21 @@ async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> Non
         user_message="Implement the change.",
         tool_definitions=[],
     )
+    assembler.session_cache.history_events = [
+        {
+            "seq": index,
+            "type": kind,
+            "data": {
+                "turn_id": "profile-turn",
+                "call_id": "profile-call",
+                "kind": "agent_profile_changed",
+                "name": "switch_agent_profile",
+                "content": "Implement the change.",
+                "result": "switched",
+            },
+        }
+        for index, kind in enumerate(("user_message", "tool_call", "tool_result", "lifecycle"), 1)
+    ]
     memoryless = await assembler.assemble(
         session=session,
         conversation=conversation,
@@ -2176,6 +2294,8 @@ async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> Non
         tool_definitions=[],
         skip_memory=True,
         skip_user_message=True,
+        required_turn_id="profile-turn",
+        require_user_event=True,
         attachment_notice="Attachment format required extraction.",
         attachment_context="Extracted attachment content.",
         routing_reminder="Continue the existing request under the new profile.",
@@ -2302,6 +2422,37 @@ async def test_context_assembler_raises_on_cold_cache_event_failure() -> None:
             user_message="cold failure",
             tool_definitions=[],
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+async def test_known_stale_cache_cannot_mask_refresh_failure(skip_memory: bool) -> None:
+    cache = _SessionCache(fail_refresh=True, cold=False)
+    cache.entry.canonical_stale = True
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    kwargs = dict(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="continue",
+        tool_definitions=[],
+        skip_memory=skip_memory,
+    )
+    with pytest.raises(RuntimeError):
+        await assembler.assemble(**kwargs)
+    # A later successful canonical refresh can restore execution.
+    cache.fail_refresh = False
+    cache.entry.canonical_stale = False
+    result = await assembler.assemble(**kwargs)
+    assert "events" not in result.degraded_sources
 
 
 @pytest.mark.asyncio
@@ -3996,3 +4147,91 @@ async def test_current_untrusted_attachment_text_is_inside_envelope() -> None:
     assert 'untrusted="true"' in user_text
     assert "Extracted attachment text" in user_text
     assert user_text.rstrip().endswith("</message>")
+
+
+class _SlowCountingLLM(_LLM):
+    """Simulates a multi-second exact count; must not block the event loop."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.calls = 0
+
+    def count_messages_tokens(self, messages: list[dict[str, object]], model: str) -> int:
+        self.calls += 1
+        time.sleep(self.delay)
+        return super().count_messages_tokens(messages, model)
+
+
+@pytest.mark.asyncio
+async def test_assemble_keeps_event_loop_responsive_during_slow_token_counts() -> None:
+    slow_llm = _SlowCountingLLM(delay=0.25)
+    cache = _SessionCache()
+    cache.history_events = [
+        {"type": "user_message", "data": {"content": f"question {index} " * 50}}
+        for index in range(20)
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=slow_llm,
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=200_000,
+        compaction_threshold=0.85,
+    )
+    baseline = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=200_000,
+        compaction_threshold=0.85,
+    )
+
+    gaps: list[float] = []
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        last = time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(0.005)
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="next",
+            tool_definitions=[],
+        )
+    finally:
+        stop.set()
+        await ticker_task
+
+    expected = await baseline.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="next",
+        tool_definitions=[],
+    )
+
+    def _without_timestamps(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            {
+                key: (re.sub(r'ts="[^"]*"', 'ts=""', value) if isinstance(value, str) else value)
+                for key, value in message.items()
+            }
+            for message in messages
+        ]
+
+    assert slow_llm.calls >= 1
+    assert max(gaps) < 0.1, f"event loop stalled for {max(gaps):.3f}s during assembly"
+    assert _without_timestamps(result.messages) == _without_timestamps(expected.messages)
+    assert result.prompt_tokens == expected.prompt_tokens
+    assert result.cache_breakpoint_index == expected.cache_breakpoint_index

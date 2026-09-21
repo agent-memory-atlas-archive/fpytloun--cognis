@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.compaction.banding import build_compaction_input
 from cognis.core.compaction.fallback import build_sliding_window_summary
 from cognis.core.compaction.input_format import format_events_for_compaction
+from cognis.core.compaction.publication import compaction_publication_guard
 from cognis.core.compaction.recovery import append_recoverable_tool_output_handles
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
@@ -544,7 +545,7 @@ class CompactionStrategy:
             entry = await self.session_cache.refresh(session)
         return await self._generate_summary_from_entry(
             session,
-            entry=entry,
+            entry=self.session_cache.get_context_snapshot(session.session_id),
             trigger=trigger,
             model_context=model_context,
             long_lived_chat=long_lived_chat,
@@ -734,9 +735,8 @@ class CompactionStrategy:
         if not self.fallback_enabled:
             return CompactionResult(compacted=False, method="llm_failed")
 
-        entry = self.session_cache.get_entry(session.session_id)
-        if entry is None:
-            entry = await self.session_cache.refresh(session)
+        await self.session_cache.refresh(session)
+        entry = self.session_cache.get_context_snapshot(session.session_id)
 
         max_input_tokens = await self._resolve_max_input_tokens(
             model_context,
@@ -862,6 +862,12 @@ class CompactionStrategy:
         )
         # Retry is handled by the Intaris provider (exponential backoff).
         idempotency_key = f"{session.session_id}:compaction:{method}:{older_events[-1].seq}"
+        guard = compaction_publication_guard.get()
+        if guard is not None:
+            # Last ownership check before the durable append: a controller that
+            # lost its direct-turn fence or the compaction lease must not publish.
+            await guard.check()
+            idempotency_key = f"{idempotency_key}:{guard.token}"
         compaction_events = with_session_events_turn_id([compaction_event], None)
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
             append_result = await self.guardrails.record_events(
@@ -869,6 +875,10 @@ class CompactionStrategy:
                 events=compaction_events,
                 idempotency_key=idempotency_key,
             )
+        if not append_result.ok:
+            from cognis.core.canonical_history import CanonicalHistoryUnavailable
+
+            raise CanonicalHistoryUnavailable("Compaction summary was not durably acknowledged")
         await self.session_cache.apply_compaction(
             session,
             summary=summary,

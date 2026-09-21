@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.core.canonical_history import read_complete_history
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
 from cognis.core.immutable_prefix import (
@@ -49,6 +51,7 @@ from cognis.runtime_context import (
     scoped_runtime_context,
 )
 from cognis.store import queries
+from cognis.store.coordination import DatabaseLeaseStore, Lease
 
 logger = get_logger(__name__)
 
@@ -385,6 +388,7 @@ class SessionManager:
         self.session_cache = session_cache
         self.event_bus = event_bus
         self.session_lock = session_lock
+        self._lease_store = DatabaseLeaseStore(session_factory)
 
     async def _evict_session_state(self, session_id: str) -> None:
         await self.session_cache.evict(session_id)
@@ -1226,24 +1230,11 @@ class SessionManager:
         after_seq: int = 0,
         limit: int = 0,
         last_n: int | None = None,
-        allow_missing_stream: bool = False,
     ) -> list[CachedEvent]:
-        cache_entry = self.session_cache.get_entry(session.session_id)
-        if cache_entry is not None and cache_entry.initialized and cache_entry.events:
-            events = sorted(list(cache_entry.events), key=lambda event: event.seq)
-            if after_seq:
-                events = [event for event in events if event.seq > after_seq]
-            if last_n is not None:
-                events = events[-last_n:]
-            elif limit:
-                events = events[:limit]
-            return events
-        event_read = await self.providers.guardrails.read_events(
-            session_id=session.intaris_session_id or session.session_id,
+        event_read = await read_complete_history(
+            self.providers.guardrails,
+            session.intaris_session_id or session.session_id,
             after_seq=after_seq,
-            limit=limit,
-            last_n=last_n,
-            allow_missing_stream=allow_missing_stream,
         )
         fetched_events: list[CachedEvent] = []
         for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0) or 0)):
@@ -1256,7 +1247,9 @@ class SessionManager:
                     ts=raw_event.get("ts"),
                 )
             )
-        return fetched_events
+        if last_n is not None:
+            return fetched_events[-last_n:]
+        return fetched_events[:limit] if limit else fetched_events
 
     @staticmethod
     def _find_last_real_user_event(
@@ -1621,8 +1614,15 @@ class SessionManager:
         compaction_summary: str | None = None,
         compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
+        fences: Sequence[Lease] = (),
     ) -> SessionModel:
         """Create a successor in the current session lane.
+
+        ``fences`` are leases (direct-turn fence, compaction lease) that must
+        still be held by the caller for the rotation to commit. They are
+        checked ``FOR UPDATE`` inside the rotation transaction, so a takeover
+        between the caller's entry check and the commit surfaces as
+        ``SessionRotationConflictError`` instead of a second rotation.
 
         Root successors advance the conversation's active-session pointer.
         Child successors retain the same parent and delegation identity and
@@ -1869,6 +1869,12 @@ class SessionManager:
                 )
                 if not transitioned:
                     raise SessionRotationConflictError("Session became terminal during rotation")
+
+                for fence in fences:
+                    if not await self._lease_store.is_current_in_session(db_session, fence):
+                        raise SessionRotationConflictError(
+                            f"Ownership lease {fence.resource_key} lost during rotation"
+                        )
 
                 # 5. Only root-lane rotation advances the conversation pointer.
                 #    Compare-and-set prevents a stale concurrent rotation from

@@ -58,7 +58,6 @@ from cognis.api.chat_v2.shared_snapshot_cache import SnapshotRequestTrace
 from cognis.api.chat_v2.snapshot_coordinator import ConversationSnapshotContext
 from cognis.api.chat_v2.sync import (
     PROJECTION_VERSION,
-    RuntimeOverlayInput,
     runtime_overlay_from_input,
 )
 from cognis.api.common import AuthenticatedUser
@@ -599,11 +598,14 @@ async def test_snapshot_fails_closed_when_rebuild_remains_inconsistent(
 
     monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
     monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot_coordinated", build_snapshot)
+    rebuild = AsyncMock(return_value=inconsistent)
+    sleep = AsyncMock()
     monkeypatch.setattr(
         chat_v2_routes,
         "rebuild_chat_snapshot_coordinated",
-        AsyncMock(return_value=inconsistent),
+        rebuild,
     )
+    monkeypatch.setattr(chat_v2_routes.asyncio, "sleep", sleep)
 
     with pytest.raises(HTTPException) as raised:
         await chat_v2_snapshot(
@@ -613,6 +615,46 @@ async def test_snapshot_fails_closed_when_rebuild_remains_inconsistent(
 
     assert raised.value.status_code == 503
     assert raised.value.detail["code"] == "event_store_inconsistent"
+    assert rebuild.await_count == len(chat_v2_routes.SNAPSHOT_CONSISTENCY_RETRY_DELAYS_SECONDS)
+    assert [call.args[0] for call in sleep.await_args_list] == [0.1, 0.3, 0.6]
+
+
+@pytest.mark.anyio
+async def test_snapshot_retries_until_admitted_history_is_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = object()
+    inconsistent = SimpleNamespace(
+        conversation=SimpleNamespace(has_message_history=True),
+        timeline=SimpleNamespace(items=[], has_more_before=False),
+    )
+    recovered = SimpleNamespace(
+        conversation=inconsistent.conversation,
+        timeline=SimpleNamespace(items=[object()], has_more_before=False),
+    )
+    rebuild = AsyncMock(side_effect=[inconsistent, inconsistent, recovered])
+    sleep = AsyncMock()
+
+    async def load_context(_request, _conversation_id):
+        return context
+
+    async def build_snapshot(_app, _context, *, request_trace):
+        request_trace.select("l1")
+        return inconsistent
+
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
+    monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot_coordinated", build_snapshot)
+    monkeypatch.setattr(chat_v2_routes, "rebuild_chat_snapshot_coordinated", rebuild)
+    monkeypatch.setattr(chat_v2_routes.asyncio, "sleep", sleep)
+
+    result = await chat_v2_snapshot(
+        cast(Any, SimpleNamespace(app=SimpleNamespace())),
+        "conversation-a",
+    )
+
+    assert result is recovered
+    assert rebuild.await_count == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [0.1, 0.3]
 
 
 @pytest.mark.anyio
@@ -870,8 +912,10 @@ def test_retry_completion_marker_ignores_unrelated_completed_events() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("attachment_lost", [False, True])
 async def test_send_message_claims_transaction_and_submits_once(
     monkeypatch: pytest.MonkeyPatch,
+    attachment_lost: bool,
 ) -> None:
     scheduler = _Scheduler()
     request = _request(scheduler)
@@ -892,6 +936,9 @@ async def test_send_message_claims_transaction_and_submits_once(
         return tx
 
     async def _mark(*_args: object, **_kwargs: object) -> None:
+        assert scheduler.submitted == []
+        if attachment_lost:
+            raise ValueError("Attachment is no longer available")
         return None
 
     monkeypatch.setattr(chat_v2_routes, "_require_mutable_conversation", _require)
@@ -899,6 +946,20 @@ async def test_send_message_claims_transaction_and_submits_once(
     monkeypatch.setattr(chat_v2_routes, "_complete_transaction", _complete)
     monkeypatch.setattr(chat_v2_routes, "_mark_attachments_attached", _mark)
 
+    if attachment_lost:
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as error:
+            await chat_v2_send_message(
+                cast(Any, request),
+                "conv-1",
+                "txn-1",
+                SendMessageV2Request(client_message_id="client-1", content="hello"),
+            )
+        assert error.value.status_code == 409
+        assert scheduler.submitted == []
+        assert tx.status == "failed"
+        return
     response = await chat_v2_send_message(
         cast(Any, request),
         "conv-1",
@@ -1586,8 +1647,10 @@ async def test_session_context_rejects_session_conversation_owner_mismatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["active", "recoverable", "terminal"])
 async def test_child_session_context_resolves_complete_lineage_from_successor(
     monkeypatch: pytest.MonkeyPatch,
+    lifecycle: str,
 ) -> None:
     request = _scoped_request("alice@example.com")
     original = _session(
@@ -1622,16 +1685,38 @@ async def test_child_session_context_resolves_complete_lineage_from_successor(
     ) -> str:
         return row.session_id
 
-    async def runtime_input(**_kwargs: Any) -> RuntimeOverlayInput:
-        return RuntimeOverlayInput(
-            runtime_epoch="child-lineage",
-            runtime_revision=0,
-            active_turn=None,
-        )
+    original.intaris_session_id = "intaris-original"
+    successor.intaris_session_id = "intaris-successor"
+    request.app.state.turn_scheduler = SimpleNamespace(
+        active_turn_checkpoint=lambda _: None,
+        durable_runtime_context=AsyncMock(
+            return_value={
+                "session_id": original.session_id,
+                "running": None
+                if lifecycle == "terminal"
+                else {
+                    "turn_id": "turn-rotated",
+                    "session_id": original.session_id,
+                    "status": "waiting" if lifecycle == "recoverable" else "running",
+                },
+                "authority": RuntimeAuthority(
+                    direct_request_id="request-rotated",
+                    turn_id="turn-rotated",
+                    fencing_token=4,
+                    lifecycle=lifecycle,
+                ),
+                "pending_user_message": None
+                if lifecycle == "terminal"
+                else {
+                    "request_id": "request-rotated",
+                    "content": "Continue after rotation",
+                },
+            }
+        ),
+    )
 
     monkeypatch.setattr(chat_v2_routes, "get_child_session_continuation_chain", get_child_chain)
     monkeypatch.setattr(chat_v2_routes, "_session_read_ref", session_read_ref)
-    monkeypatch.setattr(chat_v2_routes, "runtime_input_from_scheduler", runtime_input)
 
     context = await _load_session_context(request, successor.session_id)
 
@@ -1642,6 +1727,10 @@ async def test_child_session_context_resolves_complete_lineage_from_successor(
     assert context["scope"].key == "session:child-successor"
     assert context["scope"].session_id == "child-successor"
     assert context["scope"].status == "completed"
+    runtime = context["runtime_input"]
+    assert runtime.authority.lifecycle == lifecycle
+    assert (runtime.active_turn is not None) == (lifecycle != "terminal")
+    assert len(runtime.volatile_items) == (0 if lifecycle == "terminal" else 1)
 
 
 @pytest.mark.asyncio
@@ -1663,24 +1752,29 @@ async def test_child_session_context_clears_unrelated_active_runtime_authority(
         conversation_row=conversation_row,
     )
 
-    async def runtime_input(**_kwargs: Any) -> RuntimeOverlayInput:
-        return RuntimeOverlayInput(
-            runtime_epoch="session:child-completed",
-            runtime_revision=7,
-            active_turn={
-                "turn_id": "turn-current",
+    request.app.state.turn_scheduler = SimpleNamespace(
+        active_turn_checkpoint=lambda _: None,
+        durable_runtime_context=AsyncMock(
+            return_value={
                 "session_id": "session-current",
-                "status": "running",
-            },
-            authority=RuntimeAuthority(
-                direct_request_id="request-current",
-                turn_id="turn-current",
-                fencing_token=3,
-                lifecycle="active",
-            ),
-        )
-
-    monkeypatch.setattr(chat_v2_routes, "runtime_input_from_scheduler", runtime_input)
+                "running": {
+                    "turn_id": "turn-current",
+                    "session_id": "session-current",
+                    "status": "running",
+                },
+                "authority": RuntimeAuthority(
+                    direct_request_id="request-current",
+                    turn_id="turn-current",
+                    fencing_token=3,
+                    lifecycle="active",
+                ),
+                "pending_user_message": {
+                    "request_id": "request-current",
+                    "content": "Latest parent user message",
+                },
+            }
+        ),
+    )
 
     context = await _load_session_context(request, child.session_id)
     scoped_runtime = context["runtime_input"]
@@ -1688,6 +1782,7 @@ async def test_child_session_context_clears_unrelated_active_runtime_authority(
     assert scoped_runtime.runtime_revision == 0
     assert scoped_runtime.active_turn is None
     assert scoped_runtime.authority is None
+    assert scoped_runtime.volatile_items == []
     assert runtime_overlay_from_input(scoped_runtime).has_active_turn is False
 
 

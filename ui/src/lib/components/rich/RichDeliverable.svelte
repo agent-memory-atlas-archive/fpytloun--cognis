@@ -16,6 +16,10 @@
   } from '$lib/rich-deliverable';
   import RichBlockList from './RichBlockList.svelte';
   import RichToc from './RichToc.svelte';
+  import RichViewerChrome from './RichViewerChrome.svelte';
+  import ViewerIcon from './ViewerIcon.svelte';
+  import './rich-publication.css';
+  import { loadViewerTheme, observeViewerTheme, viewerTheme } from './viewer-theme';
   import {
     buildCitationRegistry,
     buildTocItems,
@@ -65,7 +69,14 @@
     targets[item.requestedAnchor] ??= item.anchor;
     return targets;
   }, {});
-  $: tocItems = headingItems.filter((item) => item.level <= options.tocDepth);
+  $: tocItems = [
+    ...(heroOwnsIdentity && !headingItems.some(item => item.label === 'Overview') ? [{ anchor: `${instanceNamespace}-overview`, requestedAnchor: 'overview', label: 'Overview', level: 2 as const, block: normalized.blocks[0] }] : []),
+    ...headingItems.filter((item) => item.level <= options.tocDepth).map(item => ({
+      ...item,
+      label: item.block.type === 'section' && typeof item.block.eyebrow === 'string' && /^\d+$/.test(item.block.eyebrow)
+        ? `${Number(item.block.eyebrow)}  ${item.label}` : item.label,
+    })),
+  ];
   $: decoratedBlocks = decorateBlocks(normalized.blocks, headingItems, options, instanceNamespace);
   $: heroTitle = normalized.blocks[0]?.type === 'hero' ? blockTitle(normalized.blocks[0]) : '';
   $: heroOwnsIdentity = Boolean(heroTitle);
@@ -78,14 +89,20 @@
   $: payloadOwnsIdentity = heroOwnsIdentity || dashboardSectionOwnsIdentity;
   $: documentBlocks = decoratedBlocks.map((block, index) => index === 0
     && ((block.type === 'hero' && heroOwnsIdentity) || (block.type === 'section_header' && dashboardSectionOwnsIdentity))
-    ? { ...block, __document_h1: true }
+    ? { ...block, __document_h1: true, ...(heroOwnsIdentity ? { __publication_anchor: `${instanceNamespace}-overview` } : {}) }
     : block);
   $: publicationContext.set(buildCitationRegistry(normalized.blocks, normalized.sources, instanceNamespace));
   $: showToc = options.showToc;
   let fullOpen = false;
   let inlineExpanded = !collapsedByDefault;
   let tocOpen = false;
+  let tocChosen = false;
+  let readingProgress = 0;
   let copied = false;
+  let copyError = '';
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let systemDark = true;
+  $: resolvedViewerTheme = $viewerTheme === 'system' ? (systemDark ? 'dark' : 'light') : $viewerTheme;
   let shareCopied = false;
   let shareError = '';
   let shareCopyResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -106,6 +123,7 @@
       collapseIdentity = nextCollapseIdentity;
       inlineExpanded = !collapsedByDefault;
       tocOpen = false;
+      tocChosen = false;
     }
   }
 
@@ -123,7 +141,18 @@
   }
 
   function openContextualToc() {
-    if (showToc) tocOpen = true;
+    if (showToc) { tocChosen = true; tocOpen = true; }
+  }
+
+  function closeToc() { tocChosen = true; tocOpen = false; }
+
+  function downloadMarkdown() {
+    const url = URL.createObjectURL(new Blob([content || JSON.stringify(normalized, null, 2)], { type: 'text/markdown;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${(effectiveTitle || 'deliverable').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 100)}.md`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function toggleInlineDocument() {
@@ -169,17 +198,27 @@
    * panel, since it is no longer a descendant of `root` once open. */
   function bindPanelInteractions(node: HTMLDivElement): { destroy(): void } {
     node.addEventListener('click', handleRootClick, true);
+    const stopThemeObservation = observeViewerTheme(node, refreshMermaidTheme);
     return {
       destroy(): void {
         node.removeEventListener('click', handleRootClick, true);
+        stopThemeObservation();
       },
     };
   }
 
   async function copyFallback() {
-    await navigator.clipboard?.writeText(content || JSON.stringify(normalized, null, 2));
-    copied = true;
-    setTimeout(() => copied = false, 1500);
+    copied = false;
+    copyError = '';
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(content || JSON.stringify(normalized, null, 2));
+      copied = true;
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => copied = false, 1500);
+    } catch {
+      copyError = 'Could not copy document. Check clipboard permissions and try again.';
+    }
   }
 
   async function copyShareLink() {
@@ -240,7 +279,8 @@
     // mermaid diagram. No matchMedia fallback here, or diagrams would
     // follow the OS light preference while the rest of the deliverable
     // stayed dark.
-    const isLight = document.documentElement.getAttribute('data-resolved-theme') === 'light';
+    const isLight = el.closest('[data-viewer-theme]')?.getAttribute('data-viewer-theme') === 'light'
+      || (!el.closest('[data-viewer-theme]') && document.documentElement.getAttribute('data-resolved-theme') === 'light');
     return {
       darkMode: isLight ? false : true,
       themeVariables: {
@@ -271,7 +311,7 @@
     if (nodes.length === 0) return;
     try {
       const mermaid = (await import('mermaid')).default;
-      const resolvedTheme = resolveMermaidTheme(root);
+      const resolvedTheme = resolveMermaidTheme(fullOpen ? modalPanel : root);
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: 'strict',
@@ -289,6 +329,8 @@
           const result = await mermaid.render(renderId, source);
           const wrapper = document.createElement('div');
           wrapper.className = 'rich-mermaid';
+          wrapper.dataset.mermaidSource = source;
+          wrapper.dataset.mermaidId = renderId;
           wrapper.innerHTML = namespaceMermaidSvg(result.svg, renderId);
           node.replaceWith(wrapper);
         } catch {
@@ -309,7 +351,26 @@
     });
   }
 
+  function refreshMermaidTheme() {
+    for (const scope of scopedRoots()) {
+      for (const wrapper of scope.querySelectorAll<HTMLElement>('.rich-mermaid[data-mermaid-source]')) {
+        const source = document.createElement('pre');
+        source.dataset.mermaidSource = wrapper.dataset.mermaidSource;
+        source.dataset.mermaidId = wrapper.dataset.mermaidId;
+        source.textContent = wrapper.dataset.mermaidSource ?? '';
+        wrapper.replaceWith(source);
+      }
+    }
+    scheduleMermaidRender();
+  }
+
   onMount(() => {
+    loadViewerTheme();
+    const query = window.matchMedia?.('(prefers-color-scheme: dark)');
+    systemDark = query?.matches ?? true;
+    const change = (event: MediaQueryListEvent) => systemDark = event.matches;
+    query?.addEventListener('change', change);
+    const stopThemeObservation = observeViewerTheme(root, refreshMermaidTheme);
     root.addEventListener('click', handleRootClick, true);
     root.addEventListener('rich-toc-request', openContextualToc);
     rewriteInternalLinks();
@@ -317,9 +378,14 @@
     if (typeof ResizeObserver !== 'undefined') {
       rootResizeObserver = new ResizeObserver(([entry]) => {
         inlineTocWide = (entry?.contentRect.width ?? 0) >= 960;
+        if (!tocChosen) tocOpen = inlineTocWide;
       });
       rootResizeObserver.observe(root);
     }
+    return () => {
+      query?.removeEventListener('change', change);
+      stopThemeObservation();
+    };
   });
   afterUpdate(() => {
     rewriteInternalLinks();
@@ -331,6 +397,7 @@
     unregisterOverlay?.();
     rootResizeObserver?.disconnect();
     if (shareCopyResetTimer) clearTimeout(shareCopyResetTimer);
+    if (copyResetTimer) clearTimeout(copyResetTimer);
   });
   $: if (fullOpen) scheduleMermaidRender();
 
@@ -348,7 +415,7 @@
 
   async function openFullView() {
     lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    tocOpen = false;
+    tocOpen = window.innerWidth >= 960;
     fullOpen = true;
     await tick();
     closeButton?.focus();
@@ -407,9 +474,14 @@
   data-has-contextual-toc={showToc ? 'true' : undefined}
   data-inline-toc-layout={inlineTocWide ? 'sidebar' : 'drawer'}
   data-testid="rich-deliverable"
+  data-viewer-theme={surface === 'standalone' ? resolvedViewerTheme : undefined}
 >
-  <div class="rich-orb rich-orb-a" aria-hidden="true"></div>
-  <div class="rich-orb rich-orb-b" aria-hidden="true"></div>
+  {#if surface === 'standalone'}
+    <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
+      {#if showToc && (!inlineTocWide || !tocOpen)}<button class="viewer-extra-control" type="button" aria-label="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>{/if}
+      {#if shareLinkCallback}<button class="viewer-extra-control" type="button" title={shareCopied ? 'Copied into clipboard' : 'Copy share link'} aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><span data-testid={shareCopied ? 'rich-share-copied-icon' : 'rich-share-icon'}><ViewerIcon name={shareCopied ? 'check' : 'share'} /></span></button>{/if}
+    </RichViewerChrome>
+  {/if}
 
   <header class="rich-toolbar" class:actions-only={payloadOwnsIdentity && inlineExpanded} data-testid="rich-deliverable-toolbar">
     {#if !payloadOwnsIdentity || !inlineExpanded}
@@ -422,6 +494,7 @@
       {/if}
     </div>
     {/if}
+    {#if surface === 'embedded'}
     <nav class="rich-actions" aria-label="Document actions">
       {#if collapsedByDefault}
         <button
@@ -435,8 +508,8 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d={inlineExpanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} /></svg>
         </button>
       {/if}
-      {#if showToc}
-        <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={() => tocOpen = true}>
+      {#if showToc && (!inlineTocWide || !tocOpen)}
+        <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2m3 0h11M4 12h2m3 0h11M4 18h2m3 0h11" /></svg>
         </button>
       {/if}
@@ -466,14 +539,16 @@
       {/if}
       <button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>
     </nav>
+    {/if}
   </header>
   {#if shareError}<p class="rich-action-error">{shareError}</p>{/if}
+  {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
 
   {#if !fullOpen && inlineExpanded}
   <div
     id={`${instanceNamespace}-inline-document`}
-    class:has-toc={showToc && (!inlineTocWide || surface !== 'embedded' || tocOpen)}
-    class:inline-toc-sidebar={showToc && inlineTocWide && (surface !== 'embedded' || tocOpen)}
+    class:has-toc={showToc && tocOpen}
+    class:inline-toc-sidebar={showToc && inlineTocWide && tocOpen}
     class="rich-document rich-inline-document"
     data-testid="rich-deliverable-inline-document"
   >
@@ -482,10 +557,13 @@
         items={tocItems}
         onNavigate={navigateToc}
         bind:open={tocOpen}
-        onClose={() => tocOpen = false}
+        onClose={closeToc}
+        bind:progress={readingProgress}
         layout={inlineTocWide ? 'sidebar' : 'drawer'}
-        visible={surface === 'embedded' && inlineTocWide ? tocOpen : true}
-        dismissibleSidebar={surface === 'embedded'}
+        visible={inlineTocWide ? tocOpen : true}
+        dismissibleSidebar={true}
+        theme={surface === 'standalone' ? resolvedViewerTheme : undefined}
+        documentRoot={() => root}
       />
     {/if}
 
@@ -513,25 +591,27 @@
       data-presentation={presentation}
       data-rich-density={density}
       data-rich-canvas={canvas}
+      data-viewer-theme={resolvedViewerTheme}
       on:keydown|capture={handleKeydown}
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="rich-full-panel" bind:this={modalPanel} tabindex="0" use:bindPanelInteractions>
-         <header>
-           {#if showToc}
-             <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={() => tocOpen = true}>
-               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2m3 0h11M4 12h2m3 0h11M4 18h2m3 0h11" /></svg>
-             </button>
+         <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
+           {#if shareLinkCallback}<button class="viewer-extra-control" type="button" aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><ViewerIcon name="share" /></button>{/if}
+           {#if showToc && !tocOpen}
+             <button class="viewer-extra-control" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>
            {/if}
-           <button bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
-        </header>
+           <button class="viewer-extra-control" bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><ViewerIcon name="close" /></button>
+         </RichViewerChrome>
+         {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
         <div class="rich-full-body">
-              <div class:has-toc={showToc} class="rich-document">
+              <div class:has-toc={showToc && tocOpen} class="rich-document">
                {#if showToc}
-                  <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} onClose={() => tocOpen = false} layout="auto" />
+                  <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} bind:progress={readingProgress} onClose={closeToc} layout="auto" visible={tocOpen} dismissibleSidebar={true} theme={resolvedViewerTheme} documentRoot={() => modalPanel} />
                 {/if}
 
             <div class="rich-body">
+              {#if !payloadOwnsIdentity}<h1 class="document-title">{effectiveTitle || 'Deliverable'}</h1>{#if subtitle}<p class="document-lede">{subtitle}</p>{/if}{/if}
               {#if normalized.blocks.length > 0}
                  <RichBlockList blocks={documentBlocks} sources={normalized.sources} mediaUrlFor={authorizedMediaUrlFor} />
               {:else}
@@ -553,15 +633,10 @@
     width: 100%;
     min-width: 0;
     max-width: 100%;
-    overflow: hidden;
-    border: 1px solid color-mix(in srgb, var(--rich-accent) 14%, transparent);
-    border-radius: 1.6rem;
-    background:
-      linear-gradient(180deg, var(--rich-surface), color-mix(in srgb, var(--rich-accent) 8%, var(--rich-surface-raised))),
-      radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--rich-accent) 18%, transparent), transparent 28%);
-    box-shadow:
-      0 26px 80px var(--rich-shadow-lg),
-      inset 0 1px 0 var(--rich-inset-highlight);
+    overflow: clip;
+    border: 1px solid var(--rich-line);
+    border-radius: .35rem;
+    background: var(--rich-surface);
   }
 
   .rich-deliverable.compact {
@@ -569,22 +644,14 @@
   }
 
   .rich-deliverable.embedded {
-    border-radius: 1.1rem;
-    box-shadow:
-      0 14px 44px var(--rich-shadow),
-      inset 0 1px 0 var(--rich-inset-highlight);
+    border-radius: .35rem;
   }
 
   .rich-deliverable.pulse {
     border-color: rgb(148 163 184 / 0.18);
     border-radius: .35rem;
-    background:
-      linear-gradient(180deg, rgb(15 23 42 / .96), rgb(2 6 23 / .96));
+    background: var(--rich-surface);
     box-shadow: 0 18px 55px rgb(2 6 23 / .2);
-  }
-
-  .rich-deliverable.pulse .rich-orb {
-    display: none;
   }
 
   .rich-deliverable.pulse .rich-toolbar {
@@ -607,10 +674,6 @@
     background: transparent;
   }
 
-  .rich-deliverable.pulse .rich-body {
-    width: min(100%, 76rem);
-    padding: clamp(.75rem, 2vw, 1.35rem);
-  }
 
   /* .rich-full is portaled to document.body (see use:portal) to escape the
      isolated stacking context above, so it carries its own .pulse class
@@ -627,15 +690,9 @@
      the most visible source of full-view looking different from the
      standalone page for Pulse presentations. */
   .rich-full.pulse .rich-full-panel {
-    background:
-      linear-gradient(180deg, rgb(15 23 42 / .96), rgb(2 6 23 / .96));
+    background: var(--rich-surface);
   }
 
-  .rich-full.pulse .rich-body {
-    width: min(100%, 76rem);
-    margin: 0 auto;
-    padding: clamp(.75rem, 2vw, 1.35rem);
-  }
 
   /* Dashboard presentation: flat, editorial, and dense -- restrained
      shadows/gradients (no ambient orbs, a plain surface instead of the
@@ -648,23 +705,15 @@
    .rich-deliverable.dashboard {
      border-color: transparent;
      border-radius: 0;
-     background: rgb(10 15 21);
+      background: var(--rich-surface);
      box-shadow: none;
    }
-
-  .rich-deliverable.dashboard .rich-orb {
-    display: none;
-  }
 
    .rich-full.dashboard .rich-full-panel {
-     background: rgb(10 15 21);
+      background: var(--rich-surface);
      box-shadow: none;
    }
 
-   :global(:root[data-resolved-theme='light']) .rich-deliverable.dashboard,
-   :global(:root[data-resolved-theme='light']) .rich-full.dashboard .rich-full-panel {
-     background: rgb(250 251 252);
-   }
 
    .rich-deliverable.dashboard .rich-toolbar {
      min-height: 2.25rem;
@@ -692,25 +741,9 @@
      background: transparent;
    }
 
-   .rich-deliverable.dashboard .rich-body,
-   .rich-full.dashboard .rich-body {
-     width: min(100%, 90rem);
-     margin: 0 auto;
-     padding: clamp(1rem, 3vw, 2.35rem);
-   }
 
-  /* Host-managed canvas width: `wide` only widens the two surfaces this
-     component fully owns end-to-end (the full-view modal here, and the
-     non-embedded/"standalone" document body below) -- both stay bounded by
-     `min(...)` so the real available width is still host-managed (a
-     narrower viewport or host container always wins). Embedded rendering
-     is deliberately untouched: it already fills whatever width its chat
-     host grants with no self-imposed cap, so a wider bounded canvas there
-     is the embedding host's decision, not this component's. */
-  .rich-full[data-rich-canvas='wide'] .rich-full-panel {
-    width: min(96vw, 104rem);
-  }
-
+  /* Constrain reading content, never the full-view canvas. Embedded width
+     remains owned by the chat host. */
   .rich-deliverable[data-rich-canvas='wide']:not(.embedded) .rich-body {
     width: min(100%, 104rem);
     margin: 0 auto;
@@ -724,33 +757,6 @@
      back to dark. Removed; a future explicit `data-resolved-theme="light"`
      variant can be added here when app-wide theming lands. */
 
-  .rich-orb {
-    position: absolute;
-    z-index: -1;
-    width: 20rem;
-    height: 20rem;
-    border-radius: 999px;
-    filter: blur(46px);
-    opacity: 0.45;
-    pointer-events: none;
-  }
-
-  .rich-orb-a {
-    left: -8rem;
-    top: -8rem;
-    background: rgb(14 165 233 / 0.24);
-  }
-
-  .rich-orb-b {
-    right: -7rem;
-    top: 8rem;
-    background: rgb(16 185 129 / 0.16);
-  }
-
-  :global(:root[data-resolved-theme='light']) .rich-orb {
-    opacity: 0.16;
-  }
-
   .rich-toolbar {
     display: flex;
     gap: 1rem;
@@ -758,8 +764,7 @@
     justify-content: space-between;
     padding: clamp(1.1rem, 2.5vw, 1.7rem);
     border-bottom: 1px solid var(--rich-line);
-    background: linear-gradient(180deg, color-mix(in srgb, var(--rich-surface-raised) 90%, transparent), transparent);
-    backdrop-filter: blur(14px);
+    background: var(--rich-surface);
   }
 
   .rich-toolbar.actions-only {
@@ -779,7 +784,7 @@
     display: block;
     margin: 0.15rem 0 0;
     color: var(--rich-text);
-    font-size: clamp(1.3rem, 3vw, 2rem);
+    font-size: clamp(2rem, 4vw, 3.6rem);
     letter-spacing: -0.045em;
     line-height: 1.05;
   }
@@ -840,7 +845,7 @@
   }
 
   .rich-actions svg,
-  .rich-full header svg {
+  .rich-full svg {
     width: 1.2rem;
     height: 1.2rem;
     fill: none;
@@ -852,7 +857,8 @@
 
   .rich-actions button,
   .rich-actions a,
-  .rich-full header button {
+  .rich-full button,
+  .rich-deliverable:not(.embedded) button {
     width: 2.75rem;
     min-width: 2.75rem;
     height: 2.75rem;
@@ -957,35 +963,16 @@
     display: grid;
     place-items: start center;
     overflow: auto;
-    padding: max(1rem, env(safe-area-inset-top)) 1rem 1rem;
-    background: rgb(2 6 23 / 0.76);
-    backdrop-filter: blur(18px);
+    padding: 0;
+    background: var(--rich-surface);
   }
 
   .rich-full-panel {
-    width: min(100%, 82rem);
-    min-height: min(48rem, calc(100vh - 2rem));
-    overflow: hidden;
-    border: 1px solid var(--rich-line);
-    border-radius: 1.5rem;
-    background:
-      radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--rich-accent) 16%, transparent), transparent 28%),
-      linear-gradient(180deg, var(--rich-surface-raised), var(--rich-surface));
-    box-shadow: 0 30px 110px rgb(0 0 0 / 0.55);
-  }
-
-  .rich-full header {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 1rem;
-    border-bottom: 1px solid var(--rich-line);
-    background: color-mix(in srgb, var(--rich-surface-raised) 86%, transparent);
-    padding: 1rem 1.25rem;
-    backdrop-filter: blur(14px);
+    width: 100%;
+    min-width: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: var(--rich-surface);
   }
 
   .rich-full-body {
@@ -999,7 +986,7 @@
   /* Fullscreen keeps the established viewport-driven TOC contract because
      its portal is no longer inside the inline container. Keep this threshold
      aligned with RichToc's automatic sidebar mode. */
-  @media (min-width: 1440px) {
+  @media (min-width: 1024px) {
     .rich-full-body .rich-document.has-toc {
       display: grid;
       grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
@@ -1064,11 +1051,17 @@
     }
 
     .rich-full {
-      padding: 0.5rem;
+      padding: 0;
     }
 
     .rich-full-panel {
-      border-radius: 1rem;
+      border-radius: 0;
     }
   }
+  .rich-deliverable:not(.embedded) .rich-toolbar.actions-only { display: none; }
+  .rich-deliverable:not(.embedded) .rich-document,
+  .rich-full-body { max-width: 100rem; margin-inline: auto; padding: clamp(1rem, 3vw, 3rem); }
+  .rich-body { width: 100%; margin-inline: auto; }
+  .document-title { color: var(--rich-text); font-size: clamp(2rem, 4vw, 3.6rem); line-height: 1.12; letter-spacing: -.035em; overflow-wrap: anywhere; }
+  .document-lede { color: var(--rich-text-secondary); max-width: 68ch; font-size: 1.2rem; line-height: 1.7; }
 </style>

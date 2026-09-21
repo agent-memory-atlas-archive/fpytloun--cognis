@@ -12,11 +12,13 @@ from cognis.core.compaction import (
 from cognis.core.compaction.banding import build_compaction_input
 from cognis.core.compaction.fallback import build_sliding_window_summary
 from cognis.core.compaction.strategy import _split_events
-from cognis.core.session_cache import CachedEvent, CachedSessionState
+from cognis.core.session_cache import CachedEvent, CachedSessionState, SessionCache
 from cognis.models.session import EventAppendResult, SessionModel
 
 
 class _Cache:
+    get_context_snapshot = SessionCache.get_context_snapshot
+
     def __init__(self) -> None:
         self.entry = CachedSessionState(
             session_id="session-1",
@@ -112,6 +114,50 @@ def _session() -> SessionModel:
         agent_id="agent-1",
         intaris_session_id="session-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_compaction_keeps_snapshot_when_cache_invalidates_during_model_resolution() -> None:
+    cache = _Cache()
+
+    class InvalidatingLLM(_LLM):
+        async def resolve_model(self, *args: object, **kwargs: object) -> str:
+            cache.entry.events.clear()
+            cache.entry.canonical_stale = True
+            return "test-model"
+
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=InvalidatingLLM(),
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+    result = await strategy.compact(_session())
+    assert result.compacted is True
+    assert [event.seq for event in result.preserved_tail_events] == [3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_apply_unacknowledged_summary() -> None:
+    from cognis.core.canonical_history import CanonicalHistoryUnavailable
+
+    cache = _Cache()
+
+    class RejectingGuardrails(_Guardrails):
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
+
+    strategy = CompactionStrategy(
+        guardrails=RejectingGuardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+    with pytest.raises(CanonicalHistoryUnavailable):
+        await strategy.compact(_session())
+    assert cache.applied == []
 
 
 @pytest.mark.asyncio

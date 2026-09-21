@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createReactiveAgentForm } from './agentFormTestState.svelte';
 import AgentForm from './AgentForm.svelte';
 
-function setup(readonly = false) {
+function setup(readonly = false, agents: any[] = []) {
   const form = createReactiveAgentForm();
   form.name = 'Research assistant';
   const onSave = vi.fn();
@@ -12,9 +12,9 @@ function setup(readonly = false) {
       name: 'read', description: 'Read a file', category: 'filesystem', parameters: {},
       read_only: true, capabilities: [], source: { type: 'builtin' },
       timeout_seconds: 30, non_bypassable: false
-    }], workflows: [], providers: [], readonly, onSave
+    }], workflows: [], providers: [], agents, readonly, onSave
   });
-  return { ...view, onSave };
+  return { ...view, form, onSave };
 }
 
 describe('AgentForm sections', () => {
@@ -47,7 +47,7 @@ describe('AgentForm sections', () => {
 
   it('keeps a single save action available in every section', async () => {
     const { onSave } = setup();
-    await fireEvent.click(screen.getByRole('tab', { name: 'Tools & access 1' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Tools 1' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
     expect(onSave).toHaveBeenCalledOnce();
     expect(onSave.mock.calls[0][0].name).toBe('Research assistant');
@@ -70,7 +70,7 @@ describe('AgentForm sections', () => {
 
   it('prevents search Enter from submitting and retains filtered selections', async () => {
     const { onSave } = setup();
-    await fireEvent.click(screen.getByRole('tab', { name: 'Tools & access 1' }));
+    await fireEvent.click(screen.getByRole('tab', { name: 'Tools 1' }));
     const search = screen.getByRole('searchbox');
     await fireEvent.input(search, { target: { value: 'read' } });
     await fireEvent.click(screen.getByRole('checkbox', { name: 'read' }));
@@ -85,5 +85,28 @@ describe('AgentForm sections', () => {
     await fireEvent.click(screen.getByRole('tab', { name: 'Identity' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
     expect(onSave.mock.calls[0][0].tools.disabled_tools).toEqual(['read']);
+  });
+
+  it('uses agent pickers for delegation and keeps self implicitly allowed', async () => {
+    const { form } = setup(false, [
+      { agent_id: 'worker', name: 'Worker', agent_type: 'primary', status: 'active' },
+      { agent_id: 'lumi', name: 'Lumi', agent_type: 'primary', status: 'active' },
+      { agent_id: 'system:explore', name: 'Explore', agent_type: 'secondary', is_system: true, status: 'active' }
+    ]);
+    form.agentId = 'worker';
+    await fireEvent.click(screen.getByRole('tab', { name: 'Access & delegation' }));
+    expect(screen.getByText('Execution access')).toBeVisible();
+    expect(screen.queryByRole('searchbox')).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Restrict allowed target agents' }));
+
+    expect(screen.getByText('worker')).toBeVisible();
+    expect(screen.getByText('always allowed')).toBeVisible();
+    await fireEvent.click(screen.getByRole('checkbox', { name: /Lumi/ }));
+    await fireEvent.click(screen.getByRole('checkbox', { name: /Explore/ }));
+    expect(form.allowedAgentIds).toEqual(['lumi', 'system:explore']);
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Restrict agents allowed to target this primary agent' }));
+    const lumiChoices = screen.getAllByRole('checkbox', { name: /Lumi/ });
+    await fireEvent.click(lumiChoices[lumiChoices.length - 1]);
+    expect(form.allowedControllerAgentIds).toEqual(['lumi']);
   });
 });

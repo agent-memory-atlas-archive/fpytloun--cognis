@@ -28,6 +28,7 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
         "apply_patch",
         "grep",
         "glob",
+        "lsp",
         "list_directory",
         "bash",
     ]
@@ -64,7 +65,18 @@ def test_system_explore_agent_uses_real_listing_tool() -> None:
     agent = SYSTEM_AGENTS["system:explore"]
     tools = agent.tools or {}
 
-    assert tools.get("builtin_tools") == ["read", "grep", "glob", "list_directory", "bash"]
+    assert tools.get("builtin_tools") == ["read", "grep", "glob", "lsp", "list_directory", "bash"]
+
+
+def test_code_navigating_system_agents_expose_lsp() -> None:
+    for agent_id in (
+        "system:explore",
+        "system:code-review",
+        "system:architect",
+        "system:implement",
+    ):
+        tools = SYSTEM_AGENTS[agent_id].tools or {}
+        assert "lsp" in tools.get("builtin_tools", []), agent_id
 
 
 def test_system_review_agents_use_pragmatic_prompts() -> None:

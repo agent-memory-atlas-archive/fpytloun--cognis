@@ -88,6 +88,56 @@ def test_signal_like_markdown_projection_preserves_full_document_and_links() -> 
     assert "Fallback must not replace" not in rendered
 
 
+def test_markdown_projects_viewer_identity_badge_tone_and_summary_key_values() -> None:
+    rendered = render_rich_markdown(
+        {
+            "metadata": {"viewer_identity": {"icon": {"name": "info", "alt": "Information"}}},
+            "blocks": [
+                {
+                    "type": "hero",
+                    "title": "Report",
+                    "badges": [{"label": "Verified", "tone": "success"}],
+                },
+                {
+                    "type": "key_value",
+                    "variant": "summary",
+                    "items": [{"label": "Risk", "value": "Low", "tone": "positive"}],
+                },
+            ],
+        },
+        title="Report",
+        full_view_link=None,
+        deliverable_id="dlv_semantics",
+        fallback_text="fallback",
+    )
+
+    assert "Viewer: Information" in rendered
+    assert "Verified (success)" in rendered
+    assert "Risk: Low (positive)" in rendered
+
+
+def test_markdown_escapes_viewer_and_badge_plain_text() -> None:
+    rendered = render_rich_markdown(
+        {
+            "metadata": {"viewer_identity": {"label": "[Do not link](https://example.test)"}},
+            "blocks": [
+                {
+                    "type": "hero",
+                    "title": "Report",
+                    "badges": [{"label": "[Plain text](https://example.test)", "tone": "info"}],
+                }
+            ],
+        },
+        title="Report",
+        full_view_link=None,
+        deliverable_id="dlv_plain_text",
+        fallback_text="fallback",
+    )
+
+    assert r"\[Do not link\]\(https://example\.test\)" in rendered
+    assert r"\[Plain text\]\(https://example\.test\) (info)" in rendered
+
+
 def test_markdown_projects_section_headers_progress_and_typed_cells() -> None:
     rendered = "\n".join(
         _project(

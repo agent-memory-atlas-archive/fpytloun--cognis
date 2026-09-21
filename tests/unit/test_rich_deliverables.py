@@ -8,6 +8,7 @@ import pytest
 import sqlalchemy as sa
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
+from jsonschema import Draft7Validator
 
 from cognis.api.serializers import deliverable_to_response
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
@@ -98,6 +99,108 @@ def test_rich_payload_normalization_rejects_unknown_blocks() -> None:
     assert err["path"] == "$.blocks[1]"
     assert err["expected"]
     assert "valid_example" in err
+
+
+def test_rich_payload_normalizes_viewer_identity_badges_and_summary_key_values() -> None:
+    payload, warnings = normalize_rich_payload(
+        {
+            "metadata": {
+                "viewer_identity": {
+                    "label": "Prepared for Engineering",
+                    "icon": {"name": "info", "alt": "Information"},
+                }
+            },
+            "blocks": [
+                {
+                    "type": "hero",
+                    "title": "Release readiness",
+                    "badges": ["Stable", {"label": "Verified", "tone": "success"}],
+                },
+                {
+                    "type": "key_value",
+                    "variant": "summary",
+                    "items": [
+                        {"label": "Risk", "value": "Low", "tone": "positive"},
+                        {"label": "Owner", "value": "Platform"},
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert warnings == []
+    assert payload is not None
+    assert payload["metadata"]["viewer_identity"]["label"] == "Prepared for Engineering"
+    assert payload["blocks"][0]["badges"][1] == {"label": "Verified", "tone": "success"}
+    assert payload["blocks"][1]["variant"] == "summary"
+    assert (
+        rich_render_metadata(payload)["viewer_identity"] == payload["metadata"]["viewer_identity"]
+    )
+    assert rich_export_metadata(payload)["semantic_features"]["summary_key_value"] is True
+
+
+def test_rich_tool_schema_keeps_grid_columns_outside_key_value_constraint() -> None:
+    from cognis.tools.builtin.workflow import _RICH_WRITE_DELIVERABLE_SCHEMA
+
+    errors = list(
+        Draft7Validator(_RICH_WRITE_DELIVERABLE_SCHEMA).iter_errors(
+            {
+                "action": "rich",
+                "payload": {
+                    "title": "Grid",
+                    "blocks": [{"type": "grid", "columns": 3, "blocks": []}],
+                },
+            }
+        )
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_path"),
+    [
+        (
+            {"metadata": {"viewer_identity": {"icon": {"name": "info"}}}, "blocks": []},
+            "$.metadata.viewer_identity.icon.alt",
+        ),
+        (
+            {"metadata": {"viewer_identity": {"url": "https://example.test"}}, "blocks": []},
+            "$.metadata.viewer_identity.url",
+        ),
+        (
+            {"blocks": [{"type": "hero", "badges": [{"label": "Ready", "color": "green"}]}]},
+            "$.blocks[0].badges[0].color",
+        ),
+        (
+            {"blocks": [{"type": "hero", "badges": [{"label": "Ready", "tone": "green"}]}]},
+            "$.blocks[0].badges[0].tone",
+        ),
+        (
+            {"blocks": [{"type": "kv", "variant": "compact"}]},
+            "$.blocks[0].variant",
+        ),
+        (
+            {"blocks": [{"type": "kv", "variant": "summary", "columns": 2}]},
+            "$.blocks[0].columns",
+        ),
+        (
+            {"blocks": [{"type": "kv", "data": "invalid"}]},
+            "$.blocks[0].data",
+        ),
+        (
+            {"blocks": [{"type": "kv", "items": [], "data": "invalid"}]},
+            "$.blocks[0].data",
+        ),
+    ],
+)
+def test_rich_semantic_refinements_report_exact_validation_paths(
+    payload: dict[str, Any], expected_path: str
+) -> None:
+    with pytest.raises(RichPayloadValidationError) as exc_info:
+        normalize_rich_payload(payload)
+
+    assert exc_info.value.path == expected_path
 
 
 def test_rich_payload_normalizes_renderer_neutral_dashboard_contract() -> None:
@@ -989,10 +1092,10 @@ async def test_direct_chat_rich_deliverable_scope_and_versions(tmp_path) -> None
 
     assert first.version == 1
     assert second.version == 2
-    assert first.status == "superseded"
+    assert first.status == "buffered"
     assert rows[0].deliverable_id == second.deliverable_id
-    with pytest.raises(FileNotFoundError):
-        await store.async_load("deliverables", first.deliverable_id, "content.md")
+    await hydrate_deliverable_payload(first, store)
+    assert first.rich_payload["blocks"][0]["type"] == "card"
     await hydrate_deliverable_payload(rows[0], store)
     assert rows[0].rich_payload["blocks"][0]["type"] == "markdown"
     assert rows[0].render_metadata["schema"] == "cognis.rich_deliverable.v1"
@@ -1016,7 +1119,7 @@ def test_rich_payload_validation_accepts_gallery_items_without_block_type() -> N
 
 
 @pytest.mark.asyncio
-async def test_supersede_blob_cleanup_waits_for_commit(tmp_path) -> None:
+async def test_direct_chat_blob_rollback_preserves_previous_outputs(tmp_path) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/rich-rollback.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -1073,8 +1176,7 @@ async def test_supersede_blob_cleanup_waits_for_commit(tmp_path) -> None:
         replacement_id = replacement.deliverable_id
         await session.commit()
 
-    with pytest.raises(FileNotFoundError):
-        await store.async_load("deliverables", first_id, "content.md")
+    await store.async_load("deliverables", first_id, "content.md")
     await store.async_load("deliverables", replacement_id, "content.md")
     await engine.dispose()
 
@@ -1155,8 +1257,8 @@ async def test_conversation_scoped_deliverable_access_checks_owner(tmp_path) -> 
         old_published = await get_artifact_record(session, row.deliverable_id)
         new_published = await get_artifact_record(session, replacement.deliverable_id)
         assert old_published is not None
-        assert old_published.status == "deleted"
-        assert old_published.deleted_at is not None
+        assert old_published.status == "attached"
+        assert old_published.deleted_at is None
         assert new_published is not None
         assert new_published.status == "attached"
 

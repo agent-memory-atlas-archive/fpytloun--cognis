@@ -3,6 +3,15 @@
 A rich deliverable is a renderer-neutral payload. Cognis validates and stores
 the payload; each target renderer chooses an appropriate representation.
 
+In direct chat, each `write_deliverable` call creates an independent durable
+output. All outputs are presented after the final assistant response, in write
+order. A later call does not replace or delete an earlier output. In workflow
+steps, repeated writes still revise the canonical step deliverable.
+
+If an older deliverable's stored payload is missing, artifact tools reject the
+reference without failing the turn. Browser exports return a structured
+not-found or payload-unavailable response rather than an internal server error.
+
 ## Payload shape
 
 ```text
@@ -31,6 +40,37 @@ document-level context that blocks can reference by ID.
 6. Keep the Markdown fallback complete enough for channels and accessibility.
 7. Do not nest cards inside cards without a clear information hierarchy.
 
+### Web presentation and spacing
+
+Standalone and full-view documents use an edge-to-edge canvas, at least as
+tall as the viewport. Reading gutters are inside the document layout, not an
+outer contrasting frame. The viewer toolbar is in normal flow and scrolls
+away with the document; the desktop contents sidebar remains sticky.
+Embedded chat documents retain their host boundary.
+
+The web renderer uses flat, token-based surfaces across block families.
+Charts do not add a second decorative frame inside their containing block.
+Callout backgrounds, borders, and indicators use the same authored semantic
+tone in both themes.
+
+Publication block lists own the 24px sibling gap (16px in compact mode); blocks own their internal
+padding and heading-to-content spacing. Do not add spacer blocks to compensate
+for missing renderer spacing. Sections add a larger ruled transition.
+Default, Pulse, and dashboard presentations use the same publication stylesheet:
+none bypasses typography, theme, reading gutters, or table styling. Compact
+mode changes spacing and heading scale, not the visual language. Simple metric
+tiles have no minimum height and use two columns on phones.
+
+Use `hero.subtitle` for the summary. Existing payloads using `hero.dek` remain
+readable in web, static/PDF, and Markdown renderers; `subtitle` takes precedence.
+
+The `every-block-reference` gallery scenario and
+`ui/e2e/rich-element-rhythm.spec.ts` exercise composed blocks together, including
+measured gaps. Isolated element previews alone cannot detect touching siblings.
+Phone publication views use 16px side gutters (or larger device safe-area
+insets). The responsive rule has the same specificity as the desktop shell,
+so its 40px padding cannot override the phone layout.
+
 ## Block families
 
 | Family | Typical blocks |
@@ -44,7 +84,26 @@ Aliases remain supported for compatibility: `kv` and `key_value`, for
 example, render the same key-value concept. Prefer the canonical spelling in
 new authored payloads.
 
+## Portable semantic refinements
+
+- Set `metadata.viewer_identity` only when the deliverable supplies a specific
+  opening-header identity. It accepts plain `label` and/or a registered
+  `icon: {name, alt?}`. Do not infer it. An icon-only identity requires `alt`.
+- Hero `badges` and `tags` accept legacy text or `{label, tone?}`. Use a tone
+  only to communicate meaning; the label remains required and visible.
+- Use `key_value` with `variant: "summary"` for a compact ordered fact strip.
+  Item `tone` is semantic. Do not author columns, widths, colors, or styles.
+- Standalone and full-view readers provide a flat viewer shell with theme,
+  copy, download, and table-of-contents controls. The viewer shell is
+  renderer-owned; do not model it with authored action blocks.
+
 ## Reference screenshots
+
+The QA gallery uses one compact toolbar for the scenario, theme, width, and
+surface. Each selector preserves the other URL parameters and browser history.
+Use `capture=viewer` to hide QA controls in deliverable captures.
+
+![Compact Rich gallery toolbar](../assets/screenshots/rich-deliverables/gallery-toolbar.png)
 
 The block guides use screenshots generated from the same deterministic fixture
 used by browser visual QA. Regenerate them with:
@@ -100,6 +159,8 @@ blocks as authored deliverables. Maps are not part of this portfolio.
 | `data-projections` | Observed baseline, forecast range, scenarios, assumptions, and decision |
 | `illustrated-recipe` | Step-associated media, ingredients, timing, failures, and food safety |
 | `weekly-meal-plan` | Seven-day schedule, recipe media, batch preparation, reuse, and shopping |
+| `design-document-legacy` | Long Markdown-only design document used to compare baseline renderer treatment |
+| `design-document-composed` | The same fictional design document with viewer identity, typed badges, summary facts, TOC, table, and code |
 
 Use the stable scenario URL to inspect one example:
 

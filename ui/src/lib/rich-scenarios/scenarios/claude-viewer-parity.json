@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "id": "claude-viewer-parity",
+  "title": "SCC Phase 1 — Artifact Version Ingestion and Revocable Machine Read Access",
+  "description": "User-supplied SCC reference content for visual parity. This is a design-reference specimen, not Cognis product status.",
+  "group": "design",
+  "sort_key": 612,
+  "visibility": [
+    "gallery"
+  ],
+  "content": "DESIGN AGREED\nNOT IMPLEMENTED\nPLAN MODE · NO FILES CHANGED\n\n# SCC Phase 1 — Artifact Version Ingestion and Revocable Machine Read Access\n\nGive SCC an authoritative list of deployable software versions, expose it over a read-only machine API, and make the Jenkins credential revocable.\n\nSOURCE\n\nlumilens-artifacts\n\nDECISIONS\n\n3 resolved\n\nWORK ITEMS\n\n17 across 4 repos\n\nOPEN QUESTIONS\n\n3\n\nScope: give SCC an authoritative list of deployable software versions sourced from `lumilens-artifacts` S3, expose it over a read-only machine-accessible API, and make the Jenkins credential revocable. Replaces the Jenkins free-text version inputs for engineering mode.\n\n01\n\n## Resolved decisions\n\n| # | DECISION | RESOLUTION |\n| --- | --- | --- |\n| 1 | Machine credential | Pre-minted JWT, made revocable by a `MachineCredential` allowlist registry keyed on a new `cid` claim |\n| 2 | Artifact storage | Dedicated `artifact_versions` table |\n| 3 | Catalog/S3 cross-validation | Out of scope. SCC does not audit CI output or supplement monitoring |\n\nDecision 3 excludes auditing whether an active catalog's `component_versions` exist in S3. It does **not** exclude validating an operator's engineering-mode pick against SCC's own ingested table at submit time — that is SCC validating its own data before accepting a mutation, which is squarely its purpose. See [§5](#s5).\n\n02\n\n## Security gap found during design\n\nFINDING\n\nThere is no maximum token lifetime.\n\n`TokenClaims.exp` is a required unbounded integer (`auth/identity.py:61`), and `config.py:105-108` defines only `machine_jwt_issuer`, `machine_jwt_audience`, `machine_jwks_json`, and `jwt_clock_skew_seconds`. No TTL ceiling exists anywhere in the verify path.\n\nConsequence today: any holder of a signing key listed in `SCC_MACHINE_JWKS_JSON` can mint a token with an arbitrary expiry — ten years is as valid as three minutes. The Windmill worker happens to use 180 s (`scc_legacy_snapshot.py:614-641`), but nothing enforces that.\n\nThis must be closed as part of phase 1, because it is also what makes the registry bypassable: without a ceiling on non-registry tokens, a long-lived token can simply omit `cid` and skip revocation entirely.\n\n**Fix:** add `machine_token_max_ttl_seconds` (default 900). Enforce in `verify_token`:\n\n* —Token **without** `cid` → require `exp - iat <= machine_token_max_ttl_seconds`.\n* —Token **with** `cid` → ceiling not applied; the registry governs lifetime instead.\n\nWindmill's existing 180 s tokens satisfy this unchanged.\n\n03\n\n## Revocable machine credentials\n\n### 3.1 Why a registry\n\nA JWT is self-contained by design, so revocation requires server-side state. The options:\n\n| OPTION | VERDICT |\n| --- | --- |\n| Remove `kid` from JWKS | **Rejected.** All-or-nothing per key, and `machine_jwks_json` is read at startup, so revocation would require a pod restart. Revocation must not require a deploy. |\n| Denylist table on `jti` | **Rejected.** Fails open by default, and operating it still requires a record of issued tokens — a registry with worse properties. |\n| Allowlist registry on a `cid` claim | **Chosen.** Fails closed, enumerable, per-credential revocation, supports narrowing scope without reissuing, and is the same table needed later for off-cluster opaque tokens. |\n\n### 3.2 Model\n\nPYTHON\ndb/models.py\n\n```\nclass MachineCredential(Base):\n    __tablename__ = \"machine_credentials\"\n\n    credential_id: Mapped[str]              = mapped_column(String(128), primary_key=True)\n    subject:       Mapped[str]              = mapped_column(String(255))\n    description:   Mapped[str]              = mapped_column(String(512))\n    capabilities:  Mapped[list[str]]        = mapped_column(JSONB)\n    site_ids:      Mapped[list[str] | None] = mapped_column(JSONB)   # NULL = global\n    expires_at:    Mapped[datetime]         = mapped_column(DateTime(timezone=True))\n    revoked_at:    Mapped[datetime | None]\n    revoked_by:    Mapped[str | None]       = mapped_column(String(255))\n    last_used_at:  Mapped[datetime | None]\n    created_by:    Mapped[str]              = mapped_column(String(255))\n    revision:      Mapped[int]\n```\n\n`credential_id` matches `^[a-z][a-z0-9-]{2,127}$`, consistent with the existing `workload` pattern (`identity.py:65`).\n\n### 3.3 Claim\n\nAdd `cid` to `TokenClaims`. Note `model_config = ConfigDict(extra=\"forbid\")` (`identity.py:56`) — the claim set is a closed contract, so this addition is explicit and validated rather than silently tolerated.\n\nPYTHON\n\n```\ncid: str | None = Field(default=None, pattern=r\"^[a-z][a-z0-9-]{2,127}$\")\n```\n\nAdd `credential_id` to `IdentityContext` (`identity.py:38-52`).\n\n### 3.4 Enforcement point\n\n`app.py:174-186` is a single middleware that authenticates every `/v1` and `/api/v1` request, resolves identity inside a DB session, and stores the result on `request.state.identity`. Every router reads it through a trivial `_identity` dependency.\n\nThis is the whole reason the design is cheap and safe: **one chokepoint, already holding a DB session.** Add a symmetric resolver beside the existing browser one:\n\nPYTHON\napp.py\n\n```\nidentity = await authenticate_request(request, active_settings)\nwith factory() as identity_session:\n    request.state.identity = resolve_browser_identity(...)         # existing\n    request.state.identity = resolve_machine_credential(           # new\n        identity_session, request.state.identity\n    )\n```\n\nBecause it lives in the middleware and not in per-endpoint code, it is non-bypassable by construction. A future endpoint cannot forget to apply it — precisely the footgun that `consume_machine_jti` has today, being called only from `api/legacy_sync.py`.\n\n`resolve_machine_credential` is a no-op for non-machine identities and for machine identities without `cid`.\n\n### 3.5 Resolution rules\n\nFor a machine identity carrying `cid`:\n\n1. 1Row must exist. Unknown `credential_id` → `unknown_credential`.\n2. 2`revoked_at IS NULL`, else `revoked_credential`.\n3. 3`expires_at > now()`, else `expired_credential`.\n4. 4**Effective capabilities = JWT claims ∩ registry row.**\n5. 5**Effective sites = JWT claims ∩ registry row**, unless the row is global (`NULL`).\n\nThe intersection in (4) and (5) is the important property. Neither side can escalate: a token cannot claim more than the registry grants, and the registry cannot grant more than the token asserts. Scope can therefore be **narrowed at any time without reissuing the token** — a useful intermediate response to a suspected leak, short of full revocation.\n\n### 3.6 Interaction with replay protection\n\n`cid` credentials carry a static `jti`, so they are incompatible with `consume_machine_jti` (`identity.py:610-646`), which would reject the second use.\n\nMake this structural rather than conventional: `consume_machine_jti` raises `registry_credential_not_replay_eligible` when `identity.credential_id` is set. Self-documenting, and it prevents a registry credential from ever being pointed at the legacy-sync write endpoint.\n\n### 3.7 Admin surface\n\nFollow the established `role-mapping:admin` pattern exactly: `require_human_identity`, `require_capability`, global scope required, `expected_revision` optimistic concurrency, audited through `_admin_upsert`.\n\nGET/v1/admin/machine-credentials\n\nPUT/v1/admin/machine-credentials/{credential\\_id}\n\nDELETE/v1/admin/machine-credentials/{credential\\_id}sets revoked\\_at\n\nNew capability `machine-credential:admin`, granted to `admin` only. Register in the audited-resource maps so credential changes land in the revision history like role mappings do.\n\n**Also seed declaratively.** `seed_roles.py:53-58` already seeds role mappings on deploy. Mirror it with `SCC_MACHINE_CREDENTIALS_JSON` so the credential inventory is GitOps-managed and reviewable in a pull request. Keep the API for emergency revocation, which must not wait for a deploy.\n\n### 3.8 Operational notes\n\nDo not cache credential lookups\n\nRevocation latency would equal cache TTL. Compare `_BROWSER_IDENTITY_CACHE`, which caches for 60 s. This is one indexed primary-key lookup on a request that already has a session open.\n\nCoalesce `last_used_at`\n\nA write on every read request is a hot-path write. Update at most once per 60 s per credential, best-effort, and never fail a request on it.\n\nApply rate limiting\n\nIn-process machinery already exists at `api/inventory.py:42-43`; wire the new read endpoints into it.\n\n04\n\n## Artifact version ingestion\n\n### 4.1 Placement\n\nNot `CatalogRevision`. Two blocking reasons:\n\n1. 1**Lifecycle mismatch.** `CatalogRevision` is immutable and pointer-switched via `ActiveCatalog`. It represents an approved release. The artifact inventory changes on every CI build.\n2. 2**Validation would reject real data.** `domain/catalog.py:26-31` enforces a semver-like pattern. Real artifact versions include `1.15.0.0`, `3.23.0.1+44b10f3d`, and `hf-RC-CAL-0.7.0-MH-0.4.0-20260202-074254`.\n\nUse the observability refresh pattern instead — `SourceRefreshLease` plus worker role plus snapshot — and add `artifact-refresh` alongside `health-refresh` and `alert-refresh`. Two deltas from the existing sources:\n\n* —**Lease scope.** The lease is keyed per-source per-site; the artifact bucket is global. Add a site-less lease variant; do not invent a placeholder site.\n* —**Interval.** Mimir defaults to 30 s. Use 300 s for S3, plus a manual refresh trigger.\n\n### 4.2 Source of truth\n\nIngest exactly the five prefixes Ansible downloads from (`download_artifacts.sh.j2:57-90`):\n\nS3 PREFIXES\n\n```\ntestar/{version}                testar-pyscripts/{version}     testar-testspecs/{version}\nopxcvraccessdr8/{version}/bin   opxcvrgateway/{version}/bin\n```\n\n`ListObjectsV2(Prefix=…, Delimiter='/')` → `CommonPrefixes` yields version directories directly. Verified properties:\n\n* `testar-pyscripts/{v}/` nests its contents **inside** the version directory, so delimiter listing returns only versions.\n* No `latest-*` pointers under these five prefixes.\n* Producers refuse to overwrite an existing prefix, so versions are effectively immutable.\n\n### 4.3 Completeness rule\n\n`aws s3 sync` is not atomic, so directory existence does not imply a usable artifact. Require a per-component sentinel object:\n\n| COMPONENT | SENTINEL | EVIDENCE |\n| --- | --- | --- |\n| testar | testar/{v}/VERSION | build-and-deploy.yml:93-99 |\n| pyscripts | testar-pyscripts/{v}/\\*.zip | build-python-package.yml:274-282 |\n| testspecs | testar-testspecs/{v}/\\*.zip | build-testspecs.yml:130-147 |\n| accessdr8 | UNVERIFIED | produced by sw-opxcvr-apps, not inspected |\n| gateway | UNVERIFIED | produced by sw-opxcvr-apps, not inspected |\n\n`published_at` is the sentinel's `LastModified`.\n\n> INVARIANT\n>\n> If SCC lists it, Ansible can download it.\n\n### 4.4 Table\n\nPYTHON\n\n```\nclass ArtifactVersion(Base):\n    __tablename__ = \"artifact_versions\"\n\n    artifact_version_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)\n    component:           Mapped[str]       = mapped_column(String(64))\n    version:             Mapped[str]       = mapped_column(String(256))\n    s3_prefix:           Mapped[str]       = mapped_column(String(512))\n    complete:            Mapped[bool]\n    published_at:        Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n    first_seen_at:       Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n    last_seen_at:        Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n\n    __table_args__ = (\n        UniqueConstraint(\"component\", \"version\"),\n        Index(\"ix_artifact_versions_component_published\", \"component\", \"published_at\"),\n    )\n```\n\nPlus a per-component refresh-state row mirroring `ObservabilitySnapshot` freshness semantics so the API can report staleness instead of silently serving old data.\n\nOrdering\n\nSort by `published_at`, never by parsing the version string. The version grammars are not unifiable.\n\nDisappearance policy\n\nDo not delete rows when a version stops appearing. Set `complete = false` after N consecutive misses and retain the row — silently dropping a version an engineer may be mid-deploy with is worse than showing it unavailable.\n\nPagination\n\nCursor on `(published_at, artifact_version_id)`, since version strings are not orderable.\n\n### 4.5 Read API\n\nGET/v1/artifacts/components\n\nGET/v1/artifacts/components/{component}/versions?limit=&cursor=&contains=\n\nReturns `{version, published_at, complete}`, newest first, with freshness metadata.\n\n**Gating** — reuse the dual-gate shape of `_inventory_read`:\n\nPYTHON\n\n```\nif \"artifacts:read\" in identity.capabilities:\n    require_capability(identity, \"artifacts:read\")      # machine permitted\nelse:\n    require_human_identity(identity)\n    require_capability(identity, \"catalog:read\")\n```\n\nNew capability `artifacts:read`, added to `viewer` and above. A good first broadened machine read: not site-scoped, not sensitive — a list of version strings already readable by every edge server. Minimal blast radius if a token leaks.\n\n### 4.6 Cross-account S3 access\n\n`lumilens-artifacts` lives in the **development** account `279684396218`, `us-east-2`. SCC runs in prod-infra. The bucket policy grants read only to named prod roles. **SCC is not among them.**\n\nSeparately, SCC's existing S3 client uses static access keys against `scc-projections`, not the boto3 default chain. A second client for a different bucket in a different account needs its own credential path. Use IRSA — the role already exists for RDS IAM auth — rather than a second static key pair.\n\nTerraform work: IAM role and policy granting `s3:ListBucket` plus `s3:GetObject` scoped to the five prefixes; add that role ARN to the bucket policy.\n\n05\n\n## Jenkins integration\n\nToday engineering mode uses four free-text version inputs, pipe-joined into a hidden field, pre-filled from the `stations_metadata` Mongo collection — which records *what was last deployed*, not what is available. A typo fails during the S3 download roughly twenty minutes later.\n\nReplace with SCC-backed searchable dropdowns:\n\n* —**Pipeline path** — new `vars/sccClient.groovy`, modelled on `labJunctionClient.groovy:88-112`.\n* —**Active Choices path** — read the credential via the existing `CredentialsProvider.lookupCredentials` pattern using `StringCredentials`, and add the bearer header to the existing curl.\n\nJenkins is in-cluster, so it reaches `station-control-center.mfg-portal.svc.cluster.local` exactly as Windmill does. No ingress, no TLS, no internet exposure in phase 1.\n\nPRIMARY PAYOFF\n\n**Submit-time validation** (distinct from decision 3): reject an engineering-mode assignment whose component versions are absent from `artifact_versions` or marked incomplete. This moves the failure from twenty minutes into an Ansible run to immediate form feedback. Confirm this reading of decision 3 before building.\n\n06\n\n## Out of scope for phase 1\n\n* `saveStationMetadata` — a write. Stays on mongo-client. SCC prod has `writesEnabled: false`, and a machine write capability would reintroduce per-request `jti`.\n* The GitHub version probe for CI/CD mode.\n* Opaque (non-JWT) tokens. The registry is the forward-compatible foundation: add a `token_hash` column and a lookup branch when a consumer genuinely cannot hold a JWT.\n* Catalog-versus-S3 auditing. Decision 3.\n\nADJACENT BUG · SEPARATE TICKET\n\n`_desired_component_versions` returns the *entire* active catalog map for any non-engineering assignment; release-group membership is only used as a validity gate. Every production station therefore receives the same desired-version map regardless of its release group, and drift detection inherits the error.\n\n07\n\n## Work breakdown\n\nSCC BACKEND10 items\n\n1. 01`machine_token_max_ttl_seconds` setting; TTL ceiling in `verify_token`\n2. 02`cid` claim on `TokenClaims`; `credential_id` on `IdentityContext`\n3. 03`MachineCredential` model and migration\n4. 04`resolve_machine_credential`, wired into the middleware\n5. 05`consume_machine_jti` rejects registry credentials\n6. 06`machine-credential:admin` capability, admin endpoints, audit registration, seeding\n7. 07`ArtifactVersion` model, migration, site-less refresh lease\n8. 08`artifact-refresh` worker: S3 listing, sentinel check, upsert, freshness state\n9. 09`artifacts:read` capability, dual-gated read endpoints, rate limiting\n10. 10Engineering-mode submit validation against `artifact_versions`\n\nTERRAFORM1 item\n\n1. 11SCC IRSA role with prefix-scoped read on `lumilens-artifacts`; add the role ARN to the bucket policy\n\nARGOCD-APPS4 items\n\n1. 12SCC config: bucket, region, prefixes, interval, TTL ceiling, credential seed JSON\n2. 13New signing keypair on a dedicated `kid`, separate from the Windmill key so the two are independently revocable\n3. 14Mint the Jenkins token: `cid: jenkins-station-picker`, `capabilities: [\"artifacts:read\"]`\n4. 15ExternalSecret plus JCasC secret-text credential `scc-api-token` for dev-infra and prod-infra\n\nBESKAR2 items\n\n1. 16`vars/sccClient.groovy`\n2. 17Active Choices version dropdowns replacing the four free-text inputs\n\n08\n\n## Acceptance criteria\n\n1. 01For each ingested component, SCC's listed set equals the set of S3 prefixes containing a valid sentinel.\n2. 02A version listed by SCC downloads successfully through `download_artifacts.sh.j2`.\n3. 03Engineering-mode dropdowns populate within the Active Choices render budget, with no `probe_error` path.\n4. 04An invalid engineering-mode version is rejected at submit, not at deploy.\n5. 05Revoking a credential causes the next request to fail, with no pod restart and no wait for cache expiry.\n6. 06A token minted without `cid` and an expiry beyond the TTL ceiling is rejected.\n7. 07A registry credential presented to `/legacy-sync/snapshot` is rejected.\n8. 08Windmill legacy sync continues to authenticate unchanged.\n9. 09Narrowing a registry row's capabilities takes effect without reissuing the token.\n10. 10S3 unavailability degrades to stale-flagged reads, never to an empty list presented as authoritative.\n\n09\n\n## Risks and residual gaps\n\n| RISK | MITIGATION |\n| --- | --- |\n| Sentinel objects for `accessdr8` and `gateway` unverified | Inspect `sw-opxcvr-apps` before implementation; those two may need a different completeness rule |\n| `gateway_version` drives both gateway prefixes | Confirm the prefixes carry identical version sets; if not, the UI must intersect them |\n| No key rotation automation (pre-existing) | Registry `expires_at` gives a hard stop; add a renewal reminder. Rotation remains a manual two-secret operation |\n| Token in curl argv is visible in `ps` on the controller | Pre-existing pattern for the GitHub token. Closable with `curl --config` if desired |\n| `last_used_at` write amplification | Coalesce to once per 60 s per credential, best-effort |\n| Machine ingress is internet-facing with `auth-type: none` | Phase 1 Jenkins traffic is in-cluster only. The registry is the prerequisite for any genuinely off-cluster consumer |\n\n10\n\n## Open questions\n\n1. Q1 · NEEDS CONFIRMATION\n\n   Confirm that submit-time validation of an engineering-mode pick against SCC's own `artifact_versions` table is within decision 3 as intended. It is the main payoff and is distinct from auditing CI.\n2. Q2 · DECISION NEEDED\n\n   Registry inventory authored through GitOps seeding, API, or both?\n\n   **Recommendation:** both — seeding for the reviewable steady state, API for emergency revocation.\n3. Q3 · DECISION NEEDED\n\n   Chosen value for `machine_token_max_ttl_seconds`.\n\n   **Recommendation:** 900, comfortably above Windmill's 180 s.",
+  "payload": {
+    "metadata": {
+      "viewer_identity": {
+        "label": "COGNIS"
+      },
+      "toc": {
+        "enabled": true,
+        "depth": 4
+      }
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "title": "SCC Phase 1 — Artifact Version Ingestion and Revocable Machine Read Access",
+        "subtitle": "Give SCC an authoritative list of deployable software versions, expose it over a read-only machine API, and make the Jenkins credential revocable.",
+        "badges": [
+          {
+            "label": "DESIGN AGREED",
+            "tone": "success"
+          },
+          {
+            "label": "NOT IMPLEMENTED",
+            "tone": "neutral"
+          },
+          {
+            "label": "PLAN MODE · NO FILES CHANGED",
+            "tone": "neutral"
+          }
+        ]
+      },
+      {
+        "type": "key_value",
+        "variant": "summary",
+        "items": [
+          {
+            "label": "Source",
+            "value": "`lumilens-artifacts`",
+            "tone": "info"
+          },
+          {
+            "label": "Decisions",
+            "value": "3 resolved"
+          },
+          {
+            "label": "Work items",
+            "value": "17 across 4 repos"
+          },
+          {
+            "label": "Open questions",
+            "value": "3",
+            "tone": "warning"
+          }
+        ]
+      },
+      {
+        "type": "markdown",
+        "content": "Scope: give SCC an authoritative list of deployable software versions sourced from `lumilens-artifacts` S3, expose it over a read-only machine-accessible API, and make the Jenkins credential revocable. Replaces the Jenkins free-text version inputs for engineering mode."
+      },
+      {
+        "type": "section",
+        "title": "Resolved decisions",
+        "eyebrow": "01",
+        "anchor": "s1",
+        "blocks": [
+          {
+            "type": "table",
+            "columns": [
+              {
+                "key": "number",
+                "label": "#"
+              },
+              {
+                "key": "decision",
+                "label": "DECISION"
+              },
+              {
+                "key": "resolution",
+                "label": "RESOLUTION"
+              }
+            ],
+            "rows": [
+              {
+                "number": "1",
+                "decision": "Machine credential",
+                "resolution": "Pre-minted JWT, made revocable by a `MachineCredential` allowlist registry keyed on a new `cid` claim"
+              },
+              {
+                "number": "2",
+                "decision": "Artifact storage",
+                "resolution": "Dedicated `artifact_versions` table"
+              },
+              {
+                "number": "3",
+                "decision": "Catalog/S3 cross-validation",
+                "resolution": "Out of scope. SCC does not audit CI output or supplement monitoring"
+              }
+            ]
+          },
+          {
+            "type": "markdown",
+            "content": "Decision 3 excludes auditing whether an active catalog's `component_versions` exist in S3. It does **not** exclude validating an operator's engineering-mode pick against SCC's own ingested table at submit time — that is SCC validating its own data before accepting a mutation, which is squarely its purpose. See [§5](#s5)."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Security gap found during design",
+        "eyebrow": "02",
+        "anchor": "s2",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "FINDING\n\nThere is no maximum token lifetime.\n\n`TokenClaims.exp` is a required unbounded integer (`auth/identity.py:61`), and `config.py:105-108` defines only `machine_jwt_issuer`, `machine_jwt_audience`, `machine_jwks_json`, and `jwt_clock_skew_seconds`. No TTL ceiling exists anywhere in the verify path.\n\nConsequence today: any holder of a signing key listed in `SCC_MACHINE_JWKS_JSON` can mint a token with an arbitrary expiry — ten years is as valid as three minutes. The Windmill worker happens to use 180 s (`scc_legacy_snapshot.py:614-641`), but nothing enforces that.\n\nThis must be closed as part of phase 1, because it is also what makes the registry bypassable: without a ceiling on non-registry tokens, a long-lived token can simply omit `cid` and skip revocation entirely.\n\n**Fix:** add `machine_token_max_ttl_seconds` (default 900). Enforce in `verify_token`:\n\n* —Token **without** `cid` → require `exp - iat <= machine_token_max_ttl_seconds`.\n* —Token **with** `cid` → ceiling not applied; the registry governs lifetime instead.\n\nWindmill's existing 180 s tokens satisfy this unchanged."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Revocable machine credentials",
+        "eyebrow": "03",
+        "anchor": "s3",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "### 3.1 Why a registry\n\nA JWT is self-contained by design, so revocation requires server-side state. The options:\n\n| OPTION | VERDICT |\n| --- | --- |\n| Remove `kid` from JWKS | **Rejected.** All-or-nothing per key, and `machine_jwks_json` is read at startup, so revocation would require a pod restart. Revocation must not require a deploy. |\n| Denylist table on `jti` | **Rejected.** Fails open by default, and operating it still requires a record of issued tokens — a registry with worse properties. |\n| Allowlist registry on a `cid` claim | **Chosen.** Fails closed, enumerable, per-credential revocation, supports narrowing scope without reissuing, and is the same table needed later for off-cluster opaque tokens. |"
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.2 Model\n\nPYTHON\ndb/models.py\n\n```\nclass MachineCredential(Base):\n    __tablename__ = \"machine_credentials\"\n\n    credential_id: Mapped[str]              = mapped_column(String(128), primary_key=True)\n    subject:       Mapped[str]              = mapped_column(String(255))\n    description:   Mapped[str]              = mapped_column(String(512))\n    capabilities:  Mapped[list[str]]        = mapped_column(JSONB)\n    site_ids:      Mapped[list[str] | None] = mapped_column(JSONB)   # NULL = global\n    expires_at:    Mapped[datetime]         = mapped_column(DateTime(timezone=True))\n    revoked_at:    Mapped[datetime | None]\n    revoked_by:    Mapped[str | None]       = mapped_column(String(255))\n    last_used_at:  Mapped[datetime | None]\n    created_by:    Mapped[str]              = mapped_column(String(255))\n    revision:      Mapped[int]\n```\n\n`credential_id` matches `^[a-z][a-z0-9-]{2,127}$`, consistent with the existing `workload` pattern (`identity.py:65`)."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.3 Claim\n\nAdd `cid` to `TokenClaims`. Note `model_config = ConfigDict(extra=\"forbid\")` (`identity.py:56`) — the claim set is a closed contract, so this addition is explicit and validated rather than silently tolerated.\n\nPYTHON\n\n```\ncid: str | None = Field(default=None, pattern=r\"^[a-z][a-z0-9-]{2,127}$\")\n```\n\nAdd `credential_id` to `IdentityContext` (`identity.py:38-52`)."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.4 Enforcement point\n\n`app.py:174-186` is a single middleware that authenticates every `/v1` and `/api/v1` request, resolves identity inside a DB session, and stores the result on `request.state.identity`. Every router reads it through a trivial `_identity` dependency.\n\nThis is the whole reason the design is cheap and safe: **one chokepoint, already holding a DB session.** Add a symmetric resolver beside the existing browser one:\n\nPYTHON\napp.py\n\n```\nidentity = await authenticate_request(request, active_settings)\nwith factory() as identity_session:\n    request.state.identity = resolve_browser_identity(...)         # existing\n    request.state.identity = resolve_machine_credential(           # new\n        identity_session, request.state.identity\n    )\n```\n\nBecause it lives in the middleware and not in per-endpoint code, it is non-bypassable by construction. A future endpoint cannot forget to apply it — precisely the footgun that `consume_machine_jti` has today, being called only from `api/legacy_sync.py`.\n\n`resolve_machine_credential` is a no-op for non-machine identities and for machine identities without `cid`."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.5 Resolution rules\n\nFor a machine identity carrying `cid`:\n\n1. 1Row must exist. Unknown `credential_id` → `unknown_credential`.\n2. 2`revoked_at IS NULL`, else `revoked_credential`.\n3. 3`expires_at > now()`, else `expired_credential`.\n4. 4**Effective capabilities = JWT claims ∩ registry row.**\n5. 5**Effective sites = JWT claims ∩ registry row**, unless the row is global (`NULL`).\n\nThe intersection in (4) and (5) is the important property. Neither side can escalate: a token cannot claim more than the registry grants, and the registry cannot grant more than the token asserts. Scope can therefore be **narrowed at any time without reissuing the token** — a useful intermediate response to a suspected leak, short of full revocation."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.6 Replay protection\n\n`cid` credentials carry a static `jti`, so they are incompatible with `consume_machine_jti` (`identity.py:610-646`), which would reject the second use.\n\nMake this structural rather than conventional: `consume_machine_jti` raises `registry_credential_not_replay_eligible` when `identity.credential_id` is set. Self-documenting, and it prevents a registry credential from ever being pointed at the legacy-sync write endpoint."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.7 Admin surface\n\nFollow the established `role-mapping:admin` pattern exactly: `require_human_identity`, `require_capability`, global scope required, `expected_revision` optimistic concurrency, audited through `_admin_upsert`.\n\nGET/v1/admin/machine-credentials\n\nPUT/v1/admin/machine-credentials/{credential\\_id}\n\nDELETE/v1/admin/machine-credentials/{credential\\_id}sets revoked\\_at\n\nNew capability `machine-credential:admin`, granted to `admin` only. Register in the audited-resource maps so credential changes land in the revision history like role mappings do.\n\n**Also seed declaratively.** `seed_roles.py:53-58` already seeds role mappings on deploy. Mirror it with `SCC_MACHINE_CREDENTIALS_JSON` so the credential inventory is GitOps-managed and reviewable in a pull request. Keep the API for emergency revocation, which must not wait for a deploy."
+          },
+          {
+            "type": "markdown",
+            "content": "### 3.8 Operational notes\n\nDo not cache credential lookups\n\nRevocation latency would equal cache TTL. Compare `_BROWSER_IDENTITY_CACHE`, which caches for 60 s. This is one indexed primary-key lookup on a request that already has a session open.\n\nCoalesce `last_used_at`\n\nA write on every read request is a hot-path write. Update at most once per 60 s per credential, best-effort, and never fail a request on it.\n\nApply rate limiting\n\nIn-process machinery already exists at `api/inventory.py:42-43`; wire the new read endpoints into it."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Artifact version ingestion",
+        "eyebrow": "04",
+        "anchor": "s4",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "### 4.1 Placement\n\nNot `CatalogRevision`. Two blocking reasons:\n\n1. 1**Lifecycle mismatch.** `CatalogRevision` is immutable and pointer-switched via `ActiveCatalog`. It represents an approved release. The artifact inventory changes on every CI build.\n2. 2**Validation would reject real data.** `domain/catalog.py:26-31` enforces a semver-like pattern. Real artifact versions include `1.15.0.0`, `3.23.0.1+44b10f3d`, and `hf-RC-CAL-0.7.0-MH-0.4.0-20260202-074254`.\n\nUse the observability refresh pattern instead — `SourceRefreshLease` plus worker role plus snapshot — and add `artifact-refresh` alongside `health-refresh` and `alert-refresh`. Two deltas from the existing sources:\n\n* —**Lease scope.** The lease is keyed per-source per-site; the artifact bucket is global. Add a site-less lease variant; do not invent a placeholder site.\n* —**Interval.** Mimir defaults to 30 s. Use 300 s for S3, plus a manual refresh trigger."
+          },
+          {
+            "type": "markdown",
+            "content": "### 4.2 Source of truth\n\nIngest exactly the five prefixes Ansible downloads from (`download_artifacts.sh.j2:57-90`):\n\nS3 PREFIXES\n\n```\ntestar/{version}                testar-pyscripts/{version}     testar-testspecs/{version}\nopxcvraccessdr8/{version}/bin   opxcvrgateway/{version}/bin\n```\n\n`ListObjectsV2(Prefix=…, Delimiter='/')` → `CommonPrefixes` yields version directories directly. Verified properties:\n\n* `testar-pyscripts/{v}/` nests its contents **inside** the version directory, so delimiter listing returns only versions.\n* No `latest-*` pointers under these five prefixes.\n* Producers refuse to overwrite an existing prefix, so versions are effectively immutable."
+          },
+          {
+            "type": "markdown",
+            "content": "### 4.3 Completeness rule\n\n`aws s3 sync` is not atomic, so directory existence does not imply a usable artifact. Require a per-component sentinel object:\n\n| COMPONENT | SENTINEL | EVIDENCE |\n| --- | --- | --- |\n| testar | testar/{v}/VERSION | build-and-deploy.yml:93-99 |\n| pyscripts | testar-pyscripts/{v}/\\*.zip | build-python-package.yml:274-282 |\n| testspecs | testar-testspecs/{v}/\\*.zip | build-testspecs.yml:130-147 |\n| accessdr8 | UNVERIFIED | produced by sw-opxcvr-apps, not inspected |\n| gateway | UNVERIFIED | produced by sw-opxcvr-apps, not inspected |\n\n`published_at` is the sentinel's `LastModified`.\n\n> INVARIANT\n>\n> If SCC lists it, Ansible can download it."
+          },
+          {
+            "type": "markdown",
+            "content": "### 4.4 Table\n\nPYTHON\n\n```\nclass ArtifactVersion(Base):\n    __tablename__ = \"artifact_versions\"\n\n    artifact_version_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)\n    component:           Mapped[str]       = mapped_column(String(64))\n    version:             Mapped[str]       = mapped_column(String(256))\n    s3_prefix:           Mapped[str]       = mapped_column(String(512))\n    complete:            Mapped[bool]\n    published_at:        Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n    first_seen_at:       Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n    last_seen_at:        Mapped[datetime]  = mapped_column(DateTime(timezone=True))\n\n    __table_args__ = (\n        UniqueConstraint(\"component\", \"version\"),\n        Index(\"ix_artifact_versions_component_published\", \"component\", \"published_at\"),\n    )\n```\n\nPlus a per-component refresh-state row mirroring `ObservabilitySnapshot` freshness semantics so the API can report staleness instead of silently serving old data.\n\nOrdering\n\nSort by `published_at`, never by parsing the version string. The version grammars are not unifiable.\n\nDisappearance policy\n\nDo not delete rows when a version stops appearing. Set `complete = false` after N consecutive misses and retain the row — silently dropping a version an engineer may be mid-deploy with is worse than showing it unavailable.\n\nPagination\n\nCursor on `(published_at, artifact_version_id)`, since version strings are not orderable."
+          },
+          {
+            "type": "markdown",
+            "content": "### 4.5 Read API\n\nGET/v1/artifacts/components\n\nGET/v1/artifacts/components/{component}/versions?limit=&cursor=&contains=\n\nReturns `{version, published_at, complete}`, newest first, with freshness metadata.\n\n**Gating** — reuse the dual-gate shape of `_inventory_read`:\n\nPYTHON\n\n```\nif \"artifacts:read\" in identity.capabilities:\n    require_capability(identity, \"artifacts:read\")      # machine permitted\nelse:\n    require_human_identity(identity)\n    require_capability(identity, \"catalog:read\")\n```\n\nNew capability `artifacts:read`, added to `viewer` and above. A good first broadened machine read: not site-scoped, not sensitive — a list of version strings already readable by every edge server. Minimal blast radius if a token leaks."
+          },
+          {
+            "type": "markdown",
+            "content": "### 4.6 Cross-account S3 access\n\n`lumilens-artifacts` lives in the **development** account `279684396218`, `us-east-2`. SCC runs in prod-infra. The bucket policy grants read only to named prod roles. **SCC is not among them.**\n\nSeparately, SCC's existing S3 client uses static access keys against `scc-projections`, not the boto3 default chain. A second client for a different bucket in a different account needs its own credential path. Use IRSA — the role already exists for RDS IAM auth — rather than a second static key pair.\n\nTerraform work: IAM role and policy granting `s3:ListBucket` plus `s3:GetObject` scoped to the five prefixes; add that role ARN to the bucket policy."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Jenkins integration",
+        "eyebrow": "05",
+        "anchor": "s5",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "Today engineering mode uses four free-text version inputs, pipe-joined into a hidden field, pre-filled from the `stations_metadata` Mongo collection — which records *what was last deployed*, not what is available. A typo fails during the S3 download roughly twenty minutes later.\n\nReplace with SCC-backed searchable dropdowns:\n\n* —**Pipeline path** — new `vars/sccClient.groovy`, modelled on `labJunctionClient.groovy:88-112`.\n* —**Active Choices path** — read the credential via the existing `CredentialsProvider.lookupCredentials` pattern using `StringCredentials`, and add the bearer header to the existing curl.\n\nJenkins is in-cluster, so it reaches `station-control-center.mfg-portal.svc.cluster.local` exactly as Windmill does. No ingress, no TLS, no internet exposure in phase 1.\n\nPRIMARY PAYOFF\n\n**Submit-time validation** (distinct from decision 3): reject an engineering-mode assignment whose component versions are absent from `artifact_versions` or marked incomplete. This moves the failure from twenty minutes into an Ansible run to immediate form feedback. Confirm this reading of decision 3 before building."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Out of scope for phase 1",
+        "eyebrow": "06",
+        "anchor": "s6",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "* `saveStationMetadata` — a write. Stays on mongo-client. SCC prod has `writesEnabled: false`, and a machine write capability would reintroduce per-request `jti`.\n* The GitHub version probe for CI/CD mode.\n* Opaque (non-JWT) tokens. The registry is the forward-compatible foundation: add a `token_hash` column and a lookup branch when a consumer genuinely cannot hold a JWT.\n* Catalog-versus-S3 auditing. Decision 3.\n\nADJACENT BUG · SEPARATE TICKET\n\n`_desired_component_versions` returns the *entire* active catalog map for any non-engineering assignment; release-group membership is only used as a validity gate. Every production station therefore receives the same desired-version map regardless of its release group, and drift detection inherits the error."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Work breakdown",
+        "eyebrow": "07",
+        "anchor": "s7",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "SCC BACKEND10 items\n\n1. 01`machine_token_max_ttl_seconds` setting; TTL ceiling in `verify_token`\n2. 02`cid` claim on `TokenClaims`; `credential_id` on `IdentityContext`\n3. 03`MachineCredential` model and migration\n4. 04`resolve_machine_credential`, wired into the middleware\n5. 05`consume_machine_jti` rejects registry credentials\n6. 06`machine-credential:admin` capability, admin endpoints, audit registration, seeding\n7. 07`ArtifactVersion` model, migration, site-less refresh lease\n8. 08`artifact-refresh` worker: S3 listing, sentinel check, upsert, freshness state\n9. 09`artifacts:read` capability, dual-gated read endpoints, rate limiting\n10. 10Engineering-mode submit validation against `artifact_versions`\n\nTERRAFORM1 item\n\n1. 11SCC IRSA role with prefix-scoped read on `lumilens-artifacts`; add the role ARN to the bucket policy\n\nARGOCD-APPS4 items\n\n1. 12SCC config: bucket, region, prefixes, interval, TTL ceiling, credential seed JSON\n2. 13New signing keypair on a dedicated `kid`, separate from the Windmill key so the two are independently revocable\n3. 14Mint the Jenkins token: `cid: jenkins-station-picker`, `capabilities: [\"artifacts:read\"]`\n4. 15ExternalSecret plus JCasC secret-text credential `scc-api-token` for dev-infra and prod-infra\n\nBESKAR2 items\n\n1. 16`vars/sccClient.groovy`\n2. 17Active Choices version dropdowns replacing the four free-text inputs"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Acceptance criteria",
+        "eyebrow": "08",
+        "anchor": "s8",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "1. 01For each ingested component, SCC's listed set equals the set of S3 prefixes containing a valid sentinel.\n2. 02A version listed by SCC downloads successfully through `download_artifacts.sh.j2`.\n3. 03Engineering-mode dropdowns populate within the Active Choices render budget, with no `probe_error` path.\n4. 04An invalid engineering-mode version is rejected at submit, not at deploy.\n5. 05Revoking a credential causes the next request to fail, with no pod restart and no wait for cache expiry.\n6. 06A token minted without `cid` and an expiry beyond the TTL ceiling is rejected.\n7. 07A registry credential presented to `/legacy-sync/snapshot` is rejected.\n8. 08Windmill legacy sync continues to authenticate unchanged.\n9. 09Narrowing a registry row's capabilities takes effect without reissuing the token.\n10. 10S3 unavailability degrades to stale-flagged reads, never to an empty list presented as authoritative."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Risks and residual gaps",
+        "eyebrow": "09",
+        "anchor": "s9",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "| RISK | MITIGATION |\n| --- | --- |\n| Sentinel objects for `accessdr8` and `gateway` unverified | Inspect `sw-opxcvr-apps` before implementation; those two may need a different completeness rule |\n| `gateway_version` drives both gateway prefixes | Confirm the prefixes carry identical version sets; if not, the UI must intersect them |\n| No key rotation automation (pre-existing) | Registry `expires_at` gives a hard stop; add a renewal reminder. Rotation remains a manual two-secret operation |\n| Token in curl argv is visible in `ps` on the controller | Pre-existing pattern for the GitHub token. Closable with `curl --config` if desired |\n| `last_used_at` write amplification | Coalesce to once per 60 s per credential, best-effort |\n| Machine ingress is internet-facing with `auth-type: none` | Phase 1 Jenkins traffic is in-cluster only. The registry is the prerequisite for any genuinely off-cluster consumer |"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Open questions",
+        "eyebrow": "10",
+        "anchor": "s10",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "1. Q1 · NEEDS CONFIRMATION\n\n   Confirm that submit-time validation of an engineering-mode pick against SCC's own `artifact_versions` table is within decision 3 as intended. It is the main payoff and is distinct from auditing CI.\n2. Q2 · DECISION NEEDED\n\n   Registry inventory authored through GitOps seeding, API, or both?\n\n   **Recommendation:** both — seeding for the reviewable steady state, API for emergency revocation.\n3. Q3 · DECISION NEEDED\n\n   Chosen value for `machine_token_max_ttl_seconds`.\n\n   **Recommendation:** 900, comfortably above Windmill's 180 s."
+          }
+        ]
+      }
+    ],
+    "assets": [],
+    "sources": [],
+    "datasets": [],
+    "exports": []
+  }
+}

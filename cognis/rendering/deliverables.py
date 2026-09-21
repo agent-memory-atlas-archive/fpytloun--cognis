@@ -33,7 +33,7 @@ from cognis.rendering.rich_visuals import (
 )
 from cognis.ui_assets import resolve_standalone_manifest, standalone_asset_url
 
-RENDERER_VERSION = "standalone-deliverable-v12"
+RENDERER_VERSION = "standalone-deliverable-v13"
 HTML_CACHE_FILENAME = "render.html"
 PDF_CACHE_FILENAME = "render.pdf"
 PDF_INPUT_MAX_BYTES = 20 * 1024 * 1024
@@ -765,7 +765,9 @@ def _render_document(
                 )
                 first = valid_blocks[0] if valid_blocks else None
                 if first and str(first.get("type") or "") == "hero":
-                    intro = _render_intro(first, fallback_title=title)
+                    intro = _render_intro(
+                        first, fallback_title=title, metadata=payload.get("metadata")
+                    )
                     hero_content = (
                         _markdown_to_html(_block_content(first)) if _block_content(first) else ""
                     )
@@ -805,21 +807,17 @@ def _render_intro(
 ) -> str:
     meta = metadata if isinstance(metadata, dict) else {}
     title = _block_title(block) or _text(meta, "title") or fallback_title
-    subtitle = _text(block, "subtitle") or _text(meta, "subtitle")
+    subtitle = _text(block, "subtitle") or _text(block, "dek") or _text(meta, "subtitle")
     eyebrow = _text(block, "eyebrow") or _text(meta, "eyebrow")
     badges = block.get("tags") or block.get("badges") or meta.get("badges")
-    badge_html = ""
-    if isinstance(badges, list):
-        badge_html = (
-            '<p class="badges">'
-            + "".join(
-                f"<span>{html.escape(str(value))}</span>" for value in badges if str(value).strip()
-            )
-            + "</p>"
-        )
+    badge_html = _render_badges(badges)
+    viewer_identity_html = _render_viewer_identity(meta.get("viewer_identity"))
     subtitle_html = f'<p class="subtitle">{html.escape(subtitle)}</p>' if subtitle else ""
     eyebrow_html = f'<p class="eyebrow">{html.escape(eyebrow)}</p>' if eyebrow else ""
-    return f"{eyebrow_html}<h1>{html.escape(title)}</h1>{subtitle_html}{badge_html}"
+    return (
+        f"{viewer_identity_html}{eyebrow_html}<h1>{html.escape(title)}</h1>"
+        f"{subtitle_html}{badge_html}"
+    )
 
 
 def _render_block(
@@ -959,7 +957,7 @@ def _render_block_content(
             f"<p>{html.escape(quote)}</p>{footer}{child_html}</blockquote>"
         )
     if block_type == "hero":
-        subtitle = _text(block, "subtitle")
+        subtitle = _text(block, "subtitle") or _text(block, "dek")
         body = _markdown_to_html(content)
         # Mirrors the web renderer's hero media support (a hero can carry a
         # banner image, e.g. an agent-generated cover for a published
@@ -981,8 +979,9 @@ def _render_block_content(
             f"{body}{child_html}</section>"
         )
     if block_type in {"kv", "key_value"}:
+        variant = _class_token(block.get("variant"), fallback="standard")
         return (
-            '<section class="block block-kv">'
+            f'<section class="block block-kv" data-variant="{variant}">'
             f"{heading}{_render_items_as_definitions(block)}{child_html}</section>"
         )
     if block_type in {"timeline", "steps"}:
@@ -2111,10 +2110,40 @@ def _eyebrow(block: dict[str, Any]) -> str:
 def _render_badges(values: object) -> str:
     if not isinstance(values, list):
         return ""
-    badges = "".join(
-        f"<span>{html.escape(str(value))}</span>" for value in values if str(value).strip()
-    )
+    badges = ""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            badges += f'<span class="tone-neutral">{html.escape(value)}</span>'
+        elif isinstance(value, dict):
+            label = value.get("label")
+            tone = _class_token(value.get("tone"), fallback="neutral")
+            if isinstance(label, str) and label.strip():
+                badges += f'<span class="tone-{tone}">{html.escape(label)}</span>'
     return f'<p class="badges">{badges}</p>' if badges else ""
+
+
+def _render_viewer_identity(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    label = value.get("label")
+    icon = value.get("icon")
+    label_text = label if isinstance(label, str) else ""
+    icon_name = icon.get("name") if isinstance(icon, dict) else None
+    icon_alt = icon.get("alt") if isinstance(icon, dict) else None
+    symbol = icon_symbol(icon_name)
+    if not label_text and not symbol:
+        return ""
+    accessible_name = str(label_text or icon_alt)
+    icon_html = (
+        f'<span class="viewer-identity-icon" aria-hidden="true">{html.escape(symbol)}</span>'
+        if symbol
+        else ""
+    )
+    label_html = f"<span>{html.escape(label_text)}</span>" if label_text else ""
+    return (
+        f'<p class="viewer-identity" aria-label="{html.escape(accessible_name, quote=True)}">'
+        f"{icon_html}{label_html}</p>"
+    )
 
 
 def _render_dashboard_items(block: dict[str, Any]) -> str:
@@ -2488,6 +2517,12 @@ def _render_matrix(
 
 def _render_items_as_definitions(block: dict[str, Any]) -> str:
     items = block.get("items") or block.get("data") or block.get("steps")
+    if isinstance(items, dict):
+        values = [
+            f"<div><dt>{html.escape(str(label))}</dt><dd>{html.escape(str(value))}</dd></div>"
+            for label, value in items.items()
+        ]
+        return f"<dl>{''.join(values)}</dl>" if values else ""
     if not isinstance(items, list):
         return ""
     values = []
@@ -2496,7 +2531,11 @@ def _render_items_as_definitions(block: dict[str, Any]) -> str:
             continue
         label = _text(item, "label") or _text(item, "key") or _text(item, "name")
         value = item.get("value", item.get("text", item.get("content", "")))
-        values.append(f"<div><dt>{html.escape(label)}</dt><dd>{html.escape(str(value))}</dd></div>")
+        tone = _class_token(item.get("tone"), fallback="neutral")
+        values.append(
+            f'<div class="tone-{tone}"><dt>{html.escape(label)}</dt>'
+            f"<dd>{html.escape(str(value))}</dd></div>"
+        )
     return f"<dl>{''.join(values)}</dl>" if values else ""
 
 
@@ -3065,10 +3104,16 @@ body[data-rich-canvas="wide"] .page { width: min(calc(100% - 2rem), 92rem); }
 .document-header > div { min-width: 0; }
 .document-header nav { display: flex; flex: none; gap: .5rem; }
 .eyebrow { margin: 0 0 .6rem; color: var(--eyebrow); font-size: var(--rich-fs-2xs); font-weight: var(--rich-fw-bold); letter-spacing: var(--rich-ls-wider); text-transform: uppercase; }
+.viewer-identity { display: inline-flex; align-items: center; gap: .35rem; margin: 0 0 .65rem; color: var(--label); font-size: var(--rich-fs-xs); font-weight: var(--rich-fw-semibold); }
+.viewer-identity-icon { display: inline-grid; width: 1.3rem; height: 1.3rem; place-items: center; border: 1px solid var(--badge-line); border-radius: var(--rich-radius-pill); color: var(--accent); }
 h1 { max-width: 48rem; margin: 0; font-family: inherit; font-size: var(--rich-fs-display); line-height: var(--rich-lh-tight); letter-spacing: var(--rich-ls-tight); }
 .subtitle { max-width: 48rem; margin: .8rem 0 0; color: var(--muted); font-size: var(--rich-fs-md); line-height: var(--rich-lh-relaxed); }
 .badges { display: flex; flex-wrap: wrap; gap: .4rem; margin: .9rem 0 0; }
 .badges span { border: 1px solid var(--badge-line); border-radius: var(--rich-radius-pill); padding: .22rem .5rem; color: var(--label); font-size: var(--rich-fs-2xs); font-weight: var(--rich-fw-semibold); }
+.badges .tone-info { border-color: var(--accent); color: var(--accent); }
+.badges .tone-success { border-color: var(--positive); color: var(--positive); }
+.badges .tone-warning { border-color: var(--warning); color: var(--warning); }
+.badges .tone-danger { border-color: var(--danger); color: var(--danger); }
 .action { display: inline-grid; width: 2.75rem; height: 2.75rem; place-items: center; border: 1px solid var(--line); border-radius: var(--rich-radius-pill); color: var(--accent); background: var(--surface); text-decoration: none; cursor: pointer; transition: transform .14s ease, border-color .14s ease, background .14s ease; }
 .action:hover { border-color: var(--accent); background: var(--soft); transform: translateY(-1px); }
 .action:active { transform: translateY(1px); }
@@ -3213,6 +3258,12 @@ td.emphasis-muted { color: var(--muted); }
 dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: .8rem 1.25rem; margin: 0; }
 dt { color: var(--subtle); font-size: var(--rich-fs-2xs); font-weight: var(--rich-fw-bold); letter-spacing: var(--rich-ls-wide); text-transform: uppercase; }
 dd { margin: .18rem 0 0; font-weight: var(--rich-fw-semibold); }
+.block-kv[data-variant="summary"] dl { grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--rich-radius-sm); }
+.block-kv[data-variant="summary"] dl > div { min-width: 0; padding: var(--rich-space-3) var(--rich-space-4); border-right: 1px solid var(--line); }
+.block-kv[data-variant="summary"] dl > div:last-child { border-right: 0; }
+.block-kv[data-variant="summary"] dl > div.tone-positive { border-top: 2px solid var(--positive); }
+.block-kv[data-variant="summary"] dl > div.tone-warning { border-top: 2px solid var(--warning); }
+.block-kv[data-variant="summary"] dl > div.tone-critical { border-top: 2px solid var(--danger); }
 .block-timeline ol { margin: 0; padding: 0; list-style: none; }
 .block-timeline li { display: grid; grid-template-columns: 4rem 1fr; gap: 1rem; border-top: 1px solid var(--row-line); padding: .75rem 0; }
 .block-timeline li > span { color: var(--muted); font-size: var(--rich-fs-sm); font-weight: var(--rich-fw-bold); }

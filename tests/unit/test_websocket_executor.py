@@ -1810,6 +1810,30 @@ async def test_provider_unregister_ignores_stale_connection_cleanup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_active_connection_gauge_tracks_replacement_and_stale_cleanup() -> None:
+    provider = WebSocketExecutorProvider()
+    websocket_module.EXECUTOR_WS_CONNECTIONS.set(0)
+    first = provider.register_connection(
+        "exec-1",
+        FakeWebSocket(),
+        ExecutorCapabilities(),
+        start_receiver=False,
+    )
+    second = provider.register_connection(
+        "exec-1",
+        FakeWebSocket(),
+        ExecutorCapabilities(),
+        start_receiver=False,
+    )
+
+    assert websocket_module.EXECUTOR_WS_CONNECTIONS._value.get() == 1
+    provider.unregister_connection("exec-1", first)
+    assert websocket_module.EXECUTOR_WS_CONNECTIONS._value.get() == 1
+    provider.unregister_connection("exec-1", second)
+    assert websocket_module.EXECUTOR_WS_CONNECTIONS._value.get() == 0
+
+
+@pytest.mark.asyncio
 async def test_provider_spawn_waits_for_connection() -> None:
     """spawn() waits for the executor to connect and send executor.ready."""
     provider = WebSocketExecutorProvider()

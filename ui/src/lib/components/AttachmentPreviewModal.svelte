@@ -7,7 +7,8 @@
 
   import { portal } from '$lib/actions/portal';
   import { api } from '$lib/api/client';
-  import { previewLanguage } from '$lib/attachments/preview';
+  import { previewLanguage, type AttachmentPreviewKind } from '$lib/attachments/preview';
+  import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import type { AttachmentRef } from '$lib/types/api';
 
@@ -19,7 +20,7 @@
     onDownload,
   }: {
     attachment: AttachmentRef;
-    kind: 'text' | 'video';
+    kind: AttachmentPreviewKind;
     mediaUrl?: string | null;
     onClose: () => void;
     onDownload: () => void;
@@ -30,6 +31,7 @@
   let overlayId = $state<string | null>(null);
   let content = $state('');
   let truncated = $state(false);
+  let richPayload = $state<unknown>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
@@ -44,6 +46,10 @@
       return escaped();
     }
   });
+
+  const visibleRichPayload = $derived(
+    ['markdown', 'mermaid', 'csv'].includes(kind) ? richPayload : null,
+  );
 
   function handleKeydown(event: KeyboardEvent): void {
     if (!isTopOverlay(overlayId)) return;
@@ -71,12 +77,13 @@
     const overlay = registerOverlay({ kind: 'blocking', blocksChrome: true });
     overlayId = overlay.id;
     void tick().then(() => closeButton?.focus());
-    if (kind === 'text') {
+    if (['text', 'markdown', 'mermaid', 'csv'].includes(kind)) {
       void api.artifacts.textPreview(attachment.artifact_id).then((result) => {
         content = result.content;
         truncated = result.truncated;
+        richPayload = result.rich_payload;
       }).catch(() => {
-        error = 'The text preview could not be loaded.';
+        error = 'The attachment preview could not be loaded.';
       }).finally(() => {
         loading = false;
       });
@@ -111,11 +118,29 @@
         <p class="text-sm text-slate-400">Loading preview…</p>
       {:else if error}
         <p class="text-sm text-rose-300">{error}</p>
+      {:else if ['html', 'pdf'].includes(kind) && mediaUrl}
+        <iframe
+          class="h-[72vh] min-h-96 w-full rounded-xl border border-slate-800 bg-white"
+          src={mediaUrl}
+          title={`Preview of ${attachment.filename}`}
+          sandbox={kind === 'html' ? 'allow-scripts' : undefined}
+        ></iframe>
+      {:else if ['html', 'pdf'].includes(kind)}
+        <p class="text-sm text-rose-300">The document preview could not be loaded.</p>
       {:else if kind === 'video' && mediaUrl}
         <!-- svelte-ignore a11y_media_has_caption: previews cannot synthesize a caption track -->
         <video class="mx-auto max-h-[70vh] max-w-full rounded-xl bg-black" src={mediaUrl} controls playsinline></video>
       {:else if kind === 'video'}
         <p class="text-sm text-rose-300">The video preview could not be loaded.</p>
+      {:else if visibleRichPayload}
+        {#if truncated}<p class="mb-3 text-xs text-amber-300">Preview is truncated to safe display limits.</p>{/if}
+        <RichDeliverable
+          content={content}
+          instanceId={`attachment-${attachment.artifact_id}`}
+          payload={visibleRichPayload}
+          surface="embedded"
+          title={attachment.filename}
+        />
       {:else}
         {#if truncated}<p class="mb-3 text-xs text-amber-300">Preview limited to the first 512 KB.</p>{/if}
         <pre class="min-h-full overflow-x-auto rounded-xl bg-slate-900 p-4 text-sm leading-6 text-slate-100"><code class="hljs">{@html highlighted}</code></pre>

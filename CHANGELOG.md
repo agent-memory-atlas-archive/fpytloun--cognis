@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2026-09-20
+
+### Added
+
+- Added attributed application observability, event-loop lag monitoring, maintenance leases, and high-availability background-worker diagnostics.
+- Added richer publication-grade deliverables with reusable viewer chrome, embedded fonts, additional composed scenarios, and expanded responsive visual coverage.
+- Added broader artifact preview support and managed delegation policy controls across the API, runtime, and agent editor.
+
+### Changed
+
+- Improved canonical history replay, context assembly, compaction publication, session caching, and turn scheduling for large or interrupted conversations.
+- Improved Chat v2 runtime authority, sidebar activity reconciliation, attachment presentation, and mobile/PWA layout behavior.
+- Improved deliverable export, retention, maintenance, and validation contracts.
+
+### Fixed
+
+- Fixed transient history gaps, claimed-turn reconciliation, abandoned stream progress, stale runtime state, and recoverable tool-result ordering.
+- Fixed Anthropic tool adjacency and orphan-result handling across interrupted or retried turns.
+- Fixed high-availability maintenance fencing, executor connection ownership, session-fork recovery, and trusted-evidence queue behavior.
+
 ## [0.15.0] - 2026-09-13
 
 ### Added

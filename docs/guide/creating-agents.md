@@ -47,8 +47,10 @@ For a first agent, keep personality instructions short and practical. Add more c
 - per-tool permission policy (`allow`, `evaluate`, `deny`)
 - assigned knowledgebases
 - allowed secrets
-- delegation permission
-- max delegation depth
+- delegation master switch
+- allowed primary and system-agent targets
+- primary-agent inbound controller restrictions
+- managed-conversation depth
 
 Agents combine curated tool assignment with runtime availability. The effective
 tool set is:
@@ -67,8 +69,29 @@ Knowledgebase assignment is separate from tool assignment: `allowed_knowledgebas
 controls which KBs the agent can access, while knowledgebase tools control what
 the agent can do with those KBs.
 
-Use `manage_agents` tool CRUD actions (`tools_get`, `tools_set/add/remove`, and
-`knowledgebases_*`) rather than guessing tool IDs or editing raw blobs. Use
+Delegation is split into two domains:
+
+- **Primary agents** receive managed conversations or cross-agent task
+  ownership. Managed depth `1` allows one worker level; depth `2` allows a
+  coordinator and worker. Managed descendants cannot assign tasks to another
+  agent to bypass this limit.
+- **System specialists** receive bounded synchronous `delegate()` calls. They
+  cannot delegate further or create managed conversations, tasks, schedules, or
+  workflows.
+
+The allowed target list applies to both domains. Primary target IDs authorize
+managed work and task ownership; `system:*` IDs authorize specialist calls.
+Restricting the list while leaving it empty disables every outbound target
+except the agent itself. Primary agents can always assign managed work or tasks
+to themselves. Primary agents also have an inbound controller list. An empty
+restricted inbound list prevents every other agent from targeting that agent
+while preserving self-targeting, which is appropriate for user-facing executive
+agents that must never be launched as children.
+
+Use `manage_agents` tool CRUD actions (`settings_get/update`, `tools_get`,
+`tools_set/add/remove`, and `knowledgebases_*`) rather than guessing IDs or
+editing raw blobs. `settings_update.delegation` supports the same delegation
+policy shown in the agent editor. Use
 `search_tools`, `describe_tool`, and `validate_tool_call` for authorized discovery,
 operation semantics, and mutation preflight.
 

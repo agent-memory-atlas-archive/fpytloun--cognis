@@ -159,6 +159,7 @@ def conversation_to_response(
         active_executor_source=getattr(row, "active_executor_source", None),
         active_session_status=getattr(active_session, "status", None),
         active_session_completion_reason=getattr(active_session, "completion_reason", None),
+        active_session_updated_at=getattr(active_session, "updated_at", None),
         active_turn_chat_mode=(active_turn_state or {}).get("chat_mode"),
         active_turn_chat_mode_source=(active_turn_state or {}).get("chat_mode_source"),
         pending_notification_types=pending_notification_types or [],

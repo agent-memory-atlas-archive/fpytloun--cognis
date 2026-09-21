@@ -100,6 +100,7 @@ from cognis.store.models import (
     User,
     UserUiState,
     WorkflowRow,
+    executor_observed_tools_deferred,
 )
 
 logger = logging.getLogger(__name__)
@@ -2720,6 +2721,7 @@ async def create_managed_conversation_link(
     parent_link_id: str | None = None,
     root_link_id: str | None = None,
     depth: int = 1,
+    depth_limit: int = 1,
     turn_state: str = "idle",
     active_turn_id: str | None = None,
     notify_on_completion: bool = False,
@@ -2742,8 +2744,8 @@ async def create_managed_conversation_link(
             user_email=user_email,
             for_update=True,
         )
-        if parent is None or int(parent.depth or 1) >= 2:
-            raise ValueError("Maximum managed-conversation depth is 2.")
+        if parent is None or int(parent.depth or 1) >= int(parent.depth_limit or 1):
+            raise ValueError("Maximum managed-conversation depth reached.")
         if (
             controller_agent_id != parent.target_agent_id
             or controller_conversation_id != parent.target_conversation_id
@@ -2757,7 +2759,9 @@ async def create_managed_conversation_link(
         expected_root = parent.root_link_id or parent.link_id
         if root_link_id != expected_root or depth != int(parent.depth or 1) + 1:
             raise ValueError("Managed-conversation lineage is inconsistent.")
-    elif depth != 1 or root_link_id is not None:
+        if depth_limit != int(parent.depth_limit or 1):
+            raise ValueError("Managed-conversation depth limit is inconsistent.")
+    elif depth != 1 or root_link_id is not None or depth_limit not in {1, 2}:
         raise ValueError("Root managed-conversation lineage is inconsistent.")
 
     row = ManagedConversationLink(
@@ -2771,6 +2775,7 @@ async def create_managed_conversation_link(
         parent_link_id=parent_link_id,
         root_link_id=root_link_id,
         depth=depth,
+        depth_limit=depth_limit,
         target_conversation_id=target_conversation_id,
         target_session_id=target_session_id,
         title=title,
@@ -7263,9 +7268,12 @@ async def create_deliverable(
     if attempt_number is None:
         attempt_number = 1
 
+    # Workflow writes revise one step output; direct-chat writes create
+    # independent outputs whose returned references must remain readable.
+    supersession_where = sa.and_(version_where, sa.literal(step_run_id is not None))
     superseded_result = await session.execute(
         select(DeliverableRow).where(
-            version_where,
+            supersession_where,
             DeliverableRow.status.in_(["buffered", "approved"]),
         )
     )
@@ -7291,7 +7299,7 @@ async def create_deliverable(
     await session.execute(
         update(DeliverableRow)
         .where(
-            version_where,
+            supersession_where,
             DeliverableRow.status.in_(["buffered", "approved"]),
         )
         .values(status="superseded", updated_at=_utcnow())
@@ -8878,9 +8886,17 @@ async def list_executors(
     owner_email: str | None = None,
     include_shared: bool = False,
     for_update: bool = False,
+    defer_observed_tools: bool = False,
 ) -> list[ExecutorRow]:
-    """List all executor configurations."""
+    """List all executor configurations.
+
+    ``defer_observed_tools=True`` returns rows without the ``observed_tools``
+    payload; callers that need it for one selected row can
+    ``await session.refresh(row, attribute_names=["observed_tools"])``.
+    """
     stmt = select(ExecutorRow).order_by(ExecutorRow.name)
+    if defer_observed_tools:
+        stmt = stmt.options(executor_observed_tools_deferred())
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
@@ -8944,9 +8960,12 @@ async def get_executor_row(
     *,
     owner_email: str | None = None,
     include_shared: bool = False,
+    defer_observed_tools: bool = False,
 ) -> ExecutorRow | None:
-    """Get an executor by ID."""
+    """Get an executor by ID (see ``list_executors`` for ``defer_observed_tools``)."""
     stmt = select(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
+    if defer_observed_tools:
+        stmt = stmt.options(executor_observed_tools_deferred())
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
@@ -10608,7 +10627,10 @@ async def mark_artifacts_attached(
 ) -> int:
     if not artifact_ids:
         return 0
-    stmt = update(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
+    stmt = update(ArtifactRecordRow).where(
+        ArtifactRecordRow.artifact_id.in_(artifact_ids),
+        ArtifactRecordRow.status != "deleted",
+    )
     if owner_email is not None:
         stmt = stmt.where(ArtifactRecordRow.owner_email == owner_email)
     result = await session.execute(
@@ -10640,6 +10662,52 @@ async def list_expired_temporary_artifacts(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+async def claim_artifact_cleanup(
+    session: AsyncSession, row: ArtifactRecordRow, *, now: datetime
+) -> bool:
+    """Tombstone an unchanged cleanup candidate before external deletion.
+
+    Attachment and cleanup compete in this conditional update. The committed
+    tombstone is irreversible; storage failure leaves it for a later pass.
+    """
+    if row.status == "temporary":
+        eligible = sa.and_(
+            ArtifactRecordRow.status == "temporary",
+            ArtifactRecordRow.expires_at <= now,
+        )
+    elif row.status == "attached":
+        eligible = sa.and_(
+            ArtifactRecordRow.status == "attached",
+            ArtifactRecordRow.conversation_id == row.conversation_id,
+            ArtifactRecordRow.owner_email == row.owner_email,
+            sa.or_(
+                sa.and_(
+                    ArtifactRecordRow.owner_email.is_not(None),
+                    ~sa.exists(
+                        select(User.email).where(User.email == ArtifactRecordRow.owner_email)
+                    ),
+                ),
+                sa.and_(
+                    ArtifactRecordRow.conversation_id.is_not(None),
+                    ~sa.exists(
+                        select(Conversation.conversation_id).where(
+                            Conversation.conversation_id == ArtifactRecordRow.conversation_id
+                        )
+                    ),
+                ),
+            ),
+        )
+    else:
+        return False
+    result = await session.execute(
+        update(ArtifactRecordRow)
+        .where(ArtifactRecordRow.artifact_id == row.artifact_id, eligible)
+        .values(status="deleted", deleted_at=now, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    return _rowcount(result) == 1
 
 
 async def list_orphaned_attached_artifacts(

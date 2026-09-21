@@ -4,7 +4,9 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   display: {
     theme: 'system',
     language: 'auto',
-    dashboard_workspace_windows: true
+    dashboard_workspace_windows: true,
+    conversation_sidebar_sections: true,
+    conversation_sidebar_dense: false
   },
   chat: {
     enter_to_send: true,
@@ -37,7 +39,13 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
       language,
       dashboard_workspace_windows: typeof display.dashboard_workspace_windows === 'boolean'
         ? display.dashboard_workspace_windows
-        : DEFAULT_USER_PREFERENCES.display.dashboard_workspace_windows
+        : DEFAULT_USER_PREFERENCES.display.dashboard_workspace_windows,
+      conversation_sidebar_sections: typeof display.conversation_sidebar_sections === 'boolean'
+        ? display.conversation_sidebar_sections
+        : DEFAULT_USER_PREFERENCES.display.conversation_sidebar_sections,
+      conversation_sidebar_dense: typeof display.conversation_sidebar_dense === 'boolean'
+        ? display.conversation_sidebar_dense
+        : DEFAULT_USER_PREFERENCES.display.conversation_sidebar_dense
     },
     chat: {
       enter_to_send: typeof chat.enter_to_send === 'boolean'

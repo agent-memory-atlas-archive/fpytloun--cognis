@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from cognis.core.tool_output_maintenance import ToolOutputMaintenanceService
+from cognis.core.tool_output_store import RetentionResult
 
 
 class _FakeToolOutputStore:
@@ -21,6 +22,18 @@ class _FakeToolOutputStore:
         self.cleanup_calls = 0
         self.size_cap_calls = 0
         self.pass_completed = asyncio.Event()
+
+    async def maintain(self) -> RetentionResult:
+        result = RetentionResult()
+        try:
+            result.expired_deleted = await self.cleanup_expired()
+        except Exception:
+            result.cleanup_failed = True
+        try:
+            result.size_cap_deleted = await self.enforce_size_cap()
+        except Exception:
+            result.size_cap_failed = True
+        return result
 
     async def cleanup_expired(self) -> int:
         self.cleanup_calls += 1

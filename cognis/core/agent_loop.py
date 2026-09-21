@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import html
 import inspect
@@ -54,8 +55,15 @@ from cognis.core.attachment_utils import (
     normalize_attachment_refs,
     strip_attachment_payload_bytes,
 )
+from cognis.core.canonical_history import CanonicalHistoryUnavailable
 from cognis.core.chat_modes import ResolvedChatMode, normalize_chat_mode, plan_mode_reminder
 from cognis.core.compaction import ROTATION_TOTAL, CompactionModelContext, CompactionResult
+from cognis.core.compaction.publication import (
+    CompactionOwnershipLost,
+    CompactionPublicationGuard,
+    compaction_lease_key,
+    compaction_publication_guard,
+)
 from cognis.core.context import _native_attachment_blocks
 from cognis.core.context_budget import (
     LOOP_PRESSURE_THRESHOLD_RATIO,
@@ -79,6 +87,7 @@ from cognis.core.context_projection import (
     should_reproject,
     tool_transcript_prefix_fingerprint,
 )
+from cognis.core.cpu_offload import run_cpu_bound
 from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
@@ -165,6 +174,7 @@ from cognis.core.orchestration_targets import (
     OrchestrationTargetMode,
     OrchestrationTargetService,
     OrchestrationTargetSnapshot,
+    managed_depth_limit,
 )
 from cognis.core.output_anchor_registry import build_anchor_manifest
 from cognis.core.project_context import (
@@ -349,6 +359,7 @@ from cognis.runtime_context import (
     current_workspace_root,
     scoped_runtime_context,
 )
+from cognis.store.coordination import DatabaseLeaseStore
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.models import DirectTurnRequestRow
 from cognis.store.queries import (
@@ -467,6 +478,59 @@ def _write_deliverable_execution_rejection_reason(
     if payload_fingerprint not in receipts and reason is None:
         return "missing_validation"
     return reason
+
+
+def _write_deliverable_rejection_payload(
+    reason: str,
+    *,
+    validation_errors: object,
+) -> dict[str, Any]:
+    """Build actionable, reason-specific Rich authoring rejection guidance."""
+
+    errors = validation_errors if isinstance(validation_errors, list) else []
+    if reason == "stale_validation":
+        return {
+            "status": "rejected",
+            "reason": reason,
+            "message": (
+                "Validation inputs changed after preflight; call validate_tool_call again "
+                "with the exact unchanged write_deliverable arguments."
+            ),
+            "errors": errors,
+            "required_action": "revalidate_exact_payload",
+        }
+    if reason == "missing_validation":
+        return {
+            "status": "rejected",
+            "reason": reason,
+            "message": (
+                "No successful validate_tool_call preflight matches these exact Rich "
+                "write_deliverable arguments. Validate the exact unchanged arguments, "
+                "then retry write_deliverable."
+            ),
+            "errors": [
+                {
+                    "code": "missing_preflight_validation",
+                    "path": "$",
+                    "message": (
+                        "Call validate_tool_call for write_deliverable with these exact "
+                        "arguments before retrying the Rich write."
+                    ),
+                }
+            ],
+            "required_action": "validate_exact_payload_then_retry",
+        }
+    return {
+        "status": "rejected",
+        "reason": reason,
+        "message": (
+            "write_deliverable failed the same deterministic validation pipeline used by "
+            "validate_tool_call. Correct every reported issue, validate the exact corrected "
+            "arguments, then retry."
+        ),
+        "errors": errors,
+        "required_action": "correct_payload_or_evidence_then_validate",
+    }
 
 
 def _replayed_write_deliverable_validation_fingerprints(
@@ -1191,6 +1255,8 @@ def _observe_web_tool_execution(
 
 
 AUTO_COMPACTION_TIMEOUT_SECONDS = 300
+# Compaction lease outlives the LLM timeout so a stuck owner self-heals.
+COMPACTION_LEASE_TTL_SECONDS = AUTO_COMPACTION_TIMEOUT_SECONDS + 120
 COMPACTION_RECURSION_COOLDOWN_TURNS = 3
 LLM_STREAM_REASONING_IDLE_MULTIPLIER = 3
 LLM_STREAM_MAX_REASONING_IDLE_TIMEOUT_SECONDS = 900
@@ -3268,26 +3334,22 @@ def _append_assistant_deliverable_event(
 def _queue_assistant_deliverable_event(ctx: StepContext, deliverable: Deliverable) -> None:
     """Queue a deliverable for final presentation and direct-chat rendering."""
 
-    prior = ctx.pending_assistant_deliverable
-    if prior is not None:
-        ctx.pending_presentation_refs.discard(prior.deliverable_id)
     _queue_turn_presentation_ref(ctx, deliverable.deliverable_id)
     if deliverable.step_run_id is None:
-        ctx.pending_assistant_deliverable = deliverable
+        ctx.pending_assistant_deliverables.append(deliverable)
 
 
 def _append_pending_assistant_deliverable_event(
     ctx: StepContext,
     events: list[SessionEvent],
 ) -> None:
-    """Append the latest direct-chat deliverable after the final assistant response."""
+    """Append all direct-chat deliverables after the final assistant response."""
 
-    deliverable = ctx.pending_assistant_deliverable
-    if deliverable is not None:
+    for deliverable in ctx.pending_assistant_deliverables:
         _append_assistant_deliverable_event(events, deliverable)
     for deliverable in ctx.pending_attached_deliverables:
         _append_assistant_deliverable_event(events, deliverable)
-    ctx.pending_assistant_deliverable = None
+    ctx.pending_assistant_deliverables.clear()
     ctx.pending_attached_deliverables.clear()
 
 
@@ -5687,6 +5749,9 @@ class StepContext:
         default_factory=SameTurnToolCallLedger
     )
     execution_fence: Any | None = None
+    # Per-session compaction lease held from ``_auto_compact`` through
+    # ``_rotate_after_compaction`` so rotation can be fenced transactionally.
+    compaction_lease: Any | None = None
     on_absorbed_append_start: Callable[[str, str, list[str]], Any] | None = None
     on_absorbed_persisted: Callable[[str], Any] | None = None
     on_boundary_persisted: Callable[[dict[str, Any]], Any] | None = None
@@ -5757,10 +5822,10 @@ class StepContext:
     # Content references explicitly committed for user-facing presentation at
     # turn completion. Tool output never enters this set implicitly.
     pending_presentation_refs: set[str] = field(default_factory=set)
-    # The latest automatic direct-chat deliverable renders after the final
+    # Every automatic direct-chat deliverable renders after the final
     # assistant message. Explicitly attached pre-existing deliverables are
     # additionally preserved in their own list.
-    pending_assistant_deliverable: Deliverable | None = None
+    pending_assistant_deliverables: list[Deliverable] = field(default_factory=list)
     pending_attached_deliverables: list[Deliverable] = field(default_factory=list)
     # Compaction recursion depth — incremented each time _rotate_after_compaction
     # recurses back into _execute_step.  Bounded by session.compaction_max_recursion
@@ -6624,10 +6689,18 @@ class AgentLoop:
         from cognis.core.agent_registry import AgentRegistry
 
         service = OrchestrationTargetService(AgentRegistry(session_factory))
+        context = getattr(ctx.conversation, "context", None)
+        platform_data = getattr(context, "platform_data", None) or {}
+        managed_depth = int(platform_data.get("managed_depth") or 0)
+        inherited_limit = platform_data.get("managed_depth_limit")
         try:
             ctx.orchestration_target_snapshot = await service.snapshot(
                 controller_agent=ctx.agent,
                 user_email=ctx.session.user_email,
+                managed_depth=managed_depth,
+                inherited_managed_depth_limit=(
+                    int(inherited_limit) if inherited_limit is not None else None
+                ),
             )
         except Exception:
             logger.warning(
@@ -6648,12 +6721,20 @@ class AgentLoop:
 
         from cognis.core.agent_registry import AgentRegistry
 
+        context = getattr(ctx.conversation, "context", None)
+        platform_data = getattr(context, "platform_data", None) or {}
+        managed_depth = int(platform_data.get("managed_depth") or 0)
+        inherited_limit = platform_data.get("managed_depth_limit")
         service = OrchestrationTargetService(AgentRegistry(self.session_manager.session_factory))
         return await service.require(
             mode,
             target_agent_id=target_agent_id,
             controller_agent=ctx.agent,
             user_email=ctx.session.user_email,
+            managed_depth=managed_depth,
+            inherited_managed_depth_limit=(
+                int(inherited_limit) if inherited_limit is not None else None
+            ),
         )
 
     async def _resolve_managed_target_agent(
@@ -8531,6 +8612,9 @@ class AgentLoop:
                 follow_up=ctx.follow_up,
                 routing_reminder=routing_reminder,
                 skip_user_message=profile_switch_reentry,
+                required_turn_id=ctx.turn_id,
+                require_user_event=bool(recorded_user_message)
+                and (not ctx.system_initiated or record_system_user_message),
                 skip_memory=ctx.policy.skip_memory,
                 prompt_context=_prompt_ctx,
                 executor_environment=ctx.executor_environment,
@@ -8559,10 +8643,17 @@ class AgentLoop:
             )
             if profile_switch_reentry:
                 ctx.profile_switch_continuation = False
-        except ImmutablePrefixUnavailable:
+        except (ImmutablePrefixUnavailable, CanonicalHistoryUnavailable) as exc:
+            notice = (
+                "Required conversation history is unavailable or incomplete. "
+                "Execution stopped before the next model request. "
+                "Retry the turn after history is available."
+                if isinstance(exc, CanonicalHistoryUnavailable)
+                else "Immutable prefix is unavailable for this session."
+            )
             await self._record_system_notice_audit(
                 ctx,
-                "Immutable prefix is unavailable for this session.",
+                notice,
                 turn_id=ctx.turn_id,
             )
             await self.event_bus.publish(
@@ -8572,11 +8663,17 @@ class AgentLoop:
                         "conversation_id": ctx.conversation.conversation_id,
                         "session_id": ctx.session.session_id,
                         "turn_id": ctx.turn_id,
-                        "text": "Immutable prefix is unavailable for this session.",
+                        "text": notice,
+                        "message": notice,
                     },
                 )
             )
             raise
+        # Assembly ran partly on worker threads and awaited Intaris; discard the
+        # result if control or ownership changed meanwhile.
+        self._raise_if_cancelled(ctx)
+        if ctx.execution_fence is not None:
+            await ctx.execution_fence.assert_current()
         messages = context_result.messages
         for message in messages:
             refs = message.get("_lazy_artifact_refs")
@@ -9668,7 +9765,7 @@ class AgentLoop:
                 projected_model = retry_projected_model
                 retry_projected_model = None
             else:
-                projected_model = self._project_model_messages_for_budget(
+                projected_model = await self._project_model_messages_for_budget_offloaded(
                     ctx,
                     messages=messages,
                     tool_schemas=exposure.tools,
@@ -9895,6 +9992,12 @@ class AgentLoop:
             )
             stream_activity_seen = False
             stream_idle_stats = LLMStreamIdleStats()
+            from cognis.core.tool_preparation import ToolPreparationBudget
+
+            preparation_budget = ToolPreparationBudget()
+            prepared_tools: dict[str, ToolProgressEvent] = {}
+            generation_completed = False
+            stream = None
             llm_started_at = monotonic()
             llm_status = "success"
             logger.debug(
@@ -9925,11 +10028,15 @@ class AgentLoop:
                         (
                             request_raw_prompt_tokens,
                             request_estimator_identity,
-                        ) = self._raw_prompt_token_estimate(
-                            messages=model_messages,
+                        ) = await run_cpu_bound(
+                            self._raw_prompt_token_estimate,
+                            messages=[dict(message) for message in model_messages],
                             tool_schemas=_effective_tools,
                             model=ctx.current_model,
                         )
+                        self._raise_if_cancelled(ctx)
+                        if ctx.execution_fence is not None:
+                            await ctx.execution_fence.assert_current()
                     except (AttributeError, NotImplementedError):
                         logger.debug(
                             "agent: prompt token calibration unavailable",
@@ -9954,6 +10061,11 @@ class AgentLoop:
                         # request must not expose it once the controller enters
                         # text-only finalization.
                         llm_call_kwargs["tool_choice"] = "none"
+                # Last check before spending an LLM call on a projection that
+                # may have been computed under a lost fence.
+                self._raise_if_cancelled(ctx)
+                if ctx.execution_fence is not None:
+                    await ctx.execution_fence.assert_current()
                 stream = self.providers.llm.stream_generate(
                     model_messages,
                     model=model_for_llm,
@@ -9990,6 +10102,7 @@ class AgentLoop:
                             },
                         )
                     if chunk.get("mid_stream_failure"):
+                        llm_status = "provider_error"
                         mid_stream_error = chunk.get("error", "LLM stream failed mid-generation")
                         details = chunk.get("response_error")
                         if isinstance(details, dict):
@@ -10033,8 +10146,21 @@ class AgentLoop:
                                 ),
                                 ctx.current_turn_cycle_index,
                             )
-                    if ctx.on_tool_progress is not None:
-                        for progress_evt in accumulator.pop_tool_progress_events():
+                    for progress_evt in accumulator.pop_tool_progress_events():
+                        prepared_tools[progress_evt.call_id] = progress_evt
+                        limit_reason = preparation_budget.observe(
+                            progress_evt.call_id, progress_evt.input_chars, monotonic()
+                        )
+                        if limit_reason:
+                            raise LLMStreamProviderError(
+                                limit_reason,
+                                payload={
+                                    "category": "other",
+                                    "code": "tool_preparation_limit",
+                                    "message": limit_reason,
+                                },
+                            )
+                        if ctx.on_tool_progress is not None:
                             await _emit_with_optional_trailing_arg(
                                 ctx.on_tool_progress,
                                 (
@@ -10049,6 +10175,7 @@ class AgentLoop:
                                 ),
                                 ctx.current_turn_cycle_index,
                             )
+                generation_completed = not mid_stream_error
             except OpenAIToolSearchFallbackRequired as exc:
                 if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
                     raise
@@ -10193,6 +10320,29 @@ class AgentLoop:
                 if step_output is not None and step_output.metadata.get("finalized_by_recovery"):
                     ctx.finalized_by_recovery = True
                 break
+
+            finally:
+                if not generation_completed:
+                    closer = getattr(stream, "aclose", None)
+                    if callable(closer):
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(closer(), timeout=5)
+                if not generation_completed and ctx.on_tool_progress is not None:
+                    for progress_evt in prepared_tools.values():
+                        await _emit_with_optional_trailing_arg(
+                            ctx.on_tool_progress,
+                            (
+                                progress_evt.call_id,
+                                progress_evt.tool_name,
+                                {
+                                    "phase": "input_abandoned",
+                                    "input_chars": progress_evt.input_chars,
+                                    "input_lines": progress_evt.input_lines,
+                                    "complete": False,
+                                },
+                            ),
+                            ctx.current_turn_cycle_index,
+                        )
 
             llm_finished_at = monotonic()
             last_cycle_end_at = llm_finished_at
@@ -12743,23 +12893,10 @@ class AgentLoop:
                     )
                     if rejection_reason is not None:
                         stale_validation = rejection_reason == "stale_validation"
-                        err_payload = {
-                            "status": "rejected",
-                            "reason": rejection_reason,
-                            "message": (
-                                "Validation inputs changed after preflight; call "
-                                "validate_tool_call again with the exact unchanged arguments."
-                                if stale_validation
-                                else "write_deliverable failed the same deterministic validation "
-                                "pipeline used by validate_tool_call."
-                            ),
-                            "errors": execution_validation.get("errors", []),
-                            "required_action": (
-                                "revalidate_exact_payload"
-                                if stale_validation
-                                else "correct_payload_or_evidence_then_validate"
-                            ),
-                        }
+                        err_payload = _write_deliverable_rejection_payload(
+                            rejection_reason,
+                            validation_errors=execution_validation.get("errors", []),
+                        )
                         err_content = json.dumps(err_payload)
                         if not stale_validation:
                             rejection_signature = tool_call_fingerprint(
@@ -15445,7 +15582,7 @@ class AgentLoop:
                 step_output = None
                 continue
 
-            post_tool_projection = self._project_model_messages_for_budget(
+            post_tool_projection = await self._project_model_messages_for_budget_offloaded(
                 ctx,
                 messages=messages,
                 tool_schemas=exposure.tools,
@@ -16494,17 +16631,20 @@ class AgentLoop:
                     ),
                     is_error=True,
                 )
-            copied = await fork_session_events(
-                providers=self.providers,
-                session_cache=self.session_manager.session_cache,
-                source_cognis_session_id=source_row.session_id,
-                source_intaris_session_id=source_row.intaris_session_id,
-                target_session=child_session,
-                source_label=f"delegate-lineage:{source_row.session_id}",
-                snapshot_source="delegate_lineage",
-                snapshot_extras={"delegation_metadata": lineage},
-                record_source="cognis:delegate-lineage",
-            )
+            try:
+                copied = await fork_session_events(
+                    providers=self.providers,
+                    session_cache=self.session_manager.session_cache,
+                    source_cognis_session_id=source_row.session_id,
+                    source_intaris_session_id=source_row.intaris_session_id,
+                    target_session=child_session,
+                    source_label=f"delegate-lineage:{source_row.session_id}",
+                    snapshot_source="delegate_lineage",
+                    snapshot_extras={"delegation_metadata": lineage},
+                    record_source="cognis:delegate-lineage",
+                )
+            except CanonicalHistoryUnavailable:
+                copied = False
             if not copied:
                 await self.session_manager.mark_failed(
                     child_session.session_id,
@@ -17189,6 +17329,26 @@ class AgentLoop:
                 ),
                 is_error=True,
             )
+        context = getattr(ctx.conversation, "context", None)
+        platform_data = getattr(context, "platform_data", None) or {}
+        current_depth = int(platform_data.get("managed_depth") or 0)
+        current_limit = int(
+            platform_data.get("managed_depth_limit") or managed_depth_limit(ctx.agent)
+        )
+        if (
+            tc.name in {"agent_conversation_create", "agent_conversation_fork"}
+            and current_depth >= current_limit
+        ):
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "error",
+                        "code": "managed_depth_exceeded",
+                        "message": "Maximum managed-conversation depth reached.",
+                    }
+                ),
+                is_error=True,
+            )
         if (
             tc.name
             in {
@@ -17347,13 +17507,15 @@ class AgentLoop:
                         "managed_explicit_completion": True,
                     },
                 )
-            if int(current_managed_link.depth or 1) >= 2:
+            if tc.name in {"agent_conversation_create", "agent_conversation_fork"} and int(
+                current_managed_link.depth or 1
+            ) >= int(current_managed_link.depth_limit or 1):
                 return ToolResult(
                     output=json.dumps(
                         {
                             "status": "error",
                             "code": "managed_depth_exceeded",
-                            "message": "Maximum managed-conversation depth is 2.",
+                            "message": "Maximum managed-conversation depth reached.",
                         }
                     ),
                     is_error=True,
@@ -17361,9 +17523,9 @@ class AgentLoop:
 
         async def _lineage_for_target(
             target_agent_id: str,
-        ) -> tuple[str | None, str | None, int] | ToolResult:
+        ) -> tuple[str | None, str | None, int, int] | ToolResult:
             if current_managed_link is None:
-                return None, None, 1
+                return None, None, 1, managed_depth_limit(ctx.agent)
             async with self.session_manager.session_factory() as db:
                 locked_link = await queries.get_managed_conversation_link(
                     db,
@@ -17371,13 +17533,15 @@ class AgentLoop:
                     user_email=user_email,
                     for_update=True,
                 )
-                if locked_link is None or int(locked_link.depth or 1) >= 2:
+                if locked_link is None or int(locked_link.depth or 1) >= int(
+                    locked_link.depth_limit or 1
+                ):
                     return ToolResult(
                         output=json.dumps(
                             {
                                 "status": "error",
                                 "code": "managed_depth_exceeded",
-                                "message": "Maximum managed-conversation depth is 2.",
+                                "message": "Maximum managed-conversation depth reached.",
                             }
                         ),
                         is_error=True,
@@ -17418,6 +17582,7 @@ class AgentLoop:
                 locked_link.link_id,
                 locked_link.root_link_id or locked_link.link_id,
                 int(locked_link.depth or 1) + 1,
+                int(locked_link.depth_limit or 1),
             )
 
         def _row_payload(row: Any) -> dict[str, Any]:
@@ -17454,6 +17619,7 @@ class AgentLoop:
                 "parent_link_id": row.parent_link_id,
                 "root_link_id": row.root_link_id,
                 "depth": row.depth,
+                "depth_limit": row.depth_limit,
                 "last_result_summary": projection.last_result_summary,
                 "last_result_turn_id": projection.last_result_turn_id,
                 "last_settlement_is_current": projection.last_settlement_is_current,
@@ -18597,7 +18763,7 @@ class AgentLoop:
             lineage = await _lineage_for_target(target_agent.agent_id)
             if isinstance(lineage, ToolResult):
                 return lineage
-            parent_link_id, root_link_id, managed_depth = lineage
+            parent_link_id, root_link_id, managed_depth, depth_limit = lineage
             if agent_profile_id is not None:
                 try:
                     resolve_agent_profile(target_agent, agent_profile_id, source="managed_explicit")
@@ -18619,6 +18785,7 @@ class AgentLoop:
                     "managed_parent_link_id": parent_link_id,
                     "managed_root_link_id": root_link_id,
                     "managed_depth": managed_depth,
+                    "managed_depth_limit": depth_limit,
                     "managed_session_policy": dict(ctx.session_policy),
                     "provenance_in_prefix": True,
                 },
@@ -18651,6 +18818,7 @@ class AgentLoop:
                         parent_link_id=parent_link_id,
                         root_link_id=root_link_id,
                         depth=managed_depth,
+                        depth_limit=depth_limit,
                         target_conversation_id=conversation.conversation_id,
                         target_session_id=session.session_id,
                         title=title,
@@ -19876,7 +20044,7 @@ class AgentLoop:
             lineage = await _lineage_for_target(target_agent.agent_id)
             if isinstance(lineage, ToolResult):
                 return lineage
-            parent_link_id, root_link_id, managed_depth = lineage
+            parent_link_id, root_link_id, managed_depth, depth_limit = lineage
             async with self.session_manager.session_factory() as db:
                 conversation_row = await queries.get_conversation(db, conversation_id)
                 session_row = (
@@ -19909,6 +20077,7 @@ class AgentLoop:
                     "managed_parent_link_id": parent_link_id,
                     "managed_root_link_id": root_link_id,
                     "managed_depth": managed_depth,
+                    "managed_depth_limit": depth_limit,
                     "managed_session_policy": dict(ctx.session_policy),
                     "provenance_in_prefix": True,
                 },
@@ -19971,6 +20140,7 @@ class AgentLoop:
                     parent_link_id=parent_link_id,
                     root_link_id=root_link_id,
                     depth=managed_depth,
+                    depth_limit=depth_limit,
                     target_conversation_id=new_conversation.conversation_id,
                     target_session_id=new_session.session_id,
                     title=new_conversation.title or "Agent work fork",
@@ -20308,6 +20478,17 @@ class AgentLoop:
             )
 
         if tc.name == "create_task":
+            if is_managed_agent_conversation_context(getattr(ctx.conversation, "context", None)):
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": "managed_task_creation_not_allowed",
+                            "message": "Managed descendants cannot create durable tasks.",
+                        }
+                    ),
+                    is_error=True,
+                )
             task_queue = self._task_queue
             if task_queue is None:
                 return ToolResult(
@@ -20330,6 +20511,24 @@ class AgentLoop:
                 raw_agent_id = tc.arguments.get("agent_id")
                 if not raw_agent_id or raw_agent_id == "self":
                     raw_agent_id = ctx.agent.agent_id
+                if str(raw_agent_id) != ctx.agent.agent_id:
+                    try:
+                        await self._require_orchestration_target(
+                            OrchestrationTargetMode.MANAGED,
+                            target_agent_id=str(raw_agent_id),
+                            ctx=ctx,
+                        )
+                    except OrchestrationTargetError as exc:
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "code": "task_agent_not_eligible",
+                                    "message": str(exc),
+                                }
+                            ),
+                            is_error=True,
+                        )
 
                 async with self.session_manager.session_factory() as db:
                     agent_row = await get_agent(db, str(raw_agent_id))
@@ -22022,6 +22221,16 @@ class AgentLoop:
                 output=json.dumps({"error": "LLM provider is not available."}),
                 is_error=True,
             )
+        if is_managed_agent_conversation_context(getattr(ctx.conversation, "context", None)):
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "error": "Managed descendants cannot create tasks or schedules.",
+                        "code": "managed_task_creation_not_allowed",
+                    }
+                ),
+                is_error=True,
+            )
 
         try:
             args = ComposeAndRunWorkflowArgs.model_validate(tc.arguments)
@@ -22033,6 +22242,24 @@ class AgentLoop:
         raw_agent_id = args.agent_id or ctx.agent.agent_id
         if raw_agent_id == "self":
             raw_agent_id = ctx.agent.agent_id
+        if str(raw_agent_id) != ctx.agent.agent_id:
+            try:
+                await self._require_orchestration_target(
+                    OrchestrationTargetMode.MANAGED,
+                    target_agent_id=str(raw_agent_id),
+                    ctx=ctx,
+                )
+            except OrchestrationTargetError as exc:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": "task_agent_not_eligible",
+                            "message": str(exc),
+                        }
+                    ),
+                    is_error=True,
+                )
         async with self.session_manager.session_factory() as db:
             agent_row = await get_agent(db, str(raw_agent_id))
         if agent_row is None or agent_row.owner_email != owner_email:
@@ -26144,6 +26371,49 @@ class AgentLoop:
         turn_state.last_projected_prefix_fingerprint = fingerprint
         projection.prefix_fingerprint = fingerprint
 
+    async def _project_model_messages_for_budget_offloaded(
+        self,
+        ctx: StepContext,
+        *,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]],
+        resolved_model: str,
+        max_context_tokens: int,
+        cache_breakpoint_index: int | None = None,
+        anthropic_cache_ttl: str = DEFAULT_ANTHROPIC_CACHE_TTL,
+    ) -> ProjectedMessages:
+        """Run ``_project_model_messages_for_budget`` on a worker thread.
+
+        The worker gets an isolated view: a forked ``projection_state`` and
+        shallow-copied message dicts, so an awaiter that is cancelled (or a
+        fence that is lost) while the thread is still running can never leak
+        mutations into the live step context. The projection state is
+        published to ``ctx`` only after the cancellation and fence checks pass.
+        """
+
+        shadow_state = (
+            ctx.projection_state.fork_for_projection_attempt()
+            if ctx.projection_state is not None
+            else None
+        )
+        shadow = copy.copy(ctx)
+        shadow.projection_state = shadow_state
+        projected = await run_cpu_bound(
+            self._project_model_messages_for_budget,
+            shadow,
+            messages=[dict(message) for message in messages],
+            tool_schemas=tool_schemas,
+            resolved_model=resolved_model,
+            max_context_tokens=max_context_tokens,
+            cache_breakpoint_index=cache_breakpoint_index,
+            anthropic_cache_ttl=anthropic_cache_ttl,
+        )
+        self._raise_if_cancelled(ctx)
+        if ctx.execution_fence is not None:
+            await ctx.execution_fence.assert_current()
+        ctx.projection_state = shadow.projection_state
+        return projected
+
     def _project_model_messages_for_budget(
         self,
         ctx: StepContext,
@@ -27339,6 +27609,37 @@ class AgentLoop:
             attachments=list(collected_attachments),
         )
 
+    async def _record_rotation_failure(
+        self,
+        ctx: StepContext,
+        *,
+        trigger: str,
+        run: CompactionRunContext | None,
+    ) -> None:
+        if run is not None:
+            run.status = "failed"
+            run.fallback_reason = "rotation_failed"
+            run_data = run.event_data()
+        else:
+            run_data = {
+                "compaction_id": f"compact_{uuid.uuid4().hex[:12]}",
+                "trigger": trigger,
+                "status": "failed",
+                "fallback_reason": "rotation_failed",
+            }
+        await self.persist_compaction_terminal(ctx.session, run_data)
+        await self.event_bus.publish(
+            Event(
+                type=EventType.SESSION_COMPACTION_FINISHED,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "session_id": ctx.session.session_id,
+                    **run_data,
+                },
+            )
+        )
+        return None
+
     async def _rotate_after_compaction(
         self,
         ctx: StepContext,
@@ -27348,11 +27649,49 @@ class AgentLoop:
         transition: SessionTransition = SessionTransition.COMPACT,
         run: CompactionRunContext | None = None,
     ) -> SessionModel | None:
-        """Rotate to a fresh session after a successful compaction."""
+        """Rotate to a fresh session after a successful compaction.
+
+        The rotation transaction re-checks the direct-turn fence (when
+        present) and the compaction lease ``FOR UPDATE`` before it commits, so
+        a takeover after ``_auto_compact``'s entry check cannot publish a
+        second rotation. The compaction lease is always released here.
+        """
 
         if not compaction_result.compacted or compaction_result.turns_compacted <= 0:
+            await self._release_compaction_lease(ctx)
             return None
         try:
+            return await self._rotate_after_compaction_fenced(
+                ctx,
+                compaction_result,
+                trigger=trigger,
+                transition=transition,
+                run=run,
+            )
+        finally:
+            await self._release_compaction_lease(ctx)
+
+    async def _rotate_after_compaction_fenced(
+        self,
+        ctx: StepContext,
+        compaction_result: CompactionResult,
+        *,
+        trigger: str,
+        transition: SessionTransition,
+        run: CompactionRunContext | None,
+    ) -> SessionModel | None:
+        from cognis.core.session import SessionRotationConflictError
+
+        fences: list[Any] = []
+        fence_lease = getattr(getattr(ctx, "execution_fence", None), "lease", None)
+        if fence_lease is not None:
+            fences.append(fence_lease)
+        compaction_lease = getattr(ctx, "compaction_lease", None)
+        if compaction_lease is not None:
+            fences.append(compaction_lease)
+        try:
+            self._raise_if_cancelled(ctx)
+            await self._assert_compaction_ownership(ctx)
             new_session = cast(
                 SessionModel,
                 await self.session_manager.rotate_session(
@@ -27362,6 +27701,9 @@ class AgentLoop:
                     completion_reason="compacted",
                     transition=transition,
                     compaction_summary=compaction_result.summary,
+                    # Only fenced rotations pass leases; unfenced callers keep
+                    # the original signature.
+                    **({"fences": fences} if fences else {}),
                     compaction_summary_event_data={
                         "method": compaction_result.method,
                         "marker_role": "context_seed",
@@ -27380,6 +27722,23 @@ class AgentLoop:
                 ),
             )
             ROTATION_TOTAL.labels(trigger=trigger).inc()
+        except (StaleDirectTurnOwner, CompactionOwnershipLost, StepInterrupted):
+            # A stale owner must not record anything, not even the failure.
+            raise
+        except SessionRotationConflictError as exc:
+            if fences:
+                logger.warning(
+                    "agent: session rotation refused — ownership lost in transaction",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                )
+                raise CompactionOwnershipLost(str(exc)) from exc
+            logger.warning(
+                "agent: session rotation after compaction failed",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
+            await self._record_rotation_failure(ctx, trigger=trigger, run=run)
+            return None
         except Exception:
             logger.warning(
                 "agent: session rotation after compaction failed",
@@ -27729,6 +28088,53 @@ class AgentLoop:
             reasoning_effort=reasoning_effort,
         )
 
+    def _compaction_lease_store(self) -> DatabaseLeaseStore | None:
+        if self._session_factory is None:
+            return None
+        store = getattr(self, "_compaction_leases", None)
+        if store is None:
+            store = DatabaseLeaseStore(self._session_factory)
+            self._compaction_leases = store
+        return store
+
+    def _compaction_owner_id(self) -> str:
+        runtime = self._controller_runtime
+        controller_id = getattr(runtime, "controller_id", None) or "controller"
+        incarnation_id = getattr(runtime, "incarnation_id", None) or "boot"
+        return f"{controller_id}:{incarnation_id}"
+
+    async def _release_compaction_lease(self, ctx: StepContext) -> None:
+        lease = getattr(ctx, "compaction_lease", None)
+        if lease is None:
+            return
+        ctx.compaction_lease = None
+        store = self._compaction_lease_store()
+        if store is None:
+            return
+        try:
+            await store.release(lease)
+        except Exception:
+            logger.warning(
+                "agent: compaction lease release failed",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
+
+    async def _assert_compaction_ownership(self, ctx: StepContext) -> None:
+        """Raise unless this controller still owns both the turn and the compaction."""
+
+        fence = getattr(ctx, "execution_fence", None)
+        if fence is not None:
+            await fence.assert_current()
+        lease = getattr(ctx, "compaction_lease", None)
+        if lease is None:
+            return
+        store = self._compaction_lease_store()
+        if store is not None and not await store.is_current(lease):
+            raise CompactionOwnershipLost(
+                f"compaction lease lost for session {ctx.session.session_id}"
+            )
+
     async def _auto_compact(
         self,
         ctx: StepContext,
@@ -27747,6 +28153,81 @@ class AgentLoop:
         and events were successfully recorded, or before a turn continues
         under heavy context pressure. Rotation is handled by the caller so
         pre-turn and post-turn flows can share timeout/fallback behavior.
+
+        Ownership: the caller's direct-turn fence (when present) is asserted
+        first, then a per-session compaction lease is taken so only one
+        controller compacts a session at a time — including the idle
+        checkpoint path, which carries no direct-turn fence. The lease stays
+        on ``ctx.compaction_lease`` while the result is compacted so
+        ``_rotate_after_compaction`` can fence the rotation transaction; it is
+        released here whenever nothing will be rotated.
+        """
+
+        self._raise_if_cancelled(ctx)
+        execution_fence = getattr(ctx, "execution_fence", None)
+        if execution_fence is not None:
+            await execution_fence.assert_current()
+        lease_store = self._compaction_lease_store()
+        if lease_store is not None:
+            lease = await lease_store.acquire(
+                compaction_lease_key(ctx.session.session_id),
+                self._compaction_owner_id(),
+                ttl_seconds=COMPACTION_LEASE_TTL_SECONDS,
+            )
+            if lease is None:
+                logger.info(
+                    "agent: auto-compaction skipped — another controller is compacting",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "trigger": trigger,
+                        }
+                    },
+                )
+                return None
+            ctx.compaction_lease = lease
+        compaction_lease = getattr(ctx, "compaction_lease", None)
+        guard = CompactionPublicationGuard(
+            token=(
+                f"fence{compaction_lease.fencing_token}"
+                if compaction_lease is not None
+                else "unfenced"
+            ),
+            check=lambda: self._assert_compaction_ownership(ctx),
+        )
+        guard_token = compaction_publication_guard.set(guard)
+        keep_lease = False
+        try:
+            result = await self._auto_compact_owned(
+                ctx,
+                run=run,
+                on_token=on_token,
+                trigger=trigger,
+                skip_few_events_check=skip_few_events_check,
+                min_relevant_events=min_relevant_events,
+                long_lived_chat=long_lived_chat,
+                emit_timeout_notice=emit_timeout_notice,
+            )
+            keep_lease = result is not None and result.compacted
+            return result
+        finally:
+            compaction_publication_guard.reset(guard_token)
+            if not keep_lease:
+                await self._release_compaction_lease(ctx)
+
+    async def _auto_compact_owned(
+        self,
+        ctx: StepContext,
+        *,
+        run: CompactionRunContext | None,
+        on_token: TokenCallback | None,
+        trigger: str,
+        skip_few_events_check: bool,
+        min_relevant_events: int | None,
+        long_lived_chat: bool,
+        emit_timeout_notice: bool,
+    ) -> CompactionResult | None:
+        """Compaction body; runs with the compaction lease and guard installed.
 
         Bounded to ``AUTO_COMPACTION_TIMEOUT_SECONDS`` to avoid holding
         the session lock indefinitely under provider degradation. If the
@@ -28072,7 +28553,8 @@ class AgentLoop:
 
     def _raise_if_cancelled(self, ctx: StepContext) -> None:
         """Abort the current step when external control requested interruption."""
-        if ctx.cancel_event is not None and ctx.cancel_event.is_set():
+        cancel_event = getattr(ctx, "cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
             raise StepInterrupted("Step interrupted by external control")
 
     async def _set_interactive_pause_state(
@@ -28331,7 +28813,10 @@ class AgentLoop:
             ):
                 raise ValueError("Content reference was not found or is unavailable.")
             if self.artifact_store is not None:
-                await hydrate_deliverable_payload(deliverable_row, self.artifact_store)
+                try:
+                    await hydrate_deliverable_payload(deliverable_row, self.artifact_store)
+                except FileNotFoundError as exc:
+                    raise ValueError("Content reference was not found or is unavailable.") from exc
             return (
                 None,
                 Deliverable.model_validate(
@@ -30279,6 +30764,11 @@ class AgentLoop:
         conversation = getattr(ctx, "conversation", None)
         conversation_context = getattr(conversation, "context", None)
         surface_policy = orchestration_surface_policy(conversation_context)
+        platform_data = getattr(conversation_context, "platform_data", None) or {}
+        managed_depth = int(platform_data.get("managed_depth") or 0)
+        managed_limit = int(
+            platform_data.get("managed_depth_limit") or managed_depth_limit(ctx.agent)
+        )
         # Child lifecycle controls are independent of nested-work creation policy.
         from cognis.core.external_managed_policy import (
             external_managed_policy,
@@ -30306,6 +30796,11 @@ class AgentLoop:
             expose_workflow_tools=surface_policy.expose_workflow_tools,
             expose_compose_workflow_tool=surface_policy.expose_compose_workflow_tool,
         ):
+            if (
+                tool_def.name in {"agent_conversation_create", "agent_conversation_fork"}
+                and managed_depth >= managed_limit
+            ):
+                continue
             if (
                 surface_policy.surface == OrchestrationSurface.MANAGED_AGENT_CONVERSATION
                 and is_task_tool(tool_def.name)

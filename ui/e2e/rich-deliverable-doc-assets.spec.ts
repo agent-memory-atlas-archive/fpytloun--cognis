@@ -88,6 +88,18 @@ const documentationManifest = {
   })),
 };
 
+test('compact gallery toolbar matches its documentation image', async ({ page }) => {
+  await page.setViewportSize({ width: 1230, height: 900 });
+  await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&theme=light&width=1230&surface=embedded');
+  const toolbar = page.getByTestId('rich-gallery-toolbar');
+  await expect(toolbar).toBeVisible();
+  await page.evaluate(() => document.fonts.ready);
+  const image = await toolbar.screenshot({ animations: 'disabled' });
+  const output = join(outputDir, 'gallery-toolbar.png');
+  if (updateAssets) writeFileSync(output, image);
+  else expect(await imageMismatchRatio(image, output)).toBeLessThanOrEqual(maximumMismatchRatio);
+});
+
 test('documentation preview manifest matches the canonical registry', () => {
   if (updateAssets) {
     mkdirSync(outputDir, { recursive: true });

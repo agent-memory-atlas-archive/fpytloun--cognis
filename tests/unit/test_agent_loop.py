@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +83,7 @@ from cognis.core.agent_loop import (
     _turn_presentation_notice,
     _validate_step_completion_notification,
     _visible_allowed_tool_names,
+    _write_deliverable_rejection_payload,
 )
 from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.compaction import CompactionResult
@@ -800,6 +802,79 @@ def test_prior_rich_validation_does_not_require_validation_for_text_write() -> N
             execution_valid=True,
         )
         is None
+    )
+
+
+def test_write_deliverable_missing_validation_rejection_is_actionable() -> None:
+    payload = _write_deliverable_rejection_payload(
+        "missing_validation",
+        validation_errors=[],
+    )
+
+    assert payload["reason"] == "missing_validation"
+    assert payload["required_action"] == "validate_exact_payload_then_retry"
+    assert "validate_tool_call" in payload["message"]
+    assert "exact unchanged" in payload["message"]
+    assert payload["errors"] == [
+        {
+            "code": "missing_preflight_validation",
+            "path": "$",
+            "message": (
+                "Call validate_tool_call for write_deliverable with these exact "
+                "arguments before retrying the Rich write."
+            ),
+        }
+    ]
+
+
+def test_write_deliverable_invalid_rejection_preserves_validation_errors() -> None:
+    errors = [{"code": "invalid_block", "path": "$.payload.blocks[0]"}]
+
+    payload = _write_deliverable_rejection_payload(
+        "invalid_tool_call",
+        validation_errors=errors,
+    )
+
+    assert payload["errors"] is errors
+    assert payload["required_action"] == "correct_payload_or_evidence_then_validate"
+    assert "Correct every reported issue" in payload["message"]
+
+
+def test_write_deliverable_stale_validation_rejection_requests_revalidation() -> None:
+    payload = _write_deliverable_rejection_payload(
+        "stale_validation",
+        validation_errors=[],
+    )
+
+    assert payload["required_action"] == "revalidate_exact_payload"
+    assert "Validation inputs changed" in payload["message"]
+
+
+@pytest.mark.parametrize(
+    ("receipts", "payload_fingerprint", "state_fingerprint", "execution_valid", "expected"),
+    [
+        ({}, "payload", "state", True, "missing_validation"),
+        ({"prior": "state"}, "payload", "state", True, "stale_validation"),
+        ({"payload": "prior-state"}, "payload", "state", True, "stale_validation"),
+        ({}, "payload", "state", False, "invalid_tool_call"),
+    ],
+)
+def test_write_deliverable_rich_rejection_reason_matrix(
+    receipts: dict[str, str],
+    payload_fingerprint: str,
+    state_fingerprint: str,
+    execution_valid: bool,
+    expected: str,
+) -> None:
+    assert (
+        agent_loop_module._write_deliverable_execution_rejection_reason(
+            {"action": "rich", "payload": {"title": "Report", "blocks": []}},
+            receipts,
+            payload_fingerprint=payload_fingerprint,
+            current_state_fingerprint=state_fingerprint,
+            execution_valid=execution_valid,
+        )
+        == expected
     )
 
 
@@ -6103,6 +6178,7 @@ def _background_work_ctx(
     context_ref: str | None = None,
     parent_session_id: str | None = None,
     managed_depth: int | None = None,
+    managed_depth_limit: int | None = None,
 ) -> StepContext:
     return StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
@@ -6120,7 +6196,15 @@ def _background_work_ctx(
                 type=context_type,
                 ref=context_ref,
                 platform_data=(
-                    {"kind": "agent_work", "managed_depth": managed_depth}
+                    {
+                        "kind": "agent_work",
+                        "managed_depth": managed_depth,
+                        **(
+                            {"managed_depth_limit": managed_depth_limit}
+                            if managed_depth_limit is not None
+                            else {}
+                        ),
+                    }
                     if managed_depth is not None
                     else {}
                 ),
@@ -7552,6 +7636,7 @@ async def _create_managed_link_for_background_work(
     title: str,
     target_conversation_id: str,
     controller_session_id: str = "controller-session",
+    depth_limit: int = 1,
 ):
     target = await create_conversation(
         db_session,
@@ -7570,6 +7655,7 @@ async def _create_managed_link_for_background_work(
         target_conversation_id=target.conversation_id,
         target_session_id=f"{target.conversation_id}-session",
         title=title,
+        depth_limit=depth_limit,
     )
 
 
@@ -7724,6 +7810,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
             controller.conversation_id,
             title="Depth one",
             target_conversation_id="conv-depth-one",
+            depth_limit=2,
         )
         await create_agent(
             db_session,
@@ -7752,6 +7839,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
             parent_link_id=root.link_id,
             root_link_id=root.link_id,
             depth=2,
+            depth_limit=2,
         )
         assert nested.parent_link_id == root.link_id
         assert nested.root_link_id == root.link_id
@@ -7771,6 +7859,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
                 parent_link_id=root.link_id,
                 root_link_id=root.link_id,
                 depth=2,
+                depth_limit=2,
             )
         with pytest.raises(ValueError, match="already appears"):
             await create_managed_conversation_link(
@@ -7786,6 +7875,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
                 parent_link_id=root.link_id,
                 root_link_id=root.link_id,
                 depth=2,
+                depth_limit=2,
             )
         with pytest.raises(ValueError, match="already appears"):
             await create_managed_conversation_link(
@@ -7801,6 +7891,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
                 parent_link_id=root.link_id,
                 root_link_id=root.link_id,
                 depth=2,
+                depth_limit=2,
             )
         with pytest.raises(ValueError, match="Maximum managed-conversation depth"):
             await create_managed_conversation_link(
@@ -7816,6 +7907,7 @@ async def test_managed_link_lineage_allows_depth_two_and_rejects_cycles_and_dept
                 parent_link_id=nested.link_id,
                 root_link_id=root.link_id,
                 depth=3,
+                depth_limit=2,
             )
     await engine.dispose()
 
@@ -9658,7 +9750,10 @@ async def test_handle_delegate_creation_failure_preserves_parent_cycle_metadata(
             conversation_id="conv-1",
             user_email="user@example.com",
             agent_id="worker",
-            context=ConversationContext(type="web"),
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work", "managed_depth": 1},
+            ),
         ),
         agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
         policy=CHAT_POLICY,
@@ -9702,7 +9797,11 @@ def test_depth_one_managed_conversation_exposes_joined_conversation_tools() -> N
             agent_id="worker",
             context=ConversationContext(
                 type="agent_work",
-                platform_data={"kind": "agent_work", "managed_depth": 1},
+                platform_data={
+                    "kind": "agent_work",
+                    "managed_depth": 1,
+                    "managed_depth_limit": 2,
+                },
             ),
         ),
         agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
@@ -9722,7 +9821,7 @@ def test_depth_one_managed_conversation_exposes_joined_conversation_tools() -> N
     assert "compose_and_run_workflow" not in by_name
 
 
-def test_managed_conversation_projects_explicit_task_tools() -> None:
+def test_managed_conversation_hides_task_tools_even_when_explicitly_enabled() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="managed", type="run", prompt=""),
@@ -9749,8 +9848,8 @@ def test_managed_conversation_projects_explicit_task_tools() -> None:
     by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
     deferred_names = {tool.name for tool in exposure.deferred_definitions}
 
-    assert "get_task" in deferred_names
-    assert "cancel_task" in deferred_names
+    assert "get_task" not in deferred_names
+    assert "cancel_task" not in deferred_names
     assert "create_task" not in by_name
 
 
@@ -9865,7 +9964,11 @@ def test_depth_two_managed_conversation_hides_conversation_tools() -> None:
             agent_id="worker",
             context=ConversationContext(
                 type="agent_work",
-                platform_data={"kind": "agent_work", "managed_depth": 2},
+                platform_data={
+                    "kind": "agent_work",
+                    "managed_depth": 2,
+                    "managed_depth_limit": 2,
+                },
             ),
         ),
         agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
@@ -9926,10 +10029,7 @@ def test_deferred_task_catalog_preserves_builtin_identity_and_historical_bridge(
             conversation_id="conv-task",
             user_email="user@example.com",
             agent_id="agent-1",
-            context=ConversationContext(
-                type="agent_work",
-                platform_data={"kind": "agent_work", "managed_depth": 1},
-            ),
+            context=ConversationContext(type="web"),
         ),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -10168,6 +10268,33 @@ async def test_attachable_content_ref_accepts_owned_artifact_and_rejects_local_p
     assert deliverable is None
     with pytest.raises(ValueError, match="persisted content references"):
         await loop._resolve_attachable_content_ref(ctx, "/tmp/result.png")
+
+
+@pytest.mark.asyncio
+async def test_attachable_missing_deliverable_payload_is_rejected(monkeypatch) -> None:
+    @contextlib.asynccontextmanager
+    async def session_factory():
+        yield SimpleNamespace()
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "get_deliverable",
+        AsyncMock(return_value=SimpleNamespace(conversation_id="conv-1")),
+    )
+    monkeypatch.setattr(agent_loop_module, "get_artifact_record", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        agent_loop_module,
+        "hydrate_deliverable_payload",
+        AsyncMock(side_effect=FileNotFoundError("missing content")),
+    )
+    loop = object.__new__(AgentLoop)
+    loop.session_manager = SimpleNamespace(session_factory=session_factory)
+    loop.artifact_store = object()
+    ctx = SimpleNamespace(
+        conversation=SimpleNamespace(conversation_id="conv-1", user_email="user@example.com")
+    )
+    with pytest.raises(ValueError, match="not found or is unavailable"):
+        await loop._resolve_attachable_content_ref(ctx, "dlv_missing_payload")
 
 
 def test_workflow_controller_tools_keep_step_names() -> None:
@@ -10500,6 +10627,7 @@ async def test_nested_agent_conversation_rejects_explicit_async() -> None:
             "managed-depth-one",
             context_type="agent_work",
             managed_depth=1,
+            managed_depth_limit=2,
         ),
     )
     assert result.is_error is True
@@ -10554,7 +10682,11 @@ async def test_managed_conversation_handler_rejects_policy_disabled_surfaces(
 
     payload = json.loads(result.output)
     assert result.is_error is True
-    assert payload["code"] == "managed_conversation_tools_not_allowed"
+    assert payload["code"] == (
+        "managed_depth_exceeded"
+        if context_type == "agent_work"
+        else "managed_conversation_tools_not_allowed"
+    )
 
 
 @pytest.mark.asyncio
@@ -11368,6 +11500,178 @@ def test_projection_critical_demotes_after_projected_estimate_under_band() -> No
     assert first.mode == "critical"
     assert second.mode == "pressure"
     assert ctx.projection_state.pressure_mode == PressureMode.pressure
+
+
+def _projection_offload_fixture(
+    count_hook: Callable[[], None] | None = None,
+) -> tuple[AgentLoop, SimpleNamespace, list[dict[str, Any]]]:
+    loop = object.__new__(AgentLoop)
+
+    def _count_messages(messages: list[dict[str, Any]], _model: str) -> int:
+        if count_hook is not None:
+            count_hook()
+        return 98_000 if any(m.get("content") == "new result" for m in messages) else 0
+
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=_count_messages,
+            count_tokens=lambda text, _model=None: len(str(text)),
+        )
+    )
+    ctx = SimpleNamespace(
+        current_model="test-model",
+        current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
+        agent=SimpleNamespace(llm_config=None),
+        turn_id="turn-1",
+        session=_SessionStub(session_id="sess-1"),
+        cancel_event=None,
+        execution_fence=None,
+        last_projection_snapshot=None,
+        projection_state=ProjectionTurnState(
+            turn_id="turn-1",
+            policy=ProjectionPolicy.from_budget(
+                max_context_tokens=100_000,
+                available_prompt_tokens=100_000,
+                phase="within_turn",
+                pressure_mode="normal",
+            ),
+            last_result=ProjectionResult(messages=[], mutable_start_index=0),
+            last_message_count=0,
+        ),
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-old",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-old",
+            "content": "old result",
+            "_tool_name": "bash",
+            "_recovery_call_id": "call-old",
+            "_output_size": 10,
+        },
+        {"role": "user", "content": "new turn"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-new",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-new",
+            "content": "new result",
+            "_tool_name": "read",
+            "_recovery_call_id": "call-new",
+            "_output_size": 10,
+        },
+    ]
+    return loop, ctx, messages
+
+
+@pytest.mark.asyncio
+async def test_projection_offload_matches_inline_result_and_publishes_state() -> None:
+    inline_loop, inline_ctx, inline_messages = _projection_offload_fixture()
+    inline = inline_loop._project_model_messages_for_budget(
+        inline_ctx,
+        messages=inline_messages,
+        tool_schemas=[],
+        resolved_model="test-model",
+        max_context_tokens=100_000,
+    )
+
+    loop, ctx, messages = _projection_offload_fixture()
+    original_state = ctx.projection_state
+    projected = await loop._project_model_messages_for_budget_offloaded(
+        ctx,
+        messages=messages,
+        tool_schemas=[],
+        resolved_model="test-model",
+        max_context_tokens=100_000,
+    )
+
+    assert projected.mode == inline.mode == "critical"
+    assert projected.messages == inline.messages
+    assert ctx.projection_state is not original_state, "state must be published from the shadow"
+    assert ctx.projection_state.pressure_mode == inline_ctx.projection_state.pressure_mode
+    assert (
+        ctx.projection_state.forced_critical_count
+        == inline_ctx.projection_state.forced_critical_count
+    )
+    assert ctx.projection_state.reproject_count == inline_ctx.projection_state.reproject_count
+    assert original_state.forced_critical_count == 0, "the live state was mutated by the worker"
+
+
+@pytest.mark.asyncio
+async def test_projection_offload_cancelled_awaiter_leaves_live_state_untouched() -> None:
+    import copy as _copy
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _block() -> None:
+        started.set()
+        release.wait(5.0)
+
+    loop, ctx, messages = _projection_offload_fixture(count_hook=_block)
+    state_before = _copy.deepcopy(ctx.projection_state)
+    messages_before = _copy.deepcopy(messages)
+
+    task = asyncio.create_task(
+        loop._project_model_messages_for_budget_offloaded(
+            ctx,
+            messages=messages,
+            tool_schemas=[],
+            resolved_model="test-model",
+            max_context_tokens=100_000,
+        )
+    )
+    await asyncio.get_running_loop().run_in_executor(None, started.wait, 5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    # Let the abandoned worker finish and prove it changed nothing we still use.
+    await asyncio.sleep(0.2)
+    assert ctx.projection_state.__dict__ == state_before.__dict__
+    assert messages == messages_before
+
+
+@pytest.mark.asyncio
+async def test_projection_offload_lost_fence_does_not_publish_state() -> None:
+    loop, ctx, messages = _projection_offload_fixture()
+    original_state = ctx.projection_state
+
+    class _LostFence:
+        async def assert_current(self) -> None:
+            raise StaleDirectTurnOwner("lost")
+
+    ctx.execution_fence = _LostFence()
+    with pytest.raises(StaleDirectTurnOwner):
+        await loop._project_model_messages_for_budget_offloaded(
+            ctx,
+            messages=messages,
+            tool_schemas=[],
+            resolved_model="test-model",
+            max_context_tokens=100_000,
+        )
+    assert ctx.projection_state is original_state
+    assert original_state.forced_critical_count == 0
 
 
 def test_projection_critical_uses_exact_calibrated_estimate_for_reproject_decision() -> None:
@@ -16049,6 +16353,98 @@ async def test_codex_attachment_download_timeout_strips_image_url_and_retries() 
         'artifact_read artifact_id="img_1"' in str(message["content"])
         for message in fake_llm.calls[1]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["connection", "size", "cancellation"])
+async def test_failed_preparation_is_abandoned_before_retry(failure: str) -> None:
+    progress = []
+
+    class PreparingLLM(_ModelErrorThenRecoveredDirectLLM):
+        async def stream_generate(self, messages, **kwargs):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_progress": {
+                                    "id": "unfinished-patch",
+                                    "name": "apply_patch",
+                                    "input_chars": 300000 if failure == "size" else 127331,
+                                    "input_lines": 2179,
+                                    "complete": False,
+                                }
+                            }
+                        }
+                    ]
+                }
+                if failure == "cancellation":
+                    raise asyncio.CancelledError
+                yield {
+                    "mid_stream_failure": True,
+                    "error": "incomplete chunked read",
+                    "response_error": {"category": "connection", "code": "RemoteProtocolError"},
+                }
+            else:
+                assert progress[-1][2]["phase"] == "input_abandoned"
+                yield {"choices": [{"delta": {"content": "Recovered"}}]}
+
+    async def on_progress(*args):
+        progress.append(args)
+
+    llm = PreparingLLM()
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-preparation",
+            intaris_session_id="sess-preparation",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-preparation"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-preparation",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+        on_tool_progress=on_progress,
+    )
+    if failure == "cancellation":
+        with pytest.raises(asyncio.CancelledError):
+            await loop.run_step(ctx, on_tool_progress=on_progress)
+        assert len(llm.calls) == 1
+    else:
+        output = await loop.run_step(ctx, on_tool_progress=on_progress)
+        assert output.error is None
+        assert len(llm.calls) == 2
+    assert progress[-1][2]["phase"] == "input_abandoned"
+    assert progress[-1][2]["complete"] is False
 
 
 @pytest.mark.asyncio
@@ -22476,17 +22872,17 @@ def test_direct_chat_deliverable_event_is_deferred_until_turn_finalization() -> 
     _queue_assistant_deliverable_event(ctx, deliverable)
 
     assert [event.type for event in events] == ["assistant_message"]
-    assert ctx.pending_assistant_deliverable is deliverable
+    assert ctx.pending_assistant_deliverables == [deliverable]
 
     _append_pending_assistant_deliverable_event(ctx, events)
 
     assert [event.type for event in events] == ["assistant_message", "lifecycle"]
     assert events[-1].data["event"] == "assistant_deliverable"
     assert events[-1].data["deliverable_id"] == "dlv-final"
-    assert ctx.pending_assistant_deliverable is None
+    assert ctx.pending_assistant_deliverables == []
 
 
-def test_direct_chat_deliverable_event_renders_only_latest_turn_deliverable() -> None:
+def test_direct_chat_deliverable_event_renders_all_turn_deliverables() -> None:
     ctx = _post_deliverable_ctx()
     first = Deliverable(
         deliverable_id="dlv-draft",
@@ -22514,9 +22910,12 @@ def test_direct_chat_deliverable_event_renders_only_latest_turn_deliverable() ->
     _queue_assistant_deliverable_event(ctx, latest)
     _append_pending_assistant_deliverable_event(ctx, events)
 
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0].data["event"] == "assistant_deliverable"
-    assert events[0].data["deliverable_id"] == "dlv-latest"
+    assert [event.data["deliverable_id"] for event in events] == ["dlv-draft", "dlv-latest"]
+    assert ctx.pending_presentation_refs == {"dlv-draft", "dlv-latest"}
+    _append_pending_assistant_deliverable_event(ctx, events)
+    assert len(events) == 2
 
 
 def test_step_deliverable_is_not_queued_as_direct_chat_assistant_deliverable() -> None:
@@ -22537,7 +22936,7 @@ def test_step_deliverable_is_not_queued_as_direct_chat_assistant_deliverable() -
     _append_pending_assistant_deliverable_event(ctx, events)
 
     assert events == []
-    assert ctx.pending_assistant_deliverable is None
+    assert ctx.pending_assistant_deliverables == []
 
 
 def test_append_tool_events_persist_assistant_phase_from_runtime_metadata() -> None:

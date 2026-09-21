@@ -64,6 +64,70 @@ def _indexer(factory, owner_id: str) -> KnowledgebaseIndexer:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("attach_first", [True, False])
+async def test_artifact_cleanup_and_attachment_serialize_at_database(attach_first):
+    from cognis.store.queries import (
+        claim_artifact_cleanup,
+        create_artifact_record,
+        mark_artifacts_attached,
+    )
+
+    schema_name = f"cognis_artifact_claim_{uuid.uuid4().hex}"
+    admin = create_async_engine(_url())
+    async with admin.begin() as db:
+        await db.execute(sa_schema.CreateSchema(schema_name))
+    engine = create_async_engine(
+        _url(), connect_args={"server_settings": {"search_path": f'"{schema_name}"'}}
+    )
+    factory = create_session_factory(engine)
+    try:
+        async with engine.begin() as db:
+            await db.run_sync(Base.metadata.create_all)
+        now = datetime.now(UTC)
+        async with factory() as db:
+            candidate = await create_artifact_record(
+                db,
+                artifact_id="art-race",
+                namespace="uploads",
+                object_id="art-race",
+                filename="file.txt",
+                owner_email=None,
+                purpose="attachment",
+                kind="file",
+                mime_type="text/plain",
+                size_bytes=10,
+                expires_at=now - timedelta(seconds=1),
+            )
+            await db.commit()
+
+        async def attach(db):
+            return await mark_artifacts_attached(
+                db,
+                ["art-race"],
+                conversation_id="conversation-1",
+                session_id=None,
+            )
+
+        async def claim(db):
+            return await claim_artifact_cleanup(db, candidate, now=now)
+
+        first, second = (attach, claim) if attach_first else (claim, attach)
+        async with factory() as db1, factory() as db2:
+            assert await first(db1)
+            waiting = asyncio.create_task(second(db2))
+            await asyncio.sleep(0.1)
+            assert not waiting.done()
+            await db1.commit()
+            assert not await asyncio.wait_for(waiting, 2)
+            await db2.commit()
+    finally:
+        await engine.dispose()
+        async with admin.begin() as db:
+            await db.execute(sa_schema.DropSchema(schema_name, cascade=True))
+        await admin.dispose()
+
+
+@pytest.mark.asyncio
 async def test_postgres_two_kb_indexers_claim_one_job() -> None:
     url = _url()
     schema_name = f"cognis_ha_workers_{uuid.uuid4().hex}"

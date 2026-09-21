@@ -24,6 +24,7 @@ from cognis.store.models import (
     LocalModelDeployment,
     LocalModelTargetStatus,
     User,
+    executor_observed_tools_deferred,
 )
 
 
@@ -623,7 +624,9 @@ class InferenceRouter:
                     row.executor_id: row
                     for row in (
                         await session.execute(
-                            select(ExecutorRow).where(ExecutorRow.status == "active")
+                            select(ExecutorRow)
+                            .where(ExecutorRow.status == "active")
+                            .options(executor_observed_tools_deferred())
                         )
                     )
                     .scalars()
@@ -723,10 +726,12 @@ class InferenceRouter:
                 executor.executor_id: executor
                 for executor in (
                     await session.execute(
-                        select(ExecutorRow).where(
+                        select(ExecutorRow)
+                        .where(
                             ExecutorRow.executor_id.in_(executor_ids),
                             ExecutorRow.status == "active",
                         )
+                        .options(executor_observed_tools_deferred())
                     )
                 )
                 .scalars()

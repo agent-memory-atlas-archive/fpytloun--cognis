@@ -4590,6 +4590,7 @@ def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_pa
         item = next(item for item in body["items"] if item["conversation_id"] == conversation_id)
         assert item["active_session_status"] == "suspended"
         assert item["active_session_completion_reason"] == "safety_escalation"
+        assert item["active_session_updated_at"] is not None
         assert item["active_turn_chat_mode"] is None
         assert item["active_turn_chat_mode_source"] is None
         assert item["pending_notification_types"] == ["gate"]
@@ -5291,7 +5292,11 @@ def test_signed_artifact_view_route_serves_html_inline_only_with_view_signature(
         assert forged_view_response.status_code == 403
 
 
-def test_signed_artifact_view_route_rejects_non_html(monkeypatch: object, tmp_path: Path) -> None:
+def test_signed_artifact_view_route_renders_text(monkeypatch: object, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "cognis.api.routes.artifacts.render_standalone_shell",
+        lambda *_args, **_kwargs: "<html><body>plain report</body></html>",
+    )
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
         artifact_store = app.state.artifact_store
@@ -5333,7 +5338,10 @@ def test_signed_artifact_view_route_rejects_non_html(monkeypatch: object, tmp_pa
 
         response = client.get(asyncio.run(_seed()))
 
-        assert response.status_code == 415
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert "plain report" in response.text
 
 
 def test_artifact_signed_url_api_returns_view_url_for_html_artifact(
@@ -5379,7 +5387,7 @@ def test_artifact_signed_url_api_returns_view_url_for_html_artifact(
         assert "/api/v1/artifacts/view/reports/html_api_report/report.html" in body["url"]
 
 
-def test_artifact_signed_url_api_rejects_view_url_for_non_html_artifact(
+def test_artifact_signed_url_api_returns_view_url_for_text_artifact(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -5416,7 +5424,10 @@ def test_artifact_signed_url_api_rejects_view_url_for_non_html_artifact(
             headers=_auth_headers(app, email="user@example.com"),
         )
 
-        assert response.status_code == 415
+        assert response.status_code == 200
+        body = response.json()
+        assert body["mode"] == "view"
+        assert "/api/v1/artifacts/view/reports/plain_api_report/report.txt" in body["url"]
 
 
 def test_signed_virtual_deliverable_route_serves_exact_content(

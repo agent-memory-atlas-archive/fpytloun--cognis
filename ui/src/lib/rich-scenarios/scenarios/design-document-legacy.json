@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "design-document-legacy",
+  "title": "Orbit Relay — Design Document",
+  "description": "A synthetic long-form Markdown document that exercises the baseline renderer without authored layout semantics.",
+  "group": "design",
+  "sort_key": 610,
+  "content": "Orbit Relay design document fallback.",
+  "visibility": ["gallery", "docs"],
+  "payload": {
+    "metadata": { "toc": { "enabled": true } },
+    "blocks": [
+      {
+        "type": "markdown",
+        "content": "# Orbit Relay — Design Document\n\nOrbit Relay is a fictional coordination service that turns approved field notes into a stable relay plan. This legacy fixture intentionally uses one Markdown block so visual improvement must come from the renderer, not invented document semantics.\n\n## Context\n\nA small research team records observations in different places. Reviewers need one readable plan that keeps assumptions, choices, and constraints visible without turning the document into a dashboard.\n\n## Goals\n\n- Preserve a traceable source note for each relay decision.\n- Make approval state obvious in a single reading flow.\n- Keep the format useful in a narrow embedded surface and a wide standalone view.\n\n## Non-goals\n\nOrbit Relay does not schedule people, allocate budgets, or connect to external systems. The fixture uses only fictional names and values.\n\n## Proposal\n\nA relay record contains a source, a route, an owner, and a review state. Each record remains readable without interactive controls. A reviewer can scan the proposal, compare the concise facts, and inspect the implementation boundary.\n\n## Decision table\n\n| Area | Choice | Reason |\n| --- | --- | --- |\n| Source | Field note | Preserves original context |\n| Route | Review queue | Keeps approvals explicit |\n| Retention | 30 days | Limits stale handoffs |\n\n## Implementation sketch\n\n```ts\nexport function relayState(note: Note): RelayState {\n  return note.approved ? 'ready' : 'review';\n}\n```\n\n## Risks\n\nA long title can consume too much horizontal space. Narrow layouts must retain readable text, accessible navigation, and no horizontal page overflow.\n\n## Review questions\n\n1. Is the source note sufficient for a reviewer?\n2. Does the record separate approval from execution?\n3. Can the document remain useful at 390 pixels?"
+      }
+    ],
+    "assets": [],
+    "sources": [],
+    "datasets": [],
+    "exports": []
+  }
+}

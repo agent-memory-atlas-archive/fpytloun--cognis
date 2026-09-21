@@ -7,7 +7,7 @@ from cognis.core.orchestration_targets import (
     OrchestrationTargetMode,
     OrchestrationTargetService,
 )
-from cognis.models.agent import AgentDefinition
+from cognis.models.agent import AgentDefinition, AgentPermissions
 
 
 def _agent(
@@ -20,6 +20,7 @@ def _agent(
     status: str = "active",
     owner_email: str = "user@example.com",
     description: str | None = None,
+    permissions: AgentPermissions | None = None,
 ) -> AgentDefinition:
     return AgentDefinition(
         agent_id=agent_id,
@@ -31,6 +32,7 @@ def _agent(
         hidden=hidden,
         disabled=disabled,
         status=status,
+        permissions=permissions,
     )
 
 
@@ -112,10 +114,7 @@ async def test_target_snapshot_applies_typed_eligibility_matrix() -> None:
         user_email="user@example.com",
     )
 
-    assert [target.agent_id for target in snapshot.delegate] == [
-        "custom-reviewer",
-        "system:code-review",
-    ]
+    assert [target.agent_id for target in snapshot.delegate] == ["system:code-review"]
     assert [target.agent_id for target in snapshot.managed] == ["laforge", "lumi"]
     code_review = next(
         target for target in snapshot.delegate if target.agent_id == "system:code-review"
@@ -189,3 +188,103 @@ async def test_managed_target_preserves_top_level_self_and_rejects_secondary() -
             user_email="user@example.com",
         )
     assert exc_info.value.code == "managed_target_not_eligible"
+
+
+@pytest.mark.asyncio
+async def test_target_policy_filters_both_domains_and_honors_inbound_primary_policy() -> None:
+    controller = _agent(
+        "laforge",
+        agent_type="primary",
+        permissions=AgentPermissions.model_validate(
+            {
+                "delegation": {
+                    "allowed_agent_ids": ["lumi", "system:code-review"],
+                    "primary": {"max_managed_depth": 1},
+                }
+            }
+        ),
+    )
+    accepted = _agent(
+        "lumi",
+        agent_type="primary",
+        permissions=AgentPermissions.model_validate(
+            {"delegation": {"primary": {"allowed_controller_agent_ids": ["laforge"]}}}
+        ),
+    )
+    denied = _agent(
+        "riker",
+        agent_type="primary",
+        permissions=AgentPermissions.model_validate(
+            {"delegation": {"primary": {"allowed_controller_agent_ids": []}}}
+        ),
+    )
+    specialist = _agent("system:code-review", agent_type="secondary", is_system=True)
+    other_specialist = _agent("system:explore", agent_type="secondary", is_system=True)
+
+    snapshot = await OrchestrationTargetService(
+        _Registry([controller, accepted, denied, specialist, other_specialist])
+    ).snapshot(controller_agent=controller, user_email="user@example.com")
+
+    assert [target.agent_id for target in snapshot.managed] == ["laforge", "lumi"]
+    assert [target.agent_id for target in snapshot.delegate] == ["system:code-review"]
+
+
+@pytest.mark.asyncio
+async def test_restricted_empty_lists_still_allow_primary_self_target() -> None:
+    controller = _agent(
+        "worker",
+        agent_type="primary",
+        permissions=AgentPermissions.model_validate(
+            {
+                "delegation": {
+                    "allowed_agent_ids": [],
+                    "primary": {
+                        "max_managed_depth": 1,
+                        "allowed_controller_agent_ids": [],
+                    },
+                }
+            }
+        ),
+    )
+    other = _agent("other", agent_type="primary")
+    specialist = _agent("system:explore", agent_type="secondary", is_system=True)
+    service = OrchestrationTargetService(_Registry([controller, other, specialist]))
+
+    snapshot = await service.snapshot(
+        controller_agent=controller,
+        user_email="user@example.com",
+    )
+
+    assert [target.agent_id for target in snapshot.managed] == ["worker"]
+    assert snapshot.delegate == ()
+    resolved = await service.require(
+        OrchestrationTargetMode.MANAGED,
+        target_agent_id="worker",
+        controller_agent=controller,
+        user_email="user@example.com",
+    )
+    assert resolved.agent_id == "worker"
+
+
+@pytest.mark.asyncio
+async def test_managed_depth_removes_primary_targets_but_keeps_system_specialists() -> None:
+    controller = _agent(
+        "architect",
+        agent_type="primary",
+        permissions=AgentPermissions.model_validate(
+            {"delegation": {"primary": {"max_managed_depth": 2}}}
+        ),
+    )
+    worker = _agent("worker", agent_type="primary")
+    specialist = _agent("system:explore", agent_type="secondary", is_system=True)
+    service = OrchestrationTargetService(_Registry([controller, worker, specialist]))
+
+    snapshot = await service.snapshot(
+        controller_agent=controller,
+        user_email="user@example.com",
+        managed_depth=2,
+        inherited_managed_depth_limit=2,
+    )
+
+    assert snapshot.managed == ()
+    assert [target.agent_id for target in snapshot.delegate] == ["system:explore"]

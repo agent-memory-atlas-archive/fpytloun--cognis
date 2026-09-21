@@ -12,7 +12,7 @@ safety net.
 |---|---|---:|---:|---:|---:|---:|
 | Main / channel chat | Async-first routing options | Yes, when current answer needs result | Yes, only lightweight non-interactive background work | Yes, if caller must inspect result before continuing | Yes, for visible async interactive work; prefer `agent_conversation_send` when a relevant managed conversation already exists | Yes, preferred for heavier workflow-shaped work |
 | Direct / topic chat | Inline + joined specialist work | Yes, common | No / not prompt-visible | Yes, by default, for planning/review/implementation needing interaction | Yes, when independent parent work can safely proceed | Yes, if durable/heavy |
-| Managed agent conversation | Only valid synchronous/inline options | Yes, common | Forbidden, not prompt-visible | Usually not needed from inside managed conversation | Forbidden / not prompt-visible | Yes, only if durable workflow is explicitly appropriate |
+| Managed agent conversation | Only valid synchronous/inline options | Yes, common | Forbidden, not prompt-visible | Only below the inherited managed-depth limit | Forbidden / not prompt-visible | No; descendants cannot bypass depth through durable tasks |
 | Workflow task step | Workflow-step-safe options | Yes / forced sync | Forbidden / coerced or rejected | No, unless explicitly available and needed | No | Usually no; already inside task |
 | Sub-session / delegated child | Finish assigned work | Avoid further fan-out unless necessary | No / not prompt-visible | No | No | No, unless explicitly requested and tool policy allows |
 
@@ -66,6 +66,10 @@ and route recovery. Error text does not determine delivery certainty.
    execution by the step orchestration mode.
 3. Prompts and tool schemas should be context-specific. Forbidden options
    should disappear instead of being described as available-but-prohibited.
+   Agent delegation policy further restricts every target catalog. The master
+   switch, shared target allowlist, primary/system switches, target-side
+   controller allowlist, and inherited managed-depth budget are authoritative
+   at runtime as well as during discovery.
 4. `delegate(wait=false)` is a narrow live/main or channel-chat primitive for
    lightweight non-interactive background work. It is not a general
    orchestration primitive.
@@ -92,9 +96,12 @@ and route recovery. Error text does not determine delivery certainty.
    immutable. The source stays inspectable, lineage is explicit in
    `delegation_metadata`, and derived depth is limited to eight.
 10. A lineage source must be a terminal direct child of the calling controller
-    session. An active retry for the same source blocks another retry. Delegate
-    children remain `OrchestrationMode.NONE`; async completion only notifies the
-    parent and never continues the child.
+     session. An active retry for the same source blocks another retry. Delegate
+     children remain `OrchestrationMode.NONE`; async completion only notifies the
+     parent and never continues the child.
+    `delegate()` targets active system secondary agents only. They run bounded
+    synchronous work and receive no delegation, managed-conversation, workflow,
+    schedule, or task-assignment surface.
 11. Start an initial independent review fresh. Keep fixes in the implementing
     agent. Re-review may continue the compatible reviewer only when its retained
     investigative context is materially useful and its role, criteria, findings,
@@ -147,10 +154,20 @@ and route recovery. Error text does not determine delivery certainty.
     external side effects still need tool/backend idempotency.
  16. `agent_conversation_set_profile` resolves a controller-owned managed link,
     accepts only an enabled agent-switchable target profile, and changes the
-    target conversation and active session only while the per-conversation
-    admission lock confirms there is no active or queued turn. The next managed
-    send uses the persisted profile; the link's creation-time profile is not the
-    current-profile authority.
+     target conversation and active session only while the per-conversation
+     admission lock confirms there is no active or queued turn. The next managed
+     send uses the persisted profile; the link's creation-time profile is not the
+     current-profile authority.
+ 17. Managed depth counts primary-agent edges. The first managed target is depth
+     one. New roots default to a limit of one; a per-agent limit of two supports
+     an XO-to-coordinator-to-worker chain. The root limit is persisted on every
+     link and inherited by descendants. At the limit, create and fork disappear,
+     existing-link controls remain available, and eligible system `delegate()`
+     targets remain available.
+ 18. The same primary target authorization applies to managed conversations and
+     cross-agent task/workflow ownership. A managed descendant cannot create a
+     task for another agent to reset its chain. Allowlists only restrict existing
+     ownership, grant, lifecycle, and visibility checks; they never grant access.
 
 ## Fine-tuning point
 

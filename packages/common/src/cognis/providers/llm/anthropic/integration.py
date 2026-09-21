@@ -366,9 +366,6 @@ def _prepare_native_replay_messages(
         native_assistant["_anthropic_native_blocks"] = envelope.to_dict()["native_blocks"]
         prepared.append(native_assistant)
 
-        if not tool_ids:
-            index += 1
-            continue
         result_messages: dict[str, dict[str, Any]] = {}
         trailing_messages: list[dict[str, Any]] = []
         index += 1
@@ -383,8 +380,11 @@ def _prepare_native_replay_messages(
                         )
                     candidate["_tool_is_error"] = _native_result_is_error(candidate)
                     result_messages[str(call_id)] = candidate
-                else:
-                    trailing_messages.append(candidate)
+                # The frozen native assistant turn is the sole owner of tool
+                # results before the next assistant message. Historical
+                # canonical tool calls can contain an id absent from the
+                # persisted native envelope. Forwarding that result would
+                # create an Anthropic tool_result without a matching tool_use.
             else:
                 trailing_messages.append(candidate)
             index += 1

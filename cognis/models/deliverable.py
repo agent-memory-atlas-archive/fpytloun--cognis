@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, field_validator
 
-from cognis.rendering.rich_visuals import normalize_chart
+from cognis.rendering.rich_visuals import RICH_ICON_SYMBOLS, normalize_chart
 
 
 class DeliverableFormat(StrEnum):
@@ -36,6 +36,7 @@ RICH_DELIVERABLE_MAX_STRING_LENGTH = 16_384
 RICH_SURFACES = ("plain", "subtle", "outlined", "raised", "accent")
 RICH_GRID_LAYOUTS = ("auto", "equal", "split-2-1", "split-1-2")
 RICH_SEMANTIC_TONES = ("neutral", "positive", "warning", "critical", "info")
+RICH_HERO_BADGE_TONES = ("neutral", "info", "success", "warning", "danger")
 RICH_TABLE_CELL_TYPES = ("text", "number", "code", "badge", "progress")
 RICH_TABLE_CELL_EMPHASIS = ("normal", "strong", "muted")
 RICH_TABLE_CELL_ALIGNMENTS = ("start", "center", "end")
@@ -2483,6 +2484,12 @@ def _normalize_block(block: Any, path: str, block_count: list[int]) -> dict[str,
                 expected=f"one of {list(RICH_SEMANTIC_TONES)} or omitted",
                 received=tone,
             )
+    if block_type == "hero":
+        for key in ("badges", "tags"):
+            if key in normalized:
+                normalized[key] = _normalize_hero_badges(normalized[key], _json_path(path, key))
+    if block_type in {"kv", "key_value"}:
+        _validate_key_value_block(normalized, path)
     if block_type == "metric" and "progress" in normalized:
         _validate_progress(normalized["progress"], _json_path(path, "progress"))
     if block_type == "table":
@@ -2651,6 +2658,213 @@ def _normalize_block(block: Any, path: str, block_count: list[int]) -> dict[str,
             )
         normalized[key] = normalized_children
     return normalized
+
+
+def _normalize_hero_badges(value: Any, path: str) -> list[str | dict[str, str]]:
+    if not isinstance(value, list):
+        raise RichPayloadValidationError(
+            reason="invalid_hero_badges",
+            path=path,
+            expected="array of at most 8 plain-text strings or {label, tone?} objects",
+            received=value,
+        )
+    if len(value) > 8:
+        raise RichPayloadValidationError(
+            reason="too_many_hero_badges",
+            path=path,
+            expected="at most 8 badges",
+            received=value,
+        )
+    normalized: list[str | dict[str, str]] = []
+    for index, badge in enumerate(value):
+        badge_path = _json_path(path, index)
+        if isinstance(badge, str):
+            label = badge.strip()
+            if not 1 <= len(label) <= 80:
+                raise RichPayloadValidationError(
+                    reason="invalid_hero_badge_label",
+                    path=badge_path,
+                    expected="plain trimmed text with length 1..80",
+                    received=badge,
+                )
+            normalized.append(label)
+            continue
+        if not isinstance(badge, dict):
+            raise RichPayloadValidationError(
+                reason="invalid_hero_badge",
+                path=badge_path,
+                expected="plain-text string or {label, tone?} object",
+                received=badge,
+            )
+        unknown = set(badge) - {"label", "tone"}
+        if unknown:
+            key = sorted(unknown)[0]
+            raise RichPayloadValidationError(
+                reason="unknown_hero_badge_field",
+                path=_json_path(badge_path, key),
+                expected="one of label, tone",
+                received=badge[key],
+            )
+        raw_label = badge.get("label")
+        if not isinstance(raw_label, str) or not 1 <= len(raw_label.strip()) <= 80:
+            raise RichPayloadValidationError(
+                reason="invalid_hero_badge_label",
+                path=_json_path(badge_path, "label"),
+                expected="plain trimmed text with length 1..80",
+                received=raw_label,
+            )
+        result = {"label": raw_label.strip()}
+        tone = badge.get("tone")
+        if tone is not None:
+            if tone not in RICH_HERO_BADGE_TONES:
+                raise RichPayloadValidationError(
+                    reason="invalid_hero_badge_tone",
+                    path=_json_path(badge_path, "tone"),
+                    expected=f"one of {list(RICH_HERO_BADGE_TONES)} or omitted",
+                    received=tone,
+                )
+            result["tone"] = tone
+        normalized.append(result)
+    return normalized
+
+
+def _validate_key_value_block(block: dict[str, Any], path: str) -> None:
+    variant = block.get("variant")
+    if variant is not None and variant != "summary":
+        raise RichPayloadValidationError(
+            reason="invalid_key_value_variant",
+            path=_json_path(path, "variant"),
+            expected="'summary' or omitted",
+            received=variant,
+        )
+    for key in ("columns", "width", "widths"):
+        if key in block:
+            raise RichPayloadValidationError(
+                reason="unsupported_key_value_layout",
+                path=_json_path(path, key),
+                expected="omitted; key-value layout is renderer-owned",
+                received=block[key],
+            )
+    item_keys = [key for key in ("items", "data", "steps") if key in block]
+    if len(item_keys) > 1:
+        duplicate_key = item_keys[1]
+        raise RichPayloadValidationError(
+            reason="ambiguous_key_value_items",
+            path=_json_path(path, duplicate_key),
+            expected="only one of items, data, or steps",
+            received=block[duplicate_key],
+        )
+    item_key = item_keys[0] if item_keys else "items"
+    items = block.get(item_key)
+    if items is not None and not isinstance(items, (list, dict)):
+        raise RichPayloadValidationError(
+            reason="invalid_key_value_items",
+            path=_json_path(path, item_key),
+            expected="ordered array or object of scalar values",
+            received=items,
+        )
+    if isinstance(items, list):
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            tone = item.get("tone")
+            if tone is not None and tone not in RICH_SEMANTIC_TONES:
+                raise RichPayloadValidationError(
+                    reason="invalid_key_value_tone",
+                    path=_json_path(_json_path(_json_path(path, item_key), index), "tone"),
+                    expected=f"one of {list(RICH_SEMANTIC_TONES)} or omitted",
+                    received=tone,
+                )
+
+
+def _normalize_viewer_identity(metadata: dict[str, Any]) -> None:
+    if "viewer_identity" not in metadata or metadata["viewer_identity"] is None:
+        metadata.pop("viewer_identity", None)
+        return
+    value = metadata["viewer_identity"]
+    path = "$.metadata.viewer_identity"
+    if not isinstance(value, dict):
+        raise RichPayloadValidationError(
+            reason="invalid_viewer_identity",
+            path=path,
+            expected="object with label and/or registered semantic icon",
+            received=value,
+        )
+    unknown = set(value) - {"label", "icon"}
+    if unknown:
+        key = sorted(unknown)[0]
+        raise RichPayloadValidationError(
+            reason="unknown_viewer_identity_field",
+            path=_json_path(path, key),
+            expected="one of label, icon",
+            received=value[key],
+        )
+    label = value.get("label")
+    if label is not None and (not isinstance(label, str) or not 1 <= len(label.strip()) <= 64):
+        raise RichPayloadValidationError(
+            reason="invalid_viewer_identity_label",
+            path=_json_path(path, "label"),
+            expected="plain trimmed text with length 1..64",
+            received=label,
+        )
+    icon = value.get("icon")
+    if icon is not None:
+        icon_path = _json_path(path, "icon")
+        if not isinstance(icon, dict):
+            raise RichPayloadValidationError(
+                reason="invalid_viewer_identity_icon",
+                path=icon_path,
+                expected="object with registered name and optional alt",
+                received=icon,
+            )
+        icon_unknown = set(icon) - {"name", "alt"}
+        if icon_unknown:
+            key = sorted(icon_unknown)[0]
+            raise RichPayloadValidationError(
+                reason="unknown_viewer_identity_icon_field",
+                path=_json_path(icon_path, key),
+                expected="one of name, alt",
+                received=icon[key],
+            )
+        name = icon.get("name")
+        if not isinstance(name, str) or name not in RICH_ICON_SYMBOLS:
+            raise RichPayloadValidationError(
+                reason="invalid_viewer_identity_icon_name",
+                path=_json_path(icon_path, "name"),
+                expected=f"one of {sorted(RICH_ICON_SYMBOLS)}",
+                received=name,
+            )
+        alt = icon.get("alt")
+        if alt is not None and (not isinstance(alt, str) or not 1 <= len(alt.strip()) <= 64):
+            raise RichPayloadValidationError(
+                reason="invalid_viewer_identity_icon_alt",
+                path=_json_path(icon_path, "alt"),
+                expected="plain trimmed text with length 1..64",
+                received=alt,
+            )
+        if label is None and alt is None:
+            raise RichPayloadValidationError(
+                reason="missing_viewer_identity_accessible_name",
+                path=_json_path(icon_path, "alt"),
+                expected="non-empty alt when icon is the only identity",
+                received=alt,
+            )
+    if label is None and icon is None:
+        raise RichPayloadValidationError(
+            reason="missing_viewer_identity",
+            path=path,
+            expected="at least one of label or icon",
+            received=value,
+        )
+    normalized: dict[str, Any] = {}
+    if isinstance(label, str):
+        normalized["label"] = label.strip()
+    if isinstance(icon, dict):
+        normalized_icon = {"name": icon["name"]}
+        if isinstance(icon.get("alt"), str):
+            normalized_icon["alt"] = icon["alt"].strip()
+        normalized["icon"] = normalized_icon
+    metadata["viewer_identity"] = normalized
 
 
 def _safe_rich_url(value: str, *, allow_relative: bool) -> bool:
@@ -2823,6 +3037,7 @@ def normalize_rich_payload(value: Any) -> tuple[dict[str, Any] | None, list[str]
         raw = normalized.get(key)
         _validate_string_caps(raw, f"$.{key}")
     metadata = normalized["metadata"]
+    _normalize_viewer_identity(metadata)
     for key, values in (
         ("canvas", ("standard", "wide")),
         ("density", ("compact", "comfortable", "dense", "airy")),
@@ -2916,6 +3131,9 @@ def rich_render_metadata(
         "pulse_valid": presentation == "pulse",
         "projection_max_bytes": RICH_DELIVERABLE_PROJECTION_MAX_BYTES,
         "warnings": warnings or [],
+        "viewer_identity": (
+            metadata.get("viewer_identity") if isinstance(metadata, dict) else None
+        ),
     }
     if presentation == "pulse" and pulse_version == 2 and isinstance(payload, dict):
         quality = pulse_quality_metadata(payload)
@@ -2946,6 +3164,13 @@ def rich_export_metadata(payload: dict[str, Any] | None = None) -> dict[str, Any
         "declared_exports": exports if isinstance(exports, list) else [],
         "presentation": metadata.get("presentation") if isinstance(metadata, dict) else None,
         "canvas": metadata.get("canvas") if isinstance(metadata, dict) else None,
+        "viewer_identity": (
+            metadata.get("viewer_identity") if isinstance(metadata, dict) else None
+        ),
+        "semantic_features": {
+            "typed_hero_badges": True,
+            "summary_key_value": True,
+        },
         "standalone": {
             "html": {"available": True, "cached": True},
             "pdf": {"available": True, "cached": True},

@@ -168,7 +168,7 @@
 {:else if presentation === 'pinned'}
   <aside
     id="conversation-info-drawer"
-    class={`relative col-start-2 row-span-3 row-start-1 flex min-h-0 min-w-0 flex-col border-l border-slate-800/60 bg-slate-950 ${resizing ? 'select-none' : ''}`}
+    class={`relative col-start-2 row-span-3 row-start-1 flex min-h-0 min-w-0 flex-col border-l border-slate-800/60 bg-transparent ${resizing ? 'select-none' : ''}`}
     style={`width:${width}px`}
     aria-labelledby="conversation-info-heading"
     data-testid="conversation-info-drawer"

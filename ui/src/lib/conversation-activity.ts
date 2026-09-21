@@ -17,8 +17,6 @@ export interface ActivityAvatarState {
   label: string;
 }
 
-const ERROR_SESSION_STATUSES = new Set(['failed', 'terminated']);
-
 function pendingInputState(
   types: string[] | null | undefined,
 ): { label: string; critical: boolean } | null {
@@ -39,8 +37,10 @@ export function conversationActivityState(
     | 'has_active_turn'
     | 'has_unread'
     | 'last_message_at'
+    | 'last_read_at'
     | 'active_session_status'
     | 'active_session_completion_reason'
+    | 'active_session_updated_at'
     | 'pending_notification_types'
     | 'context'
   > | null,
@@ -56,10 +56,7 @@ export function conversationActivityState(
     && backgroundWorkItemIsRunning(item)
   )));
   const attentionTone = conversation ? conversationAttentionTone(conversation) : 'default';
-  const error = attentionTone === 'rose' || Boolean(
-    conversation?.active_session_status
-    && ERROR_SESSION_STATUSES.has(conversation.active_session_status),
-  );
+  const error = attentionTone === 'rose';
   const attention = Boolean(conversation && conversationHasAttention(conversation) && attentionTone === 'amber');
   const waiting = pendingInputState(conversation?.pending_notification_types);
   const emptyTaskControl = Boolean(

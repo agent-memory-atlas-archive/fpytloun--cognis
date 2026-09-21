@@ -274,7 +274,9 @@ describe('AssistantDeliverableBlock', () => {
     triggerResize(1200);
     await waitFor(() => expect(root).toHaveAttribute('data-inline-toc-layout', 'sidebar'));
     await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
-    expect(root.querySelector('.rich-inline-document')).not.toHaveClass('inline-toc-sidebar');
+    expect(root.querySelector('.rich-inline-document')).toHaveClass('inline-toc-sidebar');
+    expect(screen.queryByRole('button', { name: 'Open table of contents' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Close table of contents' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Open table of contents' }));
     expect(root.querySelector('.rich-inline-document')).toHaveClass('inline-toc-sidebar');
 

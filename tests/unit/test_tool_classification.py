@@ -1024,7 +1024,7 @@ async def test_tool_classification_queue_passes_owner_context_to_llm(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tool_classification_queue_accepts_retried_soft_profile_group_mismatch(tmp_path):
+async def test_tool_classification_queue_keeps_soft_mismatch_ready_on_rediscovery(tmp_path):
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
     await run_schema_bootstrap(engine)
     session_factory = create_session_factory(engine)
@@ -1058,13 +1058,12 @@ async def test_tool_classification_queue_accepts_retried_soft_profile_group_mism
                 )
             )
         ).scalar_one()
-        assert row.status == "pending"
-        assert row.attempts == 1
-        assert row.last_error == "office_tool_misclassified"
-        row.next_retry_at = None
-        await session.commit()
+        assert row.status == "ready"
+        assert row.attempts == 0
+        assert row.last_error is None
 
-    await _process_due_classifications_once(queue)
+    await queue.enqueue_tools([tool], owner_email=None)
+    assert await queue._claim_due_items(10) == []
 
     async with session_factory() as session:
         row = (
@@ -1080,11 +1079,10 @@ async def test_tool_classification_queue_accepts_retried_soft_profile_group_mism
         assert row.capabilities == ["read"]
         assert row.classification_source == "llm"
         assert row.last_error is None
-        assert row.attempts == 1
+        assert row.attempts == 0
 
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 1
     assert "previous_rejection" not in llm.calls[0][0]
-    assert llm.calls[1][0]["previous_rejection"] == "office_tool_misclassified"
 
     await engine.dispose()
 
@@ -1127,6 +1125,41 @@ async def test_tool_classification_queue_requeues_ready_row_with_invalid_capabil
         assert row.last_error is None
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_classification_retry_budget_survives_rediscovery_and_restart(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    tool = _dynamic_tool_named("mcp_github__bounded_failure", "bounded/failure")
+    try:
+        for attempt in range(1, 4):
+            queue = ToolClassificationQueue(
+                session_factory=factory, llm_provider=_FailingClassifierLLM()
+            )
+            await queue.enqueue_tools([tool], owner_email=None)
+            await _process_due_classifications_once(queue)
+            async with factory() as session:
+                row = (await session.execute(sa.select(ToolClassificationRow))).scalar_one()
+                assert row.attempts == attempt
+                assert row.status == ("failed" if attempt == 3 else "pending")
+                row.next_retry_at = None
+                await session.commit()
+        await queue.enqueue_tools([tool], owner_email=None)
+        assert await queue._claim_due_items(10) == []
+        resolved = await resolve_tool_classifications(
+            [tool], session_factory=factory, owner_email=None, queue=queue
+        )
+        assert resolved[0].classification_status == "failed"
+        assert resolved[0].classification_source == "heuristic"
+        changed = tool.model_copy(update={"description": "Changed tool contract"})
+        await queue.enqueue_tools([changed], owner_email=None)
+        claimed = await queue._claim_due_items(10)
+        assert len(claimed) == 1
+        assert claimed[0].attempts == 0
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

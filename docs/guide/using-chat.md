@@ -22,6 +22,21 @@ Depending on what the agent is doing, the conversation can display:
 - queued messages when you send another message during an active turn
 - reconnection status for the WebSocket session
 
+“Sending” means the client has not yet received admission confirmation. A
+server-admitted message stops showing that label even while the agent is still
+working. Its local, live-runtime, and saved-history representations share one
+message identity, so acknowledgement does not create a second bubble.
+
+“Preparing input” means the model is still generating a tool call; the tool has
+not executed. Streamed tool preparation is bounded per generation to 600 seconds
+from its first progress event and 262,144 total input characters. A limit breach
+uses the normal bounded model-error recovery policy. Large changes should be
+split into smaller calls.
+
+When a generation fails or is cancelled, its abandoned preparation indicators
+are removed from the active overlay. This does not create tool results or change
+previously completed calls.
+
 ## Runtime selection
 
 `/model`, `/thinking`, and `/fast` select session overrides for the next message.
@@ -146,6 +161,12 @@ progress, and the child session link. The full delegated prompt is stored as the
 initial user message inside the child session so the parent timeline stays
 readable without losing auditability.
 
+A child timeline shows that child's messages and runtime state. The parent's
+latest admitted message remains in the parent timeline, including while it is
+waiting for a session. In an open conversation, the chat runtime owns the turn
+indicator; refreshing sidebar metadata cannot restart a settled indicator or
+clear a newer active turn.
+
 When background work finishes, Cognis classifies the follow-up before the agent
 responds:
 
@@ -157,6 +178,18 @@ responds:
 ## Session management and compaction
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
+
+Cognis stops execution if required history is unavailable or incomplete. A
+profile switch must retain the current turn and its recorded switch boundary.
+Cache invalidation must not silently turn an existing conversation into an
+empty prompt. Retry the turn after the event store is available again.
+
+Forks read the complete source history and confirm all required writes before
+returning success. Interrupted copies are not usable as complete conversation
+history, including after a controller restart. If a fork fails, recreate it from
+the original conversation; do not use a partially created fork as a recovery
+shortcut. Intentional fork activity filtering and compaction summaries still
+apply.
 
 Use `/compact` to compact the current conversation manually. Manual compaction
 runs immediately and rotates to the new active session before the next user

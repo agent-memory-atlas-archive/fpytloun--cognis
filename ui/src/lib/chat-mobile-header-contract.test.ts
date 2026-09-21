@@ -23,7 +23,7 @@ describe('mobile chat header contract', () => {
     expect(header.match(/data-testid="chat-header-info"/g)).toHaveLength(1);
   });
 
-  it('keeps the title header compact and delegates status-area spacing to the route frame', () => {
+  it('keeps header spacing responsive and delegates status-area ownership to shared CSS', () => {
     const headerStart = pageSource.lastIndexOf('<div', pageSource.indexOf('data-testid="chat-header"'));
     const headerEnd = pageSource.indexOf('{#if chatSearchOpen}', headerStart);
     const header = pageSource.slice(headerStart, headerEnd);
@@ -46,5 +46,83 @@ describe('mobile chat header contract', () => {
       pageSource.indexOf('// Edge-swipe handlers', pageSource.indexOf('function openMobileList(): void')),
     );
     expect(openMobileList).toContain('conversationFiltersOpen = false');
+  });
+
+  it('uses a compact expandable toolbar and automatic conversation paging', () => {
+    expect(pageSource).not.toContain('>Conversations</p>');
+    expect(pageSource).toContain('aria-label="Conversation controls"');
+    expect(pageSource).toContain('role="group" aria-label="Conversation controls"');
+    expect(pageSource).toContain('<div class="flex items-center gap-1">');
+    expect(pageSource).toContain('Expand conversation filters');
+    expect(pageSource).toContain("lucide-svelte/icons/filter");
+    expect(pageSource).not.toContain("lucide-svelte/icons/sliders-horizontal");
+    expect(pageSource).toContain('Expand conversation search');
+    expect(pageSource).not.toContain('>Filters</span>');
+    expect(pageSource).toContain('<Tooltip placement="bottom" text="Refresh conversations" showOnTouch={false}>');
+    expect(pageSource).toContain('<Tooltip placement="bottom" text="New conversation" showOnTouch={false}>');
+    expect(pageSource).toContain('showOnTouch={false}');
+    expect(pageSource).toContain('use:observeConversationListEnd');
+    expect(pageSource).not.toContain('Load more conversations');
+  });
+
+  it('emphasizes new conversation as the primary toolbar action', () => {
+    const label = pageSource.indexOf('aria-label="New conversation"');
+    const button = pageSource.slice(pageSource.lastIndexOf('<button', label), pageSource.indexOf('</button>', label));
+    expect(button).toContain('h-9 w-9');
+    expect(button).toContain('bg-sky-400/15 text-sky-300');
+    expect(button).toContain('<Plus class="h-4 w-4" strokeWidth={2.5}');
+    expect(button).toContain('focus-visible:ring-2');
+    expect(button).toContain('disabled={newChatCreating}');
+    expect(button).toContain('onclick={openNewConversationModal}');
+  });
+
+  it('presents direct agent chats as a peer section with one topic boundary', () => {
+    const agentsHeading = pageSource.indexOf('aria-labelledby="sidebar-agents-heading"');
+    const agentsSection = pageSource.slice(
+      pageSource.lastIndexOf('<section', agentsHeading),
+      pageSource.indexOf('{/if}', agentsHeading),
+    );
+    expect(agentsSection).toContain('>Agents</p>');
+    expect(agentsSection).toContain('border-b');
+    expect(agentsSection).not.toContain('border-t');
+    expect(agentsSection).toContain('pb-0');
+    expect(agentsSection).toContain('tracking-[0.24em]');
+  });
+
+  it('shows subtle right-aligned counts for active and waiting conversations', () => {
+    expect(pageSource).toContain('visibleConversationLanes.active.length} active conversations');
+    expect(pageSource).toContain('visibleConversationLanes.waiting.length} waiting conversations');
+    expect(pageSource).toContain('bg-sky-400/10');
+    expect(pageSource).toContain('bg-amber-400/10');
+    expect(pageSource).toContain('justify-between');
+    expect(pageSource).toContain('tabular-nums');
+  });
+
+  it('uses one shared topic-conversation scroller on every viewport', () => {
+    expect(pageSource).toContain("const root = node.closest<HTMLElement>('[data-pull-to-refresh-scroller]')");
+    expect(pageSource).not.toContain('data-conversation-history-scroll');
+    expect(pageSource).not.toContain('lg:max-h-44 lg:overflow-y-auto');
+    expect(pageSource).not.toContain('lg:flex-1 lg:overflow-y-auto');
+  });
+
+  it('starts the timeline directly below the chat header separator at all widths', () => {
+    expect(pageSource).toContain('px-2.5 pb-1.5 pt-0 sm:px-4 sm:pb-4"');
+    expect(pageSource).not.toContain('px-2.5 py-1.5 sm:p-4');
+    expect(pageSource).not.toContain('sm:p-4');
+  });
+
+  it('routes unread conversations into the waiting lane', () => {
+    expect(pageSource).toContain('partitionSidebarConversationLanes(visibleConversationList, backgroundWork.items)');
+    expect(pageSource).toContain('waitingReason={dashboardConversationWaitingReason(conversation)}');
+    expect(pageSource).not.toContain("'Unread activity'");
+  });
+
+  it('renders History date labels as subtle secondary metadata', () => {
+    const dateLabel = pageSource.match(/id=\{`history-section-\$\{section\.key\}`\} class="([^"]+)"/)?.[1] ?? '';
+    expect(dateLabel).toContain('text-right');
+    expect(dateLabel).toContain('italic');
+    expect(dateLabel).toContain('text-slate-400');
+    expect(dateLabel).not.toContain('bg-slate-950');
+    expect(dateLabel).not.toContain('rounded-lg');
   });
 });

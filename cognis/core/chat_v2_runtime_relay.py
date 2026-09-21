@@ -1087,6 +1087,10 @@ class ChatV2RuntimeRedisRelay:
         envelope = await self._decode_payload(payload)
         if envelope is None:
             return None
+        age = (datetime.now(UTC) - envelope.generated_at).total_seconds()
+        if age > RUNTIME_MAX_AGE_SECONDS or age < -FUTURE_SKEW_SECONDS:
+            _drop("stale")
+            return None
         expected = self._matches_context(envelope, context)
         if expected != AdmissionDecision.ACCEPT:
             _drop(expected.value)
@@ -1098,7 +1102,7 @@ class ChatV2RuntimeRedisRelay:
             _drop("wrong_turn")
             return None
         seen = self._seen_decision(envelope)
-        if seen is not None:
+        if seen is not None and seen != "duplicate":
             _drop(seen)
             return None
         verdict = await (durable_validator or self._durable_validator)(envelope)
@@ -1123,6 +1127,10 @@ class ChatV2RuntimeRedisRelay:
             return None
         envelope = await self._decode_payload(payload)
         if envelope is None or envelope.authority is None:
+            return None
+        age = (datetime.now(UTC) - envelope.generated_at).total_seconds()
+        if age > RUNTIME_MAX_AGE_SECONDS or age < -FUTURE_SKEW_SECONDS:
+            _drop("stale")
             return None
         envelope_authority = envelope.authority
         if (

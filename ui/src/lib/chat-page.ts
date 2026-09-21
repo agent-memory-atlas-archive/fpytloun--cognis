@@ -507,6 +507,17 @@ export function deriveChatV2ViewProjection(state: ChatV2ClientState): ChatV2View
   };
 }
 
+/** List metadata cannot supersede the open timeline's admitted runtime. */
+export function reconcileConversationWithChatRuntime(
+  conversation: Conversation,
+  state: ChatV2ClientState,
+  pendingAdmission: Partial<Conversation> | null = null,
+): Conversation {
+  if (!state.cursor || state.conversationId !== conversation.conversation_id) return conversation;
+  const patch = pendingAdmission ?? chatV2RuntimeConversationPatch(state);
+  return patch ? { ...conversation, ...patch } : conversation;
+}
+
 /**
  * Applies the authoritative cached page-level queue fields over a freshly
  * derived Chat v2 projection, preserving everything else the projection
@@ -1485,8 +1496,8 @@ export const CHAT_PINNED_INSPECTOR_MIN_WIDTH = 320;
 export const CHAT_PINNED_INSPECTOR_MIN_CHAT_WIDTH = 480;
 export const CHAT_PINNED_INSPECTOR_GAP = 12;
 
-export function initialConversationFiltersOpen(viewportWidth: number): boolean {
-  return viewportWidth >= 1024;
+export function initialConversationFiltersOpen(_viewportWidth: number): boolean {
+  return false;
 }
 
 export function mobileConversationStatusLabel(
@@ -1953,12 +1964,10 @@ export function conversationStatusFilterForConversation(
 export function conversationAttentionTone(conversation: {
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
+  active_session_updated_at?: string | null;
   pending_notification_types?: string[] | null;
+  last_read_at?: string | null;
 }): ConversationAttentionTone {
-  const status = conversation.active_session_status ?? null;
-  if (status && ROSE_SESSION_STATUSES.has(status)) return 'rose';
-  if (status && AMBER_SESSION_STATUSES.has(status)) return 'amber';
-
   const pendingNotificationTypes = conversation.pending_notification_types ?? [];
   if (pendingNotificationTypes.some((type) => ROSE_PENDING_NOTIFICATION_TYPES.has(type))) {
     return 'rose';
@@ -1966,6 +1975,17 @@ export function conversationAttentionTone(conversation: {
   if (pendingNotificationTypes.some((type) => ATTENTION_PENDING_NOTIFICATION_TYPES.has(type))) {
     return 'amber';
   }
+
+  // Session outcomes are historical once observed. Keep actionable
+  // notifications persistent, but let a read after the latest session update
+  // clear lifecycle attention without hiding a later terminal transition.
+  const sessionUpdatedAt = timestampValue(conversation.active_session_updated_at);
+  const lastReadAt = timestampValue(conversation.last_read_at);
+  if (sessionUpdatedAt > 0 && lastReadAt >= sessionUpdatedAt) return 'default';
+
+  const status = conversation.active_session_status ?? null;
+  if (status && ROSE_SESSION_STATUSES.has(status)) return 'rose';
+  if (status && AMBER_SESSION_STATUSES.has(status)) return 'amber';
 
   const completionReason = conversation.active_session_completion_reason ?? null;
   if (status === 'completed' && completionReason && !NORMAL_COMPLETION_REASONS.has(completionReason)) {
@@ -2018,9 +2038,29 @@ export function conversationAttentionLabel(tone: ConversationAttentionTone): str
 export function conversationHasAttention(conversation: {
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
+  active_session_updated_at?: string | null;
   pending_notification_types?: string[] | null;
+  last_read_at?: string | null;
 }): boolean {
   return conversationAttentionTone(conversation) !== 'default';
+}
+
+export function conversationReadAcknowledgementAt(
+  conversation: {
+    active_session_updated_at?: string | null;
+    last_message_at?: string | null;
+    last_read_at?: string | null;
+  } | null | undefined,
+  observedAt?: string | null,
+): string | null {
+  return [
+    observedAt,
+    conversation?.last_message_at,
+    conversation?.last_read_at,
+    conversation?.active_session_updated_at,
+  ].reduce<string | null>((latest, candidate) => (
+    timestampValue(candidate) > timestampValue(latest) ? candidate ?? null : latest
+  ), null);
 }
 
 export function conversationShowsAttentionDot(
@@ -2028,7 +2068,9 @@ export function conversationShowsAttentionDot(
     has_unread?: boolean | null;
     active_session_status?: string | null;
     active_session_completion_reason?: string | null;
+    active_session_updated_at?: string | null;
     pending_notification_types?: string[] | null;
+    last_read_at?: string | null;
   },
   isActive: boolean,
   inProgress: boolean,
@@ -2045,6 +2087,7 @@ export interface ConversationUpdatedRowPatchEvent {
   active_turn_chat_mode_source?: ChatModeSource | null;
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
+  active_session_updated_at?: string | null;
   pending_notification_types?: string[];
   last_read_at?: string | null;
   last_message_at?: string | null;
@@ -2069,6 +2112,7 @@ export function conversationUpdatedRowPatch(
   if (typeof event.active_turn_chat_mode_source === 'string') patch.active_turn_chat_mode_source = event.active_turn_chat_mode_source;
   if (typeof event.active_session_status === 'string' || event.active_session_status === null) patch.active_session_status = event.active_session_status;
   if (typeof event.active_session_completion_reason === 'string' || event.active_session_completion_reason === null) patch.active_session_completion_reason = event.active_session_completion_reason;
+  if (typeof event.active_session_updated_at === 'string' || event.active_session_updated_at === null) patch.active_session_updated_at = event.active_session_updated_at;
   if (Array.isArray(event.pending_notification_types)) patch.pending_notification_types = event.pending_notification_types;
   if (typeof event.last_read_at === 'string' || event.last_read_at === null) patch.last_read_at = event.last_read_at;
   if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;

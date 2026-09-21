@@ -94,6 +94,7 @@ async def _seed_managed_rich_deliverable(factory) -> None:
             target_conversation_id="conv-child",
             target_session_id="sess-child",
             title="Child",
+            depth_limit=2,
         )
         await create_managed_conversation_link(
             session,
@@ -108,6 +109,7 @@ async def _seed_managed_rich_deliverable(factory) -> None:
             parent_link_id=parent.link_id,
             root_link_id=parent.link_id,
             depth=2,
+            depth_limit=2,
         )
         await create_deliverable(
             session,

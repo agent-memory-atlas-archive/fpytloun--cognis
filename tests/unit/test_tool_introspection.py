@@ -611,6 +611,20 @@ def test_write_deliverable_registers_authoritative_dashboard_operation() -> None
     assert contract["valid_skeleton"]
 
 
+def test_write_deliverable_guides_substantial_payloads_through_artifacts() -> None:
+    assert "substantial Rich payload" in WRITE_DELIVERABLE_TOOL.description
+    assert "editable local JSON file" in WRITE_DELIVERABLE_TOOL.description
+    assert "validate_tool_call" in WRITE_DELIVERABLE_TOOL.description
+    assert "exact unchanged arguments" in WRITE_DELIVERABLE_TOOL.description
+
+    payload_artifact = WRITE_DELIVERABLE_TOOL.provider_exposure_schema["properties"][
+        "payload_artifact"
+    ]
+    description = payload_artifact["properties"]["artifact_id"]["description"]
+    assert "Prefer this source for substantial payloads" in description
+    assert "publish it as application/json" in description
+
+
 @pytest.mark.parametrize(
     "operation_name",
     ["write_deliverable", "rich", "rich:dashboard", "rich:pulse"],

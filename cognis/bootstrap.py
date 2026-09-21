@@ -2613,6 +2613,14 @@ def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
                 "ALTER TABLE managed_conversation_links ADD COLUMN depth INTEGER NOT NULL DEFAULT 1"
             )
         )
+    depth_limit_added = "depth_limit" not in columns
+    if depth_limit_added:
+        execute(
+            text(
+                "ALTER TABLE managed_conversation_links "
+                "ADD COLUMN depth_limit INTEGER NOT NULL DEFAULT 1"
+            )
+        )
     if "last_result_turn_id" not in columns:
         execute(
             text("ALTER TABLE managed_conversation_links ADD COLUMN last_result_turn_id VARCHAR")
@@ -2636,6 +2644,16 @@ def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
             "WHERE root_link_id IS NULL"
         )
     )
+    if depth_limit_added:
+        execute(
+            text(
+                "UPDATE managed_conversation_links "
+                "SET depth_limit = COALESCE(("
+                "SELECT MAX(descendant.depth) FROM managed_conversation_links AS descendant "
+                "WHERE descendant.root_link_id = managed_conversation_links.root_link_id"
+                "), depth, 1)"
+            )
+        )
     execute(
         text(
             "CREATE INDEX IF NOT EXISTS ix_managed_conversation_links_parent_link "

@@ -60,8 +60,19 @@ describe('conversationActivityState', () => {
     expect(conversationActivityState(normalEventOnly, { open: false }).unread).toBe(true);
   });
 
-  it('maps control-chat session failure to error', () => {
-    expect(conversationActivityState(conversation({ active_session_status: 'failed' })).error).toBe(true);
+  it('clears control-chat session failure after it is observed', () => {
+    expect(conversationActivityState(conversation({
+      has_unread: true,
+      active_session_status: 'failed',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T06:59:59Z',
+    })).error).toBe(true);
+    expect(conversationActivityState(conversation({
+      has_unread: false,
+      active_session_status: 'failed',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+    })).error).toBe(false);
   });
 
   it('preserves conversation-sidebar critical and ordinary attention severity', () => {

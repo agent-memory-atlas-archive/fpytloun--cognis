@@ -15,8 +15,14 @@ from cognis.core.project_context import (
     project_context_event_data,
 )
 from cognis.core.redis_service import RedisService
-from cognis.core.session_cache import SessionCache
-from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
+from cognis.core.session_cache import CanonicalHistoryUnavailable, SessionCache
+from cognis.models.session import (
+    EventAppendResult,
+    EventPaginationError,
+    EventReadResult,
+    SessionEvent,
+    SessionModel,
+)
 
 
 @pytest.mark.asyncio
@@ -1888,3 +1894,179 @@ def test_clear_active_thinking_records_cleared_turn_id() -> None:
 
     # The cleared turn is recorded
     assert (session_id, "turn_abc") in cache._cleared_thinking_turns
+
+
+class _PagedGuardrails:
+    """Scripted Intaris reads: each call pops the next page for its after_seq."""
+
+    def __init__(self, script: list[object]) -> None:
+        self.script = list(script)
+        self.calls: list[int] = []
+
+    async def read_events(self, session_id: str, after_seq: int = 0, **_: object) -> object:
+        del session_id
+        self.calls.append(after_seq)
+        if not self.script:
+            raise AssertionError("unexpected read")
+        page = self.script.pop(0)
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+
+def _page(
+    seqs: list[int], *, last_seq: int, has_more: bool = False, fallback: bool = False
+) -> EventReadResult:
+    return EventReadResult(
+        events=[
+            {"seq": seq, "type": "user_message", "data": {"content": f"m{seq}"}} for seq in seqs
+        ],
+        last_seq=last_seq,
+        has_more=has_more,
+        missing_stream_fallback_used=fallback,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_stream_fallback_fails_closed_on_cold_load() -> None:
+    guardrails = _PagedGuardrails([_page([], last_seq=0, fallback=True)])
+    cache = SessionCache(guardrails)
+
+    with pytest.raises(CanonicalHistoryUnavailable):
+        await cache.refresh(_session("session-cold"))
+
+    entry = cache.get_entry("session-cold")
+    assert entry is not None
+    assert entry.initialized is False
+    assert entry.canonical_stale is True
+    assert entry.events == []
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_stream_fallback_keeps_existing_history_and_fails_closed() -> None:
+    guardrails = _PagedGuardrails(
+        [
+            _page([1, 2, 3], last_seq=3),
+            _page([], last_seq=0, fallback=True),
+            # Recovery must rebuild the full stream, including any prior gaps.
+            _page([1, 2, 3, 4], last_seq=4),
+        ]
+    )
+    cache = SessionCache(guardrails)
+    session = _session("session-warm")
+    warmed = await cache.refresh(session)
+    assert [event.seq for event in warmed.events] == [1, 2, 3]
+
+    # The tenant-mismatch 404 on a warm refresh must not be treated as "no new events".
+    with pytest.raises(CanonicalHistoryUnavailable):
+        await cache.refresh(session)
+    entry = cache.get_entry("session-warm")
+    assert entry is not None
+    assert entry.canonical_stale is True
+    assert [event.seq for event in entry.events] == [1, 2, 3], "existing evidence retained"
+
+    # A later complete read clears the stale flag.
+    recovered = await cache.refresh(session)
+    assert recovered.canonical_stale is False
+    assert [event.seq for event in recovered.events] == [1, 2, 3, 4]
+    assert guardrails.calls == [0, 3, 0]
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_watermark_is_the_applied_seq_not_the_server_high_water() -> None:
+    # Intaris computes last_seq after the page; an append that landed between
+    # the two server calls must be fetched on the next refresh, not skipped.
+    guardrails = _PagedGuardrails(
+        [
+            _page([1, 2], last_seq=3),
+            _page([3], last_seq=3),
+            # Prefix-rebuild full read issued by the warm refresh.
+            _page([1, 2, 3], last_seq=3),
+        ]
+    )
+    cache = SessionCache(guardrails)
+    session = _session("session-watermark")
+    entry = await cache.refresh(session)
+    assert entry.last_event_seq == 2
+    entry = await cache.refresh(session)
+    assert [event.seq for event in entry.events] == [1, 2, 3]
+    assert entry.last_event_seq == 3
+    assert guardrails.calls == [0, 2, 0]
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_paged_reads_apply_all_or_nothing() -> None:
+    guardrails = _PagedGuardrails(
+        [
+            _page([1, 2], last_seq=5, has_more=True),
+            _page([3, 4, 5], last_seq=5),
+        ]
+    )
+    cache = SessionCache(guardrails)
+    entry = await cache.refresh(_session("session-paged"))
+    assert [event.seq for event in entry.events] == [1, 2, 3, 4, 5]
+    assert guardrails.calls == [0, 2]
+    await cache.aclose()
+
+    failing = _PagedGuardrails(
+        [
+            _page([1, 2], last_seq=5, has_more=True),
+            RuntimeError("page 2 failed"),
+        ]
+    )
+    cache = SessionCache(failing)
+    with pytest.raises(RuntimeError, match="page 2 failed"):
+        await cache.refresh(_session("session-paged-fail"))
+    entry = cache.get_entry("session-paged-fail")
+    assert entry is not None
+    assert entry.events == [], "no partial page may be published"
+    assert entry.initialized is False
+    assert entry.canonical_stale is True
+    await cache.aclose()
+
+    stuck = _PagedGuardrails(
+        [_page([1], last_seq=9, has_more=True), _page([], last_seq=9, has_more=True)]
+    )
+    cache = SessionCache(stuck)
+    with pytest.raises(EventPaginationError):
+        await cache.refresh(_session("session-paged-stuck"))
+    entry = cache.get_entry("session-paged-stuck")
+    assert entry is not None and entry.events == [] and entry.canonical_stale is True
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_history_shrink_diagnostic_fires_only_without_compaction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    guardrails = _PagedGuardrails([_page([1, 2, 3, 4], last_seq=4)])
+    cache = SessionCache(guardrails)
+    session = _session("session-shrink")
+    entry = await cache.refresh(session)
+    events = list(entry.events)
+
+    caplog.set_level("WARNING", logger="cognis.core.session_cache")
+    cache.record_assembled_history(session.session_id, events, estimator_identity="est:v1")
+    cache.record_assembled_history(session.session_id, events, estimator_identity="est:v1")
+    assert not [r for r in caplog.records if "shrank" in r.getMessage()]
+
+    # Same compaction boundary, half the events gone -> warn with both digests.
+    cache.record_assembled_history(session.session_id, events[3:], estimator_identity="est:v1")
+    shrink = [r for r in caplog.records if "shrank" in r.getMessage()]
+    assert len(shrink) == 1
+    extra = shrink[0].extra_data  # type: ignore[attr-defined]
+    assert extra["previous"]["event_count"] == 4
+    assert extra["current"]["event_count"] == 1
+    assert extra["current"]["first_seq"] == 4
+    assert extra["current"]["estimator_identity"] == "est:v1"
+
+    # A compaction between two assemblies legitimately drops history: no warning.
+    caplog.clear()
+    cache.record_assembled_history(session.session_id, events, estimator_identity="est:v1")
+    entry.last_compaction_seq = 3
+    cache.record_assembled_history(session.session_id, events[3:], estimator_identity="est:v1")
+    assert not [r for r in caplog.records if "shrank" in r.getMessage()]
+    await cache.aclose()

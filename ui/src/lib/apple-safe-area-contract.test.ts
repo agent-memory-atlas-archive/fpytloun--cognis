@@ -81,7 +81,17 @@ describe('Apple safe-area contract', () => {
     expect(layout).toContain('bg-slate-950 px-3 py-1');
     expect(layout).toContain('class="h-10 w-10 lg:hidden');
     expect(layout).not.toContain('0.625rem+env(safe-area-inset-top)');
-    expect(styles).toContain('.chat-header-shell {\n  background: #020617;');
+    expect(layout).not.toContain('chat-workspace-surface');
+    expect(layout).toContain('app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-slate-950');
+    expect(styles).toContain('.chat-header-shell,\n.app-keyboard-stable-header {');
+    expect(styles).toContain('background: var(--app-chrome-bg)');
+    expect(styles).not.toContain('.chat-header-shell {\n  background: transparent;');
+    const manifest = JSON.parse(readFileSync('static/manifest.webmanifest', 'utf8'));
+    const color = manifest.theme_color.toLowerCase();
+    expect(manifest.background_color.toLowerCase()).toBe(color);
+    expect(readFileSync('src/app.html', 'utf8').toLowerCase()).toContain(`name="theme-color" content="${color}"`);
+    expect(styles).toContain(`--app-chrome-bg: ${color}`);
+    expect(styles).toContain('linear-gradient(180deg, var(--app-chrome-bg) 0px, var(--app-chrome-bg) 64px');
     expect(styles).toContain('.app-chat-mobile-safe-top {\n    padding-top: 0;');
   });
 

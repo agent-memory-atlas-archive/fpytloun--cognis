@@ -48,8 +48,10 @@ describe('RichDeliverable component rendering', () => {
       });
       await tick();
       const document = container.querySelector('[data-testid="rich-deliverable-inline-document"]')!;
-      expect(document).not.toHaveClass('inline-toc-sidebar');
+      expect(document).toHaveClass('inline-toc-sidebar');
 
+      expect(screen.queryByRole('button', { name: 'Open table of contents' })).toBeNull();
+      await fireEvent.click(screen.getByRole('button', { name: 'Close table of contents' }));
       await fireEvent.click(screen.getByRole('button', { name: 'Open table of contents' }));
       await tick();
       expect(document).toHaveClass('inline-toc-sidebar');
@@ -113,6 +115,65 @@ describe('RichDeliverable component rendering', () => {
       expect(screen.queryByText('Toolbar fallback')).toBeNull();
     },
   );
+
+  it.each([
+    [{ label: 'Atlas workspace' }, 'Atlas workspace', 'text'],
+    [{ icon: { name: 'activity', alt: 'Activity workspace' } }, 'Activity workspace', 'icon'],
+    [{ label: 'Atlas workspace', icon: { name: 'activity', alt: 'Activity workspace' } }, 'Atlas workspace', 'text'],
+  ])('renders a typed viewer identity %o', (viewerIdentity, expectedName, expectedKind) => {
+    render(RichDeliverable, {
+      title: 'Identity fixture',
+      content: 'Fallback',
+      payload: {
+        metadata: { viewer_identity: viewerIdentity },
+        blocks: [{ type: 'markdown', content: 'Body' }],
+      },
+    });
+
+    const identity = screen.getByTestId('rich-viewer-identity');
+    if (expectedKind === 'icon') {
+      expect(within(identity).getByLabelText(expectedName)).toBeTruthy();
+    } else {
+      expect(identity).toHaveTextContent(expectedName);
+    }
+    expect(screen.queryByText('[object Object]')).toBeNull();
+  });
+
+  it('omits viewer identity chrome when metadata does not author it', () => {
+    render(RichDeliverable, {
+      title: 'Identity fixture',
+      content: 'Fallback',
+      payload: { blocks: [{ type: 'markdown', content: 'Body' }] },
+    });
+
+    expect(screen.queryByTestId('rich-viewer-identity')).toBeNull();
+  });
+
+  it('renders typed hero badges and a summary key-value strip', () => {
+    const { container } = render(RichDeliverable, {
+      content: 'Fallback',
+      payload: {
+        metadata: { toc: { enabled: true } },
+        blocks: [
+          {
+            type: 'hero',
+            title: 'Typed semantics',
+            badges: [{ label: 'Ready', tone: 'success' }, { label: 'Review', tone: 'warning' }],
+          },
+          {
+            type: 'key_value',
+            variant: 'summary',
+            items: [{ label: 'Status', value: 'Ready', tone: 'positive' }],
+          },
+        ],
+      },
+    });
+
+    expect(container.querySelector('.rich-hero-badges .tone-success')).toHaveTextContent('Ready');
+    expect(screen.getByText('Review')).toHaveClass('tone-warning');
+    expect(container.querySelector('.rich-kv-summary .tone-positive')).toHaveTextContent('Ready');
+    expect(container.querySelector('.rich-kv-summary')).not.toBeNull();
+  });
 
   it('renders the pulse contract with one H1, neutral chrome, sources, and chart fallback', () => {
     const { container } = render(RichDeliverable, {
@@ -1099,7 +1160,7 @@ describe('RichDeliverable component rendering', () => {
 
     expect(screen.queryAllByTestId('rich-deliverable-toc')).toHaveLength(5);
     expect(screen.queryAllByRole('navigation', { name: 'Table of contents' })).toHaveLength(5);
-    expect(screen.queryByText('Contents')).toBeNull();
+    expect(screen.getAllByText('Contents')).toHaveLength(5);
     // The hamburger trigger is no longer restricted to surface="standalone"
     // (that restriction was the bug: embedded chat deliverables had no way
     // to open their TOC at all). It is width-driven via CSS, not surface --

@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-import httpx
-
+from cognis.core.canonical_history import (
+    CanonicalHistoryUnavailable,
+    read_complete_history,
+)
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
     ImmutablePrefixEntry,
@@ -73,7 +75,6 @@ async def fork_session_events(
     max_source_seq: int | None = None,
     event_filter: Callable[[CachedEvent], bool] | None = None,
     event_transform: Callable[[CachedEvent], CachedEvent | None] | None = None,
-    prefer_durable_source: bool = False,
     record_source: str = "cognis:fork",
 ) -> bool:
     """Copy one session's event history into another session.
@@ -82,30 +83,59 @@ async def fork_session_events(
     the target session's immutable prefix with an explicit context snapshot.
     """
 
+    target_intaris_id = target_session.intaris_session_id or target_session.session_id
+    copy_started = SessionEvent(
+        type="lifecycle",
+        data={"event": "history_copy_started", "history_copy_id": target_session.session_id},
+    )
+    try:
+        started_result = await providers.guardrails.record_events(
+            session_id=target_intaris_id,
+            events=[copy_started],
+            source=record_source,
+            idempotency_key=f"{target_session.session_id}:fork:started",
+        )
+    except Exception as exc:
+        raise CanonicalHistoryUnavailable("Fork initialization could not be persisted") from exc
+    if not started_result.ok:
+        raise CanonicalHistoryUnavailable("Fork initialization was not acknowledged")
     source_events: list[CachedEvent] = []
     prefix_entries: list[ImmutablePrefixEntry] = []
 
-    if source_cognis_session_id and not prefer_durable_source:
-        cache_entry = session_cache.get_entry(source_cognis_session_id)
-        if cache_entry is not None and cache_entry.initialized and cache_entry.events:
-            source_events = [
-                event for event in cache_entry.events if event.type not in PREFIX_EVENT_TYPES
-            ]
-        if copy_prefix:
-            cached_prefix_entries = session_cache.get_prefix_entries(source_cognis_session_id)
-            prefix_entries.extend(cached_prefix_entries or [])
-
-    if not source_events and source_intaris_session_id:
+    # Cache health does not prove freshness across controllers.
+    source_id = source_intaris_session_id or source_cognis_session_id
+    if source_id:
         try:
-            event_read = await providers.guardrails.read_events(
-                session_id=source_intaris_session_id,
-                after_seq=0,
-                allow_missing_stream=not prefer_durable_source,
+            event_read = await read_complete_history(providers.guardrails, source_id)
+            # Never mix cached prefix entries with a different durable generation.
+            prefix_entries = []
+            ordered_events = sorted(event_read.events, key=lambda event: int(event.get("seq", 0)))
+            latest_snapshot = next(
+                (
+                    event
+                    for event in reversed(ordered_events)
+                    if event.get("type") == "context_snapshot"
+                ),
+                None,
             )
-            for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0))):
+            prefix_seqs: set[int] | None = None
+            if copy_prefix and latest_snapshot is not None:
+                prefix_seqs = {
+                    int(item["seq"]) for item in latest_snapshot.get("data", {}).get("entries", [])
+                }
+                available_prefix_seqs = {
+                    int(event["seq"])
+                    for event in ordered_events
+                    if _prefix_entry_from_event(event) is not None
+                }
+                if not prefix_seqs.issubset(available_prefix_seqs):
+                    raise CanonicalHistoryUnavailable("Fork prefix snapshot is incomplete")
+            for raw_event in ordered_events:
                 event_type = str(raw_event.get("type") or "")
                 if event_type in PREFIX_EVENT_TYPES:
                     if not copy_prefix:
+                        continue
+                    if prefix_seqs is not None and int(raw_event.get("seq", 0)) not in prefix_seqs:
                         continue
                     entry = _prefix_entry_from_event(raw_event)
                     if entry is not None:
@@ -120,12 +150,15 @@ async def fork_session_events(
                         ts=raw_event.get("ts"),
                     )
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "session fork: failed to read source events",
                 extra={"extra_data": {"source_label": source_label}},
                 exc_info=True,
             )
+            raise CanonicalHistoryUnavailable(
+                "Could not read complete fork source history"
+            ) from exc
 
     if max_source_seq is not None:
         source_events = [event for event in source_events if event.seq <= max_source_seq]
@@ -160,6 +193,11 @@ async def fork_session_events(
     appendable_source_events: list[CachedEvent] = []
     skipped_event_types: dict[str, int] = {}
     for event in source_events:
+        if event.type == "lifecycle" and event.data.get("event") in {
+            "history_copy_started",
+            "history_copy_completed",
+        }:
+            continue  # Copy boundaries are target-local, not inherited context.
         if event.type not in INTARIS_APPENDABLE_EVENT_TYPES:
             skipped_event_types[event.type] = skipped_event_types.get(event.type, 0) + 1
             continue
@@ -177,15 +215,10 @@ async def fork_session_events(
         )
     source_events = appendable_source_events
 
-    if not source_events and not prefix_entries:
-        logger.debug(
-            "session fork: no source events or prefix entries to copy",
-            extra={"extra_data": {"source_label": source_label}},
-        )
-        return False
+    has_context = bool(source_events or prefix_entries)
 
-    target_intaris_id = target_session.intaris_session_id or target_session.session_id
     try:
+        pending_batches: list[tuple[list[CachedEvent], int]] = []
         if source_events:
             last_seq = 0
             for batch_start in range(0, len(source_events), INTARIS_EVENT_APPEND_BATCH_SIZE):
@@ -199,7 +232,12 @@ async def fork_session_events(
                     session_id=target_intaris_id,
                     events=session_events,
                     source=record_source,
+                    idempotency_key=f"{target_session.session_id}:fork:history:{batch_start}",
                 )
+                if not append_result.ok or (
+                    append_result.last_seq - append_result.first_seq + 1 != len(source_batch)
+                ):
+                    raise CanonicalHistoryUnavailable("Fork history append was not acknowledged")
                 remapped_events = [
                     CachedEvent(
                         seq=append_result.first_seq + index,
@@ -210,11 +248,7 @@ async def fork_session_events(
                     )
                     for index, event in enumerate(source_batch)
                 ]
-                await session_cache.seed_events(
-                    target_session,
-                    remapped_events,
-                    append_result.last_seq,
-                )
+                pending_batches.append((remapped_events, append_result.last_seq))
                 last_seq = append_result.last_seq
         else:
             last_seq = 0
@@ -251,33 +285,48 @@ async def fork_session_events(
                     idempotency_key=f"{target_session.session_id}:immutable_prefix:{snapshot_source}:snapshot",
                 )
                 if snapshot_result.ok:
-                    await session_cache.append_recorded_events(
-                        target_session,
-                        message_events,
-                        message_result,
-                    )
-                    await session_cache.append_recorded_events(
-                        target_session,
-                        snapshot_events,
-                        snapshot_result,
-                    )
-                    await session_cache.store_prefix_snapshot(
-                        target_session.session_id,
-                        resolved_entries,
-                        snapshot_seq=snapshot_result.last_seq,
-                        snapshot_source=snapshot_source,
-                    )
                     last_seq = snapshot_result.last_seq
                 else:
-                    logger.warning(
-                        "session fork: failed to persist fork snapshot event",
-                        extra={"extra_data": {"target_session": target_session.session_id}},
-                    )
+                    raise CanonicalHistoryUnavailable("Fork snapshot append was not acknowledged")
             else:
-                logger.warning(
-                    "session fork: failed to persist fork prefix messages",
-                    extra={"extra_data": {"target_session": target_session.session_id}},
-                )
+                raise CanonicalHistoryUnavailable("Fork prefix append was not acknowledged")
+        copy_completed = SessionEvent(
+            type="lifecycle",
+            data={"event": "history_copy_completed", "history_copy_id": target_session.session_id},
+        )
+        completed_result = await providers.guardrails.record_events(
+            session_id=target_intaris_id,
+            events=[copy_completed],
+            source=record_source,
+            idempotency_key=f"{target_session.session_id}:fork:completed",
+        )
+        if not completed_result.ok:
+            raise CanonicalHistoryUnavailable("Fork completion was not acknowledged")
+        # Publish cache state only after every durable batch is acknowledged.
+        await session_cache.seed_events(
+            target_session,
+            [CachedEvent(seq=started_result.first_seq, type="lifecycle", data=copy_started.data)],
+            started_result.last_seq,
+        )
+        for events, seq in pending_batches:
+            await session_cache.seed_events(target_session, events, seq)
+        if prefix_entries:
+            await session_cache.append_recorded_events(
+                target_session, message_events, message_result
+            )
+            await session_cache.append_recorded_events(
+                target_session, snapshot_events, snapshot_result
+            )
+            await session_cache.store_prefix_snapshot(
+                target_session.session_id,
+                resolved_entries,
+                snapshot_seq=snapshot_result.last_seq,
+                snapshot_source=snapshot_source,
+            )
+        await session_cache.append_recorded_events(
+            target_session, [copy_completed], completed_result
+        )
+        last_seq = completed_result.last_seq
 
         logger.info(
             "session fork: copied source session into target session",
@@ -291,15 +340,11 @@ async def fork_session_events(
                 }
             },
         )
-        return True
+        return has_context
     except Exception as exc:
-        extra_data: dict[str, Any] = {"source_label": source_label}
-        if isinstance(exc, httpx.HTTPStatusError):
-            extra_data["response_status_code"] = exc.response.status_code
-            extra_data["response_body"] = exc.response.text[:1000]
         logger.warning(
             "session fork: failed to copy source session into target session",
-            extra={"extra_data": extra_data},
+            extra={"extra_data": {"source_label": source_label}},
             exc_info=True,
         )
-        return False
+        raise CanonicalHistoryUnavailable("Fork history could not be persisted completely") from exc

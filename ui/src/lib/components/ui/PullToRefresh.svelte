@@ -80,6 +80,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   bind:this={scroller}
+  data-pull-to-refresh-scroller
   class={`relative overflow-y-auto overscroll-contain touch-pan-y ${className}`}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}

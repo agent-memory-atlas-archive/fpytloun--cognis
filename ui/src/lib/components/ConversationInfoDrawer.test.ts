@@ -20,7 +20,8 @@ describe('ConversationInfoDrawer', () => {
     expect(screen.getByRole('heading', { name: 'Context' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Expand inspector' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Close conversation information' })).toBeNull();
-    expect(screen.getByTestId('conversation-info-drawer').className).toContain('bg-slate-950');
+    expect(screen.getByTestId('conversation-info-drawer')).toHaveClass('bg-transparent', 'border-l', 'border-slate-800/60');
+    expect(screen.getByTestId('conversation-info-drawer')).not.toHaveClass('bg-slate-950');
     expect(screen.getByRole('separator', { name: 'Resize conversation inspector' }))
       .toHaveClass('touch-resize-handle', 'touch-resize-handle--left');
   });

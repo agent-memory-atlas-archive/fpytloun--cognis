@@ -28,6 +28,7 @@ from cognis.api.chat_v2.event_store import (
     SessionEventStore,
     SessionWatermark,
 )
+from cognis.api.chat_v2.item_keys import KIND_RANK, runtime_timeline_sort_key
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
 from cognis.api.chat_v2.schemas import (
@@ -37,6 +38,7 @@ from cognis.api.chat_v2.schemas import (
     ChatViewOp,
     ConversationStateView,
     ConversationSummary,
+    MessageTimelineItem,
     QueueMessage,
     QueueState,
     ReplaceConversationOp,
@@ -58,11 +60,9 @@ from cognis.models.config import GenerationPerformanceSnapshot
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-# v3: assistant message timeline ids became phase-aware
-# (message:{id}:phase:{n}). Bumped so a client holding a pre-deploy cached view
-# (with unphased message:{id} items) forces a clean reset on its next sync
-# instead of mixing old and new ids under the same projection version.
-PROJECTION_VERSION = "chat-v2-projection-v3"
+# v5: legacy scheduler user admissions have a turn-scoped fallback identity.
+# Reset previously cached event-sequence IDs instead of retaining both copies.
+PROJECTION_VERSION = "chat-v2-projection-v5"
 _projection_version = PROJECTION_VERSION
 SNAPSHOT_SESSION_EVENT_LIMIT = 5_000
 SNAPSHOT_WINDOW_EVENT_LIMIT = 800
@@ -567,6 +567,7 @@ async def runtime_input_from_scheduler(
     *,
     conversation_id: str,
     scope_key: str | None = None,
+    scope_session_ids: Sequence[str] | None = None,
     active_session_id: str | None,
     turn_scheduler: Any,
     session_cache: Any = None,
@@ -600,6 +601,10 @@ async def runtime_input_from_scheduler(
         context = await durable_context(conversation_id)
         running = context.get("running")
         authority = context.get("authority")
+        pending_user_message = context.get("pending_user_message")
+        owner_session_id = (
+            context["session_id"] if "session_id" in context else (running or {}).get("session_id")
+        )
     else:
         durable_running = getattr(turn_scheduler, "durable_running_turn_state", None)
         running = (
@@ -608,7 +613,18 @@ async def runtime_input_from_scheduler(
             else turn_scheduler.running_turn_state(conversation_id)
         )
         authority = None
+        pending_user_message = None
+        owner_session_id = (running or {}).get("session_id")
     checkpoint = turn_scheduler.active_turn_checkpoint(conversation_id)
+    # The requested session is not evidence of turn ownership. Filter the whole
+    # projection, including unassigned admissions and terminal authority.
+    # Verified continuation predecessors belong to the same timeline: a turn
+    # admitted before compaction can execute in its successor.
+    if scope_session_ids is not None and owner_session_id not in scope_session_ids:
+        running = None
+        authority = None
+        pending_user_message = None
+        checkpoint = None
     active_turn: dict[str, Any] | None = None
     if running is not None:
         active_turn = {
@@ -635,12 +651,42 @@ async def runtime_input_from_scheduler(
                 else {}
             ),
         }
+    volatile_items: list[TimelineItem] = []
+    if isinstance(pending_user_message, dict):
+        request_id = str(pending_user_message.get("request_id") or "")
+        client_message_id = _str_or_none(pending_user_message.get("client_message_id"))
+        if request_id:
+            message_identity = client_message_id or request_id
+            message_id = (
+                f"client:{client_message_id}" if client_message_id else f"queue:{request_id}"
+            )
+            volatile_items.append(
+                MessageTimelineItem(
+                    id=f"user:{message_identity}",
+                    sort_key=runtime_timeline_sort_key(
+                        phase=0,
+                        kind_rank=KIND_RANK["user_message"],
+                        local=0,
+                    ),
+                    role="user",
+                    content=str(pending_user_message.get("content") or ""),
+                    message_id=message_id,
+                    client_message_id=client_message_id,
+                    turn_id=_str_or_none(pending_user_message.get("turn_id")),
+                    attachments=list(pending_user_message.get("attachments") or []),
+                    created_at=_str_or_none(pending_user_message.get("created_at")),
+                    updated_at=_str_or_none(pending_user_message.get("updated_at")),
+                    # Admission acknowledges delivery; stability waits for Intaris.
+                    status="complete",
+                    stable=False,
+                )
+            )
     return RuntimeOverlayInput(
         runtime_epoch=runtime_epoch_for(scope_key or f"conversation:{conversation_id}"),
         runtime_revision=1 if active_turn is not None else 0,
         active_turn=active_turn,
         authority=authority,
-        volatile_items=[],
+        volatile_items=volatile_items,
         volatile_items_complete=False,
         context_usage=context_usage,
         last_generation=last_generation,

@@ -4,6 +4,7 @@
   import type { TocItem } from './publication';
   import { nestTocItems } from './publication';
   import RichTocList from './RichTocList.svelte';
+  import ViewerIcon from './ViewerIcon.svelte';
 
   export let items: TocItem[] = [];
   export let onNavigate: (item: TocItem) => void;
@@ -15,6 +16,8 @@
   export let dismissibleSidebar = false;
   export let onClose: (() => void) | undefined = undefined;
   export let layout: 'auto' | 'sidebar' | 'drawer' = 'auto';
+  export let theme: 'light' | 'dark' | undefined = undefined;
+  export let documentRoot: (() => HTMLElement | undefined) | undefined = undefined;
 
   $: nodes = nestTocItems(items);
   let activeAnchor = '';
@@ -22,6 +25,28 @@
   let closeButton: HTMLButtonElement;
   let restoreFocus: HTMLElement | null = null;
   let observer: IntersectionObserver | null = null;
+  export let progress = 0;
+  let scrollFrame = 0;
+
+  function updateReadingPosition() {
+    scrollFrame = 0;
+    const scope = documentRoot?.();
+    if (!scope) return;
+    const bounds = scope.getBoundingClientRect();
+    const viewport = Math.min(window.innerHeight, scope.closest('.rich-full')?.clientHeight || window.innerHeight);
+    const distance = Math.max(0, bounds.height - viewport);
+    progress = distance ? Math.round(Math.min(1, Math.max(0, -bounds.top / distance)) * 100) : 100;
+    let current = items[0]?.anchor ?? '';
+    for (const item of items) {
+      const heading = scope.querySelector<HTMLElement>(`#${item.anchor}`);
+      if (heading && heading.getBoundingClientRect().top <= 120) current = item.anchor;
+    }
+    activeAnchor = current;
+  }
+
+  function schedulePosition() {
+    if (!scrollFrame) scrollFrame = requestAnimationFrame(updateReadingPosition);
+  }
   // "Narrow" covers everything up to a very large/wide screen, not just
   // phones -- tablets (including iPad Pro landscape) and typical laptop/
   // desktop windows all get the hamburger-triggered drawer instead of a
@@ -71,11 +96,13 @@
     if (closeInProgress || !open) return;
     closeInProgress = true;
     open = false;
+    onClose?.();
     await tick();
-    const target = restoreFocus;
+    const scope = documentRoot?.();
+    const target = scope?.querySelector<HTMLElement>('[aria-label="Open table of contents"]')
+      ?? (scope?.contains(restoreFocus) ? restoreFocus : null);
     restoreFocus = null;
     if (target?.isConnected) target.focus({ preventScroll: true });
-    onClose?.();
     closeInProgress = false;
   }
 
@@ -130,7 +157,7 @@
   onMount(() => {
     document.addEventListener('focusin', keepFocusInDrawer);
     if (typeof window.matchMedia === 'function') {
-      narrowQuery = window.matchMedia('(max-width: 1439.98px)');
+      narrowQuery = window.matchMedia('(max-width: 959.98px)');
       applyLayout(narrowQuery.matches);
       if (open && isNarrow) {
         restoreFocus ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -138,11 +165,13 @@
       }
       narrowChangeHandler = (event: MediaQueryListEvent) => {
         applyLayout(event.matches);
-        if (!isNarrow && open) void closeDrawer({ restoreTrigger: false });
       };
       narrowQuery.addEventListener('change', narrowChangeHandler);
     }
-    if ('IntersectionObserver' in window) {
+    document.addEventListener('scroll', schedulePosition, true);
+    window.addEventListener('resize', schedulePosition);
+    void tick().then(schedulePosition);
+    if (!documentRoot && 'IntersectionObserver' in window) {
       observer = new IntersectionObserver(
         (entries) => {
           const visible = entries.filter((entry) => entry.isIntersecting)
@@ -152,7 +181,7 @@
         { rootMargin: '-12% 0px -72% 0px', threshold: [0, 1] }
       );
       for (const item of items) {
-        const heading = document.getElementById(item.anchor);
+        const heading = panel?.closest('.rich-document')?.querySelector(`#${item.anchor}`);
         if (heading) observer.observe(heading);
       }
     }
@@ -164,6 +193,9 @@
 
   onDestroy(() => {
     observer?.disconnect();
+    document.removeEventListener('scroll', schedulePosition, true);
+    window.removeEventListener('resize', schedulePosition);
+    cancelAnimationFrame(scrollFrame);
     document.removeEventListener('focusin', keepFocusInDrawer);
     if (narrowQuery && narrowChangeHandler) {
       narrowQuery.removeEventListener('change', narrowChangeHandler);
@@ -176,8 +208,9 @@
         scroll-spy highlighted via activeAnchor (see RichTocList). -->
   <aside class="rich-toc" aria-label="Table of contents" data-testid="rich-deliverable-toc">
     {#if dismissibleSidebar}<header>
+      <strong>Contents</strong>
       <button type="button" aria-label="Close table of contents" on:click={() => void closeSidebar()}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+        <ViewerIcon name="collapse" />
       </button>
     </header>{/if}
     <nav aria-label="Table of contents">
@@ -197,7 +230,7 @@
        z-index. Without the portal, the drawer visibly mis-layers behind
        the app's own chrome (verified via rendered screenshots). -->
    {#if visible && open}
-    <div class="rich-toc-drawer-root" data-testid="rich-deliverable-toc" use:portal>
+    <div class="rich-toc-drawer-root" data-viewer-theme={theme} data-testid="rich-deliverable-toc" use:portal>
       <button
         class="rich-toc-backdrop"
         type="button"
@@ -237,9 +270,10 @@
 {/if}
 
 <style>
-  .rich-toc { position: sticky; top: .85rem; align-self: start; z-index: 2; min-width: 0; }
-  .rich-toc > header { display: flex; justify-content: flex-end; }
-  .rich-toc > header button { display: inline-grid; width: 2rem; height: 2rem; place-items: center; border: 0; border-radius: .45rem; background: transparent; color: var(--rich-muted); }
+  .rich-toc { position: sticky; top: 5rem; align-self: start; z-index: 2; min-width: 0; }
+  .rich-toc > header { display: flex; align-items: center; justify-content: space-between; color: var(--rich-muted); font-family: var(--rich-font-mono); font-size: .8rem; letter-spacing: .1em; }
+  .rich-toc > header button { display: inline-grid; width: 44px; height: 44px; place-items: center; border: 0; border-radius: .45rem; background: transparent; color: var(--rich-muted); }
+  progress { display: block; width: 100%; height: 3px; margin: .5rem 0 1rem; accent-color: var(--rich-accent); }
   .rich-toc > header button:hover, .rich-toc > header button:focus-visible { color: var(--rich-text); background: var(--rich-surface-raised); }
   nav { max-height: calc(100vh - 1.7rem); overflow: auto; border-left: 1px solid var(--rich-line); padding: .25rem 0 .25rem .65rem; }
   svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-linecap: round; stroke-width: 1.8; }

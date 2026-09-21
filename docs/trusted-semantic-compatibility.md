@@ -22,7 +22,9 @@ the same canonical rejection replays through the paired route.
 Neither outcome means that memory ingestion succeeded.
 The failure notice contains only a fixed explanation and the safe reason code.
 
-Terminal deterministic rows prevent reconciliation from recreating retry loops.
+Terminal deterministic rows prevent repeated producer handoffs from recreating
+retry loops. Auto-remember does not run historical reconciliation; see
+[HA background maintenance](development/ha-background-maintenance.md).
 Derived rows do not inherit retained source fields. Each failed trusted request
 retains its own source under the existing queue-row retention behavior.
 There is no automatic TTL for these terminal queue rows in the current code.

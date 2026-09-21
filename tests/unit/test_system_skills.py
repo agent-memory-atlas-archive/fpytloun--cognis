@@ -108,6 +108,21 @@ def test_coding_skill_assigns_conditional_review_and_evidence_ownership() -> Non
     assert "architect in coordinate mode" not in instructions.lower()
 
 
+def test_rich_deliverable_skill_links_validation_and_artifact_authoring_tools() -> None:
+    skill = get_system_skill_default("cognis-rich-deliverable")
+
+    assert skill is not None
+    assert {
+        "builtin:describe_tool",
+        "builtin:validate_tool_call",
+        "builtin:artifact_publish",
+        "builtin:write_deliverable",
+    } <= set(skill["linked_tool_ids"])
+    instructions = _normalized_instructions(skill)
+    assert "editable local JSON file" in instructions
+    assert "exact unchanged validated arguments" in instructions
+
+
 def test_coding_skill_defines_bounded_delivery_contract() -> None:
     skill = get_system_skill_default("cognis-coding")
 

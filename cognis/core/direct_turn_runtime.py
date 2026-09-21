@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from cognis.store.coordination import DatabaseLeaseStore, Lease
+from cognis.store.coordination import LEASE_RENEWAL_DELAY_SECONDS, DatabaseLeaseStore, Lease
 from cognis.store.direct_turns import (
     DirectTurnStatus,
     DirectTurnStore,
@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 class StaleDirectTurnOwner(RuntimeError):
     """Raised when a turn loses its distributed execution fence."""
+
+
+class LocalDirectTurnBusy(RuntimeError):
+    """Local cancellation cleanup still owns the conversation execution slot."""
 
 
 class UnboundToolDispatch(RuntimeError):
@@ -442,6 +446,27 @@ class DurableDirectTurnRuntime:
             await self._execute_claimed_turn(row, payload, fence)
         except StaleDirectTurnOwner:
             return
+        except LocalDirectTurnBusy:
+            current = await self.store.get(row.request_id)
+            current_outcome = (
+                current.outcome if current is not None and isinstance(current.outcome, dict) else {}
+            )
+            await self.store.mark_recoverable(
+                row.request_id,
+                lease=lease,
+                outcome={
+                    **current_outcome,
+                    "phase": "local_turn_busy",
+                },
+            )
+            self._retry_after[row.request_id] = (
+                asyncio.get_running_loop().time() + DIRECT_TURN_ACTIVE_POLL_SECONDS
+            )
+            asyncio.get_running_loop().call_later(
+                DIRECT_TURN_ACTIVE_POLL_SECONDS,
+                self._signal_wake,
+            )
+            retry_scheduled = True
         except PermanentDirectTurnPayloadError as exc:
             failed = await self.store.mark_terminal(
                 row.request_id,
@@ -604,8 +629,15 @@ class DurableDirectTurnRuntime:
         ownership_lost: asyncio.Event,
     ) -> None:
         current = lease
+        renew_interval = DIRECT_TURN_LEASE_SECONDS / 3
         while True:
-            await asyncio.sleep(DIRECT_TURN_LEASE_SECONDS / 3)
+            scheduled_at = asyncio.get_running_loop().time()
+            await asyncio.sleep(renew_interval)
+            # Lag between the intended and the actual wake-up is exactly the
+            # loop stall this lease is exposed to; export it for acceptance.
+            LEASE_RENEWAL_DELAY_SECONDS.labels(lease="direct_turn").observe(
+                max(0.0, asyncio.get_running_loop().time() - scheduled_at - renew_interval)
+            )
             try:
                 renewed = await self._lease_store.renew(
                     current,
@@ -636,7 +668,7 @@ class DurableDirectTurnRuntime:
         while True:
             await asyncio.sleep(DIRECT_TURN_CANCELLATION_POLL_SECONDS)
             try:
-                row = await self.store.get(request_id)
+                cancel_state = await self.store.get_cancel_state(request_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -645,7 +677,7 @@ class DurableDirectTurnRuntime:
                     extra={"request_id": request_id},
                 )
                 continue
-            if row is None or row.cancel_requested_at is None:
+            if cancel_state is None or cancel_state[1] is None:
                 continue
             if execution_task is not None and not execution_task.done():
                 execution_task.cancel()

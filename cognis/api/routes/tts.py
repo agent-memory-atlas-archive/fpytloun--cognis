@@ -12,7 +12,6 @@ metadata row — subsequent calls will re-synthesize.
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Request
@@ -51,11 +50,6 @@ _TTS_FORMAT_TO_EXTENSION: dict[str, str] = {
     "wav": ".wav",
     "pcm": ".pcm",
 }
-
-
-def _tts_cache_object_id(*, message_id: str, voice: str, model: str) -> str:
-    digest = hashlib.sha256(f"{message_id}|{voice}|{model}".encode()).hexdigest()[:32]
-    return f"tts_{digest}"
 
 
 @router.post("/synthesize", response_model=TtsSynthesizeResponse)
@@ -143,6 +137,10 @@ async def synthesize_tts(
                 voice=voice,
                 model=resolved_model,
             )
+            if cached is not None:
+                cached_artifact = await get_artifact_record(session, cached.artifact_id)
+                if cached_artifact is None or cached_artifact.status == "deleted":
+                    cached = None
         if cached is not None:
             # Verify the artifact still exists (defensive).
             exists = await artifact_store.async_exists(
@@ -177,12 +175,9 @@ async def synthesize_tts(
         raise api_exception(502, "tts_failed", f"TTS synthesis failed: {exc}") from exc
 
     extension = _TTS_FORMAT_TO_EXTENSION.get(response_format, ".bin")
-    if payload.message_id:
-        artifact_id = _tts_cache_object_id(
-            message_id=payload.message_id, voice=voice, model=result.model
-        )
-    else:
-        artifact_id = artifact_store.generate_id("tts")
+    # The cache key remains (message, voice, model), but each physical generation
+    # is immutable. Cleanup of an old generation cannot erase a concurrent save.
+    artifact_id = artifact_store.generate_id("tts")
     filename = f"speech{extension}"
 
     await artifact_store.async_save(
@@ -211,40 +206,20 @@ async def synthesize_tts(
                 duration_seconds=result.duration_seconds,
                 size_bytes=len(result.audio_bytes),
             )
-        # The artifact_id is deterministic when message_id is set, so a row
-        # for it may already exist (e.g. an earlier successful synthesize
-        # whose tts_cache row has since been pruned, or a partial write
-        # where the cache row failed but the artifact row committed).
-        # Update the existing row instead of inserting to avoid a
-        # UniqueViolation on artifacts_pkey.
-        existing_record = await get_artifact_record(session, artifact_id)
-        if existing_record is None:
-            await create_artifact_record(
-                session,
-                artifact_id=artifact_id,
-                namespace="tts",
-                object_id=artifact_id,
-                filename=filename,
-                owner_email=user.email,
-                purpose="tts",
-                kind=ArtifactKind.AUDIO.value,
-                mime_type=result.content_type,
-                size_bytes=len(result.audio_bytes),
-                status=record_status,
-                expires_at=record_expires_at,
-            )
-        else:
-            existing_record.namespace = "tts"
-            existing_record.object_id = artifact_id
-            existing_record.filename = filename
-            existing_record.owner_email = user.email
-            existing_record.purpose = "tts"
-            existing_record.kind = ArtifactKind.AUDIO.value
-            existing_record.mime_type = result.content_type
-            existing_record.size_bytes = len(result.audio_bytes)
-            existing_record.status = record_status
-            existing_record.expires_at = record_expires_at
-            existing_record.deleted_at = None
+        await create_artifact_record(
+            session,
+            artifact_id=artifact_id,
+            namespace="tts",
+            object_id=artifact_id,
+            filename=filename,
+            owner_email=user.email,
+            purpose="tts",
+            kind=ArtifactKind.AUDIO.value,
+            mime_type=result.content_type,
+            size_bytes=len(result.audio_bytes),
+            status=record_status,
+            expires_at=record_expires_at,
+        )
         await session.commit()
 
     signed_url = await artifact_store.async_get_public_url("tts", artifact_id, filename)

@@ -16,6 +16,7 @@ import httpcore
 import httpx
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
+from cognis.artifacts.preview import supports_artifact_view
 from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.content_refs import (
@@ -95,10 +96,6 @@ def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> in
         expires_at = expires_at.replace(tzinfo=UTC)
     remaining_seconds = int((expires_at - datetime.now(UTC)).total_seconds())
     return max(60, min(requested_ttl_seconds, remaining_seconds))
-
-
-def _is_html_content_type(content_type: str) -> bool:
-    return content_type.split(";", 1)[0].strip().lower() == "text/html"
 
 
 ARTIFACT_READ_TOOL = ToolDefinition(
@@ -286,7 +283,7 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
             "mode": {
                 "type": "string",
                 "enum": ["download", "view"],
-                "description": "URL serving mode. Default download serves files as attachments; view serves supported HTML artifacts inline.",
+                "description": "URL serving mode. Default download serves files as attachments; view opens the best supported artifact preview.",
             },
         },
         "required": ["artifact_id"],
@@ -805,9 +802,9 @@ async def _handle_artifact_get_url(
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
         await record_deliverable_access(session_factory, ref)
-        if mode == "view" and not _is_html_content_type(ref.mime_type):
+        if mode == "view" and not supports_artifact_view(ref.filename, ref.mime_type):
             return ToolResult(
-                output=f"Artifact view is only supported for HTML artifacts: {artifact_id}",
+                output=f"Artifact preview is not supported: {artifact_id}",
                 is_error=True,
             )
         try:
@@ -847,9 +844,9 @@ async def _handle_artifact_get_url(
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
     if row.owner_email and user_email and row.owner_email != user_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
-    if mode == "view" and not _is_html_content_type(str(row.mime_type)):
+    if mode == "view" and not supports_artifact_view(row.filename, str(row.mime_type)):
         return ToolResult(
-            output=f"Artifact view is only supported for HTML artifacts: {artifact_id}",
+            output=f"Artifact preview is not supported: {artifact_id}",
             is_error=True,
         )
 

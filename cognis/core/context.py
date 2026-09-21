@@ -46,6 +46,7 @@ from cognis.core.context_projection import (
     project_messages,
     projection_result_from_messages,
 )
+from cognis.core.cpu_offload import run_cpu_bound
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -1158,6 +1159,8 @@ class ContextAssembler:
         follow_up: FollowUpMetadata | None = None,
         routing_reminder: str | None = None,
         skip_user_message: bool = False,
+        required_turn_id: str | None = None,
+        require_user_event: bool = False,
         skip_memory: bool = False,
         prompt_context: PromptContext = PromptContext.CHAT,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
@@ -1218,6 +1221,8 @@ class ContextAssembler:
                 follow_up=follow_up,
                 routing_reminder=routing_reminder,
                 skip_user_message=skip_user_message,
+                required_turn_id=required_turn_id,
+                require_user_event=require_user_event,
                 prompt_context=prompt_context,
                 executor_environment=executor_environment,
                 workspace_root=workspace_root,
@@ -1335,7 +1340,11 @@ class ContextAssembler:
         if isinstance(cache_result, Exception):
             # Allow if we have a warm cache from a previous refresh
             cache_entry = self.session_cache.get_entry(session.session_id)
-            if cache_entry is None or not cache_entry.initialized:
+            if (
+                cache_entry is None
+                or not cache_entry.initialized
+                or getattr(cache_entry, "canonical_stale", False)
+            ):
                 logger.error(
                     "context: Intaris event refresh failed (mandatory provider, no cache)",
                     extra={"extra_data": {"session_id": session.session_id}},
@@ -1349,6 +1358,18 @@ class ContextAssembler:
             degraded_sources.append("events")
         else:
             cache_entry = cache_result
+
+        # Capture history and prefix together before any further provider await.
+        # A successful refresh is not a lease on the mutable cache.
+        context_snapshot = self.session_cache.get_context_snapshot(session.session_id)
+        context_snapshot.require_turn(
+            required_turn_id,
+            user_event=require_user_event,
+            profile_switch=skip_user_message,
+        )
+        prefix_entries = context_snapshot.prefix_entries
+        project_messages = self._project_context_messages(session.session_id)
+        pruned_call_ids = self._resolve_pruned_call_ids(session)
 
         # Intention is best-effort (non-critical)
         if isinstance(intention_result, Exception):
@@ -1508,32 +1529,19 @@ class ContextAssembler:
             ),
         )
         max_context_tokens = budget.max_context_tokens
-        immutable_prefix = self._compose_immutable_prefix(
+        max_prompt_tokens = budget.available_prompt_tokens
+        # Prefix composition and exact static counts are CPU-bound; run them
+        # off the loop so lease renewals and probes keep flowing.
+        immutable_prefix, system_prompt_tokens, tool_schema_tokens = await run_cpu_bound(
+            self._prepare_prefix_budget,
             agent=agent,
             prompt_context=prompt_context,
             prefix_entries=prefix_entries,
             resolved_model=resolved_model,
-            visible_tool_names={tool.name for tool in tool_definitions or []},
-        )
-        system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
-            resolved_model=resolved_model,
-            immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
             tool_schema_tokens_override=tool_schema_tokens_override,
+            max_prompt_tokens=max_prompt_tokens,
         )
-        max_prompt_tokens = budget.available_prompt_tokens
-        if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
-            immutable_prefix = self._cap_prefix_section(
-                immutable_prefix,
-                resolved_model,
-                max(0, max_prompt_tokens - tool_schema_tokens),
-            )
-            system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
-                resolved_model=resolved_model,
-                immutable_prefix=immutable_prefix,
-                tool_definitions=tool_definitions or [],
-                tool_schema_tokens_override=tool_schema_tokens_override,
-            )
         static_tokens = system_prompt_tokens + tool_schema_tokens
         dynamic_tokens = max(0, budget.available_prompt_tokens - static_tokens)
 
@@ -1544,7 +1552,7 @@ class ContextAssembler:
             messages.append({"role": "system", "content": immutable_prefix, IMMUTABLE_PREFIX: True})
 
         if include_project_context:
-            messages.extend(self._project_context_messages(session.session_id))
+            messages.extend(project_messages)
 
         # ----- Mutable suffix -----
 
@@ -1613,18 +1621,19 @@ class ContextAssembler:
         # History messages (append-only)
         prefix_event_seqs = {entry.seq for entry in prefix_entries if entry.seq > 0}
         prefix_event_sources = {entry.source for entry in prefix_entries}
+        history_events = [
+            event
+            for event in context_snapshot.events
+            if event.type in EVENT_TYPES_FOR_CONTEXT
+            and _event_seq(event) not in prefix_event_seqs
+            and _event_prefix_source(event) not in prefix_event_sources
+        ]
+        self._record_assembled_history(session, history_events, resolved_model)
         history_messages = await self._events_to_messages(
-            [
-                event
-                for event in self.session_cache.get_events_since_compaction(
-                    session.session_id, EVENT_TYPES_FOR_CONTEXT
-                )
-                if _event_seq(event) not in prefix_event_seqs
-                and _event_prefix_source(event) not in prefix_event_sources
-            ],
+            history_events,
             model_info=model_info,
             owner_email=session.user_email,
-            pruned_call_ids=self._resolve_pruned_call_ids(session),
+            pruned_call_ids=pruned_call_ids,
             disabled_artifact_urls=disabled_artifact_urls,
             disabled_artifact_ids=disabled_artifact_ids,
         )
@@ -1861,33 +1870,24 @@ class ContextAssembler:
             active_executor_id=active_executor_id,
         )
 
-        messages, projection = self._project_cross_turn_messages(
+        # Cross-turn projection, pruning and the exact prompt count are
+        # CPU-bound over the whole transcript; run them off the loop. The
+        # worker owns ``messages`` from here on and returns the final list.
+        (
+            messages,
+            projection,
+            projection_compacted_anchors,
+            audit_messages,
+            cache_breakpoint_index,
+            prompt_tokens,
+        ) = await run_cpu_bound(
+            self._finalize_assembled_messages,
             messages=messages,
             resolved_model=resolved_model,
             max_context_tokens=max_context_tokens,
             available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
-        )
-        projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
-
-        audit_messages = self._collect_audit_messages(messages)
-
-        # Recompute cache breakpoint after pruning while internal markers are still present.
-        cache_breakpoint_index = _find_cache_breakpoint(messages)
-
-        # Strip internal markers before returning to the agent loop.  Keep the
-        # turn-boundary marker in-memory so the loop can compute moving provider
-        # cache breakpoints on the projected transcript; the provider-facing
-        # projection strips it before the request is sent.
-        for msg in messages:
-            for _marker in ALL_INTERNAL_MARKERS:
-                if _marker == TURN_BOUNDARY:
-                    continue
-                msg.pop(_marker, None)
-
-        prompt_tokens = (
-            self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
         recommend_compaction = (
             budget.available_prompt_tokens > 0
@@ -1951,6 +1951,8 @@ class ContextAssembler:
         follow_up: FollowUpMetadata | None = None,
         routing_reminder: str | None = None,
         skip_user_message: bool = False,
+        required_turn_id: str | None = None,
+        require_user_event: bool = False,
         prompt_context: PromptContext = PromptContext.TASK_STEP,
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
         workspace_root: str | None = None,
@@ -1983,7 +1985,11 @@ class ContextAssembler:
             cache_result = exc
         if isinstance(cache_result, Exception):
             cache_entry = self.session_cache.get_entry(session.session_id)
-            if cache_entry is None or not cache_entry.initialized:
+            if (
+                cache_entry is None
+                or not cache_entry.initialized
+                or getattr(cache_entry, "canonical_stale", False)
+            ):
                 raise cache_result
             degraded_sources.append("events")
         else:
@@ -2061,32 +2067,28 @@ class ContextAssembler:
             allow_empty_memory=True,
             memory_policy=memory_policy,
         )
-        immutable_prefix = self._compose_immutable_prefix(
+        context_snapshot = self.session_cache.get_context_snapshot(session.session_id)
+        context_snapshot.require_turn(
+            required_turn_id,
+            user_event=require_user_event,
+            profile_switch=skip_user_message,
+        )
+        prefix_entries = context_snapshot.prefix_entries
+        project_messages = self._project_context_messages(session.session_id)
+        pruned_call_ids = self._resolve_pruned_call_ids(session)
+        max_prompt_tokens = budget.available_prompt_tokens
+        # Prefix composition and exact static counts are CPU-bound; run them
+        # off the loop so lease renewals and probes keep flowing.
+        immutable_prefix, system_prompt_tokens, tool_schema_tokens = await run_cpu_bound(
+            self._prepare_prefix_budget,
             agent=agent,
             prompt_context=prompt_context,
             prefix_entries=prefix_entries,
             resolved_model=resolved_model,
-            visible_tool_names={tool.name for tool in tool_definitions or []},
-        )
-        system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
-            resolved_model=resolved_model,
-            immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
             tool_schema_tokens_override=tool_schema_tokens_override,
+            max_prompt_tokens=max_prompt_tokens,
         )
-        max_prompt_tokens = budget.available_prompt_tokens
-        if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
-            immutable_prefix = self._cap_prefix_section(
-                immutable_prefix,
-                resolved_model,
-                max(0, max_prompt_tokens - tool_schema_tokens),
-            )
-            system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
-                resolved_model=resolved_model,
-                immutable_prefix=immutable_prefix,
-                tool_definitions=tool_definitions or [],
-                tool_schema_tokens_override=tool_schema_tokens_override,
-            )
         static_tokens = system_prompt_tokens + tool_schema_tokens
         dynamic_tokens = max(0, budget.available_prompt_tokens - static_tokens)
 
@@ -2097,7 +2099,7 @@ class ContextAssembler:
             messages.append({"role": "system", "content": immutable_prefix, IMMUTABLE_PREFIX: True})
 
         if include_project_context:
-            messages.extend(self._project_context_messages(session.session_id))
+            messages.extend(project_messages)
 
         messages.append(
             {
@@ -2163,18 +2165,19 @@ class ContextAssembler:
 
         prefix_event_seqs = {entry.seq for entry in prefix_entries if entry.seq > 0}
         prefix_event_sources = {entry.source for entry in prefix_entries}
+        history_events = [
+            event
+            for event in context_snapshot.events
+            if event.type in EVENT_TYPES_FOR_CONTEXT
+            and _event_seq(event) not in prefix_event_seqs
+            and _event_prefix_source(event) not in prefix_event_sources
+        ]
+        self._record_assembled_history(session, history_events, resolved_model)
         history_messages = await self._events_to_messages(
-            [
-                event
-                for event in self.session_cache.get_events_since_compaction(
-                    session.session_id, EVENT_TYPES_FOR_CONTEXT
-                )
-                if _event_seq(event) not in prefix_event_seqs
-                and _event_prefix_source(event) not in prefix_event_sources
-            ],
+            history_events,
             model_info=model_info,
             owner_email=session.user_email,
-            pruned_call_ids=self._resolve_pruned_call_ids(session),
+            pruned_call_ids=pruned_call_ids,
             disabled_artifact_urls=disabled_artifact_urls,
             disabled_artifact_ids=disabled_artifact_ids,
         )
@@ -2359,26 +2362,24 @@ class ContextAssembler:
             active_executor_id=active_executor_id,
         )
 
-        messages, projection = self._project_cross_turn_messages(
+        # Cross-turn projection, pruning and the exact prompt count are
+        # CPU-bound over the whole transcript; run them off the loop. The
+        # worker owns ``messages`` from here on and returns the final list.
+        (
+            messages,
+            projection,
+            projection_compacted_anchors,
+            audit_messages,
+            cache_breakpoint_index,
+            prompt_tokens,
+        ) = await run_cpu_bound(
+            self._finalize_assembled_messages,
             messages=messages,
             resolved_model=resolved_model,
             max_context_tokens=max_context_tokens,
             available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
-        )
-        projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
-
-        audit_messages = self._collect_audit_messages(messages)
-        cache_breakpoint_index = _find_cache_breakpoint(messages)
-
-        for msg in messages:
-            for _marker in ALL_INTERNAL_MARKERS:
-                if _marker == TURN_BOUNDARY:
-                    continue
-                msg.pop(_marker, None)
-        prompt_tokens = (
-            self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
         recommend_compaction = (
             budget.available_prompt_tokens > 0
@@ -3233,6 +3234,128 @@ class ContextAssembler:
             hydrated_events.append(next_event)
         return hydrated_events
 
+    def _record_assembled_history(
+        self,
+        session: SessionModel,
+        events: list[Any],
+        resolved_model: str,
+    ) -> None:
+        """Feed the cache's history-shrink diagnostic (no-op for caches without it)."""
+
+        record = getattr(self.session_cache, "record_assembled_history", None)
+        if not callable(record):
+            return
+        identity_fn = getattr(self.llm, "token_estimator_identity", None)
+        identity = str(identity_fn(resolved_model)) if callable(identity_fn) else None
+        try:
+            record(session.session_id, events, estimator_identity=identity)
+        except Exception:
+            logger.debug("context: history diagnostic failed", exc_info=True)
+
+    def _prepare_prefix_budget(
+        self,
+        *,
+        agent: AgentDefinition,
+        prompt_context: PromptContext,
+        prefix_entries: list[ImmutablePrefixEntry],
+        resolved_model: str,
+        tool_definitions: list[ToolDefinition],
+        tool_schema_tokens_override: int | None,
+        max_prompt_tokens: int,
+    ) -> tuple[str | None, int, int]:
+        """Compose the immutable prefix and count static tokens (sync, CPU-bound).
+
+        Runs on a worker thread via ``run_cpu_bound``; it only touches its
+        arguments and the tokenizer.
+        """
+
+        immutable_prefix = self._compose_immutable_prefix(
+            agent=agent,
+            prompt_context=prompt_context,
+            prefix_entries=prefix_entries,
+            resolved_model=resolved_model,
+            visible_tool_names={tool.name for tool in tool_definitions},
+        )
+        system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
+            resolved_model=resolved_model,
+            immutable_prefix=immutable_prefix,
+            tool_definitions=tool_definitions,
+            tool_schema_tokens_override=tool_schema_tokens_override,
+        )
+        if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
+            immutable_prefix = self._cap_prefix_section(
+                immutable_prefix,
+                resolved_model,
+                max(0, max_prompt_tokens - tool_schema_tokens),
+            )
+            system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
+                resolved_model=resolved_model,
+                immutable_prefix=immutable_prefix,
+                tool_definitions=tool_definitions,
+                tool_schema_tokens_override=tool_schema_tokens_override,
+            )
+        return immutable_prefix, system_prompt_tokens, tool_schema_tokens
+
+    def _finalize_assembled_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        resolved_model: str,
+        max_context_tokens: int,
+        available_prompt_tokens: int,
+        max_prompt_tokens: int,
+        tool_schema_tokens: int,
+    ) -> tuple[
+        list[dict[str, Any]],
+        ProjectionResult,
+        list[str],
+        list[dict[str, Any]],
+        int | None,
+        int,
+    ]:
+        """Project, prune, strip markers and count the final prompt (sync, CPU-bound).
+
+        Runs on a worker thread via ``run_cpu_bound``. The caller hands over
+        ``messages`` and must not touch it until this returns.
+        """
+
+        messages, projection = self._project_cross_turn_messages(
+            messages=messages,
+            resolved_model=resolved_model,
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=available_prompt_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            tool_schema_tokens=tool_schema_tokens,
+        )
+        projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
+
+        audit_messages = self._collect_audit_messages(messages)
+
+        # Recompute cache breakpoint after pruning while internal markers are still present.
+        cache_breakpoint_index = _find_cache_breakpoint(messages)
+
+        # Strip internal markers before returning to the agent loop.  Keep the
+        # turn-boundary marker in-memory so the loop can compute moving provider
+        # cache breakpoints on the projected transcript; the provider-facing
+        # projection strips it before the request is sent.
+        for msg in messages:
+            for _marker in ALL_INTERNAL_MARKERS:
+                if _marker == TURN_BOUNDARY:
+                    continue
+                msg.pop(_marker, None)
+
+        prompt_tokens = (
+            self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
+        )
+        return (
+            messages,
+            projection,
+            projection_compacted_anchors,
+            audit_messages,
+            cache_breakpoint_index,
+            prompt_tokens,
+        )
+
     def _project_cross_turn_messages(
         self,
         *,
@@ -3468,7 +3591,14 @@ def events_to_messages(
     native_open_tool_call_ids: set[str] = set()
     native_tool_batch_by_call_id: dict[str, set[str]] = {}
 
-    normalized_events = list(events)
+    from cognis.core.history_replay import (
+        defer_tool_batch_notices,
+        interrupted_batch_evidence,
+        is_model_history_event,
+        recorded_tool_output,
+    )
+
+    normalized_events = [event for event in events if is_model_history_event(event)]
     seen_call_ids: set[tuple[Any, Any, Any]] = set()
 
     def _tool_identity(item: Any) -> tuple[Any, Any, Any] | None:
@@ -3592,15 +3722,32 @@ def events_to_messages(
             messages.append(message)
 
     def _discard_native_tool_batch(call_id: str) -> None:
-        """Remove one incomplete native turn instead of inventing tool results."""
+        """Replace an incomplete native turn with explicitly uncertain evidence."""
 
         discarded_call_ids = native_tool_batch_by_call_id.get(call_id, {call_id})
+        logger.warning(
+            "context: discarding incomplete native tool batch during history replay",
+            extra={
+                "extra_data": {
+                    "call_ids": sorted(discarded_call_ids),
+                    "reason": "unresolved_at_history_boundary",
+                    "canonical_result_call_ids": sorted(
+                        {
+                            identity[1]
+                            for kind, identity in canonical_tool_events
+                            if kind == "tool_result" and identity[1] in discarded_call_ids
+                        }
+                    ),
+                }
+            },
+        )
         native_open_tool_call_ids.difference_update(discarded_call_ids)
         for discarded_id in discarded_call_ids:
             native_tool_batch_by_call_id.pop(discarded_id, None)
         open_tool_call_ids[:] = [
             open_id for open_id in open_tool_call_ids if open_id not in discarded_call_ids
         ]
+        evidence = interrupted_batch_evidence(discarded_call_ids, messages)
         retained: list[dict[str, Any]] = []
         for message in messages:
             if (
@@ -3612,11 +3759,14 @@ def events_to_messages(
                     for tool_call in message["tool_calls"]
                 )
             ):
+                if message.get("content"):
+                    retained.append({"role": "assistant", "content": message["content"]})
                 continue
             if message.get("role") == "tool" and message.get("tool_call_id") in discarded_call_ids:
                 continue
             retained.append(message)
         messages[:] = retained
+        messages.append(evidence)
 
     def _append_orphan_placeholders() -> None:
         """Close unresolved tool calls with synthetic tool messages."""
@@ -3628,15 +3778,28 @@ def events_to_messages(
             if tc_id in native_open_tool_call_ids:
                 _discard_native_tool_batch(tc_id)
                 continue
-            messages.append(
+            # A later tool batch may already have been replayed before a
+            # history boundary exposes this orphan. Keep the uncertainty
+            # marker with its owning batch, not after the later assistant.
+            owner = next(
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") == "assistant"
+                and any(call.get("id") == tc_id for call in message.get("tool_calls", []))
+            )
+            insert_at = owner + 1
+            while insert_at < len(messages) and messages[insert_at].get("role") == "tool":
+                insert_at += 1
+            messages.insert(
+                insert_at,
                 {
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "content": "[No result recorded - step may have been interrupted]",
-                }
+                },
             )
 
-    for event in normalized_events:
+    for event in defer_tool_batch_notices(normalized_events):
         if isinstance(event, dict):
             event_type = str(event.get("type", ""))
             event_data: dict[str, Any] = event.get("data", {})
@@ -3798,7 +3961,7 @@ def events_to_messages(
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";
             # fall back to "output" for forward-compatibility.
-            output = event_data.get("result") or event_data.get("output")
+            output = recorded_tool_output(event_data)
             call_id = event_data.get("call_id", "")
             if isinstance(output, str) and call_id in open_tool_call_ids:
                 open_tool_call_ids.remove(call_id)

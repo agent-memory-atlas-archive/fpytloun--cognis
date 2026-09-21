@@ -448,7 +448,15 @@ def apply_persisted_classifications(
             str(getattr(row, "status", "")) != "ready"
             or _validate_profile_group(tool, stored_profile_group, capabilities) is not None
         ):
-            overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
+            overlaid.append(
+                tool.model_copy(
+                    update={
+                        "classification_status": (
+                            "failed" if str(getattr(row, "status", "")) == "failed" else "pending"
+                        )
+                    }
+                )
+            )
             continue
         overlaid.append(
             tool.model_copy(
@@ -514,7 +522,6 @@ async def llm_classification_outcomes(
     *,
     llm: Any,
     acting_user_email: str | None = None,
-    allow_soft_profile_group_mismatch_for: set[str] | None = None,
     retry_context: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Return accepted tool classifications and per-tool rejection reasons."""
@@ -523,7 +530,6 @@ async def llm_classification_outcomes(
         tools,
         llm=llm,
         acting_user_email=acting_user_email,
-        allow_soft_profile_group_mismatch_for=allow_soft_profile_group_mismatch_for,
         retry_context=retry_context,
     )
 
@@ -670,13 +676,11 @@ async def _classify_with_llm(
     *,
     llm: Any,
     acting_user_email: str | None = None,
-    allow_soft_profile_group_mismatch_for: set[str] | None = None,
     retry_context: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     uncached: list[tuple[str, ToolDefinition, str]] = []
     cached_results: dict[str, dict[str, Any]] = {}
     rejected: dict[str, str] = {}
-    allow_soft_profile_group_mismatch_for = allow_soft_profile_group_mismatch_for or set()
     retry_context = retry_context or {}
     async with _CACHE_LOCK:
         for tool in tools:
@@ -725,8 +729,7 @@ async def _classify_with_llm(
                                 {
                                     "previous_rejection": retry_context[tool_id],
                                     "retry_instruction": (
-                                        "Reconsider the prior profile_group disagreement. "
-                                        "Deterministic keyword hints are advisory for profile groups; "
+                                        "Correct the prior invalid classification. "
                                         "return your best valid profile_group and capabilities."
                                     ),
                                 }
@@ -843,21 +846,6 @@ async def _classify_with_llm(
             capabilities,
         )
         if error is not None:
-            if (
-                tool_id in allow_soft_profile_group_mismatch_for
-                and _is_soft_profile_group_validation_error(error)
-            ):
-                logger.info(
-                    "Accepting retried LLM tool classification despite heuristic profile-group mismatch",
-                    extra={"extra_data": {"tool_id": tool_id, "prior_reason": error}},
-                )
-                results_by_id[tool_id] = normalized
-                matched_cache_key = next(
-                    (key for candidate_id, _tool, key in uncached if candidate_id == tool_id), None
-                )
-                if matched_cache_key is not None:
-                    to_cache[matched_cache_key] = normalized
-                continue
             logger.warning(
                 "Rejected LLM tool classification",
                 extra={"extra_data": {"tool_id": tool_id, "reason": error}},
@@ -877,20 +865,6 @@ async def _classify_with_llm(
         if tool_id not in results_by_id and tool_id not in rejected:
             rejected[tool_id] = "no_classification_result"
     return results_by_id, rejected
-
-
-def _is_soft_profile_group_validation_error(error: str) -> bool:
-    """Return true when the LLM profile group should win after one corrective retry."""
-
-    return error in {
-        "browser_tool_misclassified",
-        "browser_group_without_browser_signal",
-        "web_group_for_browser_tool",
-        "communication_tool_misclassified",
-        "office_tool_misclassified",
-        "personal_tool_misclassified",
-        "web_group_without_web_signal",
-    }
 
 
 def _normalize_capabilities(value: Any) -> list[ToolCapability]:
@@ -932,6 +906,7 @@ def _validate_profile_group(
     profile_group: str,
     capabilities: list[ToolCapability],
 ) -> str | None:
+    """Validate the contract consistently; keyword group hints are advisory."""
     normalized_group = profile_group.strip().lower()
     if normalized_group not in AUTO_PROFILE_GROUPS:
         if normalized_group in RESERVED_PROFILE_GROUPS:
@@ -953,28 +928,6 @@ def _validate_profile_group(
         return "unknown_profile_group"
     if not capabilities:
         return "missing_capabilities"
-    if tool is None:
-        return None
-    haystack = _tool_haystack(tool)
-    is_browser = _contains_any(haystack, _BROWSER_HINTS)
-    is_communication = _contains_any(haystack, _COMMUNICATION_HINTS)
-    is_office = _contains_any(haystack, _OFFICE_HINTS)
-    is_personal = _contains_any(haystack, _PERSONAL_HINTS)
-    is_web = _contains_any(haystack, _WEB_HINTS)
-    if is_browser and normalized_group != "browser":
-        return "browser_tool_misclassified"
-    if normalized_group == "browser" and not is_browser:
-        return "browser_group_without_browser_signal"
-    if normalized_group == "web" and is_browser:
-        return "web_group_for_browser_tool"
-    if is_communication and not is_office and normalized_group != "communication":
-        return "communication_tool_misclassified"
-    if is_office and normalized_group not in {"office", "communication"}:
-        return "office_tool_misclassified"
-    if is_personal and normalized_group != "personal":
-        return "personal_tool_misclassified"
-    if normalized_group == "web" and not (is_web or tool.read_only):
-        return "web_group_without_web_signal"
     return None
 
 

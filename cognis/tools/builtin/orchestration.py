@@ -2055,7 +2055,10 @@ def orchestration_target_tool_available(
         return True
     if tool.name == DELEGATE_TOOL.name:
         return bool(snapshot.delegate)
-    if tool.name == AGENT_CONVERSATION_CREATE_TOOL.name:
+    if tool.name in {
+        AGENT_CONVERSATION_CREATE_TOOL.name,
+        AGENT_CONVERSATION_FORK_TOOL.name,
+    }:
         return bool(snapshot.managed)
     return True
 

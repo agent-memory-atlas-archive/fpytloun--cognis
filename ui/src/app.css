@@ -43,7 +43,8 @@
   --app-visual-viewport-offset-top: 0px;
   --app-safe-area-top: env(safe-area-inset-top, 0px);
   --app-bottom-inset: 0px;
-  --app-bottom-chrome-bg: #07111a;
+  --app-chrome-bg: #07111a;
+  --app-bottom-chrome-bg: var(--app-chrome-bg);
   /* Browser/desktop fallback. Installed display modes override this below with
      a larger optical gutter that keeps controls inside rounded screen edges. */
   --app-bottom-comfort-inset: 0.5rem;
@@ -93,7 +94,7 @@
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-  background: #07111a;
+  background: var(--app-chrome-bg);
 }
 
 /*
@@ -616,8 +617,9 @@ textarea:focus-visible,
 .app-shell-viewport {
   /* Keep decorative blue highlights inside the app viewport only. Body/html
      stay flat gray so any iOS keyboard or rounded-corner exposure is not blue. */
-  background-color: #07111a;
+  background-color: var(--app-chrome-bg);
   background-image:
+    linear-gradient(180deg, var(--app-chrome-bg) 0px, var(--app-chrome-bg) 64px, rgb(7 17 26 / 0) 160px),
     radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.12), transparent 32%),
     radial-gradient(circle at 88% 8%, rgb(6 182 212 / 0.08), transparent 30%),
     linear-gradient(180deg, var(--theme-obsidian) 0%, var(--theme-void) 54%, #0f1719 100%);
@@ -670,8 +672,11 @@ textarea:focus-visible,
   }
 }
 
-.chat-header-shell {
-  background: #020617;
+.chat-header-shell,
+.app-keyboard-stable-header {
+  /* Translated headers overlap messages while the keyboard is open. Keep
+     their paint opaque and identical to the system chrome in every state. */
+  background: var(--app-chrome-bg);
 }
 
 @media (any-pointer: coarse) {

@@ -7,10 +7,15 @@ import contextlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import sqlalchemy as sa
+
+from cognis.core.maintenance_lease import run_periodic_maintenance
 from cognis.logging import get_logger
+from cognis.store.coordination import DatabaseLeaseStore
+from cognis.store.models import ArtifactRecordRow, TtsCacheRow
 from cognis.store.queries import (
+    claim_artifact_cleanup,
     delete_artifact_record,
-    delete_expired_tts_cache_entries,
     get_setting_value,
     list_expired_temporary_artifacts,
     list_orphaned_attached_artifacts,
@@ -31,12 +36,14 @@ class ArtifactMaintenanceService:
         session_factory: Any,
         artifact_store: Any,
         interval_seconds: int = 300,
+        lease_store: DatabaseLeaseStore | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._artifact_store = artifact_store
         self._interval_seconds = interval_seconds
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._lease_store = lease_store
 
     async def start(self) -> None:
         if self._task is not None:
@@ -57,52 +64,102 @@ class ArtifactMaintenanceService:
         async with self._session_factory() as session:
             expired = await list_expired_temporary_artifacts(session, now=now)
             orphaned = await list_orphaned_attached_artifacts(session)
+            for row in [*expired, *orphaned]:
+                await claim_artifact_cleanup(session, row, now=now)
 
-            for row in expired:
-                await self._artifact_store.async_delete_object(row.namespace, row.object_id)
-                await delete_artifact_record(session, row.artifact_id)
-
-            for row in orphaned:
-                await self._artifact_store.async_delete_object(row.namespace, row.object_id)
-                await delete_artifact_record(session, row.artifact_id)
-
-            # TTS cache TTL prune. Deletes expired tts_cache rows AND the
-            # corresponding artifact_records row + storage bytes so a future
-            # re-synthesize for the same (message, voice, model) tuple does
-            # not collide on the deterministic artifact_id.
+            # Tombstone physical generations; cache entries remain readable only
+            # while their artifact is live. New syntheses use new object IDs.
             ttl_days = await _resolve_tts_ttl_days(session)
             tts_cutoff = now - timedelta(days=ttl_days)
-            tts_expired = await delete_expired_tts_cache_entries(session, older_than=tts_cutoff)
-            for tts_row in tts_expired:
-                with contextlib.suppress(Exception):
-                    await self._artifact_store.async_delete_object("tts", tts_row.artifact_id)
-                with contextlib.suppress(Exception):
-                    await delete_artifact_record(session, tts_row.artifact_id)
-
+            tts_ids = list(
+                (
+                    await session.scalars(
+                        sa.select(TtsCacheRow.artifact_id)
+                        .where(TtsCacheRow.created_at < tts_cutoff)
+                        .limit(200)
+                    )
+                ).all()
+            )
+            if tts_ids:
+                await session.execute(
+                    sa.update(ArtifactRecordRow)
+                    .where(
+                        ArtifactRecordRow.artifact_id.in_(tts_ids),
+                        ArtifactRecordRow.namespace == "tts",
+                    )
+                    .values(status="deleted", deleted_at=now, updated_at=now)
+                )
+            # A replaced cache entry can leave its old immutable generation.
+            # Retire such objects after the same TTL, without another sweeper.
+            orphan_tts = (
+                sa.select(ArtifactRecordRow.artifact_id)
+                .where(
+                    ArtifactRecordRow.namespace == "tts",
+                    ArtifactRecordRow.status != "deleted",
+                    ArtifactRecordRow.updated_at < tts_cutoff,
+                    ~sa.exists(
+                        sa.select(TtsCacheRow.artifact_id).where(
+                            TtsCacheRow.artifact_id == ArtifactRecordRow.artifact_id
+                        )
+                    ),
+                )
+                .limit(200)
+            )
+            await session.execute(
+                sa.update(ArtifactRecordRow)
+                .where(ArtifactRecordRow.artifact_id.in_(orphan_tts))
+                .values(status="deleted", deleted_at=now, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
             await session.commit()
-
-        if expired or orphaned or tts_expired:
+            pending = list(
+                (
+                    await session.scalars(
+                        sa.select(ArtifactRecordRow)
+                        .where(ArtifactRecordRow.status == "deleted")
+                        .order_by(ArtifactRecordRow.updated_at)
+                        .limit(600)
+                    )
+                ).all()
+            )
+        deleted = 0
+        for row in pending:
+            try:
+                await self._artifact_store.async_delete_object(row.namespace, row.object_id)
+            except Exception:
+                logger.warning(
+                    "Artifact storage cleanup failed",
+                    extra={"artifact_id": row.artifact_id},
+                    exc_info=True,
+                )
+                continue
+            async with self._session_factory() as session:
+                await session.execute(
+                    sa.delete(TtsCacheRow).where(TtsCacheRow.artifact_id == row.artifact_id)
+                )
+                await delete_artifact_record(session, row.artifact_id)
+                await session.commit()
+            deleted += 1
+        if deleted:
             logger.info(
                 "artifact maintenance completed",
                 extra={
                     "extra_data": {
                         "expired_deleted": len(expired),
                         "orphan_candidates": len(orphaned),
-                        "tts_cache_pruned": len(tts_expired),
+                        "deleted": deleted,
                     }
                 },
             )
 
     async def _run_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await self.run_once()
-            except Exception:
-                logger.warning("artifact maintenance failed", exc_info=True)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._interval_seconds)
-            except TimeoutError:
-                continue
+        await run_periodic_maintenance(
+            self.run_once,
+            stop=self._stop,
+            interval_seconds=self._interval_seconds,
+            resource_key="maintenance:artifacts",
+            lease_store=self._lease_store,
+        )
 
 
 async def _resolve_tts_ttl_days(session: Any) -> int:

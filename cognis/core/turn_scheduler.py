@@ -28,7 +28,8 @@ import json
 import re
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -67,6 +68,7 @@ from cognis.core.controller_runtime import ControllerLifecycleState, ControllerR
 from cognis.core.direct_turn_runtime import (
     DirectTurnExecutionFence,
     DurableDirectTurnRuntime,
+    LocalDirectTurnBusy,
     PermanentDirectTurnControllerError,
     StaleDirectTurnOwner,
     ToolRecoveryPersistenceError,
@@ -104,6 +106,12 @@ from cognis.core.managed_conversations import (
     ManagedConversationTurnObserver,
 )
 from cognis.core.message_envelope import message_metadata
+from cognis.core.observability import (
+    Attribution,
+    record_attributed_turn,
+    reset_attribution,
+    set_attribution,
+)
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
@@ -281,6 +289,11 @@ FOLLOW_UP_DEDUPE_TOTAL = Counter(
     "cognis_follow_up_dedupe_total",
     "Suppressed duplicate follow-up turn requests",
     ["reason"],
+)
+FOLLOW_UP_FENCE_RECONCILIATIONS_TOTAL = Counter(
+    "cognis_follow_up_fence_reconciliations_total",
+    "Missing durable follow-up fences reconciled without replay.",
+    ["outcome"],
 )
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1119,55 @@ def _recovered_question_tool_result_event(
     )
 
 
+@asynccontextmanager
+async def _direct_turn_tenant_scope(
+    session_factory: Any,
+    row: DirectTurnRequestRow,
+) -> AsyncIterator[None]:
+    """Bind a durable request's tenant to the runtime context.
+
+    Takeover recovery and permanent-failure handling run from background loops
+    with no request context, so Intaris calls fell back to the system tenant
+    and 404'd on streams that exist. Every direct-turn path that can reach
+    Intaris runs under the request row's user and agent.
+    """
+
+    agent_id = getattr(row, "agent_id", None)
+    user_email = getattr(row, "user_id", None)
+    if not isinstance(agent_id, str) or not isinstance(user_email, str):
+        # Test doubles and legacy rows without tenant fields: nothing to bind.
+        yield
+        return
+    agent_owner_email: str | None = None
+    if session_factory is not None:
+        try:
+            async with session_factory() as db_session:
+                agent = await queries.get_agent(db_session, agent_id)
+        except Exception:
+            logger.warning(
+                "turn_scheduler: agent lookup failed while binding tenant context",
+                extra={
+                    "extra_data": {
+                        "agent_id": agent_id,
+                        "request_id": getattr(row, "request_id", None),
+                    }
+                },
+                exc_info=True,
+            )
+            agent = None
+        if agent is not None:
+            agent_owner_email = agent.owner_email
+    if agent_owner_email is None:
+        system_agent = SYSTEM_AGENTS.get(agent_id)
+        agent_owner_email = system_agent.owner_email if system_agent is not None else user_email
+    with scoped_runtime_context(
+        user_email=user_email,
+        agent_id=agent_id,
+        agent_owner_email=agent_owner_email,
+    ):
+        yield
+
+
 class TurnScheduler:
     """Transport-agnostic turn orchestration.
 
@@ -1783,6 +1845,9 @@ class TurnScheduler:
                 )
                 self._active_tool_outputs[key] = snapshot
             snapshot.arguments = dict(arguments)
+            snapshot.assistant_phase_index = self._assistant_phase_for_tool(
+                conversation_id, turn_id, call_id
+            )
             snapshot.turn_cycle_index = effective_turn_cycle_index
             snapshot.updated_at = _utcnow()
         await self._persist_active_tool_output_l2(conversation_id)
@@ -1823,8 +1888,10 @@ class TurnScheduler:
                 conversation_id, turn_id, call_id
             )
             snapshot.turn_cycle_index = effective_turn_cycle_index
-            snapshot.status = "running"
             phase = progress.get("phase")
+            if snapshot.status in {"complete", "failed"}:
+                return
+            snapshot.status = "failed" if phase == "input_abandoned" else "running"
             snapshot.progress_phase = phase if isinstance(phase, str) else None
             input_chars = progress.get("input_chars")
             snapshot.progress_input_chars = input_chars if isinstance(input_chars, int) else None
@@ -2462,6 +2529,7 @@ class TurnScheduler:
         client_message_id: str | None,
         chat_mode: ResolvedChatMode,
         cancel_event: asyncio.Event,
+        queue_id: str | None = None,
         intaris_session_id_override: str | None = None,
         user_message_metadata: dict[str, Any] | None = None,
         contextual_messages: list[dict[str, Any]] | None = None,
@@ -2500,6 +2568,7 @@ class TurnScheduler:
             "intention_eligible": intention_eligible,
             "turn_id": turn_id,
             "client_message_id": client_message_id,
+            "queue_id": queue_id,
             "chat_mode": chat_mode.mode,
             "chat_mode_source": chat_mode.source,
             "attachments": attachment_refs_to_dicts(attachments, include_url=False),
@@ -3462,6 +3531,8 @@ class TurnScheduler:
                 await self._direct_turn_runtime.wake()
             return None
 
+        if _durable_request_id is not None and self._turn_lock(conversation_id).locked():
+            raise LocalDirectTurnBusy(_durable_request_id)
         async with self._turn_lock(conversation_id):
             refresh_error = await _refresh_managed_runtime_for_admission()
             if refresh_error is not None:
@@ -3485,7 +3556,12 @@ class TurnScheduler:
                 if active.done():
                     self._active_turns.pop(conversation_id, None)
                 else:
-                    if not allow_queue:
+                    # A durable worker already owns this request and its
+                    # conversation lease. Re-enqueuing it behind process-local
+                    # cleanup leaves the durable row claimed while no turn can
+                    # start. Return a transient error so the durable runtime
+                    # releases ownership and retries after local cleanup.
+                    if _durable_request_id is not None or not allow_queue:
                         return TurnError(
                             code="queueing_not_allowed",
                             message="A turn is already active for this conversation.",
@@ -3629,6 +3705,10 @@ class TurnScheduler:
             except AttributeError:
                 session_locked = False
             if session_locked:
+                if _durable_request_id is not None:
+                    # Release the durable lease rather than renewing ownership
+                    # indefinitely while another local lifecycle holds the lock.
+                    raise LocalDirectTurnBusy(_durable_request_id)
                 await self._agent_loop.wait_for_session_unlock(session.session_id)
             refreshed_runtime = await self._load_conversation_runtime(
                 conversation_id,
@@ -3842,6 +3922,9 @@ class TurnScheduler:
             return False
         if runtime.state is not ControllerLifecycleState.READY:
             return False
+        active = self._active_turns.get(row.conversation_id)
+        if active is not None and not active.done():
+            return False
         return (
             self._pause_waiter.find_pending(
                 pause_type="escalation",
@@ -3851,6 +3934,16 @@ class TurnScheduler:
         )
 
     async def _handle_permanent_direct_turn_failure(
+        self,
+        row: DirectTurnRequestRow,
+        exc: Exception,
+    ) -> None:
+        async with _direct_turn_tenant_scope(getattr(self, "_session_factory", None), row):
+            await TurnScheduler._handle_permanent_direct_turn_failure_unscoped(
+                self, row=row, exc=exc
+            )
+
+    async def _handle_permanent_direct_turn_failure_unscoped(
         self,
         row: DirectTurnRequestRow,
         exc: Exception,
@@ -3891,6 +3984,7 @@ class TurnScheduler:
                 client_message_id=metadata.get("client_message_id"),
                 chat_mode=chat_mode,
                 cancel_event=asyncio.Event(),
+                queue_id=row.request_id,
                 evidence_admission=deserialize_evidence_admission(
                     metadata.get(TRUSTED_EVIDENCE_ADMISSION_KEY)
                 ),
@@ -3932,6 +4026,17 @@ class TurnScheduler:
         await self._notify_queue_updated(row.conversation_id)
 
     async def _handle_fenced_permanent_direct_turn_failure(
+        self,
+        row: DirectTurnRequestRow,
+        exc: Exception,
+        lease: Lease,
+    ) -> None:
+        async with _direct_turn_tenant_scope(getattr(self, "_session_factory", None), row):
+            await TurnScheduler._handle_fenced_permanent_direct_turn_failure_unscoped(
+                self, row=row, exc=exc, lease=lease
+            )
+
+    async def _handle_fenced_permanent_direct_turn_failure_unscoped(
         self,
         row: DirectTurnRequestRow,
         exc: Exception,
@@ -4202,6 +4307,14 @@ class TurnScheduler:
             ) from exc
 
     async def _recover_interrupted_tool_calls(
+        self,
+        row: DirectTurnRequestRow,
+        lease: Lease,
+    ) -> None:
+        async with _direct_turn_tenant_scope(getattr(self, "_session_factory", None), row):
+            await TurnScheduler._recover_interrupted_tool_calls_unscoped(self, row=row, lease=lease)
+
+    async def _recover_interrupted_tool_calls_unscoped(
         self,
         row: DirectTurnRequestRow,
         lease: Lease,
@@ -4714,6 +4827,17 @@ class TurnScheduler:
         payload: MaterializedDirectTurnPayload,
         fence: DirectTurnExecutionFence,
     ) -> None:
+        async with _direct_turn_tenant_scope(getattr(self, "_session_factory", None), row):
+            await TurnScheduler._execute_claimed_direct_turn_unscoped(
+                self, row=row, payload=payload, fence=fence
+            )
+
+    async def _execute_claimed_direct_turn_unscoped(
+        self,
+        row: DirectTurnRequestRow,
+        payload: MaterializedDirectTurnPayload,
+        fence: DirectTurnExecutionFence,
+    ) -> None:
         metadata = payload.metadata
         admission_origin = deserialize_evidence_origin(metadata.get("evidence_origin"))
         if admission_origin is None:
@@ -4911,6 +5035,7 @@ class TurnScheduler:
                     else int(metadata.get("retry_attempt") or 1),
                 ),
                 turn_id=row.turn_id,
+                allow_queue=False,
                 _durable_request_id=row.request_id,
                 _durable_lease=fence.lease,
                 _durable_user_append_session_id=durable_append_session_id,
@@ -4918,6 +5043,8 @@ class TurnScheduler:
                 _trusted_evidence_admission=evidence_admission,
             )
             if error is not None:
+                if error.code == "queueing_not_allowed":
+                    raise LocalDirectTurnBusy(row.request_id)
                 raise RuntimeError(error.message)
             task = self._active_turns.get(row.conversation_id)
             if task is not None:
@@ -5012,16 +5139,34 @@ class TurnScheduler:
                 self._schedule_absorbed_change(pending)
 
     async def _publish_durable_turn_change(self, row: DirectTurnRequestRow) -> None:
-        """Invalidate remote Chat v2 projections after a durable turn transition."""
+        """Invalidate local and remote projections after a committed transition."""
 
         await self._settle_orphaned_managed_terminal(row)
+        from cognis.core.cluster_signals import ClusterSignalKind
+
+        revision = f"direct-turn:{row.request_id}:{row.status}:{row.updated_at.isoformat()}"
+        # Cluster transport deliberately ignores its publisher's own messages.
+        # Completion observers may have refreshed before the terminal DB commit.
+        await self._event_bus.publish(
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={
+                    "kind": ClusterSignalKind.CHAT_SCOPE_CHANGED,
+                    "scope": {
+                        "conversation_id": row.conversation_id,
+                        "session_id": row.session_id,
+                    },
+                    "revision": revision,
+                },
+            )
+        )
         cluster_signals = getattr(self, "cluster_signals", None)
         if cluster_signals is None:
             return
         await cluster_signals.publish_chat_change(
             row.conversation_id,
             session_id=row.session_id,
-            revision=f"direct-turn:{row.request_id}:{row.status}:{row.updated_at.isoformat()}",
+            revision=revision,
         )
 
     async def _settle_orphaned_managed_terminal(self, row: DirectTurnRequestRow) -> None:
@@ -5392,6 +5537,12 @@ class TurnScheduler:
                 self._remove_durable_queue_cache_entry(conversation_id, row.request_id)
                 if cancel_result.cancellation_requested:
                     cancelled_active_request_id = row.request_id
+                self._track_best_effort_task(
+                    asyncio.create_task(
+                        self._publish_durable_turn_change(row),
+                        name=f"turn-cancel-change:{row.request_id}",
+                    )
+                )
             TURN_CONTROL_STAGE_DURATION.labels(stage="cancel_durable_request").observe(
                 monotonic() - cancel_started
             )
@@ -5576,6 +5727,7 @@ class TurnScheduler:
         row = await self._direct_turn_store.get_conversation_active(
             conversation_id,
             session=session,
+            include_recoverable=True,
         )
         if row is None:
             return None
@@ -5619,8 +5771,12 @@ class TurnScheduler:
             session=session,
         )
         if row is None:
-            return {"running": None, "authority": None}
+            return {"running": None, "authority": None, "pending_user_message": None}
+        pending_user_message = self._durable_pending_user_message(row)
         return {
+            # Admission ownership is a Cognis session ID. Outcome session IDs
+            # may identify Intaris streams instead and are not scope authority.
+            "session_id": row.session_id,
             "running": (
                 self._durable_runtime_state_from_row(
                     row,
@@ -5634,6 +5790,31 @@ class TurnScheduler:
                 else None
             ),
             "authority": self._runtime_authority_from_row(row),
+            "pending_user_message": pending_user_message,
+        }
+
+    @staticmethod
+    def _durable_pending_user_message(row: DirectTurnRequestRow) -> dict[str, Any] | None:
+        """Project accepted user input until its durable turn becomes terminal."""
+
+        if row.status not in {
+            *(status.value for status in ACTIVE_STATUSES),
+            DirectTurnStatus.RECOVERABLE.value,
+        }:
+            return None
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("system_initiated"):
+            return None
+        return {
+            "request_id": row.request_id,
+            "turn_id": row.turn_id,
+            "content": str(payload.get("content") or ""),
+            "attachments": list(payload.get("attachments") or []),
+            "client_message_id": metadata.get("client_message_id"),
+            "created_at": row.created_at.isoformat(),
+            "updated_at": row.updated_at.isoformat(),
         }
 
     @staticmethod
@@ -5714,6 +5895,7 @@ class TurnScheduler:
         rows = await self._direct_turn_store.list_conversations_active(
             conversation_ids,
             session=session,
+            include_recoverable=True,
         )
         return {
             conversation_id: self._durable_runtime_state_from_row(
@@ -6762,10 +6944,13 @@ class TurnScheduler:
                     delete(FollowUpDedupeRow)
                     .where(
                         FollowUpDedupeRow.expires_at <= _utcnow(),
-                        or_(
-                            FollowUpDedupeRow.status.not_in(("processing", "admitted")),
-                            FollowUpDedupeRow.lease_expires_at <= _utcnow(),
-                        ),
+                        ~select(FollowUpIntentRow.intent_id)
+                        .where(
+                            FollowUpIntentRow.conversation_id == FollowUpDedupeRow.conversation_id,
+                            FollowUpIntentRow.follow_up_id == FollowUpDedupeRow.follow_up_id,
+                            FollowUpIntentRow.status.in_(("pending", "processing", "admitted")),
+                        )
+                        .exists(),
                     )
                     .execution_options(synchronize_session=False)
                 )
@@ -7590,6 +7775,10 @@ class TurnScheduler:
         if existing is not None:
             dedupe_key = self._follow_up_dedupe_key(conversation_id, follow_up_id)
             if await db_session.get(FollowUpDedupeRow, dedupe_key) is None:
+                if existing.status in {"pending", "processing", "admitted"}:
+                    # Recovery owns nonterminal orphan settlement. Recreating a
+                    # pending fence here can replay work with an unknown outcome.
+                    return cast(FollowUpIntentRow, existing)
                 db_session.add(
                     FollowUpDedupeRow(
                         dedupe_key=dedupe_key,
@@ -8017,6 +8206,11 @@ class TurnScheduler:
                     ),
                 ),
             )
+            await self._reconcile_missing_follow_up_fences(
+                now=now,
+                stale_before=stale_before,
+                limit=limit,
+            )
             abandoned_managed: list[tuple[ManagedConversationLink, str, str, str]] = []
             async with self._session_factory() as db_session:
                 abandoned = list(
@@ -8025,7 +8219,17 @@ class TurnScheduler:
                             select(
                                 FollowUpIntentRow.conversation_id,
                                 FollowUpIntentRow.follow_up_id,
-                            ).where(stale_admitted)
+                            )
+                            .join(
+                                FollowUpDedupeRow,
+                                and_(
+                                    FollowUpDedupeRow.conversation_id
+                                    == FollowUpIntentRow.conversation_id,
+                                    FollowUpDedupeRow.follow_up_id
+                                    == FollowUpIntentRow.follow_up_id,
+                                ),
+                            )
+                            .where(stale_admitted)
                         )
                     ).all()
                 )
@@ -8106,7 +8310,17 @@ class TurnScheduler:
                             select(
                                 FollowUpIntentRow.conversation_id,
                                 FollowUpIntentRow.follow_up_id,
-                            ).where(
+                            )
+                            .join(
+                                FollowUpDedupeRow,
+                                and_(
+                                    FollowUpDedupeRow.conversation_id
+                                    == FollowUpIntentRow.conversation_id,
+                                    FollowUpDedupeRow.follow_up_id
+                                    == FollowUpIntentRow.follow_up_id,
+                                ),
+                            )
+                            .where(
                                 exhausted_intent,
                             )
                         )
@@ -8154,6 +8368,15 @@ class TurnScheduler:
                     (
                         await db_session.execute(
                             select(FollowUpIntentRow)
+                            .join(
+                                FollowUpDedupeRow,
+                                and_(
+                                    FollowUpDedupeRow.conversation_id
+                                    == FollowUpIntentRow.conversation_id,
+                                    FollowUpDedupeRow.follow_up_id
+                                    == FollowUpIntentRow.follow_up_id,
+                                ),
+                            )
                             .where(
                                 or_(
                                     FollowUpIntentRow.status == "pending",
@@ -8192,6 +8415,165 @@ class TurnScheduler:
                     Event(type=EventType.FOLLOW_UP_TURN_REQUESTED, data=dict(row.event_payload))
                 )
             return len(rows)
+
+    async def _reconcile_missing_follow_up_fences(
+        self,
+        *,
+        now: datetime,
+        stale_before: datetime,
+        limit: int,
+    ) -> int:
+        """Atomically quarantine stale orphan intents without replaying their work."""
+
+        stale_nonterminal = or_(
+            and_(
+                FollowUpIntentRow.status == "pending",
+                FollowUpIntentRow.updated_at <= stale_before,
+            ),
+            and_(
+                FollowUpIntentRow.status.in_(("processing", "admitted")),
+                or_(
+                    FollowUpIntentRow.lease_expires_at <= now,
+                    and_(
+                        FollowUpIntentRow.lease_owner.is_(None),
+                        FollowUpIntentRow.updated_at <= stale_before,
+                    ),
+                ),
+            ),
+        )
+        async with self._session_factory() as db_session:
+            candidates = list(
+                (
+                    await db_session.execute(
+                        select(FollowUpIntentRow.intent_id)
+                        .outerjoin(
+                            FollowUpDedupeRow,
+                            and_(
+                                FollowUpDedupeRow.conversation_id
+                                == FollowUpIntentRow.conversation_id,
+                                FollowUpDedupeRow.follow_up_id == FollowUpIntentRow.follow_up_id,
+                            ),
+                        )
+                        .where(
+                            stale_nonterminal,
+                            FollowUpDedupeRow.dedupe_key.is_(None),
+                        )
+                        .order_by(FollowUpIntentRow.updated_at, FollowUpIntentRow.intent_id)
+                        .limit(max(1, limit))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        repaired = 0
+        for intent_id in candidates:
+            async with self._session_factory() as db_session:
+                intent = (
+                    await db_session.execute(
+                        select(FollowUpIntentRow)
+                        .where(
+                            FollowUpIntentRow.intent_id == intent_id,
+                            stale_nonterminal,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if intent is None:
+                    continue
+                dedupe_key = self._follow_up_dedupe_key(
+                    intent.conversation_id,
+                    intent.follow_up_id,
+                )
+                if await db_session.get(FollowUpDedupeRow, dedupe_key) is not None:
+                    continue
+                follow_up = (
+                    intent.event_payload.get("follow_up", {})
+                    if isinstance(intent.event_payload, dict)
+                    else {}
+                )
+                metadata = follow_up.get("metadata", {}) if isinstance(follow_up, dict) else {}
+                expected_link_id = metadata.get("link_id") if isinstance(metadata, dict) else None
+                expected_turn_id = (
+                    metadata.get("target_turn_id") if isinstance(metadata, dict) else None
+                )
+                target_conversation_id = (
+                    metadata.get("target_conversation_id") if isinstance(metadata, dict) else None
+                )
+                link = (
+                    await queries.get_managed_conversation_link_for_target(
+                        db_session,
+                        target_conversation_id,
+                    )
+                    if isinstance(target_conversation_id, str)
+                    else None
+                )
+                completion_proven = bool(
+                    link is not None
+                    and isinstance(expected_link_id, str)
+                    and link.link_id == expected_link_id
+                    and link.controller_conversation_id == intent.conversation_id
+                    and link.conversation_state == "completed"
+                    and link.turn_state == "completed"
+                    and isinstance(expected_turn_id, str)
+                    and link.last_result_turn_id == expected_turn_id
+                )
+                outcome = "submitted" if completion_proven else "failed"
+                reason = (
+                    "Missing durable follow-up fence reconciled from completed managed "
+                    "conversation evidence; work was not replayed."
+                    if completion_proven
+                    else "Missing durable follow-up fence reconciled without completion "
+                    "evidence; work was not replayed."
+                )
+                intent.status = outcome
+                intent.lease_owner = None
+                intent.lease_expires_at = None
+                intent.last_error = None if completion_proven else reason
+                intent.updated_at = now
+                db_session.add(
+                    FollowUpDedupeRow(
+                        dedupe_key=dedupe_key,
+                        conversation_id=intent.conversation_id,
+                        follow_up_id=intent.follow_up_id,
+                        status="handled",
+                        expires_at=now + timedelta(seconds=FOLLOW_UP_DEDUPE_TTL_SECONDS),
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                try:
+                    await db_session.commit()
+                except Exception:
+                    await db_session.rollback()
+                    logger.info(
+                        "turn_scheduler: follow-up fence reconciliation deferred",
+                        extra={
+                            "extra_data": {
+                                "intent_id": intent_id,
+                                "outcome": "retry",
+                            }
+                        },
+                    )
+                    FOLLOW_UP_FENCE_RECONCILIATIONS_TOTAL.labels(outcome="retry").inc()
+                    continue
+                repaired += 1
+                FOLLOW_UP_FENCE_RECONCILIATIONS_TOTAL.labels(outcome=outcome).inc()
+                logger.warning(
+                    "turn_scheduler: reconciled missing durable follow-up fence",
+                    extra={
+                        "extra_data": {
+                            "intent_id": intent_id,
+                            "conversation_id": intent.conversation_id,
+                            "follow_up_id": intent.follow_up_id,
+                            "prior_status": "nonterminal",
+                            "outcome": outcome,
+                        }
+                    },
+                )
+        return repaired
 
     async def _managed_join_tool_result_is_durable(
         self,
@@ -9211,6 +9593,21 @@ class TurnScheduler:
                     or session.session_id
                 ),
             )
+        attribution_token = set_attribution(
+            Attribution(
+                user=user_email,
+                agent=str(getattr(agent, "agent_id", None) or "unknown"),
+                provider=str(getattr(session, "model_override_provider_id", None) or "inherit"),
+                model=str(getattr(session, "model_override", None) or "inherit"),
+                profile=str(getattr(session, "agent_profile_id", None) or "none"),
+                origin=(
+                    "system"
+                    if system_initiated
+                    else str(getattr(admission_origin, "source", None) or "unknown")
+                ),
+                status="unknown",
+            )
+        )
         try:
             if execution_fence is not None and durable_user_append_phase == "user_append_pending":
                 await execution_fence.checkpoint(
@@ -9320,6 +9717,7 @@ class TurnScheduler:
                     client_message_id=client_message_id,
                     chat_mode=resolved_chat_mode,
                     cancel_event=cancel_event,
+                    queue_id=queue_id,
                     intaris_session_id_override=durable_user_append_session_id,
                 )
                 user_message_recorded = admission_result[0]
@@ -9496,6 +9894,7 @@ class TurnScheduler:
                     )
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
                 TURNS_TOTAL.labels(outcome="delegated").inc()
+                record_attributed_turn(status="delegated")
                 turn_succeeded = True
                 return
 
@@ -9756,6 +10155,7 @@ class TurnScheduler:
                     durable_user_email=user_email,
                 )
                 TURNS_TOTAL.labels(outcome="error").inc()
+                record_attributed_turn(status="error")
                 return
 
             queued_continuation_pending = continuation_result.successor_turn_id is not None
@@ -9896,6 +10296,7 @@ class TurnScheduler:
                 )
             await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
+            record_attributed_turn(status="completed")
             turn_succeeded = True
 
             logger.info(
@@ -10048,6 +10449,7 @@ class TurnScheduler:
                     durable_user_email=user_email,
                 )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
+            record_attributed_turn(status="cancelled")
             logger.info(
                 "turn_scheduler: turn cancelled",
                 extra={
@@ -10191,8 +10593,10 @@ class TurnScheduler:
                 durable_user_email=user_email,
             )
             TURNS_TOTAL.labels(outcome="error").inc()
+            record_attributed_turn(status="error")
 
         finally:
+            reset_attribution(attribution_token)
             if (
                 execution_fence is not None
                 and durable_request_id is not None
@@ -10728,10 +11132,9 @@ class TurnScheduler:
             progress: dict[str, Any],
             turn_cycle_index: int | None = None,
         ) -> None:
-            await self._reset_active_stream(conversation_id)
-            # Idempotent per-call phase assignment (side effect kept so the
-            # tool's phase matches on_tool_call); the return is unused here.
-            self._bump_assistant_phase_for_tool(conversation_id, turn_id, call_id, tool_name)
+            # Input progress can precede assistant persistence. Only the actual
+            # tool-call boundary may advance its phase or clear its stream;
+            # otherwise live and durable copies acquire different identities.
             # See on_tool_call: fall back to the last recorded turn cycle.
             effective_turn_cycle_index = self._effective_turn_cycle_for_tool(
                 conversation_id,

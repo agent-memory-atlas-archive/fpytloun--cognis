@@ -298,7 +298,7 @@ async def _authorized_deliverable(
     async with request.app.state.session_factory() as session:
         row = await get_accessible_conversation_deliverable(session, deliverable_id, user.email)
         if row is not None and not await _is_managed_deliverable(session, row):
-            await hydrate_deliverable_payload(row, artifact_store)
+            await _hydrate_available_payload(row, artifact_store)
             return row
         accessor_agent_id: str | None = None
         if accessor_conversation_id:
@@ -325,8 +325,18 @@ async def _public_deliverable(request: Request, deliverable_id: str) -> Delivera
         row = await get_deliverable(session, deliverable_id)
         if row is None or await _is_managed_deliverable(session, row):
             raise api_exception(404, "not_found", "Deliverable not found")
-        await hydrate_deliverable_payload(row, request.app.state.artifact_store)
+        await _hydrate_available_payload(row, request.app.state.artifact_store)
         return row
+
+
+async def _hydrate_available_payload(row: DeliverableRow, artifact_store: Any) -> None:
+    """Translate absent payload storage after access has been authorized."""
+    try:
+        await hydrate_deliverable_payload(row, artifact_store)
+    except FileNotFoundError as exc:
+        raise api_exception(
+            409, "deliverable_payload_unavailable", "Deliverable payload is unavailable"
+        ) from exc
 
 
 async def _media_response(

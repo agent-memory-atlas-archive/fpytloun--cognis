@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 const childSource = readFileSync(resolve('src/lib/components/chat-v2/ChildChatView.svelte'), 'utf8');
 const pageSource = readFileSync(resolve('src/routes/(app)/chat/[conversationId]/+page.svelte'), 'utf8');
+const layoutSource = readFileSync(resolve('src/routes/(app)/+layout.svelte'), 'utf8');
 
 describe('ChildChatView shell ownership', () => {
   it('uses the shared scoped timeline, live follow, and a real Inspector toggle', () => {
@@ -317,14 +318,14 @@ describe('ChildChatView PWA-safe theme and layout', () => {
     expect(childSource).toContain('padding-bottom: var(--app-bottom-control-inset);');
   });
 
-  it('clears top/left/right safe areas on the header without a fixed shell-offset assumption', () => {
+  it('inherits the route-owned top safe area while protecting horizontal edges', () => {
     const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
-    expect(header).toContain('env(safe-area-inset-top)');
+    expect(header).not.toContain('env(safe-area-inset-top)');
     expect(header).toContain('env(safe-area-inset-left)');
     expect(header).toContain('env(safe-area-inset-right)');
-    // Reuses the safe-area contract directly (matches the sibling root header
-    // treatment for this same route) rather than an overlay-only offset that
-    // would double-count chrome already reserved elsewhere.
+    expect(header).toContain('app-keyboard-stable-header chat-header-shell');
+    expect(layoutSource).toContain('app-chat-shell-safe');
+    expect(layoutSource).toContain('app-chat-mobile-safe-top');
     expect(header).not.toContain('app-overlay-inner');
   });
 

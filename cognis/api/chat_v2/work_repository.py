@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 from prometheus_client import Histogram
-from sqlalchemy import and_, case, func, literal, literal_column, or_, select, union_all
+from sqlalchemy import and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.api.chat_v2.schemas import (
@@ -2434,6 +2434,7 @@ async def _recent_activity(
     list[WorkRecordRow],
     dict[str, TimelineItem],
 ]:
+    categories = ("files", "commands", "mutations", "artifacts", "deliverables")
     common_columns = (
         WorkRecordRow.work_record_id,
         WorkRecordRow.source_item_id,
@@ -2445,100 +2446,109 @@ async def _recent_activity(
         WorkRecordRow.source_seq,
         WorkRecordRow.item_ordinal,
     )
-    rows: list[Any] = []
-    artifact_metadata: dict[str, ArtifactRecordRow] = {}
-    for category in ("files", "commands", "mutations", "artifacts", "deliverables"):
-        metadata_columns = (
-            literal(None, type_=ArtifactRecordRow.filename.type).label("artifact_filename"),
-            literal(None, type_=ArtifactRecordRow.mime_type.type).label("artifact_mime_type"),
-            literal(None, type_=ArtifactRecordRow.size_bytes.type).label("artifact_size_bytes"),
+    ordering = (
+        WorkRecordRow.occurred_at.desc(),
+        WorkRecordRow.session_id.desc(),
+        WorkRecordRow.source_seq.desc(),
+        WorkRecordRow.item_ordinal.desc(),
+        WorkRecordRow.work_record_id.desc(),
+    )
+    identity = case(
+        (
+            and_(WorkRecordRow.entity_id.is_not(None), WorkRecordRow.entity_id != ""),
+            WorkRecordRow.entity_id,
+        ),
+        else_=WorkRecordRow.source_item_id,
+    )
+    artifact_category = WorkRecordRow.category == "artifacts"
+    candidates = (
+        select(
+            *common_columns,
+            case(
+                (artifact_category, ArtifactRecordRow.filename),
+                else_=literal(None, type_=ArtifactRecordRow.filename.type),
+            ).label("artifact_filename"),
+            case(
+                (artifact_category, ArtifactRecordRow.mime_type),
+                else_=literal(None, type_=ArtifactRecordRow.mime_type.type),
+            ).label("artifact_mime_type"),
+            case(
+                (artifact_category, ArtifactRecordRow.size_bytes),
+                else_=literal(None, type_=ArtifactRecordRow.size_bytes.type),
+            ).label("artifact_size_bytes"),
+            func.row_number()
+            .over(
+                partition_by=(WorkRecordRow.category, identity),
+                order_by=ordering,
+            )
+            .label("identity_ordinal"),
         )
-        recent_statement = (
-            select(
-                *common_columns,
-                *metadata_columns,
-            )
-            .where(
-                WorkRecordRow.owner_email == owner_email,
-                WorkRecordRow.session_id.in_(session_ids or [""]),
-                WorkRecordRow.materializer_version == WORK_MATERIALIZER_VERSION,
-                WorkRecordRow.is_evidence.is_(True),
-                WorkRecordRow.category
-                >= literal_column(f"'{category}'", type_=WorkRecordRow.category.type),
-                WorkRecordRow.category
-                <= literal_column(f"'{category}'", type_=WorkRecordRow.category.type),
-            )
-            .order_by(
-                WorkRecordRow.category.desc(),
-                WorkRecordRow.occurred_at.desc(),
-                WorkRecordRow.session_id.desc(),
-                WorkRecordRow.source_seq.desc(),
-                WorkRecordRow.item_ordinal.desc(),
-                WorkRecordRow.work_record_id.desc(),
-            )
+        .outerjoin(
+            ArtifactRecordRow,
+            and_(
+                artifact_category,
+                ArtifactRecordRow.artifact_id == WorkRecordRow.entity_id,
+                ArtifactRecordRow.owner_email == owner_email,
+            ),
         )
-        seen: set[str] = set()
-        frontier: list[Any] | None = None
-        while len(seen) < 10:
-            page_statement = recent_statement
-            if frontier is not None:
-                page_statement = page_statement.where(_older_than_predicate(frontier))
-            stream = await db.stream(
-                page_statement.limit(4096).execution_options(
-                    yield_per=32,
-                    stream_results=True,
+        .where(
+            WorkRecordRow.owner_email == owner_email,
+            WorkRecordRow.session_id.in_(session_ids or [""]),
+            WorkRecordRow.materializer_version == WORK_MATERIALIZER_VERSION,
+            WorkRecordRow.is_evidence.is_(True),
+            WorkRecordRow.category.in_(categories),
+            or_(
+                ~artifact_category,
+                and_(
+                    ArtifactRecordRow.artifact_id.is_not(None),
+                    ArtifactRecordRow.deleted_at.is_(None),
+                ),
+            ),
+        )
+        .subquery("recent_activity_candidates")
+    )
+    candidate_ordering = (
+        candidates.c.occurred_at.desc(),
+        candidates.c.session_id.desc(),
+        candidates.c.source_seq.desc(),
+        candidates.c.item_ordinal.desc(),
+        candidates.c.work_record_id.desc(),
+    )
+    ranked = (
+        select(
+            *(column for column in candidates.c if column.key != "identity_ordinal"),
+            func.row_number()
+            .over(
+                partition_by=candidates.c.category,
+                order_by=candidate_ordering,
+            )
+            .label("category_ordinal"),
+        )
+        .where(candidates.c.identity_ordinal == 1)
+        .subquery("recent_activity_ranked")
+    )
+    category_order = case(
+        {category: ordinal for ordinal, category in enumerate(categories)},
+        value=ranked.c.category,
+    )
+    rows = list(
+        (
+            await db.execute(
+                select(*(column for column in ranked.c if column.key != "category_ordinal"))
+                .where(ranked.c.category_ordinal <= 10)
+                .order_by(
+                    category_order,
+                    *(
+                        ranked.c.occurred_at.desc(),
+                        ranked.c.session_id.desc(),
+                        ranked.c.source_seq.desc(),
+                        ranked.c.item_ordinal.desc(),
+                        ranked.c.work_record_id.desc(),
+                    ),
                 )
             )
-            last: Any | None = None
-            try:
-                async for partition in stream.partitions(32):
-                    last = partition[-1]
-                    if category == "artifacts":
-                        artifacts_by_id = {
-                            artifact.artifact_id: artifact
-                            for artifact in (
-                                await db.scalars(
-                                    select(ArtifactRecordRow).where(
-                                        ArtifactRecordRow.owner_email == owner_email,
-                                        ArtifactRecordRow.artifact_id.in_(
-                                            {
-                                                str(row.entity_id)
-                                                for row in partition
-                                                if row.entity_id is not None
-                                            }
-                                            or {""}
-                                        ),
-                                        ArtifactRecordRow.deleted_at.is_(None),
-                                    )
-                                )
-                            ).all()
-                        }
-                    else:
-                        artifacts_by_id = {}
-                    for row in partition:
-                        identity = str(row.entity_id or row.source_item_id)
-                        artifact = artifacts_by_id.get(identity)
-                        if identity in seen or (category == "artifacts" and artifact is None):
-                            continue
-                        seen.add(identity)
-                        rows.append(row)
-                        if artifact is not None:
-                            artifact_metadata[str(row.work_record_id)] = artifact
-                        if len(seen) == 10:
-                            break
-                    if len(seen) == 10:
-                        break
-            finally:
-                await stream.close()
-            if last is None or len(seen) == 10:
-                break
-            frontier = [
-                last.occurred_at.isoformat(),
-                last.session_id,
-                last.source_seq,
-                last.item_ordinal,
-                last.work_record_id,
-            ]
+        ).all()
+    )
     selected_ids = [str(row.work_record_id) for row in rows]
     records_by_id = {
         record.work_record_id: record
@@ -2553,6 +2563,15 @@ async def _recent_activity(
     ]
     authorized_records: list[WorkRecordRow] = []
     item_overrides: dict[str, TimelineItem] = {}
+    artifact_metadata = {
+        str(row.work_record_id): SimpleNamespace(
+            filename=row.artifact_filename,
+            mime_type=row.artifact_mime_type,
+            size_bytes=row.artifact_size_bytes,
+        )
+        for row in rows
+        if str(row.category) == "artifacts"
+    }
     for record in records:
         if record.category == "artifacts":
             artifact = artifact_metadata.get(record.work_record_id)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -225,6 +226,68 @@ async def test_get_lsp_statuses_passes_owner_email() -> None:
     await composite.get_lsp_statuses(owner_email="user@example.com")
 
     ip.get_lsp_statuses.assert_awaited_once_with(owner_email="user@example.com")
+
+
+@pytest.mark.asyncio
+async def test_get_lsp_statuses_uses_remote_controller_owner_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inventory collection reaches an executor connected to another controller."""
+    ip = _make_mock_provider()
+    ws = _make_mock_provider("websocket")
+    sp = _make_mock_provider()
+    ip.get_lsp_statuses = AsyncMock(return_value=[])
+    remote_handle = ExecutorHandle(
+        executor_id="remote-executor",
+        executor_type="websocket",
+        capabilities=ExecutorCapabilities(tools=["bash"]),
+    )
+    ws.list_active = AsyncMock(return_value=[remote_handle])
+    ws.get_handle.return_value = remote_handle
+    remote_report = LSPStatusReport(
+        supported=True,
+        enabled=True,
+        executor_id="remote-executor",
+        executor_type="websocket",
+        state="ready",
+        config=LSPStatusConfig(
+            enabled=True,
+            auto_install=False,
+            diagnostics_timeout_ms=1000,
+            idle_timeout_seconds=60,
+            max_concurrent_servers=2,
+        ),
+        totals=LSPStatusTotals(),
+    )
+    ws.get_lsp_status = AsyncMock(return_value=remote_report)
+
+    class SessionFactory:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def __call__(self) -> SessionFactory:
+            return self
+
+    async def rows(*args: object, **kwargs: object) -> list[object]:
+        del args, kwargs
+        return [
+            SimpleNamespace(
+                executor_id="remote-executor",
+                executor_type="websocket",
+                config={},
+            )
+        ]
+
+    monkeypatch.setattr("cognis.providers.executor.composite.list_executors", rows)
+    composite = CompositeExecutorProvider(ip, ws, sp, session_factory=SessionFactory())
+    statuses = await composite.get_lsp_statuses()
+
+    ws.list_active.assert_awaited_once()
+    ws.get_lsp_status.assert_awaited_once_with(remote_handle, source={})
+    assert [status.executor_id for status in statuses] == ["remote-executor"]
 
 
 @pytest.mark.asyncio

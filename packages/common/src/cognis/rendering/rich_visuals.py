@@ -59,7 +59,7 @@ _LEGACY_CHART_DATA_KEYS = {"data", "rows", "series_key", "x_key", "y_key", "vari
 _CHART_CHILD_BLOCK_KEYS = ("blocks", "children")
 _CHART_ITEM_BACKED_BLOCK_TYPES = {"accordion", "gallery", "modal", "tabs"}
 
-_ICON_SYMBOLS = {
+RICH_ICON_SYMBOLS = {
     "activity": "↗",
     "alert": "⚠",
     "calendar": "▣",
@@ -78,8 +78,8 @@ def icon_symbol(value: Any) -> str:
 
     text = _text(value).strip()
     normalized = text.lower().replace("-", "_").replace(" ", "_")
-    if normalized in _ICON_SYMBOLS:
-        return _ICON_SYMBOLS[normalized]
+    if normalized in RICH_ICON_SYMBOLS:
+        return RICH_ICON_SYMBOLS[normalized]
     return text if text and not text.replace("_", "").replace("-", "").isalnum() else ""
 
 

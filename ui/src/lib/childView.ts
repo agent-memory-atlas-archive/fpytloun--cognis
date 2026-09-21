@@ -8,7 +8,7 @@ import type { BackgroundWorkItem, Conversation } from '$lib/types/api';
 import { structuralParentSessionId, workstreamForSession } from '$lib/inspectorTreeNavigation';
 
 export type ChildView =
-  | { kind: 'delegate'; sessionId: string; controllerRootConversationId: string; nodeKey: string }
+  | { kind: 'delegate'; conversationId: string; sessionId: string; controllerRootConversationId: string; nodeKey: string }
   | { kind: 'managed'; conversationId: string; sessionId: string; controllerRootConversationId: string; nodeKey: string };
 
 export function controllerRootConversationId(conversation: Conversation): string {
@@ -18,7 +18,13 @@ export function controllerRootConversationId(conversation: Conversation): string
 export function childViewForWorkstream(node: WorkstreamRef, controllerRootId: string): ChildView {
   return node.kind === 'managed' && Boolean(node.conversation_id || node.link_id) && node.conversation_id
     ? { kind: 'managed', conversationId: node.conversation_id, sessionId: node.session_id, controllerRootConversationId: controllerRootId, nodeKey: node.key }
-    : { kind: 'delegate', sessionId: node.session_id, controllerRootConversationId: controllerRootId, nodeKey: node.key };
+    : {
+        kind: 'delegate',
+        conversationId: node.conversation_id ?? controllerRootId,
+        sessionId: node.session_id,
+        controllerRootConversationId: controllerRootId,
+        nodeKey: node.key,
+      };
 }
 
 export function canonicalChildView(nodes: WorkstreamRef[], sessionId: string, controllerRootId: string): ChildView | null {
@@ -29,7 +35,7 @@ export function canonicalChildView(nodes: WorkstreamRef[], sessionId: string, co
 export function childViewScope(view: ChildView): TimelineScope {
   return view.kind === 'managed'
     ? conversationTimelineScope(view.conversationId)
-    : sessionTimelineScope(view.sessionId, view.controllerRootConversationId);
+    : sessionTimelineScope(view.sessionId, view.conversationId);
 }
 
 export function childViewWorkstream(nodes: WorkstreamRef[], view: ChildView | null): WorkstreamRef | null {

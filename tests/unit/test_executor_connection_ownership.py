@@ -379,3 +379,80 @@ async def test_controller_directory_heartbeat_cannot_regress_draining(
 
     await directory.stop()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deferred_observed_tools_stay_out_of_hot_reads_and_writes(tmp_path: Path) -> None:
+    import re
+
+    from sqlalchemy import event
+    from sqlalchemy.exc import InvalidRequestError
+
+    from cognis.store.queries import list_executors, update_executor
+
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'deferred.db'}")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    catalog = [{"name": f"tool-{index}", "description": "x" * 200} for index in range(50)]
+    async with factory() as session:
+        await create_executor(
+            session,
+            executor_id="executor-1",
+            name="Executor",
+            executor_type="websocket",
+        )
+        await session.commit()
+    async with factory() as session:
+        await update_executor(session, "executor-1", observed_tools=catalog)
+        await session.commit()
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    observed_column = re.compile(r"\bobserved_tools\b")
+
+    authority = ExecutorConnectionOwnership(factory, "controller-a:boot-a")
+    owner = await authority.takeover_validated("executor-1", token_version=0)
+    assert owner is not None
+
+    # Heartbeat-style path: deferred read + owned RETURNING update, no catalog decode.
+    statements.clear()
+    async with factory() as session:
+        row = await get_executor_row(session, "executor-1", defer_observed_tools=True)
+        assert row is not None
+        with pytest.raises(InvalidRequestError):
+            _ = row.observed_tools
+        updated = await authority.update_runtime_state(
+            session,
+            owner,
+            runtime_metadata={"call_snapshot": {"seq": 1}},
+        )
+        assert updated is not None
+        await session.commit()
+    assert statements and not any(observed_column.search(s) for s in statements), statements
+
+    # The catalog is intact and still loads for readers that ask for it.
+    async with factory() as session:
+        rows = await list_executors(session, defer_observed_tools=True)
+        assert len(rows) == 1
+        await session.refresh(rows[0], attribute_names=["observed_tools"])
+        assert rows[0].observed_tools == catalog
+        assert rows[0].runtime_metadata == {"call_snapshot": {"seq": 1}}
+
+    # Writing the catalog still round-trips through the owned update.
+    statements.clear()
+    async with factory() as session:
+        updated = await authority.update_runtime_state(
+            session,
+            owner,
+            observed_tools=catalog[:1],
+        )
+        assert updated is not None
+        await session.commit()
+    async with factory() as session:
+        row = await get_executor_row(session, "executor-1")
+        assert row is not None and row.observed_tools == catalog[:1]
+    await engine.dispose()

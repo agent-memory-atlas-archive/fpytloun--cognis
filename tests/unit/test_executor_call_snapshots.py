@@ -180,7 +180,7 @@ async def test_controller_rejects_duplicate_out_of_order_and_wrong_instance(
         )
     )
 
-    async def _get_row(*_: object) -> SimpleNamespace:
+    async def _get_row(*_: object, **__: object) -> SimpleNamespace:
         return row
 
     async def _update(_session: object, _executor_id: str, **values: object) -> SimpleNamespace:
@@ -227,7 +227,7 @@ async def test_controller_accepts_instance_replacement_without_resource_cadence(
         )
     )
 
-    async def _get_row(*_: object) -> SimpleNamespace:
+    async def _get_row(*_: object, **__: object) -> SimpleNamespace:
         return row
 
     async def _update(_session: object, _executor_id: str, **values: object) -> SimpleNamespace:

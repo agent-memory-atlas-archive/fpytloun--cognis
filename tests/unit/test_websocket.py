@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock
 
 import httpx
 import pyotp
@@ -84,6 +84,98 @@ from cognis.store.queries import (
     create_managed_conversation_link,
     create_user,
 )
+
+
+@pytest.mark.asyncio
+async def test_targeted_runtime_hydration_does_not_broadcast_to_other_connections() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    scope = TimelineScope(
+        key="conversation:conversation-1", kind="conversation", conversation_id="conversation-1"
+    )
+    connections = {
+        cid: SimpleNamespace(
+            chat_v2_scopes={scope.key: scope},
+            chat_v2_cursors={scope.key: "cursor"},
+            chat_v2_session_ids={},
+            send_text=AsyncMock(),
+        )
+        for cid in ("first", "second")
+    }
+    manager._connections.update(connections)
+    manager._by_chat_v2_conversation["conversation-1"] = set(connections)
+    envelope = ChatV2RuntimeRelayEnvelope(
+        kind=RelayKind.TERMINAL,
+        event_id="terminal-hydration",
+        generated_at=datetime.now(UTC),
+        origin=RelayOrigin(
+            controller_id="controller-a", incarnation_id="boot-a", runtime_epoch="runtime-a"
+        ),
+        conversation_id="conversation-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        direct_request_id="request-1",
+        owner=RelayOwner(controller_id="controller-a", incarnation_id="boot-a"),
+        fencing_token=7,
+        source_revision=1,
+        has_active_turn=False,
+    )
+    await manager.apply_relayed_runtime(envelope, connection_id="first")
+    assert connections["first"].send_text.await_count == 1
+    connections["second"].send_text.assert_not_awaited()
+    await manager.apply_relayed_runtime(envelope)
+    assert connections["first"].send_text.await_count == 2
+    assert connections["second"].send_text.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claimed", [0, 1])
+async def test_message_attachment_claim_precedes_submission(monkeypatch, claimed):
+    import cognis.api.websocket as ws
+
+    scheduler = SimpleNamespace(submit_turn=AsyncMock(return_value=None))
+    db = AsyncMock()
+    factory = MagicMock()
+    factory.return_value.__aenter__.return_value = db
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            turn_scheduler=scheduler,
+            session_factory=factory,
+        )
+    )
+    manager = SimpleNamespace(
+        subscribe=MagicMock(),
+        send_queue_snapshot=AsyncMock(),
+        send_error=AsyncMock(),
+    )
+    connection = SimpleNamespace(user_email="user@example.com")
+    monkeypatch.setattr(ws, "_authorize_conversation_frame", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "cognis.store.queries.get_conversation",
+        AsyncMock(return_value=SimpleNamespace(active_session_id=None)),
+    )
+
+    async def claim(*args, **kwargs):
+        scheduler.submit_turn.assert_not_awaited()
+        return claimed
+
+    monkeypatch.setattr(ws, "mark_artifacts_attached", claim)
+    await ws._handle_message(
+        app,
+        manager,
+        connection,
+        {
+            "conversation_id": "conversation-1",
+            "content": "hello",
+            "attachments": [{"artifact_id": "art-attachment"}],
+        },
+    )
+    if claimed:
+        scheduler.submit_turn.assert_awaited_once()
+        db.commit.assert_awaited_once()
+    else:
+        scheduler.submit_turn.assert_not_awaited()
+        db.commit.assert_not_awaited()
+        assert manager.send_error.call_args.kwargs["code"] == "attachment_unavailable"
 
 
 def test_apply_patch_input_progress_is_not_a_relay_boundary() -> None:
@@ -282,6 +374,7 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
     relay = SimpleNamespace(
         make_envelope=Mock(return_value=envelope),
         enqueue=Mock(return_value=True),
+        invalidate=Mock(),
     )
     manager = WebSocketConnectionManager(
         SimpleNamespace(
@@ -310,6 +403,18 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
     relay.enqueue.assert_called_once_with(envelope, cumulative_boundary=False)
     assert relay.make_envelope.call_args.kwargs["volatile_items_complete"] is True
 
+    manager.send_sidebar_update_to_owner = AsyncMock()
+    for kind in ("sidebar_changed", "chat_scope_changed"):
+        await manager._handle_cluster_scope_invalidated(
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={
+                    "kind": kind,
+                    "revision": "1",
+                    "scope": {"conversation_id": "conversation-1"},
+                },
+            )
+        )
     await manager.send_chat_v2_runtime_to_conversation(
         "conversation-1",
         volatile_items=[],
@@ -430,9 +535,10 @@ async def test_terminal_runtime_relay_logs_enqueue_rejection(
 
 
 @pytest.mark.asyncio
-async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_marks_session_stale() -> (
-    None
-):
+@pytest.mark.parametrize("local_commit", [False, True])
+async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_marks_session_stale(
+    local_commit: bool,
+) -> None:
     cache = SimpleNamespace(invalidate_canonical=AsyncMock(return_value=True))
     manager = WebSocketConnectionManager(
         SimpleNamespace(state=SimpleNamespace(session_cache=cache))
@@ -468,26 +574,58 @@ async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_mark
     manager._by_chat_v2_scope["conversation:conv-1"].add("owner")  # noqa: SLF001
     manager._by_chat_v2_scope["conversation:conv-2"].add("foreign")  # noqa: SLF001
 
-    await manager._handle_event(  # noqa: SLF001
-        Event(
-            type=EventType.CLUSTER_SCOPE_INVALIDATED,
-            data={
-                "kind": "chat_scope_changed",
-                "revision": "42",
-                "scope": {
-                    "conversation_id": "conv-1",
-                    "session_id": "session-1",
+    expected_revision = "42"
+
+    async def publish_invalidation() -> None:
+        nonlocal expected_revision
+        if local_commit:
+            from datetime import UTC, datetime
+
+            from cognis.core.events import EventBus
+            from cognis.core.turn_scheduler import TurnScheduler
+
+            bus = EventBus()
+            bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, manager._handle_event)
+            scheduler = SimpleNamespace(
+                _event_bus=bus,
+                _settle_orphaned_managed_terminal=AsyncMock(),
+                cluster_signals=None,
+            )
+            updated_at = datetime.now(UTC)
+            expected_revision = f"direct-turn:request-terminal:completed:{updated_at.isoformat()}"
+            await TurnScheduler._publish_durable_turn_change(
+                scheduler,
+                SimpleNamespace(
+                    request_id="request-terminal",
+                    status="completed",
+                    conversation_id="conv-1",
+                    session_id="session-1",
+                    updated_at=updated_at,
+                ),
+            )
+            return
+        await manager._handle_event(  # noqa: SLF001
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={
+                    "kind": "chat_scope_changed",
+                    "revision": "42",
+                    "scope": {
+                        "conversation_id": "conv-1",
+                        "session_id": "session-1",
+                    },
                 },
-            },
+            )
         )
-    )
+
+    await publish_invalidation()
 
     cache.invalidate_canonical.assert_awaited_once_with("session-1")
     owner.send_scope_invalidation_nowait.assert_called_once_with(
         {
             "type": "scope_invalidated",
             "reason": "chat_scope_changed",
-            "revision": "42",
+            "revision": expected_revision,
             "conversation_id": "conv-1",
             "session_id": "session-1",
         }
@@ -771,6 +909,99 @@ async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscrib
         }
     )
     foreign.send_scope_invalidation_nowait.assert_not_called()
+    # Results are exhausted: warm routing must not issue another DB query.
+    for _ in range(3):
+        assert await manager._chat_v2_connection_ids_for_event_session_token(
+            "intaris:intaris-2", cache
+        ) == {"owner"}
+    # A rotated session token misses and refreshes active-session routing.
+    results.extend(
+        [
+            Result([("conv-1", "session-4")]),
+            Result(
+                [
+                    SimpleNamespace(session_id="session-4", intaris_session_id="intaris-4"),
+                    SimpleNamespace(session_id="session-3", intaris_session_id="intaris-3"),
+                ]
+            ),
+        ]
+    )
+    assert await manager._chat_v2_connection_ids_for_event_session_token(
+        "intaris:intaris-4", cache
+    ) == {"owner"}
+    assert "intaris:intaris-2" not in manager._event_routes
+    owner.chat_v2_scopes.clear()
+    foreign.chat_v2_scopes.clear()
+    assert (
+        await manager._chat_v2_connection_ids_for_event_session_token("intaris:intaris-4", cache)
+        == set()
+    )
+    assert manager._event_routes == {}
+
+
+@pytest.mark.asyncio
+async def test_event_route_rebuilds_are_serialized() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    order = []
+
+    async def resolve(token, cache):
+        order.append(token)
+        if token == "old":
+            entered.set()
+            await release.wait()
+        manager._event_routes = {token: {"owner"}}
+        return {"owner"}
+
+    manager._resolve_event_session_routes = resolve
+    first = asyncio.create_task(
+        manager._chat_v2_connection_ids_for_event_session_token("old", None)
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        manager._chat_v2_connection_ids_for_event_session_token("new", None)
+    )
+    await asyncio.sleep(0)
+    assert order == ["old"]
+    release.set()
+    await asyncio.gather(first, second)
+    assert order == ["old", "new"]
+    assert manager._event_routes == {"new": {"owner"}}
+
+
+@pytest.mark.asyncio
+async def test_admin_subscription_does_not_replace_durable_owner() -> None:
+    session = AsyncMock()
+    session.get.return_value = SimpleNamespace(user_email="owner@example.com")
+    context = AsyncMock()
+    context.__aenter__.return_value = session
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(session_factory=Mock(return_value=context)))
+    )
+    manager._connections["admin"] = SimpleNamespace(user_email="admin@example.com", role="admin")
+    manager._by_user["admin@example.com"].add("admin")
+    manager._by_chat_v2_conversation["conv-1"].add("admin")
+    assert (
+        await manager._resolve_cluster_signal_owner({"conversation_id": "conv-1"})
+        == "owner@example.com"
+    )
+    session.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalidation_owner_uses_authorized_subscription_without_database() -> None:
+    factory = Mock(side_effect=AssertionError("Unexpected routing database read"))
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(session_factory=factory))
+    )
+    manager._connections["owner"] = SimpleNamespace(user_email="owner@example.com", role="user")
+    manager._by_user["owner@example.com"].add("owner")
+    manager._by_chat_v2_conversation["conv-1"].add("owner")
+    assert (
+        await manager._resolve_cluster_signal_owner({"conversation_id": "conv-1"})
+        == "owner@example.com"
+    )
 
 
 @pytest.mark.asyncio
@@ -1118,6 +1349,88 @@ async def test_chat_v2_missing_stream_manager_skips_registration_observer_and_ru
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["session-original", "session-successor", "session-parent"])
+@pytest.mark.parametrize("rotates_after_subscription", [False, True])
+async def test_rotated_scope_subscription_and_fanout_share_lineage(
+    monkeypatch: pytest.MonkeyPatch, owner: str, rotates_after_subscription: bool
+) -> None:
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                session_factory=Mock(return_value=AsyncMock()),
+            )
+        )
+    )
+    lineage = AsyncMock(
+        return_value=(
+            [
+                SimpleNamespace(session_id="session-original"),
+                SimpleNamespace(session_id="session-successor"),
+            ],
+            False,
+        )
+    )
+    monkeypatch.setattr("cognis.store.queries.get_child_session_continuation_chain", lineage)
+    socket = _RecordingWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="rotated",
+        websocket=cast(Any, socket),
+        user_email="user@example.com",
+        role="user",
+    )
+    manager._connections[connection.connection_id] = connection  # noqa: SLF001
+    scope = TimelineScope(
+        key="session:session-original"
+        if rotates_after_subscription
+        else "session:session-successor",
+        kind="session",
+        session_id="session-original" if rotates_after_subscription else "session-successor",
+        conversation_id="conversation-1",
+    )
+    turn = {"turn_id": "turn-rotated", "session_id": owner, "status": "running"}
+    monkeypatch.setattr(manager, "_ensure_turn_observer", lambda _: None)
+    monkeypatch.setattr(
+        manager,
+        "_conversation_runtime_snapshot",
+        AsyncMock(
+            return_value={
+                "has_active_turn": True,
+                "active_turn": turn,
+            }
+        ),
+    )
+    manager.subscribe_chat_v2(
+        connection,
+        scope,
+        cursor="cursor-rotated",
+        session_ids=frozenset(
+            ["session-original"]
+            if rotates_after_subscription
+            else ["session-original", "session-successor"]
+        ),
+    )
+    await manager.send_chat_v2_scope_runtime_snapshot(connection, scope)
+    assert socket.payloads[-1]["runtime"]["has_active_turn"] == (owner != "session-parent")
+    socket.payloads.clear()
+    await manager._fanout_chat_v2_runtime(  # noqa: SLF001
+        "conversation-1",
+        volatile_items=[],
+        has_active_turn=True,
+        active_session_id=owner,
+        active_turn=turn,
+        context_usage=None,
+        last_generation=None,
+    )
+    assert bool(socket.payloads) == (owner != "session-parent")
+    assert lineage.await_count == (
+        1
+        if owner == "session-parent"
+        or (rotates_after_subscription and owner == "session-successor")
+        else 0
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_v2_forged_missing_stream_false_is_rehydrated_before_cursor_or_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1424,6 +1737,8 @@ class _RecordingManager:
         last_generation: dict[str, Any] | None = None,
         lifecycle: str | None = None,
         retire_assistant_streams: bool = False,
+        active_turn: dict[str, Any] | None = None,
+        runtime_authority: RuntimeAuthority | None = None,
     ) -> None:
         del active_session_id, context_usage
         self.chat_v2_runtime_payloads.append(
@@ -2638,6 +2953,67 @@ async def test_conversation_fanout_includes_chat_v2_subscribers_when_requested()
 
 
 @pytest.mark.asyncio
+async def test_retry_notice_keeps_authority_without_local_relay_owner() -> None:
+    authority = RuntimeAuthority(
+        direct_request_id="request-retry",
+        turn_id="turn-retry",
+        fencing_token=8,
+        lifecycle="recoverable",
+    )
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    manager._fanout_chat_v2_runtime = AsyncMock()
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-retry",
+        volatile_items=[],
+        active_turn={"turn_id": "turn-retry", "session_id": "session-retry", "status": "waiting"},
+        runtime_authority=authority,
+    )
+    assert manager._fanout_chat_v2_runtime.call_args.kwargs["authority"] == authority
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_retry_notice_uses_durable_waiting_state(cancelled: bool) -> None:
+    waiting = {
+        "turn_id": "turn-retry",
+        "session_id": "session-retry",
+        "status": "waiting",
+        "retry_at": "2026-09-15T19:40:00+00:00",
+    }
+    authority = RuntimeAuthority(
+        direct_request_id="request-retry",
+        turn_id="turn-retry",
+        fencing_token=8,
+        lifecycle="recoverable",
+    )
+    scheduler = SimpleNamespace(
+        durable_runtime_context=AsyncMock(
+            return_value={"running": None if cancelled else waiting, "authority": authority}
+        ),
+    )
+    manager = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler)),
+        send_to_conversation=AsyncMock(),
+        send_chat_v2_runtime_to_conversation=AsyncMock(),
+    )
+    observer = WebSocketTurnObserver(manager)
+    await observer.on_system_message(
+        "conv-retry",
+        "Waiting to retry",
+        notice_id="retry-notice",
+        kind="turn_retry_pending",
+        turn_id="turn-retry",
+    )
+    if cancelled:
+        manager.send_chat_v2_runtime_to_conversation.assert_not_awaited()
+    else:
+        kwargs = manager.send_chat_v2_runtime_to_conversation.call_args.kwargs
+        assert kwargs["active_turn"] == waiting
+        assert kwargs["runtime_authority"] == authority
+        assert kwargs["lifecycle"] == "recoverable"
+
+
+@pytest.mark.asyncio
 async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
     manager = _RecordingManager()
     observer = WebSocketTurnObserver(manager)  # type: ignore[arg-type]
@@ -3381,17 +3757,24 @@ async def test_conversation_updated_fanout_enriches_read_timestamps(
 ) -> None:
     last_read_at = datetime(2026, 6, 8, 12, 5, tzinfo=UTC)
     last_message_at = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)
+    active_session_updated_at = datetime(2026, 6, 8, 12, 4, tzinfo=UTC)
 
     async def _fake_get_conversation(_session: object, conversation_id: str) -> object:
         assert conversation_id == "conv-1"
         return SimpleNamespace(
             conversation_id="conv-1",
             user_email="user@example.com",
+            active_session_id="session-1",
             last_read_at=last_read_at,
             last_message_at=last_message_at,
         )
 
+    async def _fake_get_session_row(_session: object, session_id: str) -> object:
+        assert session_id == "session-1"
+        return SimpleNamespace(updated_at=active_session_updated_at)
+
     monkeypatch.setattr("cognis.api.websocket.get_conversation", _fake_get_conversation)
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _fake_get_session_row)
     app = SimpleNamespace(state=SimpleNamespace(session_factory=lambda: _NullSession()))
     manager = WebSocketConnectionManager(app)
 
@@ -3402,6 +3785,7 @@ async def test_conversation_updated_fanout_enriches_read_timestamps(
 
     assert enriched["last_read_at"] == last_read_at.isoformat()
     assert enriched["last_message_at"] == last_message_at.isoformat()
+    assert enriched["active_session_updated_at"] == active_session_updated_at.isoformat()
     assert enriched["has_unread"] is False
 
 

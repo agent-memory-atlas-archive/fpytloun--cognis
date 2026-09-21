@@ -94,7 +94,9 @@ from cognis.core.events import EventBus, EventType
 from cognis.core.local_model_catalog import LocalModelCatalog
 from cognis.core.local_model_reconciler import LocalModelReconciler
 from cognis.core.local_model_runtime import LocalModelRuntimeManager
+from cognis.core.loop_watchdog import EventLoopWatchdog
 from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService
+from cognis.core.observability import ObservabilityService
 from cognis.core.redis_service import RedisService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
@@ -518,6 +520,11 @@ def create_app(
         )
         await tool_classification_queue.start()
         await _print_startup_status(config_runtime, providers, ui_build_dir)
+        observability_service = ObservabilityService(
+            session_factory,
+            owner_id=controller_runtime.owner_id,
+            lsp_provider=providers.executor,
+        )
 
         async with session_factory() as session:
             from cognis.core.executor_availability import is_executor_type_available
@@ -630,8 +637,12 @@ def create_app(
         )
         tool_output_spool = ToolOutputSpool()
         from cognis.core.tool_output_maintenance import ToolOutputMaintenanceService
+        from cognis.store.coordination import DatabaseLeaseStore
 
-        tool_output_maintenance = ToolOutputMaintenanceService(tool_output_store)
+        maintenance_leases = DatabaseLeaseStore(session_factory)
+        tool_output_maintenance = ToolOutputMaintenanceService(
+            tool_output_store, lease_store=maintenance_leases
+        )
 
         # Artifact store for images and other binary content
         from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
@@ -673,6 +684,7 @@ def create_app(
         artifact_maintenance = ArtifactMaintenanceService(
             session_factory=session_factory,
             artifact_store=artifact_store,
+            lease_store=maintenance_leases,
         )
         await artifact_maintenance.start()
 
@@ -1583,6 +1595,9 @@ def create_app(
                     session_lock.evict(session_id, reason="sweeper")
 
         session_lock_sweeper_task = asyncio.create_task(_session_lock_sweeper())
+        loop_watchdog = EventLoopWatchdog()
+        loop_watchdog.start()
+        app.state.loop_watchdog = loop_watchdog
         mcp_oauth_service.start_refresh_maintenance()
         await tool_output_maintenance.start()
 
@@ -1680,6 +1695,8 @@ def create_app(
             cancel_timeout_seconds=config_runtime.shutdown_cancel_timeout_seconds,
         )
         app.state.shutdown_coordinator = shutdown_coordinator
+        await observability_service.start()
+        app.state.observability_service = observability_service
         yield
 
         await shutdown_coordinator.drain()
@@ -1704,6 +1721,7 @@ def create_app(
         if chat_v2_runtime_relay is not None:
             turn_scheduler.remove_global_observer(ws_manager._observer)
             await chat_v2_runtime_relay.stop(drain_timeout_seconds=1.0)
+        loop_watchdog.stop()
         if session_lock_sweeper_task is not None:
             session_lock_sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1736,12 +1754,13 @@ def create_app(
         await providers.memory.client.aclose()
         await providers.guardrails.client.aclose()
         await local_model_catalog.aclose()
+        await observability_service.stop()
         await controller_directory.stop()
         await work_graph_resolver.stop()
         await engine.dispose()
         controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.15.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.16.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -1825,6 +1844,18 @@ def create_app(
             "validation_error",
             "Request validation failed",
             details={"errors": exc.errors()},
+        )
+
+    from cognis.store.direct_turns import DirectTurnConflictError
+
+    @app.exception_handler(DirectTurnConflictError)
+    async def direct_turn_conflict_handler(
+        request: Request, exc: DirectTurnConflictError
+    ) -> JSONResponse:
+        return error_response(
+            409,
+            "direct_turn_conflict",
+            "The turn request conflicts with an existing request.",
         )
 
     @app.exception_handler(ValueError)

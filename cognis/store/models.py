@@ -31,7 +31,7 @@ from sqlalchemy import (
     text,
     true,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, defer, mapped_column
 
 
 def _utcnow() -> datetime:
@@ -1434,6 +1434,7 @@ class ManagedConversationLink(Base):
         String, ForeignKey("managed_conversation_links.link_id"), nullable=True
     )
     depth: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    depth_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     target_agent_id: Mapped[str] = mapped_column(
         String, ForeignKey("agents.agent_id"), nullable=False
     )
@@ -2476,6 +2477,18 @@ class ExecutorRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+
+def executor_observed_tools_deferred() -> Any:
+    """Loader option that skips the multi-megabyte ``observed_tools`` JSON column.
+
+    asyncpg decodes JSON columns on the event loop before application code runs,
+    so hot paths that never read ``observed_tools`` opt out of loading it. The
+    ``raiseload`` flag makes an accidental read fail loudly instead of issuing a
+    lazy load that async sessions cannot service.
+    """
+
+    return defer(ExecutorRow.observed_tools, raiseload=True)
 
 
 class LocalModelDeployment(Base):

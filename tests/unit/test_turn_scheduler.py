@@ -72,6 +72,11 @@ from cognis.models.session import (
     SessionModel,
     SessionStatus,
 )
+from cognis.runtime_context import (
+    current_agent_id,
+    current_agent_owner_email,
+    current_user_email,
+)
 from cognis.store import queries
 from cognis.store.direct_turns import (
     TOOL_DISPATCH_DESCRIPTOR_LIMIT,
@@ -306,7 +311,10 @@ async def test_begin_drain_preserves_already_accepted_queued_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_permanent_direct_turn_failure_loads_runtime_without_user_email_argument() -> None:
+@pytest.mark.parametrize("already_appended", [False, True])
+async def test_permanent_direct_turn_failure_loads_runtime_without_user_email_argument(
+    already_appended: bool,
+) -> None:
     scheduler = object.__new__(TurnScheduler)
     session = SimpleNamespace(session_id="sess-1")
     agent = SimpleNamespace()
@@ -324,13 +332,19 @@ async def test_permanent_direct_turn_failure_loads_runtime_without_user_email_ar
         turn_id="turn-1",
         request_id="request-1",
         payload={"metadata": {}},
-        outcome={"phase": "user_appended"},
+        outcome={"phase": "user_appended"} if already_appended else {},
     )
 
     await scheduler._handle_permanent_direct_turn_failure(row, RuntimeError("failed"))
 
     scheduler._load_conversation_runtime.assert_awaited_once_with("conv-1")
-    scheduler._persist_admitted_user_message.assert_not_awaited()
+    if already_appended:
+        scheduler._persist_admitted_user_message.assert_not_awaited()
+    else:
+        scheduler._persist_admitted_user_message.assert_awaited_once()
+        assert (
+            scheduler._persist_admitted_user_message.await_args.kwargs["queue_id"] == row.request_id
+        )
     scheduler._persist_turn_error_event.assert_awaited_once()
     scheduler._publish_turn_error.assert_awaited_once()
     scheduler._notify_queue_updated.assert_awaited_once_with("conv-1")
@@ -428,9 +442,13 @@ async def test_interruption_makes_durable_turn_recoverable_before_cancelling_loc
 @pytest.mark.asyncio
 async def test_user_cancel_wins_after_active_request_becomes_recoverable() -> None:
     scheduler = object.__new__(TurnScheduler)
+    scheduler._event_bus = EventBus()
     row = SimpleNamespace(
         request_id="request-1",
         status=DirectTurnStatus.RECOVERABLE.value,
+        conversation_id="conv-1",
+        session_id="session-1",
+        updated_at=datetime.now(UTC),
     )
     store = SimpleNamespace(
         cancel_conversation=AsyncMock(
@@ -445,7 +463,10 @@ async def test_user_cancel_wins_after_active_request_becomes_recoverable() -> No
     scheduler._turn_sessions = {}
     scheduler._agent_loop = SimpleNamespace(cancel_children=AsyncMock(return_value=[]))
     scheduler._notify_queue_updated = AsyncMock()
-    scheduler.cluster_signals = SimpleNamespace(publish=AsyncMock(return_value=True))
+    scheduler.cluster_signals = SimpleNamespace(
+        publish=AsyncMock(return_value=True), publish_chat_change=AsyncMock()
+    )
+    scheduler._settle_orphaned_managed_terminal = AsyncMock()
 
     cancelled = await scheduler.cancel_turn("conv-1", clear_queue=False)
 
@@ -454,6 +475,12 @@ async def test_user_cancel_wins_after_active_request_becomes_recoverable() -> No
         "conv-1", clear_queue=False, active_request_id="request-1"
     )
     scheduler.cluster_signals.publish.assert_not_awaited()
+    await asyncio.gather(*scheduler._best_effort_tasks)
+    scheduler.cluster_signals.publish_chat_change.assert_awaited_once_with(
+        "conv-1",
+        session_id="session-1",
+        revision=f"direct-turn:request-1:{row.status}:{row.updated_at.isoformat()}",
+    )
 
 
 @pytest.mark.asyncio
@@ -495,16 +522,22 @@ async def test_durable_cancel_refreshes_stale_queue_cache() -> None:
 @pytest.mark.asyncio
 async def test_cancel_targets_active_parent_not_absorbing_children() -> None:
     scheduler = object.__new__(TurnScheduler)
+    scheduler._event_bus = EventBus()
     parent = SimpleNamespace(
         request_id="request-parent",
         status=DirectTurnStatus.RUNNING.value,
+        conversation_id="conv-1",
+        session_id="session-1",
+        updated_at=datetime.now(UTC),
     )
     store = SimpleNamespace(
         cancel_conversation=AsyncMock(
             return_value=[SimpleNamespace(request=parent, cancellation_requested=True)]
         ),
     )
-    cluster_signals = SimpleNamespace(publish=AsyncMock(return_value=True))
+    cluster_signals = SimpleNamespace(
+        publish=AsyncMock(return_value=True), publish_chat_change=AsyncMock()
+    )
     scheduler._direct_turn_store = store
     scheduler._durable_request_by_conversation = {}
     scheduler._turn_locks = {}
@@ -525,6 +558,7 @@ async def test_cancel_targets_active_parent_not_absorbing_children() -> None:
     await asyncio.gather(*tuple(scheduler._best_effort_tasks))
     published_scope = cluster_signals.publish.await_args.kwargs["scope"]
     assert published_scope.direct_request_id == "request-parent"
+    cluster_signals.publish_chat_change.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1375,6 +1409,17 @@ async def test_slow_idle_checkpoint_runs_after_admission_and_queues_next_message
     )
     assert disallowed_error is not None
     assert disallowed_error.code == "queueing_not_allowed"
+    assert scheduler.queued_messages("conv-1") == []
+
+    durable_error = await scheduler.submit_turn(
+        "conv-1",
+        "durable",
+        user_email="user@example.com",
+        _durable_request_id="request-durable",
+        _durable_lease=SimpleNamespace(fencing_token=7),
+    )
+    assert durable_error is not None
+    assert durable_error.code == "queueing_not_allowed"
     assert scheduler.queued_messages("conv-1") == []
 
     second_error = await scheduler.submit_turn(
@@ -2500,12 +2545,14 @@ async def test_normal_user_turn_does_not_persist_visible_turn_notice() -> None:
         cancel_event=asyncio.Event(),
         turn_control=_TurnControl(),
         turn_id="turn-1",
+        queue_id="dtr-admission",
     )
 
     assert len(guardrails.calls) == 1
     recorded_event = guardrails.calls[0]["events"][0]
     assert recorded_event.type == "user_message"
     assert recorded_event.data["turn_id"] == "turn-1"
+    assert recorded_event.data["queue_id"] == "dtr-admission"
     assert recorded_event.data["content"] == "hello"
     assert (
         scheduler._workflow_engine.run_direct_turn.await_args.kwargs[
@@ -2837,7 +2884,10 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_active_tool_output_snapshots_include_progress_only_preparing_state() -> None:
+@pytest.mark.parametrize("abandoned", [False, True])
+async def test_active_tool_output_snapshots_include_progress_only_preparing_state(
+    abandoned: bool,
+) -> None:
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
         workflow_engine=SimpleNamespace(),
@@ -2860,6 +2910,40 @@ async def test_active_tool_output_snapshots_include_progress_only_preparing_stat
     scheduler._turn_controls["conv-1"] = control
 
     try:
+        scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] = 55
+        on_token, _, on_tool_call, _, on_progress, _, _ = scheduler._build_callbacks(
+            "conv-1", "sess-1", "turn-1", "turn-1"
+        )
+        await on_token("Commentary before the patch.", 46)
+        streamed = scheduler._active_streams["conv-1"].snapshot()
+        for complete in (False, False, True):
+            await on_progress(
+                "call-patch",
+                "apply_patch",
+                {"phase": "preparing_input", "input_chars": 42, "complete": complete},
+                46,
+            )
+        assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 55
+        assert scheduler._active_streams["conv-1"].snapshot() == streamed
+        assert scheduler._assistant_phase_for_tool("conv-1", "turn-1", "call-patch") is None
+        if not abandoned:
+            # Persistence reads the same phase as streaming before tool dispatch.
+            assert streamed["assistant_phase_index"] == 55
+            await on_tool_call("apply_patch", "call-patch", {"patch": "patch input"}, 46)
+            assert scheduler._assistant_phase_for_tool("conv-1", "turn-1", "call-patch") == 55
+            assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 56
+            assert (
+                scheduler._active_tool_outputs[
+                    ("conv-1", "sess-1", "call-patch")
+                ].assistant_phase_index
+                == 55
+            )
+            assert "conv-1" not in scheduler._active_streams
+            await on_tool_call("apply_patch", "call-patch", {"patch": "patch input"}, 46)
+            assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 56
+            await on_token("Next commentary.", 47)
+            await on_progress("call-patch", "apply_patch", {"phase": "complete"}, 46)
+            assert scheduler._active_streams["conv-1"].snapshot()["assistant_phase_index"] == 56
         await scheduler._update_active_tool_progress(
             conversation_id="conv-1",
             session_id="sess-1",
@@ -2885,6 +2969,24 @@ async def test_active_tool_output_snapshots_include_progress_only_preparing_stat
         assert snapshots[0]["progress_input_chars"] == 1234
         assert snapshots[0]["progress_input_lines"] == 42
         assert snapshots[0]["progress_complete"] is False
+        for phase in ("input_abandoned", "preparing_input"):
+            await scheduler._update_active_tool_progress(
+                conversation_id="conv-1",
+                session_id="sess-1",
+                call_id="call-patch",
+                tool_name="apply_patch",
+                turn_id="turn-1",
+                progress={"phase": phase, "complete": False},
+            )
+        assert await scheduler.active_tool_output_snapshots("conv-1") == []
+        abandoned_snapshot = scheduler._active_tool_outputs[("conv-1", "sess-1", "call-patch")]
+        assert abandoned_snapshot.status == "failed"
+        assert abandoned_snapshot.progress_phase == "input_abandoned"
+        assert abandoned_snapshot.result == ""
+        if abandoned:
+            await on_progress("call-patch", "apply_patch", {"phase": "input_abandoned"}, 46)
+            assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 55
+            assert scheduler._active_streams["conv-1"].snapshot() == streamed
     finally:
         scheduler._active_turns["conv-1"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -3653,7 +3755,14 @@ async def test_pending_escalation_admits_to_durable_store_before_ack(
     scheduler._clear_redo_on_accepted_user_turn = AsyncMock()  # type: ignore[method-assign]
     scheduler._notify_observers_system_message = AsyncMock()  # type: ignore[method-assign]
     scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
-    durable_row = SimpleNamespace(request_id="dtr-1", turn_id="turn-1")
+    durable_row = SimpleNamespace(
+        request_id="dtr-1",
+        turn_id="turn-1",
+        status="queued",
+        conversation_id="conv-1",
+        session_id="sess-1",
+        updated_at=datetime.now(UTC),
+    )
     scheduler._direct_turn_store = SimpleNamespace(  # noqa: SLF001
         list_conversation_pending=AsyncMock(return_value=[]),
         admit=AsyncMock(return_value=SimpleNamespace(request=durable_row, created=True)),
@@ -4847,7 +4956,10 @@ async def test_submit_turn_reactivates_idle_session_before_launch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_turn_waits_for_locked_session_and_reloads_runtime() -> None:
+@pytest.mark.parametrize("durable_lock", [None, "session", "conversation"])
+async def test_submit_turn_waits_for_locked_session_and_reloads_runtime(
+    durable_lock: str | None,
+) -> None:
     class _LockedAgentLoop:
         def __init__(self) -> None:
             self.locked = True
@@ -4910,6 +5022,31 @@ async def test_submit_turn_waits_for_locked_session_and_reloads_runtime() -> Non
     scheduler._update_conversation_last_message_at = AsyncMock()  # type: ignore[method-assign]
     scheduler._launch_turn = lambda **kwargs: launched.update(kwargs)  # type: ignore[assignment]
 
+    if durable_lock is not None:
+        from cognis.core.direct_turn_runtime import LocalDirectTurnBusy
+
+        lock = scheduler._turn_lock("conv-1")
+        if durable_lock == "conversation":
+            await lock.acquire()
+        try:
+            with pytest.raises(LocalDirectTurnBusy):
+                await asyncio.wait_for(
+                    scheduler.submit_turn(
+                        "conv-1",
+                        "hello",
+                        user_email="user@example.com",
+                        _durable_request_id="request-locked",
+                    ),
+                    timeout=1,
+                )
+        finally:
+            if durable_lock == "conversation":
+                lock.release()
+        assert not launched
+        assert agent_loop.waited_for == []
+        session_manager.mark_active.assert_not_awaited()
+        return
+
     error = await scheduler.submit_turn(
         "conv-1",
         "hello",
@@ -4921,6 +5058,38 @@ async def test_submit_turn_waits_for_locked_session_and_reloads_runtime() -> Non
     assert runtime_calls == 2
     session_manager.mark_active.assert_not_awaited()
     assert launched["session"] is new_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cluster_enabled", [False, True])
+async def test_committed_direct_turn_change_invalidates_publishing_controller(
+    cluster_enabled: bool,
+) -> None:
+    from cognis.core.cluster_signals import ClusterSignalKind
+
+    bus = SimpleNamespace(publish=AsyncMock())
+    cluster = SimpleNamespace(publish_chat_change=AsyncMock()) if cluster_enabled else None
+    scheduler = SimpleNamespace(
+        _event_bus=bus,
+        cluster_signals=cluster,
+        _settle_orphaned_managed_terminal=AsyncMock(),
+    )
+    row = SimpleNamespace(
+        request_id="request-completed",
+        conversation_id="conv-1",
+        session_id="sess-1",
+        status="completed",
+        updated_at=datetime.now(UTC),
+    )
+    await TurnScheduler._publish_durable_turn_change(scheduler, row)
+    bus.publish.assert_awaited_once()
+    event = bus.publish.call_args.args[0]
+    assert event.type == EventType.CLUSTER_SCOPE_INVALIDATED
+    assert event.data["kind"] == ClusterSignalKind.CHAT_SCOPE_CHANGED
+    assert event.data["scope"] == {"conversation_id": "conv-1", "session_id": "sess-1"}
+    assert ":completed:" in event.data["revision"]
+    if cluster is not None:
+        cluster.publish_chat_change.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -7090,6 +7259,345 @@ def _follow_up_test_scheduler(session_factory) -> TurnScheduler:
     )
 
 
+async def _insert_orphan_follow_up(
+    session_factory,
+    *,
+    follow_up_id: str,
+    status: str,
+    stale: bool = True,
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            FollowUpIntentRow(
+                intent_id=f"fui_{follow_up_id}",
+                conversation_id=f"conv_{follow_up_id}",
+                follow_up_id=follow_up_id,
+                event_payload={},
+                status=status,
+                attempt_count=1,
+                lease_owner="lost-owner" if status != "pending" else None,
+                lease_expires_at=now - timedelta(seconds=1)
+                if stale
+                else now + timedelta(minutes=5),
+                last_error=None,
+                created_at=now - timedelta(minutes=5),
+                updated_at=now - timedelta(minutes=5) if stale else now,
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "processing", "admitted"])
+async def test_missing_follow_up_fence_is_quarantined_without_replay(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / f'orphan-{status}.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    scheduler.submit_turn = AsyncMock()  # type: ignore[method-assign]
+    await _insert_orphan_follow_up(
+        session_factory,
+        follow_up_id=f"fup_{status}",
+        status=status,
+    )
+
+    assert await scheduler.recover_follow_up_intents() == 0
+
+    async with session_factory() as session:
+        intent = (
+            await session.execute(
+                select(FollowUpIntentRow).where(FollowUpIntentRow.follow_up_id == f"fup_{status}")
+            )
+        ).scalar_one()
+        fence = await session.get(
+            FollowUpDedupeRow,
+            scheduler._follow_up_dedupe_key(intent.conversation_id, intent.follow_up_id),
+        )
+        assert intent.status == "failed"
+        assert intent.lease_owner is None
+        assert intent.lease_expires_at is None
+        assert "work was not replayed" in (intent.last_error or "")
+        assert fence is not None
+        assert fence.status == "handled"
+    scheduler.submit_turn.assert_not_awaited()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_missing_fence_uses_completed_managed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'orphan-completed.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    await _insert_orphan_follow_up(
+        session_factory,
+        follow_up_id="fup_completed",
+        status="admitted",
+    )
+    async with session_factory() as session:
+        await session.execute(
+            update(FollowUpIntentRow)
+            .where(FollowUpIntentRow.follow_up_id == "fup_completed")
+            .values(
+                event_payload={
+                    "follow_up": {
+                        "metadata": {
+                            "link_id": "mconv_completed",
+                            "target_conversation_id": "conv_target",
+                            "target_turn_id": "turn_completed",
+                        }
+                    }
+                }
+            )
+        )
+        await session.commit()
+
+    async def _completed_link(*_args, **_kwargs):
+        return SimpleNamespace(
+            link_id="mconv_completed",
+            controller_conversation_id="conv_fup_completed",
+            conversation_state="completed",
+            turn_state="completed",
+            last_result_turn_id="turn_completed",
+        )
+
+    monkeypatch.setattr(
+        queries,
+        "get_managed_conversation_link_for_target",
+        _completed_link,
+    )
+    assert await scheduler.recover_follow_up_intents() == 0
+
+    async with session_factory() as session:
+        intent = (
+            await session.execute(
+                select(FollowUpIntentRow).where(FollowUpIntentRow.follow_up_id == "fup_completed")
+            )
+        ).scalar_one()
+        assert intent.status == "submitted"
+        assert intent.last_error is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_missing_fence_reconciliation_rechecks_staleness_and_existing_fence(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'orphan-races.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    await _insert_orphan_follow_up(
+        session_factory,
+        follow_up_id="fup_active",
+        status="processing",
+        stale=False,
+    )
+    await _insert_orphan_follow_up(
+        session_factory,
+        follow_up_id="fup_repaired",
+        status="processing",
+    )
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            FollowUpDedupeRow(
+                dedupe_key=scheduler._follow_up_dedupe_key("conv_fup_repaired", "fup_repaired"),
+                conversation_id="conv_fup_repaired",
+                follow_up_id="fup_repaired",
+                status="processing",
+                expires_at=now + timedelta(minutes=5),
+                lease_owner="new-owner",
+                lease_expires_at=now + timedelta(minutes=5),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+    now = datetime.now(UTC)
+    assert (
+        await scheduler._reconcile_missing_follow_up_fences(
+            now=now,
+            stale_before=now - timedelta(seconds=120),
+            limit=100,
+        )
+        == 0
+    )
+
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(FollowUpIntentRow).where(
+                        FollowUpIntentRow.follow_up_id.in_(("fup_active", "fup_repaired"))
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {row.status for row in rows} == {"processing"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_purge_retains_nonterminal_fence_and_removes_terminal_fence(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fence-purge.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        for suffix, intent_status in (("live", "admitted"), ("done", "submitted")):
+            session.add(
+                FollowUpIntentRow(
+                    intent_id=f"fui_{suffix}",
+                    conversation_id=f"conv_{suffix}",
+                    follow_up_id=f"fup_{suffix}",
+                    event_payload={},
+                    status=intent_status,
+                    attempt_count=1,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                FollowUpDedupeRow(
+                    dedupe_key=scheduler._follow_up_dedupe_key(f"conv_{suffix}", f"fup_{suffix}"),
+                    conversation_id=f"conv_{suffix}",
+                    follow_up_id=f"fup_{suffix}",
+                    status="handled" if intent_status == "submitted" else "admitted",
+                    expires_at=now - timedelta(seconds=1),
+                    lease_owner=None,
+                    lease_expires_at=now - timedelta(seconds=1),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await session.commit()
+
+    await scheduler._purge_expired_follow_ups()
+
+    async with session_factory() as session:
+        assert (
+            await session.get(
+                FollowUpDedupeRow,
+                scheduler._follow_up_dedupe_key("conv_live", "fup_live"),
+            )
+            is not None
+        )
+        assert (
+            await session.get(
+                FollowUpDedupeRow,
+                scheduler._follow_up_dedupe_key("conv_done", "fup_done"),
+            )
+            is None
+        )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_multiple_orphans_and_two_reconcilers_converge(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'orphan-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler_a = _follow_up_test_scheduler(session_factory)
+    scheduler_b = _follow_up_test_scheduler(session_factory)
+    for index in range(3):
+        await _insert_orphan_follow_up(
+            session_factory,
+            follow_up_id=f"fup_multi_{index}",
+            status=("pending", "processing", "admitted")[index],
+        )
+
+    await asyncio.gather(
+        scheduler_a.recover_follow_up_intents(),
+        scheduler_b.recover_follow_up_intents(),
+    )
+
+    async with session_factory() as session:
+        intents = list((await session.execute(select(FollowUpIntentRow))).scalars().all())
+        fences = list((await session.execute(select(FollowUpDedupeRow))).scalars().all())
+        assert len(intents) == 3
+        assert len(fences) == 3
+        assert {row.status for row in intents} == {"failed"}
+        assert {row.status for row in fences} == {"handled"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_missing_fence_reconciliation_rolls_back_intent_when_tombstone_fails(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'orphan-rollback.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    await _insert_orphan_follow_up(
+        session_factory,
+        follow_up_id="fup_rollback",
+        status="admitted",
+    )
+
+    def _fail_tombstone(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().lower().startswith("insert into follow_up_dedupe"):
+            raise RuntimeError("simulated tombstone insert failure")
+
+    sqlalchemy_event.listen(engine.sync_engine, "before_cursor_execute", _fail_tombstone)
+    try:
+        now = datetime.now(UTC)
+        assert (
+            await scheduler._reconcile_missing_follow_up_fences(
+                now=now,
+                stale_before=now - timedelta(seconds=120),
+                limit=100,
+            )
+            == 0
+        )
+    finally:
+        sqlalchemy_event.remove(engine.sync_engine, "before_cursor_execute", _fail_tombstone)
+
+    async with session_factory() as session:
+        intent = (
+            await session.execute(
+                select(FollowUpIntentRow).where(FollowUpIntentRow.follow_up_id == "fup_rollback")
+            )
+        ).scalar_one()
+        assert intent.status == "admitted"
+        assert (
+            await session.get(
+                FollowUpDedupeRow,
+                scheduler._follow_up_dedupe_key(
+                    intent.conversation_id,
+                    intent.follow_up_id,
+                ),
+            )
+            is None
+        )
+    await engine.dispose()
+
+
 def test_turn_tool_call_ledger_seeds_retry_and_continuation_lineage() -> None:
     scheduler = _follow_up_test_scheduler(SimpleNamespace())
     source = scheduler._tool_call_ledger_for_turn(
@@ -8547,6 +9055,7 @@ async def test_reclaimed_transient_step_error_skips_canonical_user_reappend() ->
     assert scheduler.submit_turn.await_args.kwargs["retry_reason"] is RetryReason.CONTROLLER_RESTART
     assert scheduler.submit_turn.await_args.kwargs["retry_attempt"] == 2
     assert scheduler.submit_turn.await_args.kwargs["intention_eligible"] is True
+    assert scheduler.submit_turn.await_args.kwargs["allow_queue"] is False
     assert (
         render_user_message(
             payload.content,
@@ -8866,7 +9375,10 @@ async def test_retry_lineage_reconstruction_uses_page_cursor_not_stream_high_wat
 
 
 @pytest.mark.asyncio
-async def test_uncertain_append_retry_reuses_original_intaris_key_after_rotation() -> None:
+@pytest.mark.parametrize("client_message_id", [None, "client-1"])
+async def test_uncertain_append_retry_reuses_original_intaris_key_after_rotation(
+    client_message_id: str | None,
+) -> None:
     record_events = AsyncMock(
         return_value=SimpleNamespace(
             ok=True,
@@ -8907,7 +9419,8 @@ async def test_uncertain_append_retry_reuses_original_intaris_key_after_rotation
         ],
         attachments=[],
         turn_id="turn-1",
-        client_message_id="client-1",
+        client_message_id=client_message_id,
+        queue_id="dtr-admission",
         chat_mode=ResolvedChatMode(mode="default", source="system_default"),
         cancel_event=asyncio.Event(),
         intaris_session_id_override="isess-original",
@@ -8921,6 +9434,8 @@ async def test_uncertain_append_retry_reuses_original_intaris_key_after_rotation
     )
     event_data = record_events.await_args.kwargs["events"][0].data
     assert event_data["content"] == "hello"
+    assert event_data["queue_id"] == "dtr-admission"
+    assert event_data["client_message_id"] == client_message_id
     assert event_data["intention_eligible"] is False
     assert event_data["message_metadata"] == {"ts": "2026-08-01T10:15:00Z"}
     assert event_data["context_messages"][0]["content"] == "context"
@@ -9090,7 +9605,16 @@ async def test_durable_transient_failure_notifies_observers_before_retry(
     store = SimpleNamespace(
         checkpoint=AsyncMock(return_value=SimpleNamespace(cancel_requested_at=None)),
         has_fence=AsyncMock(return_value=True),
-        mark_running=AsyncMock(return_value=SimpleNamespace(cancel_requested_at=None)),
+        mark_running=AsyncMock(
+            return_value=SimpleNamespace(
+                cancel_requested_at=None,
+                request_id="request-1",
+                status="running",
+                conversation_id="conv-1",
+                session_id="sess-1",
+                updated_at=datetime.now(UTC),
+            )
+        ),
         get=AsyncMock(
             return_value=SimpleNamespace(
                 attempt_count=attempt_count,
@@ -13591,3 +14115,52 @@ async def test_tool_recovery_does_not_swallow_cancellation() -> None:
             cast(Any, row),
             cast(Any, None),
         )
+
+
+class _TenantRecordingRecovery(_RecordingToolRecovery):
+    """Record the tenant context that Intaris-facing recovery runs under."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tenants: list[tuple[str | None, str | None, str | None]] = []
+        self._session_factory = None
+
+    async def _recover_tool_call_group(self, **kwargs: Any) -> None:
+        self.tenants.append(
+            (
+                current_user_email.get(),
+                current_agent_id.get(),
+                current_agent_owner_email.get(),
+            )
+        )
+        await super()._recover_tool_call_group(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_tool_recovery_runs_under_the_request_tenant() -> None:
+    # Takeover recovery runs from a background loop with no request context;
+    # Intaris must still see the request's user, or it 404s on real streams.
+    recovery = _TenantRecordingRecovery()
+    row = _tool_in_flight_row(
+        {
+            "tool_dispatch_groups": [
+                {
+                    "session_id": "sess-parent",
+                    "turn_id": "turn-parent",
+                    "tool_calls": [_dispatch_descriptor("call-parent")],
+                }
+            ]
+        }
+    )
+    row.user_id = "owner@example.com"
+    row.agent_id = "agent-shared"
+
+    assert current_user_email.get() is None
+    await TurnScheduler._recover_interrupted_tool_calls(
+        cast(Any, recovery),
+        cast(Any, row),
+        cast(Any, None),
+    )
+
+    assert recovery.tenants == [("owner@example.com", "agent-shared", "owner@example.com")]
+    assert current_user_email.get() is None, "tenant context must not leak past recovery"

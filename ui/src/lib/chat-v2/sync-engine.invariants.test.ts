@@ -712,13 +712,13 @@ describe('Chat v2 invariant scenarios', () => {
 
     const crossTurnIds = scenario.lastRecord().items.map((item) => item.id);
     expect(crossTurnIds).toContain('message:turn-1:phase:0');
-    expect(crossTurnIds).toContain('local-user:cmsg-2');
+    expect(crossTurnIds).toContain('user:cmsg-2');
     expect(crossTurnIds).toContain('message:turn-2:phase:0');
     // Order: turn1 reply -> queued user msg -> turn2 stream.
     expect(crossTurnIds.indexOf('message:turn-1:phase:0')).toBeLessThan(
-      crossTurnIds.indexOf('local-user:cmsg-2')
+      crossTurnIds.indexOf('user:cmsg-2')
     );
-    expect(crossTurnIds.indexOf('local-user:cmsg-2')).toBeLessThan(
+    expect(crossTurnIds.indexOf('user:cmsg-2')).toBeLessThan(
       crossTurnIds.indexOf('message:turn-2:phase:0')
     );
 
@@ -737,7 +737,7 @@ describe('Chat v2 invariant scenarios', () => {
     const ids = scenario.lastRecord().items.map((item) => item.id);
     expect(ids).toContain('message:turn-1:phase:0');
     expect(ids).toContain('user:cmsg-2');
-    expect(ids).not.toContain('local-user:cmsg-2');
+    expect(ids.filter((id) => id === 'user:cmsg-2')).toHaveLength(1);
     scenario.finish();
   });
 

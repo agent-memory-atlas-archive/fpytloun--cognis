@@ -27,15 +27,17 @@ import {
   isTaskControlConversationSummary,
   shouldInsertDirectlyLoadedConversation,
   conversationAttentionDotClass,
-  conversationAttentionLabel,
-  conversationAttentionOrbitClass,
-  conversationAttentionTone,
-  conversationShowsAttentionDot,
+    conversationAttentionLabel,
+    conversationAttentionOrbitClass,
+    conversationAttentionTone,
+    conversationReadAcknowledgementAt,
+    conversationShowsAttentionDot,
   conversationStatusFilterForConversation,
   conversationTurnModeTone,
   conversationUpdatedRowPatch,
   orderedConversationUpdatedRowPatch,
   chatV2RuntimeConversationPatch,
+  reconcileConversationWithChatRuntime,
   hasUnreadFromConversationTimestamps,
   DEFAULT_INITIAL_TIMELINE_LIMIT,
   DIRECT_CHAT_INITIAL_SESSION_LIMIT,
@@ -206,10 +208,10 @@ describe('recoverable turn retry state', () => {
 });
 
 describe('chat page helpers', () => {
-  it('starts conversation filters collapsed on mobile and expanded on desktop', () => {
+  it('starts conversation filters collapsed on every viewport', () => {
     expect(initialConversationFiltersOpen(390)).toBe(false);
     expect(initialConversationFiltersOpen(1023)).toBe(false);
-    expect(initialConversationFiltersOpen(1024)).toBe(true);
+    expect(initialConversationFiltersOpen(1024)).toBe(false);
   });
   it('pins the inspector from available width without a browser or PWA mode exception', () => {
     expect(conversationInspectorFits(811)).toBe(false);
@@ -1131,6 +1133,37 @@ describe('chat page helpers', () => {
       active_turn_chat_mode: null,
       active_turn_chat_mode_source: null,
     });
+  });
+
+  it.each([true, false])('keeps admitted runtime active=%s over conflicting list metadata', (active) => {
+    const state = {
+      ...emptyChatV2State(),
+      conversationId: 'conv-a',
+      cursor: 'cursor-a',
+      runtime: {
+        runtime_epoch: 'epoch-a',
+        runtime_revision: 4,
+        generated_at: '2026-01-01T00:05:00.000Z',
+        has_active_turn: active,
+        active_turn: active ? {
+          turn_id: 'turn-a', session_id: 'session-a', status: 'running' as const,
+        } : null,
+        volatile_items: [],
+      },
+    };
+    const row = {
+      conversation_id: 'conv-a', title: 'Updated title',
+      // Even newer metadata is not a runtime revision.
+      updated_at: '2026-01-01T00:10:00.000Z',
+      has_active_turn: !active,
+    } as Conversation;
+    const merged = reconcileConversationWithChatRuntime(row, state);
+    expect(merged.has_active_turn).toBe(active);
+    expect(merged.title).toBe('Updated title');
+    expect(reconcileConversationWithChatRuntime(row, { ...state, cursor: null })).toBe(row);
+    expect(reconcileConversationWithChatRuntime(row, { ...state, conversationId: 'conv-b' })).toBe(row);
+    expect(reconcileConversationWithChatRuntime(row, state, optimisticConversationTurnPatch('build')))
+      .toMatchObject({ has_active_turn: true, active_turn_chat_mode: 'build' });
   });
 
   it('orders foreign sidebar runtime patches by timestamp and turn identity', () => {
@@ -2224,6 +2257,53 @@ describe('chat page helpers', () => {
     expect(conversationAttentionDotClass('rose')).toBe('bg-rose-400');
     expect(conversationAttentionOrbitClass('amber')).toBe('conversation-turn-orbit--amber');
     expect(conversationAttentionLabel('default')).toBe('unread');
+  });
+
+  it('clears lifecycle attention after the conversation is observed', () => {
+    expect(conversationAttentionTone({
+      active_session_status: 'cancelled',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T06:59:59Z',
+    })).toBe('amber');
+    expect(conversationAttentionTone({
+      active_session_status: 'cancelled',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+    })).toBe('default');
+    expect(conversationAttentionTone({
+      active_session_status: 'failed',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+    })).toBe('default');
+    expect(conversationAttentionTone({
+      active_session_status: 'completed',
+      active_session_completion_reason: 'task_failed',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+    })).toBe('default');
+  });
+
+  it('keeps actionable notification attention after the conversation is observed', () => {
+    expect(conversationAttentionTone({
+      active_session_status: 'cancelled',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+      pending_notification_types: ['gate'],
+    })).toBe('amber');
+    expect(conversationAttentionTone({
+      active_session_status: 'failed',
+      active_session_updated_at: '2026-09-20T07:00:00Z',
+      last_read_at: '2026-09-20T07:00:01Z',
+      pending_notification_types: ['credential_request'],
+    })).toBe('rose');
+  });
+
+  it('optimistically acknowledges lifecycle attention through the latest session update', () => {
+    expect(conversationReadAcknowledgementAt({
+      active_session_updated_at: '2026-09-20T07:00:03Z',
+      last_message_at: '2026-09-20T07:00:01Z',
+      last_read_at: '2026-09-20T07:00:02Z',
+    }, '2026-09-20T07:00:01Z')).toBe('2026-09-20T07:00:03Z');
   });
 
   it('clears direct-chat unread dots from conversation_updated row patches', () => {

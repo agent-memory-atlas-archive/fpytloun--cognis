@@ -305,6 +305,8 @@ class UserDisplayPreferences(BaseModel):
     theme: Literal["system", "dark", "light"] = "system"
     language: str = "auto"
     dashboard_workspace_windows: bool = True
+    conversation_sidebar_sections: bool = True
+    conversation_sidebar_dense: bool = False
 
     @field_validator("language")
     @classmethod
@@ -645,6 +647,7 @@ class ConversationResponse(BaseModel):
     active_executor_source: str | None = None
     active_session_status: str | None = None
     active_session_completion_reason: str | None = None
+    active_session_updated_at: datetime | None = None
     active_turn_chat_mode: str | None = None
     active_turn_chat_mode_source: str | None = None
     pending_notification_types: list[str] = Field(default_factory=list)

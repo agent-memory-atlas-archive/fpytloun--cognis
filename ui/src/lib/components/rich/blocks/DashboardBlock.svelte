@@ -49,10 +49,12 @@
           </span>
           {#if card.status}<strong>{@html renderInlineMarkdown(String(card.status))}</strong>{/if}
         </div>
+        {#if card.value != null || card.current != null || card.count != null || card.delta}
         <div class="rich-dashboard-value">
           <strong>{@html renderInlineMarkdown(valueText(card.value ?? card.current ?? card.count ?? ''))}</strong>
           {#if card.delta}<em>{@html renderInlineMarkdown(String(card.delta))}</em>{/if}
         </div>
+        {/if}
         {#if sparklinePoints(card.sparkline ?? card.trend)}
           <svg class="rich-sparkline" viewBox="0 0 96 40" role="img" aria-label="Sparkline">
             <polyline points={sparklinePoints(card.sparkline ?? card.trend)} />
@@ -83,10 +85,8 @@
     break-inside: avoid;
     border: 1px solid var(--rich-line);
     border-radius: var(--rich-radius-lg);
-    background:
-      linear-gradient(145deg, var(--rich-surface), var(--rich-surface-solid)),
-      radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--rich-tone-success-fg) 16%, transparent), transparent 34%);
-    box-shadow: 0 20px 60px var(--rich-shadow-lg), inset 0 1px 0 var(--rich-inset-highlight);
+    background: var(--rich-surface);
+    box-shadow: none;
     padding: clamp(1rem, 2vw, 1.45rem);
   }
 
@@ -129,15 +129,14 @@
     border: 1px solid var(--rich-line);
     border-radius: var(--rich-radius-md);
     background: var(--rich-surface-raised);
-    box-shadow: inset 0 1px 0 var(--rich-inset-highlight);
+    box-shadow: none;
     transition: border-color .16s ease, transform .16s ease;
     padding: 0.9rem;
   }
 
   .rich-dashboard-card:is(.tone-success, .tone-positive, .tone-warning, .tone-danger, .tone-critical, .tone-info) {
     border-color: var(--rich-tone-border);
-    background:
-      linear-gradient(160deg, color-mix(in srgb, var(--rich-tone-bg) 70%, var(--rich-surface-raised)), var(--rich-surface-raised));
+    background: var(--rich-tone-bg);
   }
 
   .rich-status-pill:is(.tone-success, .tone-positive, .tone-warning, .tone-danger, .tone-critical, .tone-info) {

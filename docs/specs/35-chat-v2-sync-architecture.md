@@ -9,6 +9,16 @@ retains its text as complete until canonical synchronization replaces it.
 Canonical assistant phases supersede earlier runtime phases by message identity,
 even when the runtime text is only a prefix of the saved text.
 
+Native tool-input progress is not tool admission: it must neither advance the
+assistant phase nor clear the preceding assistant stream before persistence.
+The scheduler owns these turn-lifetime buffers and per-call phase assignments.
+Progress snapshots may have no phase until admission stamps the assigned phase;
+repeated progress and abandoned input never consume a phase. The existing
+idempotent tool-call boundary owns the advance and stream reset. This changes
+no execution, cancellation, transaction, or external-tool side-effect ownership;
+snapshot updates retain their existing locks and reconstructable L2 persistence.
+No event schema or historical event rewrite is required.
+
 The completion observer can publish a terminal envelope before the execution
 wrapper commits settlement. A receiving replica accepts this envelope only for
 the exact current request, turn, fence, and owner. A different owner or a newer
@@ -16,6 +26,33 @@ fence still invalidates the envelope. This ordering adds no database operation
 to the streaming path.
 
 ## Purpose
+
+### User admission identity
+
+Optimistic, runtime, and canonical user items use `user:<client_message_id>`.
+Durable admission means delivery is acknowledged (`status=complete`) but does
+not imply canonical persistence (`stable` remains false without event refs).
+Canonical user items supersede runtime items by client-message identity.
+Accepted runtime input is retained as an acknowledged local fallback until
+canonical convergence, including across reconnect/settlement. Late HTTP failures
+and queued responses cannot reverse observed admission. Old-controller pending
+runtime input is normalized at presentation during rolling deployment.
+
+Admissions without a browser client ID use `user:<queue_id>`; the scheduler
+passes the durable request ID into the existing Intaris admission append.
+This is identity metadata, not another append or a change to the admission
+idempotency key, event hash, cancellation owner, or transaction/lock lifetime.
+No stored history is rewritten.
+
+Persisted older `source=user_input` events may lack every admission identity.
+Projection v5 gives those events `user:admitted-turn:<turn_id>` only when no
+explicit message, client, queue, or transaction identity exists. This compatibility
+identity confirms a server runtime `queue:` admission for that exact turn in
+the scoped timeline, including carried local items after settlement. Other user
+events in the same turn and repeated text remain independent. The compatibility
+path must remain while such immutable legacy events are readable; it can be
+removed when they are no longer supported. The projection generation change
+invalidates cached pre-v5 IDs.
 
 This spec defines the replacement architecture for Cognis chat timeline state
 across web chat, PWA, and future native mobile clients.

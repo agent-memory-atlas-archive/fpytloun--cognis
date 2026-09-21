@@ -43,6 +43,34 @@ _SETTINGS_SCHEMA: dict[str, Any] = {
         "voice": {"type": ["string", "null"]},
         "memory_backend": {"type": "string"},
         "memory_backend_options": {"type": "object"},
+        "delegation": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "allowed_agent_ids": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                },
+                "primary": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "max_managed_depth": {"type": "integer", "minimum": 0, "maximum": 2},
+                        "allowed_controller_agent_ids": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                "system": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"enabled": {"type": "boolean"}},
+                },
+            },
+        },
     },
 }
 
@@ -123,6 +151,7 @@ _BASE_SCHEMA: dict[str, Any] = {
         "skills": {"type": "object"},
         "tools": {"type": "object"},
         "permissions": {"type": "object"},
+        "delegation": _SETTINGS_SCHEMA["properties"]["delegation"],
         "llm_config": {"type": "object"},
         "execution": {"type": "object"},
         "settings": {
@@ -263,6 +292,7 @@ _UPDATE_FIELDS = (
     "personality",
     "avatar_image_id",
     "status",
+    "delegation",
     "generate_avatar",
     "avatar_prompt",
     "avatar_size",

@@ -48,6 +48,23 @@ def _seed_user(client: TestClient, email: str = "admin@example.com", role: str =
     asyncio.run(_seed())
 
 
+def test_direct_turn_conflict_is_a_structured_http_conflict(monkeypatch, tmp_path) -> None:
+    import json
+
+    from cognis.store.direct_turns import DirectTurnConflictError
+
+    client = _create_test_client(monkeypatch, tmp_path)
+    handler = client.app.exception_handlers[DirectTurnConflictError]
+    response = asyncio.run(
+        handler(
+            Request({"type": "http", "method": "POST", "path": "/api/chat-v2"}),
+            DirectTurnConflictError("idempotency key was reused with a different request"),
+        )
+    )
+    assert response.status_code == 409
+    assert json.loads(response.body)["error"]["code"] == "direct_turn_conflict"
+
+
 def _login(client: TestClient, email: str = "admin@example.com") -> None:
     response = client.post("/api/auth/login", json={"email": email, "password": "password123"})
     assert response.status_code == 200

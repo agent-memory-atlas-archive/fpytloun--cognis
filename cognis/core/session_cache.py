@@ -18,14 +18,21 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import secrets
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 
 from prometheus_client import Counter, Gauge
 
+from cognis.core.canonical_history import (
+    CanonicalHistoryUnavailable,
+    read_complete_history,
+    require_completed_history_copy,
+)
 from cognis.core.context_budget import LOOP_PRESSURE_THRESHOLD_RATIO
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
@@ -44,7 +51,12 @@ from cognis.core.project_context import (
 from cognis.core.redis_service import RedisService
 from cognis.logging import get_logger
 from cognis.models.config import GenerationPerformanceSnapshot
-from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
+from cognis.models.session import (
+    EventAppendResult,
+    EventReadResult,
+    SessionEvent,
+    SessionModel,
+)
 
 logger = get_logger(__name__)
 
@@ -52,6 +64,10 @@ CACHE_HITS = Counter("cognis_session_cache_hits_total", "Session cache hits")
 CACHE_MISSES = Counter("cognis_session_cache_misses_total", "Session cache misses")
 CACHE_EVICTIONS = Counter("cognis_session_cache_evictions_total", "Session cache evictions")
 CACHE_SIZE = Gauge("cognis_session_cache_size", "Session cache entry count")
+HISTORY_SHRINK_TOTAL = Counter(
+    "cognis_session_cache_history_shrink_total",
+    "Context assemblies whose reconstructed history shrank without a compaction",
+)
 REDIS_HITS = Counter("cognis_session_cache_redis_hits_total", "Redis L2 cache hits")
 REDIS_MISSES = Counter("cognis_session_cache_redis_misses_total", "Redis L2 cache misses")
 REDIS_ERRORS = Counter("cognis_session_cache_redis_errors_total", "Redis L2 errors")
@@ -120,6 +136,20 @@ class ActiveThinkingState:
     # so the id stays stable across the entire segment lifetime and matches the
     # history projector's id (which keys on the first block in event order).
     first_block_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AssembledHistoryDigest:
+    """What one context assembly reconstructed from the cache, for drift diagnostics."""
+
+    event_count: int
+    first_seq: int
+    last_seq: int
+    content_bytes: int
+    compaction_seq: int
+    projection_revision: int
+    estimator_identity: str | None
+    controller_id: str | None
 
 
 @dataclass(slots=True)
@@ -199,6 +229,8 @@ class CachedSessionState:
     redis_checkpoint_at: float = 0.0
     redis_persisted_seq: int = 0
     redis_event_head: str = ""
+    # Process-local diagnostics of the last assembled history (not persisted).
+    last_assembled_history: AssembledHistoryDigest | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +603,50 @@ def _discovered_tool_handle_from_raw(raw: dict[str, Any]) -> DiscoveredToolHandl
         else None,
         last_used_at=raw.get("last_used_at") if isinstance(raw.get("last_used_at"), str) else None,
     )
+
+
+# A stream read is only trusted when every page arrived; partial history must
+# never be published into the cache.
+_MAX_EVENT_PAGES = 50
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalContextSnapshot:
+    """Detached canonical state owned by one assembly or compaction."""
+
+    events: list[CachedEvent]
+    prefix_entries: list[ImmutablePrefixEntry]
+    last_compaction_summary: str | None
+    last_event_seq: int
+    last_compaction_seq: int
+    projection_revision: int
+
+    def require_turn(self, turn_id: str | None, *, user_event: bool, profile_switch: bool) -> None:
+        """Reject a continuation missing its durable admission or switch boundary."""
+        if turn_id is None:
+            if profile_switch:
+                raise CanonicalHistoryUnavailable("Profile continuation has no turn identity")
+            return
+        events = [event for event in self.events if event.data.get("turn_id") == turn_id]
+        if user_event and not any(event.type == "user_message" for event in events):
+            raise CanonicalHistoryUnavailable("Current user instruction is missing from history")
+        if profile_switch:
+            switches = [
+                event
+                for event in events
+                if event.type == "lifecycle" and event.data.get("kind") == "agent_profile_changed"
+            ]
+            if not switches:
+                raise CanonicalHistoryUnavailable("Profile switch is missing from history")
+            call_id = switches[-1].data.get("call_id")
+            if not call_id or not all(
+                any(
+                    event.type == event_type and event.data.get("call_id") == call_id
+                    for event in events
+                )
+                for event_type in ("tool_call", "tool_result")
+            ):
+                raise CanonicalHistoryUnavailable("Profile switch tool exchange is incomplete")
 
 
 class SessionCache:
@@ -1121,7 +1197,7 @@ class SessionCache:
         redis_events_to_write: list[CachedEvent] | None = None
         cache_changed = False
         async with entry.lock:
-            if not entry.initialized:
+            if not entry.initialized or entry.canonical_stale:
                 await self._cold_load(entry, session)
                 cache_changed = True
                 logger.debug(
@@ -1138,27 +1214,16 @@ class SessionCache:
                     },
                 )
             else:
-                event_read = await self.guardrails.read_events(
-                    session_id=entry.intaris_session_id,
+                event_read = await self._read_complete_stream(
+                    entry,
                     after_seq=entry.last_event_seq,
-                    allow_missing_stream=True,
+                    reason="warm_refresh",
                 )
                 fetched_seqs = {
                     int(raw_event.get("seq") or 0)
                     for raw_event in event_read.events
                     if isinstance(raw_event, dict) and int(raw_event.get("seq") or 0) > 0
                 }
-                if getattr(event_read, "missing_stream_fallback_used", False):
-                    logger.warning(
-                        "cache: warm refresh fell back to missing Intaris stream",
-                        extra={
-                            "extra_data": {
-                                "session_id": entry.session_id,
-                                "intaris_session_id": entry.intaris_session_id,
-                                "after_seq": entry.last_event_seq,
-                            }
-                        },
-                    )
                 self._apply_intaris_events(entry, event_read.events)
                 cache_changed = bool(event_read.events)
                 redis_events_to_write = [
@@ -1181,31 +1246,22 @@ class SessionCache:
                     str(raw_event.get("type") or "") == "context_snapshot"
                     for raw_event in event_read.events
                 ):
-                    full_read = await self.guardrails.read_events(
-                        session_id=entry.intaris_session_id,
+                    full_read = await self._read_complete_stream(
+                        entry,
                         after_seq=0,
-                        allow_missing_stream=True,
+                        reason=(
+                            "missing_prefix_entries"
+                            if force_prefix_rebuild
+                            else "incremental_context_snapshot"
+                        ),
                     )
-                    if getattr(full_read, "missing_stream_fallback_used", False):
-                        logger.warning(
-                            "cache: full prefix rebuild fell back to missing Intaris stream",
-                            extra={
-                                "extra_data": {
-                                    "session_id": entry.session_id,
-                                    "intaris_session_id": entry.intaris_session_id,
-                                    "rebuild_reason": (
-                                        "missing_prefix_entries"
-                                        if force_prefix_rebuild
-                                        else "incremental_context_snapshot"
-                                    ),
-                                }
-                            },
-                        )
                     self._replace_from_intaris_events(entry, full_read.events)
-                    entry.last_event_seq = max(entry.last_event_seq, full_read.last_seq)
                     redis_events_to_write = None
                     cache_changed = True
-                entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
+                # The watermark is the highest seq actually applied (advanced
+                # per event by ``_apply_cached_event``), never the server's
+                # ``last_seq``: Intaris computes that after the page, so a
+                # concurrent append could otherwise be skipped forever.
                 logger.debug(
                     "cache: warm refresh complete",
                     extra={
@@ -2241,6 +2297,91 @@ class SessionCache:
         entry.events_since_compaction_memo = {memo_key: events}
         return events
 
+    def get_context_snapshot(self, session_id: str) -> CanonicalContextSnapshot:
+        """Capture a complete generation without yielding to invalidation.
+
+        Canonical cache mutations and this synchronous copy run on the event
+        loop. Consumers retain the detached snapshot across awaits rather than
+        holding a cache lock across model/provider I/O.
+        """
+        entry = self.get_entry(session_id)
+        if entry is None or not entry.initialized or entry.canonical_stale:
+            raise CanonicalHistoryUnavailable("Canonical context is stale; retry the turn")
+        require_completed_history_copy(
+            [event.data for event in entry.events if event.type == "lifecycle"]
+        )
+        return CanonicalContextSnapshot(
+            events=deepcopy(entry.events),
+            prefix_entries=deepcopy(entry.prefix_entries),
+            last_compaction_summary=entry.last_compaction_summary,
+            last_event_seq=entry.last_event_seq,
+            last_compaction_seq=entry.last_compaction_seq,
+            projection_revision=entry.projection_revision,
+        )
+
+    def record_assembled_history(
+        self,
+        session_id: str,
+        events: list[Any],
+        *,
+        estimator_identity: str | None = None,
+    ) -> None:
+        """Log when the reconstructed history shrinks without a compaction.
+
+        Detects the "same session, wildly different prompt" symptom: a drop of
+        more than half the events or bytes, or a forward jump of the first
+        seq, while ``last_compaction_seq`` did not move. Diagnostic only; the
+        fail-closed rules in ``_read_complete_stream`` are the guard.
+        """
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        seqs = [seq for event in events if isinstance((seq := getattr(event, "seq", None)), int)]
+        content_bytes = 0
+        for event in events:
+            data = getattr(event, "data", None)
+            if isinstance(data, dict):
+                for value in data.values():
+                    if isinstance(value, str):
+                        content_bytes += len(value)
+        digest = AssembledHistoryDigest(
+            event_count=len(events),
+            first_seq=min(seqs) if seqs else 0,
+            last_seq=max(seqs) if seqs else 0,
+            content_bytes=content_bytes,
+            compaction_seq=entry.last_compaction_seq,
+            projection_revision=entry.projection_revision,
+            estimator_identity=estimator_identity,
+            controller_id=os.getenv("COGNIS_CONTROLLER_ID"),
+        )
+        previous = entry.last_assembled_history
+        entry.last_assembled_history = digest
+        if previous is None or previous.compaction_seq != digest.compaction_seq:
+            return
+        shrunk = (
+            (previous.event_count > 0 and digest.event_count < previous.event_count / 2)
+            or (previous.content_bytes > 0 and digest.content_bytes < previous.content_bytes / 2)
+            or (previous.first_seq > 0 and digest.first_seq > previous.first_seq)
+        )
+        if not shrunk:
+            return
+        HISTORY_SHRINK_TOTAL.inc()
+        logger.warning(
+            "cache: assembled history shrank without a compaction",
+            extra={
+                "extra_data": {
+                    "session_id": session_id,
+                    "intaris_session_id": entry.intaris_session_id,
+                    "previous": asdict(previous),
+                    "current": asdict(digest),
+                    "cached_event_count": len(entry.events),
+                    "last_event_seq": entry.last_event_seq,
+                    "canonical_stale": entry.canonical_stale,
+                }
+            },
+        )
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -2314,30 +2455,53 @@ class SessionCache:
             return entry
 
     async def _cold_load(self, entry: CachedSessionState, session: SessionModel) -> None:
-        # Always allow missing streams on cold load.  A 404 from Intaris
-        # simply means the session has no recorded events (e.g. pre-Intaris
-        # sessions, failed create_session calls, or very new sessions whose
-        # stream hasn't been created yet).  The cache initialises as empty
-        # and callers degrade gracefully (compaction returns noop, context
-        # assembly works with no history).
-        event_read = await self.guardrails.read_events(
-            session_id=entry.intaris_session_id,
-            after_seq=0,
-            allow_missing_stream=True,
-        )
-        if getattr(event_read, "missing_stream_fallback_used", False):
+        del session
+        # A brand-new session reads as an empty 200 page. A 404 on the event
+        # stream while the session itself resolves is not evidence of an empty
+        # history (tenant mismatch, disabled event store); ``_read_complete_stream``
+        # fails closed on it instead of initialising an empty view.
+        event_read = await self._read_complete_stream(entry, after_seq=0, reason="cold_load")
+        self._replace_from_intaris_events(entry, event_read.events)
+        entry.initialized = True
+
+    async def _read_complete_stream(
+        self,
+        entry: CachedSessionState,
+        *,
+        after_seq: int,
+        reason: str,
+    ) -> EventReadResult:
+        """Read every page after ``after_seq`` or raise without touching the entry.
+
+        Partial success is never published: a missing-stream fallback, a page
+        cap, a non-advancing cursor, or any page failure marks the entry
+        ``canonical_stale`` and raises :class:`CanonicalHistoryUnavailable`, so
+        assembly fails closed rather than running on truncated history.
+        """
+
+        try:
+            return await read_complete_history(
+                self.guardrails,
+                entry.intaris_session_id,
+                after_seq=after_seq,
+                max_pages=_MAX_EVENT_PAGES,
+            )
+        except Exception:
+            entry.canonical_stale = True
             logger.warning(
-                "cache: cold load fell back to missing Intaris stream",
+                "cache: canonical history unavailable; failing closed",
                 extra={
                     "extra_data": {
-                        "session_id": session.session_id,
+                        "session_id": entry.session_id,
                         "intaris_session_id": entry.intaris_session_id,
+                        "after_seq": after_seq,
+                        "reason": reason,
+                        "initialized": entry.initialized,
                     }
                 },
+                exc_info=True,
             )
-        self._replace_from_intaris_events(entry, event_read.events)
-        entry.last_event_seq = event_read.last_seq
-        entry.initialized = True
+            raise
 
     def _replace_from_intaris_events(
         self, entry: CachedSessionState, raw_events: list[dict[str, Any]]

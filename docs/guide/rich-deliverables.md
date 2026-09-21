@@ -54,8 +54,10 @@ write_deliverable(
 )
 ```
 
-For large payloads, publish an `application/json` file with
-`artifact_publish`. Then pass its immutable `art_*` ID:
+For a substantial payload that would be difficult to inspect or retry inline,
+create an editable local JSON file with the available file-editing tool and
+publish it as `application/json` with `artifact_publish`. Then pass its
+immutable `art_*` ID:
 
 ```text
 write_deliverable(
@@ -67,6 +69,11 @@ write_deliverable(
 Do not combine `payload` and `payload_artifact`. Rich calls do not accept
 `content`, `format`, `rich`, top-level `title`, `target`, or top-level
 `outputs`. Put the title and optional outputs in the payload.
+
+Before writing a Rich deliverable, call `validate_tool_call` with the complete
+proposed `write_deliverable` arguments. Then call `write_deliverable` with
+those exact unchanged arguments. Validation receipts are bound to the argument
+shape, including the selected payload source.
 
 The **Cognis Rich Deliverable** system skill guides agents toward appropriate
 composition, hierarchy, evidence, and block selection. It is a writing and
@@ -83,6 +90,13 @@ the wider bounded dashboard canvas.
 
 The payload can include a top-level `title`. The stored deliverable title from
 the host takes precedence when both values exist.
+
+## Viewer shell
+
+Standalone and full-view rendering provide viewer-owned theme, copy, download,
+and table-of-contents controls. A payload can optionally identify that shell
+with `metadata.viewer_identity` when an authored label or semantic icon adds
+meaning. Omitting it adds no identity chrome.
 
 ## Choose the smallest useful format
 

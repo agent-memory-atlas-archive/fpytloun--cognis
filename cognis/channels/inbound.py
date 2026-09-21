@@ -1182,7 +1182,6 @@ class InboundPipeline:
                 events = await self._session_manager._read_history_events(
                     session_model,
                     last_n=remaining_events,
-                    allow_missing_stream=True,
                 )
             except Exception:
                 logger.warning(
@@ -1300,7 +1299,6 @@ class InboundPipeline:
                 source_model,
                 after_seq=source_seq - 1,
                 limit=cutoff_lookahead,
-                allow_missing_stream=True,
             )
             source_event = next((event for event in source_events if event.seq == source_seq), None)
             if source_event is None:

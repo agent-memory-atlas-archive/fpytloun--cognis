@@ -56,8 +56,14 @@ export interface AgentFormState {
   allowedSecrets: string[];
   allowedCredentials: string[];
   allowedKnowledgebases: string[];
-  canDelegate: boolean;
-  maxDelegationDepth: number;
+  delegationEnabled: boolean;
+  primaryDelegationEnabled: boolean;
+  systemDelegationEnabled: boolean;
+  maxManagedDepth: number;
+  restrictDelegationTargets: boolean;
+  allowedAgentIds: string[];
+  restrictControllers: boolean;
+  allowedControllerAgentIds: string[];
   toolPermissions: Record<string, string>;
   providerId: string;
   model: string;
@@ -286,8 +292,14 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     allowedSecrets: [],
     allowedCredentials: [],
     allowedKnowledgebases: [],
-    canDelegate: true,
-    maxDelegationDepth: 3,
+    delegationEnabled: true,
+    primaryDelegationEnabled: true,
+    systemDelegationEnabled: true,
+    maxManagedDepth: 1,
+    restrictDelegationTargets: false,
+    allowedAgentIds: [],
+    restrictControllers: false,
+    allowedControllerAgentIds: [],
     toolPermissions: {},
     providerId: '',
     model: '',
@@ -327,6 +339,18 @@ export function agentToFormState(agent: Agent): AgentFormState {
   const form = createEmptyAgentForm();
   const personality = agent.personality ?? {};
   const permissions = agent.permissions ?? {};
+  const delegation =
+    permissions.delegation && typeof permissions.delegation === 'object'
+      ? (permissions.delegation as Record<string, unknown>)
+      : {};
+  const primaryDelegation =
+    delegation.primary && typeof delegation.primary === 'object'
+      ? (delegation.primary as Record<string, unknown>)
+      : {};
+  const systemDelegation =
+    delegation.system && typeof delegation.system === 'object'
+      ? (delegation.system as Record<string, unknown>)
+      : {};
   const llmConfig = agent.llm_config ?? {};
   const execution = agent.execution ?? {};
   const tools = agent.tools ?? {};
@@ -356,9 +380,26 @@ export function agentToFormState(agent: Agent): AgentFormState {
     allowedKnowledgebases: Array.isArray(permissions.allowed_knowledgebases)
       ? (permissions.allowed_knowledgebases as unknown[]).filter((v): v is string => typeof v === 'string')
       : [],
-    canDelegate: permissions.can_delegate !== false,
-    maxDelegationDepth:
-      typeof permissions.max_delegation_depth === 'number' ? permissions.max_delegation_depth : 3,
+    delegationEnabled:
+      typeof delegation.enabled === 'boolean'
+        ? delegation.enabled
+        : permissions.can_delegate !== false,
+    primaryDelegationEnabled: primaryDelegation.enabled !== false,
+    systemDelegationEnabled: systemDelegation.enabled !== false,
+    maxManagedDepth:
+      typeof primaryDelegation.max_managed_depth === 'number'
+        ? primaryDelegation.max_managed_depth
+        : 1,
+    restrictDelegationTargets: Array.isArray(delegation.allowed_agent_ids),
+    allowedAgentIds: Array.isArray(delegation.allowed_agent_ids)
+      ? delegation.allowed_agent_ids.filter((value): value is string => typeof value === 'string')
+      : [],
+    restrictControllers: Array.isArray(primaryDelegation.allowed_controller_agent_ids),
+    allowedControllerAgentIds: Array.isArray(primaryDelegation.allowed_controller_agent_ids)
+      ? primaryDelegation.allowed_controller_agent_ids.filter(
+          (value): value is string => typeof value === 'string'
+        )
+      : [],
     toolPermissions:
       permissions.tool_permissions && typeof permissions.tool_permissions === 'object'
         ? (permissions.tool_permissions as Record<string, string>)
@@ -596,12 +637,27 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         allowed_secrets: form.allowedSecrets,
         allowed_credentials: form.allowedCredentials,
         allowed_knowledgebases: form.allowedKnowledgebases,
-        can_delegate: form.canDelegate,
-        max_delegation_depth: form.maxDelegationDepth
+        can_delegate: form.delegationEnabled,
+        delegation: {
+          enabled: form.delegationEnabled,
+          allowed_agent_ids: form.restrictDelegationTargets
+            ? [...new Set(form.allowedAgentIds)]
+            : null,
+          primary: {
+            enabled: form.primaryDelegationEnabled,
+            max_managed_depth: form.maxManagedDepth,
+            allowed_controller_agent_ids: form.restrictControllers
+              ? [...new Set(form.allowedControllerAgentIds)]
+              : null
+          },
+          system: {
+            enabled: form.systemDelegationEnabled
+          }
+        }
       },
     tools: {
       ...preservedTools,
-      delegation_tools: form.canDelegate,
+      delegation_tools: form.delegationEnabled,
       ...(disabledCategories.length > 0
         ? { disabled_categories: disabledCategories }
         : {}),

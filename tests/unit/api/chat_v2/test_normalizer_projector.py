@@ -35,6 +35,44 @@ from cognis.api.chat_v2.schemas import (
 )
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({}, "user:admitted-turn:turn-1"),
+        ({"queue_id": "dtr-admission"}, "user:dtr-admission"),
+        ({"client_message_id": "client-1", "queue_id": "dtr-admission"}, "user:client-1"),
+        ({"client_txn_id": "txn-1"}, "user-txn:txn-1"),
+        ({"source": "queued_input", "message_id": "queued-1"}, "user:queued-1"),
+    ],
+)
+def test_scheduler_admission_identity(metadata: dict[str, Any], expected: str) -> None:
+    events = normalize_session_events(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=887,
+                type="user_message",
+                data={
+                    "content": "continue",
+                    "source": "user_input",
+                    "turn_id": "turn-1",
+                    **metadata,
+                },
+            ),
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=889,
+                type="user_message",
+                data={"content": "continue", "turn_id": "turn-1", "message_id": "distinct-input"},
+            ),
+        ]
+    )
+    items = project_timeline(events.events).timeline.items
+    assert [item.id for item in items] == [expected, "user:distinct-input"]
+
+
 def test_terminal_compaction_lifecycle_projects_with_occurrence_identity() -> None:
     normalization = normalize_session_events(
         [

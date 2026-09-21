@@ -15,6 +15,8 @@
   $: sortedRows = sortMatrixRows(rows, sort);
   $: surface = blockSurface(block);
   $: span = blockSpan(block);
+  $: numberedRows = columns.length === 3 && rows.length > 0
+    && rows.every(row => /^\d+$/.test(String(row[columns[0].key] ?? '')));
 
   function sortBy(key: string) {
     const direction: SortDirection = sort?.key === key && sort.direction === 'asc' ? 'desc' : 'asc';
@@ -45,7 +47,7 @@
   {#if blockTitle(block)}<h4>{@html renderInlineMarkdown(blockTitle(block))}</h4>{/if}
   {#if blockText(block, 'description')}<p>{@html renderInlineMarkdown(blockText(block, 'description'))}</p>{/if}
   <div class="rich-table-wrap">
-    <table>
+    <table class:rich-table-numbered={numberedRows}>
       {#if blockText(block, 'caption') || block.__table_number}
         <caption>{#if block.__table_number}<strong>Table {String(block.__table_number)}. </strong>{/if}{@html renderInlineMarkdown(blockText(block, 'caption'))}</caption>
       {/if}

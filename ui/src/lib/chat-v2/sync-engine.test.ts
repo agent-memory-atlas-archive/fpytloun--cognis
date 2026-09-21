@@ -12,6 +12,7 @@ import {
   applySyncResponse,
   deleteQueuedAdmission,
   maybeApplyRuntime,
+  markOptimisticUserMessageFailed,
   promoteQueuedUserMessage,
   updateQueuedAdmissionContent,
   visibleQueueMessages,
@@ -52,6 +53,205 @@ function runtime(revision: number, overrides: Partial<RuntimeOverlaySnapshot> = 
     ...overrides
   };
 }
+
+describe('user admission handover', () => {
+  it('reconciles legacy server input through active refresh, settlement and reconnect', () => {
+    const pending = message({
+      id: 'user:dtr-admission', message_id: 'queue:dtr-admission', role: 'user',
+      turn_id: 'turn-1', content: 'continue', stable: false, source_refs: [],
+      status: 'complete', sort_key: '9998:999999999999999:000000:01:000000000',
+    });
+    const canonical = message({
+      id: 'user:admitted-turn:turn-1', message_id: 'user:sess-1:887',
+      role: 'user', turn_id: 'turn-1', content: 'continue',
+    });
+    const active = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      volatile_items: [pending],
+    });
+    const initial = applySnapshot(snapshot({ timeline: { items: [], has_more_before: false }, runtime: active }));
+    expect(visibleTimelineItems(initial).map((item) => item.id)).toEqual([pending.id]);
+    const confirmed = applySnapshot(snapshot({
+      timeline: { items: [canonical], has_more_before: false }, runtime: { ...active, runtime_revision: 2 },
+    }), initial);
+    expect(visibleTimelineItems(confirmed).map((item) => item.id)).toEqual([canonical.id]);
+    const settled = applySnapshot(snapshot({
+      timeline: { items: [canonical], has_more_before: false }, runtime: runtime(3),
+    }), confirmed);
+    expect(settled.localItems).toEqual([]);
+    expect(visibleTimelineItems(settled).map((item) => item.id)).toEqual([canonical.id]);
+    const reconnected = applySnapshot(snapshot({
+      timeline: { items: [canonical], has_more_before: false }, runtime: active,
+    }));
+    expect(visibleTimelineItems(reconnected).map((item) => item.id)).toEqual([canonical.id]);
+  });
+
+  it.each([
+    { id: 'user:other-input', turn_id: 'turn-1' },
+    { id: 'user:admitted-turn:other-turn', turn_id: 'other-turn' },
+  ])('preserves unconfirmed admissions beside $id even with identical text', (other) => {
+    const state = applySnapshot(snapshot({
+      timeline: { items: [message({ ...other, role: 'user', content: 'continue' })], has_more_before: false },
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [message({
+          id: 'user:dtr-admission', message_id: 'queue:dtr-admission', role: 'user',
+          turn_id: 'turn-1', content: 'continue', source_refs: [], stable: false,
+        })],
+      }),
+    }));
+    expect(visibleTimelineItems(state)).toHaveLength(2);
+  });
+  it('settles local admission ordering when the prior turn emitted no runtime items', () => {
+    const old = addOptimisticUserMessage(applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'old', session_id: 'sess-1', status: 'starting' },
+      }),
+    })), { clientMessageId: 'cancelled-before-start', content: 'continue' });
+    const settled = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      runtime: runtime(2),
+    }), old);
+    const next = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      runtime: runtime(3, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'new', session_id: 'sess-1', status: 'running' },
+        volatile_items: [message({
+          id: 'message:new', turn_id: 'new',
+          sort_key: '9998:999999999999999:000000:02:000000000',
+        })],
+      }),
+    }), settled);
+    const items = visibleTimelineItems(next);
+    expect(items.map((item) => item.id)).toEqual([
+      'user:cancelled-before-start', 'message:new',
+    ]);
+    expect(items[0].sort_key.startsWith('9996:')).toBe(true);
+  });
+  it('drops previously leaked parent runtime on the scoped projection upgrade', () => {
+    const scope = { key: 'session:child', kind: 'session' as const, session_id: 'child', conversation_id: 'conv-1' };
+    const old = applySnapshot(snapshot({
+      scope,
+      projection_version: 'chat-v2-projection-v3',
+      runtime: runtime(7, {
+        authority: {
+          protocol: 'runtime_authority_v1', direct_request_id: 'parent-request',
+          turn_id: 'parent-turn', fencing_token: 3, lifecycle: 'terminal',
+        },
+        volatile_items: [message({
+          id: 'user:parent', role: 'user', stable: false, status: 'complete',
+          message_id: 'client:parent', client_message_id: 'parent', source_refs: [],
+        })],
+      }),
+    }));
+    expect(visibleTimelineItems(old).some((item) => item.id === 'user:parent')).toBe(true);
+    const fresh = applySnapshot(snapshot({
+      scope,
+      projection_version: 'chat-v2-projection-v4',
+      runtime: runtime(0),
+    }), old);
+    expect(fresh.runtime?.authority).toBeUndefined();
+    expect(visibleTimelineItems(fresh).some((item) => item.id === 'user:parent')).toBe(false);
+  });
+  it('keeps a remotely admitted next-turn user after the carried prior reply', () => {
+    const old = applySnapshot(snapshot({
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'old', session_id: 'sess-1', status: 'running' },
+        volatile_items: [message({
+          id: 'message:old', turn_id: 'old', content: 'prior reply',
+          sort_key: '9998:999999999999999:000001:02:000000000'
+        })]
+      })
+    }));
+    const next = applySnapshot(snapshot({
+      runtime: runtime(2, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'new', session_id: 'sess-1', status: 'running' },
+        volatile_items: [message({
+          id: 'user:remote', role: 'user', client_message_id: 'remote', turn_id: 'new',
+          content: 'next question', status: 'complete', source_refs: [],
+          sort_key: '9998:999999999999999:000000:00:000000000'
+        })]
+      })
+    }), old);
+    const ids = visibleTimelineItems(next).map((item) => item.id);
+    expect(ids.indexOf('message:old')).toBeLessThan(ids.indexOf('user:remote'));
+  });
+  it('promotes queued admission through runtime before a late queued response', () => {
+    let state = addOptimisticUserMessage(applySnapshot(snapshot()), {
+      clientMessageId: 'promoted', content: 'repeat'
+    });
+    const queued = {
+      status: 'queued' as const, conversation_id: 'conv-1',
+      client_message_id: 'promoted', client_txn_id: 'txn-promoted', queue_id: 'queue-promoted',
+      server_time: '2026-01-01T00:00:01Z'
+    };
+    state = applySendResponse(state, queued);
+    expect(visibleQueueMessages(state).messages).toHaveLength(1);
+    state = applySnapshot(snapshot({
+      runtime: runtime(2, { has_active_turn: true, volatile_items: [message({
+        id: 'user:promoted', role: 'user', client_message_id: 'promoted',
+        turn_id: 'turn-promoted', content: 'repeat', status: 'complete', source_refs: []
+      })] })
+    }), state);
+    expect(visibleQueueMessages(state).messages).toHaveLength(0);
+    state = applySendResponse(state, queued);
+    expect(visibleQueueMessages(state).messages).toHaveLength(0);
+    expect(visibleTimelineItems(state).filter((i) => i.id === 'user:promoted')).toHaveLength(1);
+    state = addOptimisticUserMessage(state, { clientMessageId: 'distinct', content: 'repeat' });
+    expect(visibleTimelineItems(state).filter((i) => i.kind === 'message' && i.content === 'repeat')).toHaveLength(2);
+  });
+  it.each([true, false])('keeps one acknowledged identity with HTTP first=%s', (httpFirst) => {
+    let state = addOptimisticUserMessage(applySnapshot(snapshot()), {
+      clientMessageId: 'client-admitted', content: 'same text'
+    });
+    const ack = {
+      status: 'accepted' as const, conversation_id: 'conv-1',
+      client_message_id: 'client-admitted', client_txn_id: 'txn-admitted',
+      server_time: '2026-01-01T00:00:01Z'
+    };
+    const input = message({
+      id: 'user:client-admitted', role: 'user', client_message_id: 'client-admitted',
+      content: 'same text', status: 'pending', stable: false, source_refs: [],
+      sort_key: '9998:999999999999999:000000:00:000000000'
+    });
+    if (httpFirst) state = applySendResponse(state, ack);
+    state = applySnapshot(snapshot({
+      runtime: runtime(2, { has_active_turn: true, volatile_items: [input] })
+    }), state);
+    if (!httpFirst) state = applySendResponse(state, ack);
+    const visible = visibleTimelineItems(state).filter((i) => i.id === input.id);
+    expect(visible).toHaveLength(1);
+    expect(visible[0].status).toBe('complete');
+    state = markOptimisticUserMessageFailed(state, 'client-admitted');
+    expect(visibleTimelineItems(state).find((i) => i.id === input.id)?.status).toBe('complete');
+    state = applySnapshot(snapshot({ runtime: runtime(3) }), state);
+    expect(visibleTimelineItems(state).filter((i) => i.id === input.id)).toHaveLength(1);
+    expect(visibleTimelineItems(state).find((i) => i.id === input.id)?.status).toBe('complete');
+  });
+
+  it('never overlays canonical user content with stale admitted input', () => {
+    const canonical = message({
+      id: 'user:client-admitted', role: 'user', client_message_id: 'client-admitted',
+      status: 'complete', content: 'canonical', stable: true
+    });
+    if (canonical.kind !== 'message') throw new Error('Expected message fixture');
+    const state = applySnapshot(snapshot({
+      timeline: { ...snapshot().timeline, items: [canonical] },
+      runtime: runtime(2, {
+        has_active_turn: true,
+        volatile_items: [message({ ...canonical, content: 'stale', status: 'pending', source_refs: [], stable: false })]
+      })
+    }));
+    expect(visibleTimelineItems(state)).toEqual([canonical]);
+  });
+});
 
 function snapshot(overrides: Partial<ChatSnapshot> = {}): ChatSnapshot {
   return {
@@ -159,6 +359,20 @@ describe('authoritative runtime overlay ordering', () => {
       volatile_items_complete: true
     });
     expect(maybeApplyRuntime(current, inactive)).toBe(inactive);
+  });
+
+  it('does not revive a cancelled retry when a delayed notice has a newer local revision', () => {
+    const cancelled = runtime(3, {
+      authority: authority({ lifecycle: 'terminal', source_revision: null }),
+      volatile_items_complete: true
+    });
+    const delayedWaiting = runtime(99, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'waiting' },
+      authority: authority({ lifecycle: 'recoverable', source_revision: null }),
+      volatile_items_complete: false
+    });
+    expect(maybeApplyRuntime(cancelled, delayedWaiting)).toBe(cancelled);
   });
 
   it('keeps partial continuity but lets a complete same-source snapshot replace it', () => {
@@ -2015,7 +2229,7 @@ describe('Chat v2 sync engine', () => {
       state
     );
 
-    expect(visibleTimelineItems(refreshed).map((item) => item.id)).toEqual(['local-user:cmsg-1']);
+    expect(visibleTimelineItems(refreshed).map((item) => item.id)).toEqual(['user:cmsg-1']);
 
     const canonical = message({
       id: 'user:cmsg-1',
@@ -2899,7 +3113,7 @@ describe('Chat v2 sync engine', () => {
 
     const ids = visibleTimelineItems(withOptimistic).map((item) => item.id);
     expect(ids.indexOf('message:turn-1:phase:0')).toBeLessThan(
-      ids.indexOf('local-user:cmsg_follow_up')
+      ids.indexOf('user:cmsg_follow_up')
     );
   });
 
@@ -2969,7 +3183,7 @@ describe('Chat v2 sync engine', () => {
       ids.indexOf('compaction:sess-old')
     );
     expect(ids.indexOf('compaction:sess-old')).toBeLessThan(
-      ids.indexOf('local-user:cmsg-next')
+      ids.indexOf('user:cmsg-next')
     );
   });
 
@@ -2979,7 +3193,7 @@ describe('Chat v2 sync engine', () => {
       content: 'first',
       clientMessageId: 'cmsg_1'
     });
-    const firstKey = withFirst.localItems.find((item) => item.id === 'local-user:cmsg_1')?.sort_key;
+    const firstKey = withFirst.localItems.find((item) => item.id === 'user:cmsg_1')?.sort_key;
 
     // Canonical echo confirms the first message → local item evicted.
     const confirmed = {
@@ -2994,14 +3208,14 @@ describe('Chat v2 sync engine', () => {
           sort_key: '0000:000000000000002:000000:00:000000000'
         })
       ],
-      localItems: withFirst.localItems.filter((item) => item.id !== 'local-user:cmsg_1')
+      localItems: withFirst.localItems.filter((item) => item.id !== 'user:cmsg_1')
     };
 
     const withSecond = addOptimisticUserMessage(confirmed, {
       content: 'second',
       clientMessageId: 'cmsg_2'
     });
-    const secondKey = withSecond.localItems.find((item) => item.id === 'local-user:cmsg_2')?.sort_key;
+    const secondKey = withSecond.localItems.find((item) => item.id === 'user:cmsg_2')?.sort_key;
     // A length-based counter would reuse the first key here.
     expect(secondKey).toBeDefined();
     expect(firstKey).toBeDefined();

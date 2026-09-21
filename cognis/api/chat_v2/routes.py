@@ -138,6 +138,7 @@ from cognis.store.work_live_invalidation import read_live_work_revision
 
 router = APIRouter(prefix="/api/v1/chat/v2", tags=["chat-v2"])
 logger = logging.getLogger(__name__)
+SNAPSHOT_CONSISTENCY_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.3, 0.6)
 WORK_PAGE_MAX_LIMIT = 100
 WORK_REQUEST_MAX_SECONDS = 20.0
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
@@ -331,10 +332,23 @@ async def chat_v2_snapshot(request: Request, conversation_id: str) -> ChatSnapsh
             context,
             request_trace=trace,
         )
-        if _snapshot_is_unexpectedly_empty(snapshot):
+        for delay_seconds in SNAPSHOT_CONSISTENCY_RETRY_DELAYS_SECONDS:
+            if not _snapshot_is_unexpectedly_empty(snapshot):
+                break
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
             snapshot = await rebuild_chat_snapshot_coordinated(request.app, context)
             trace.select("bypass")
         if _snapshot_is_unexpectedly_empty(snapshot):
+            logger.error(
+                "chat_v2: canonical conversation history remained empty after bounded recovery",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "recovery_attempts": len(SNAPSHOT_CONSISTENCY_RETRY_DELAYS_SECONDS),
+                    }
+                },
+            )
             raise api_exception(
                 503,
                 "event_store_inconsistent",
@@ -680,6 +694,22 @@ async def chat_v2_send_message(
         nonlocal durable_admission
         durable_admission = admission
 
+    try:
+        await _mark_attachments_attached(request, row, user.email, attachments)
+    except Exception:
+        await _complete_transaction(
+            request,
+            tx_row.transaction_id,
+            status="failed",
+            error={
+                "code": "attachment_unavailable",
+                "message": "Attachment is no longer available; upload it again.",
+                "http_status": 409,
+            },
+        )
+        raise api_exception(
+            409, "attachment_unavailable", "Attachment is no longer available; upload it again."
+        ) from None
     error = await turn_scheduler.submit_turn(
         conversation_id,
         normalized.content,
@@ -705,7 +735,6 @@ async def chat_v2_send_message(
         )
         raise _turn_error_to_http(error)
 
-    await _mark_attachments_attached(request, row, user.email, attachments)
     queued_message = None
     if durable_admission is None:
         queued_message = _queued_message_for_client(
@@ -1656,16 +1685,10 @@ async def _single_session_context(
         conversation_id=conversation_id,
         scope_key=scope.key,
         active_session_id=current_session_row.session_id,
+        scope_session_ids=[row.session_id for row in session_rows],
         turn_scheduler=getattr(request.app.state, "turn_scheduler", None),
         session_cache=session_cache,
     )
-    if (
-        runtime_input.active_turn is not None
-        and runtime_input.active_turn.get("session_id") != current_session_row.session_id
-    ):
-        runtime_input = runtime_input.model_copy(
-            update={"runtime_revision": 0, "active_turn": None, "authority": None}
-        )
     return {
         "scope": scope,
         "conversation": (
@@ -1961,23 +1984,21 @@ async def _mark_attachments_attached(
     user_email: str,
     attachments: list[AttachmentRef],
 ) -> None:
-    try:
-        async with request.app.state.session_factory() as session:
-            latest_row = await get_conversation(session, conversation_row.conversation_id)
-            await mark_artifacts_attached(
-                session,
-                [item.artifact_id for item in attachments],
-                owner_email=user_email,
-                conversation_id=conversation_row.conversation_id,
-                session_id=latest_row.active_session_id if latest_row else None,
-            )
-            await session.commit()
-    except Exception:
-        logger.warning(
-            "Failed to persist Chat v2 post-submit attachment association",
-            extra={"extra_data": {"conversation_id": conversation_row.conversation_id}},
-            exc_info=True,
+    if not attachments:
+        return
+    async with request.app.state.session_factory() as session:
+        latest_row = await get_conversation(session, conversation_row.conversation_id)
+        ids = list({item.artifact_id for item in attachments})
+        count = await mark_artifacts_attached(
+            session,
+            ids,
+            owner_email=user_email,
+            conversation_id=conversation_row.conversation_id,
+            session_id=latest_row.active_session_id if latest_row else None,
         )
+        if count != len(ids):
+            raise ValueError("Attachment is no longer available")
+        await session.commit()
 
 
 async def _persist_generated_text_artifacts(

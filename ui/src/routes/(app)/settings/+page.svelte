@@ -3804,6 +3804,38 @@
                <span class="block font-medium text-slate-100">Dashboard workspace windows</span>
                <span class="mt-1 block text-xs leading-5 text-slate-500">
                  Open Dashboard chats and task cockpits in non-blocking workspace windows on desktop and tablet. Phone behavior is unchanged.
+              </span>
+            </span>
+           </label>
+
+           <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+             <input
+               type="checkbox"
+               checked={$userPreferences.display.conversation_sidebar_sections}
+               disabled={busy}
+               class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+               onchange={(event) => void updateDisplayPreference('conversation_sidebar_sections', event.currentTarget.checked)}
+             />
+             <span>
+               <span class="block font-medium text-slate-100">Conversation sidebar sections</span>
+               <span class="mt-1 block text-xs leading-5 text-slate-500">
+                 Separate ongoing, waiting, and historical conversations so active work and required input stay visible.
+               </span>
+             </span>
+           </label>
+
+           <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+             <input
+               type="checkbox"
+               checked={$userPreferences.display.conversation_sidebar_dense}
+               disabled={busy}
+               class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+               onchange={(event) => void updateDisplayPreference('conversation_sidebar_dense', event.currentTarget.checked)}
+             />
+             <span>
+               <span class="block font-medium text-slate-100">Dense conversation sidebar</span>
+               <span class="mt-1 block text-xs leading-5 text-slate-500">
+                 Use compact single-line conversation rows. Long titles remain horizontally scrollable.
                </span>
              </span>
            </label>

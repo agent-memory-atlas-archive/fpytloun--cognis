@@ -251,6 +251,9 @@ class GenericRichProjector:
     ) -> list[str]:
         blocks = _objects(payload.get("blocks"))
         sections: list[str] = []
+        viewer_identity = _viewer_identity_text(payload.get("metadata"))
+        if viewer_identity:
+            sections.append(viewer_identity)
         if title and not _first_block_has_equivalent_title(blocks, title):
             sections.append(_heading(title, 1, context))
         sections.extend(_render_block(block, context=context, depth=2) for block in blocks)
@@ -280,8 +283,8 @@ def _render_block(
 
     if block_type == "hero":
         eyebrow = _text(block.get("eyebrow"))
-        subtitle = _text(block.get("subtitle"))
-        badges = _string_list(block.get("badges") or block.get("tags"))
+        subtitle = _text(block.get("subtitle")) or _text(block.get("dek"))
+        badges = _hero_badges(block.get("badges") or block.get("tags"))
         if eyebrow:
             parts.append(f"_{eyebrow}_")
         if title:
@@ -552,7 +555,9 @@ def _render_named_items(
                 label = _text(item.get("label") or item.get("key") or item.get("name"))
                 value = _scalar(item.get("value") or item.get("text") or item.get("content"))
                 if label or value:
-                    values.append(": ".join(part for part in (label, value) if part))
+                    entry = ": ".join(part for part in (label, value) if part)
+                    tone = _text(item.get("tone"))
+                    values.append(f"{entry} ({tone})" if tone else entry)
             elif _scalar(item):
                 values.append(_scalar(item))
         if values:
@@ -1333,6 +1338,35 @@ def _objects(value: Any) -> list[dict[str, Any]]:
 
 def _string_list(value: Any) -> list[str]:
     return [text for item in value if (text := _scalar(item))] if isinstance(value, list) else []
+
+
+def _hero_badges(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    badges = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            badges.append(_escape_markdown_inline(item.strip()))
+        elif isinstance(item, dict):
+            label = _text(item.get("label"))
+            tone = _text(item.get("tone"))
+            if label:
+                safe_label = _escape_markdown_inline(label)
+                badges.append(f"{safe_label} ({tone})" if tone else safe_label)
+    return badges
+
+
+def _viewer_identity_text(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    identity = metadata.get("viewer_identity")
+    if not isinstance(identity, dict):
+        return ""
+    label = _text(identity.get("label"))
+    icon = identity.get("icon")
+    icon_alt = _text(icon.get("alt")) if isinstance(icon, dict) else ""
+    name = label or icon_alt
+    return f"Viewer: {_escape_markdown_inline(name)}" if name else ""
 
 
 def _title(value: dict[str, Any]) -> str:

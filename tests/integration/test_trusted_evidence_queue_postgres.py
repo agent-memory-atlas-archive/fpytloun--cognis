@@ -539,10 +539,8 @@ async def test_expired_evidence_dispatch_lease_is_taken_over_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_controllers_claim_ordinary_once_while_reconciliation_is_blocked() -> None:
+async def test_two_controllers_claim_ordinary_once_without_history_reconciliation() -> None:
     async with _database() as (factory, user_email):
-        reconcile_started = [asyncio.Event(), asyncio.Event()]
-        reconcile_cancelled = [asyncio.Event(), asyncio.Event()]
         remember_called = asyncio.Event()
 
         class Reader:
@@ -582,23 +580,8 @@ async def test_two_controllers_claim_ordinary_once_while_reconciliation_is_block
             for _ in range(2)
         ]
 
-        def blocker(index: int) -> Any:
-            async def block_reconciliation() -> None:
-                reconcile_started[index].set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    reconcile_cancelled[index].set()
-
-            return block_reconciliation
-
-        for index, queue in enumerate(queues):
-            queue._run_scheduled_reconciliation_cycle = blocker(index)  # type: ignore[method-assign]
+        for queue in queues:
             await queue.start()
-        await asyncio.wait_for(
-            asyncio.gather(*(started.wait() for started in reconcile_started)),
-            timeout=2,
-        )
 
         await queues[0].enqueue(
             {
@@ -621,4 +604,4 @@ async def test_two_controllers_claim_ordinary_once_while_reconciliation_is_block
         await asyncio.gather(*(queue.stop() for queue in queues))
 
         assert worker.calls == 1
-        assert all(cancelled.is_set() for cancelled in reconcile_cancelled)
+        assert all(not hasattr(queue, "_reconciliation_task") for queue in queues)

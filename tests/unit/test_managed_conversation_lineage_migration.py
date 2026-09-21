@@ -68,7 +68,7 @@ def test_migration_graph_has_single_linear_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["149_signal_destination_policy"]
+    assert script.get_heads() == ["150_managed_delegation_depth_limit"]
     revisions = list(script.walk_revisions("base", "144_work_v8_projection_repair"))
     assert [revision.revision for revision in revisions[:17]] == [
         "144_work_v8_projection_repair",
@@ -194,6 +194,63 @@ def test_managed_join_handoff_migration_upgrades_104_schema(tmp_path: Path) -> N
             "handoff_tool_call_id",
         }.issubset(columns)
         assert "ix_managed_conversation_links_handoff_owner" in indexes
+    finally:
+        sync_engine.dispose()
+
+
+def test_managed_depth_limit_migration_upgrades_legacy_links(tmp_path: Path) -> None:
+    database_path = tmp_path / "managed-depth-limit.db"
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
+
+    with _preserve_logging_state():
+        command.upgrade(config, "149_signal_destination_policy")
+
+    sync_engine = sa.create_engine(f"sqlite:///{database_path}")
+    try:
+        with sync_engine.begin() as connection:
+            connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO managed_conversation_links (
+                        link_id, user_email, controller_agent_id,
+                        controller_conversation_id, controller_session_id,
+                        parent_link_id, root_link_id, depth, target_agent_id,
+                        target_conversation_id, target_session_id, title,
+                        conversation_state, turn_state, notify_on_completion,
+                        kind, completion_policy, owner_epoch, created_at, updated_at
+                    ) VALUES
+                        ('root-link', 'owner@example.com', 'root-agent',
+                         'root-conversation', 'root-session', NULL, 'root-link', 1,
+                         'child-agent', 'child-conversation', 'child-session', 'Child',
+                         'open', 'idle', 0, 'agent', 'turn', 1,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+                        ('child-link', 'owner@example.com', 'child-agent',
+                         'child-conversation', 'child-session', 'root-link', 'root-link', 2,
+                         'worker-agent', 'worker-conversation', 'worker-session', 'Worker',
+                         'open', 'idle', 0, 'agent', 'turn', 1,
+                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """
+                )
+            )
+    finally:
+        sync_engine.dispose()
+
+    with _preserve_logging_state():
+        command.upgrade(config, "150_managed_delegation_depth_limit")
+
+    sync_engine = sa.create_engine(f"sqlite:///{database_path}")
+    try:
+        with sync_engine.connect() as connection:
+            rows = dict(
+                connection.execute(
+                    sa.text(
+                        "SELECT link_id, depth_limit FROM managed_conversation_links "
+                        "WHERE root_link_id = 'root-link'"
+                    )
+                ).all()
+            )
+        assert rows == {"root-link": 2, "child-link": 2}
     finally:
         sync_engine.dispose()
 

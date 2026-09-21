@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -329,6 +330,45 @@ async def _harness(tmp_path: Path) -> _Harness:
         store=DirectTurnStore(session_factory),
         leases=DatabaseLeaseStore(session_factory),
     )
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_is_visible_in_public_queries_until_cancelled(tmp_path: Path) -> None:
+    from cognis.core.turn_scheduler import TurnScheduler
+
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="retry-wait", content="Wait for provider")
+        async with harness.session_factory() as session:
+            model = type(admitted.request)
+            row = (
+                await session.execute(
+                    select(model).where(model.request_id == admitted.request.request_id)
+                )
+            ).scalar_one()
+            assert row is not None
+            row.status = DirectTurnStatus.RECOVERABLE.value
+            await session.commit()
+        scheduler = object.__new__(TurnScheduler)
+        scheduler._direct_turn_store = harness.store
+        scheduler.running_turn_state = lambda _: None
+        # The lease/execution queries deliberately still exclude retry-wait.
+        assert await harness.store.get_conversation_active("conv-a") is None
+        assert await harness.store.list_conversations_active(["conv-a"]) == {}
+        for _ in range(3):
+            single = await scheduler.durable_running_turn_state("conv-a")
+            batch = await scheduler.durable_running_turn_states(["conv-a", "conv-b"])
+            snapshot = await scheduler.durable_runtime_context("conv-a")
+            assert single is not None
+            assert single["status"] == "waiting"
+            assert batch == {"conv-a": single}
+            assert snapshot["running"] == single
+        await harness.store.request_cancel(admitted.request.request_id)
+        assert await scheduler.durable_running_turn_state("conv-a") is None
+        assert await scheduler.durable_running_turn_states(["conv-a"]) == {}
+        assert (await scheduler.durable_runtime_context("conv-a"))["running"] is None
+    finally:
+        await harness.engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -2001,5 +2041,107 @@ async def test_expired_lease_cannot_claim(tmp_path: Path) -> None:
             )
             is None
         )
+    finally:
+        await harness.engine.dispose()
+
+
+_PAYLOAD_COLUMN = re.compile(r"\bpayload\b(?!_)")
+
+
+def _capture_statements(engine: AsyncEngine) -> list[str]:
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    return statements
+
+
+@pytest.mark.asyncio
+async def test_has_fence_is_a_single_statement_without_payload(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="fence", content="payload body")
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        statements = _capture_statements(harness.engine)
+        assert await harness.store.has_fence(admitted.request.request_id, lease=lease)
+        selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+        assert len(selects) == 1, selects
+        assert not _PAYLOAD_COLUMN.search(selects[0])
+
+        wrong_token = Lease(
+            resource_key=lease.resource_key,
+            owner_id=lease.owner_id,
+            fencing_token=lease.fencing_token + 1,
+            lease_expires_at=lease.lease_expires_at,
+        )
+        assert not await harness.store.has_fence(admitted.request.request_id, lease=wrong_token)
+        other_owner = Lease(
+            resource_key=lease.resource_key,
+            owner_id="controller-b:boot-b",
+            fencing_token=lease.fencing_token,
+            lease_expires_at=lease.lease_expires_at,
+        )
+        assert not await harness.store.has_fence(admitted.request.request_id, lease=other_owner)
+        assert not await harness.store.has_fence("dtr_missing", lease=lease)
+
+        # Unclaimed rows have NULL owner columns: the SQL concat must yield false.
+        unclaimed = await _admit(harness, conversation_id="conv-b", key="unclaimed", content="x")
+        unclaimed_lease = await _lease(harness, conversation_id="conv-b")
+        assert not await harness.store.has_fence(
+            unclaimed.request.request_id, lease=unclaimed_lease
+        )
+
+        assert await harness.leases.release(lease)
+        assert not await harness.store.has_fence(admitted.request.request_id, lease=lease)
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_get_cancel_state_and_checkpoint_skip_payload(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="cancel", content="payload body")
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        assert await harness.store.get_cancel_state("dtr_missing") is None
+        status, cancel_requested_at = await harness.store.get_cancel_state(
+            admitted.request.request_id
+        )
+        assert status == DirectTurnStatus.CLAIMED.value
+        assert cancel_requested_at is None
+
+        statements = _capture_statements(harness.engine)
+        checkpointed = await harness.store.checkpoint(
+            admitted.request.request_id,
+            lease=lease,
+            phase="model_wait",
+            metadata={},
+        )
+        assert checkpointed is not None
+        selects = [s for s in statements if "direct_turn_requests" in s and "SELECT" in s.upper()]
+        assert selects and not any(_PAYLOAD_COLUMN.search(s) for s in selects), selects
+        updates = [s for s in statements if s.lstrip().upper().startswith("UPDATE")]
+        assert updates and not any(_PAYLOAD_COLUMN.search(u) for u in updates), updates
+
+        # The durable payload is still intact for readers that need it.
+        materialized = await harness.store.materialize_claimed_payload(
+            admitted.request.request_id, lease=lease, artifact_store=None
+        )
+        assert materialized is not None
+        assert materialized.content == "payload body"
     finally:
         await harness.engine.dispose()

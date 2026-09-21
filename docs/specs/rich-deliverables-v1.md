@@ -23,7 +23,23 @@ Rich payloads use a renderer-neutral, block-composed shape:
 
 The top-level `title` is optional for persisted compatibility. New authoring
 schemas require it. Metadata can include the portable `canvas` (`standard` or
-`wide`) and `density` (`compact` or `comfortable`) hints.
+`wide`) and `density` (`compact` or `comfortable`) hints. It can also include
+an optional `viewer_identity` for the opening header only:
+
+```json
+{
+  "viewer_identity": {
+    "label": "Prepared for Engineering",
+    "icon": {"name": "info", "alt": "Information"}
+  }
+}
+```
+
+`label` is plain trimmed text (1..64 characters). `icon` uses a registered
+semantic icon name and may include plain trimmed `alt`; an icon-only identity
+must provide `alt`. Identity is never inferred and a missing or null value
+renders no placeholder. It cannot contain URLs, placement, title, HTML, SVG,
+CSS, colors, or arbitrary icon source.
 
 There is no primary `kind` or `template_hint`. Canonical writes reject unsupported block
 types and invalid child containers before persistence. The persisted `content`
@@ -38,6 +54,16 @@ Supported v2 block types:
 - media: `figure`, `gallery`
 - data: `table`, `comparison_matrix`, `chart`, `day_agenda`
 - diagrams/web: `mermaid`, `link`, `link_preview`, `source_list`
+
+Hero `badges`/`tags` preserve legacy plain-text strings and also accept
+`{"label": "Verified", "tone": "success"}`. A hero has at most eight badges;
+the label is plain text (1..80 characters) and tone is one of `neutral`,
+`info`, `success`, `warning`, or `danger`. Renderers always retain label text
+alongside tone semantics.
+
+`kv` and `key_value` remain aliases. Their optional `variant: "summary"` is a
+renderer-owned summary strip that preserves ordered key/value items and optional
+item semantic tone. Authors cannot set columns or widths.
 
 Charts use the canonical `cognis.chart.v1` block contract described below. Raw
 chart-library configurations, callbacks, agent-supplied JavaScript, and executable

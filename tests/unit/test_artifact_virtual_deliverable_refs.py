@@ -135,6 +135,7 @@ async def _seed_managed_deliverables(factory) -> None:
             target_conversation_id="conv-child",
             target_session_id="sess-child",
             title="Child",
+            depth_limit=2,
         )
         await create_managed_conversation_link(
             session,
@@ -149,6 +150,7 @@ async def _seed_managed_deliverables(factory) -> None:
             parent_link_id=parent.link_id,
             root_link_id=parent.link_id,
             depth=2,
+            depth_limit=2,
         )
         await create_managed_conversation_link(
             session,
@@ -273,6 +275,52 @@ async def test_artifact_tools_read_and_metadata_owned_deliverable(
     assert read.metadata is not None
     assert read.metadata["source"] == "deliverable"
     assert read.metadata["virtual"] is True
+
+
+@pytest.mark.asyncio
+async def test_workflow_deliverable_writes_still_supersede(task_continuation_db) -> None:
+    from cognis.store.queries import get_deliverable
+
+    store = task_continuation_db.artifact_store
+    async with task_continuation_db() as session:
+        first = await get_deliverable(session, "dlv_owner")
+        replacement = await create_deliverable(
+            session,
+            step_run_id=first.step_run_id,
+            content="Revised step output",
+            format="markdown",
+            artifact_store=store,
+        )
+        assert first.status == "superseded"
+        replacement_id = replacement.deliverable_id
+        await session.commit()
+    with pytest.raises(FileNotFoundError):
+        await store.async_load("deliverables", "dlv_owner", "content.md")
+    content, _ = await store.async_load("deliverables", replacement_id, "content.md")
+    assert content == b"Revised step output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["artifact_read", "artifact_get_metadata", "artifact_get_url"])
+async def test_missing_deliverable_payload_is_a_tool_error(task_continuation_db, tool) -> None:
+    await task_continuation_db.artifact_store.async_delete_object("deliverables", "dlv_owner")
+    result = await handle_artifact_tool(
+        tool,
+        {"artifact_id": "dlv_owner"},
+        llm=None,
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+        user_email="owner@example.com",
+    )
+    assert result.is_error is True
+    assert "not found" in result.output.lower()
+    async with task_continuation_db() as session:
+        assert (
+            await get_deliverable_ref_unscoped(
+                session, task_continuation_db.artifact_store, "dlv_owner"
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -448,7 +496,7 @@ async def test_artifact_get_url_returns_virtual_deliverable_url(task_continuatio
 
 
 @pytest.mark.asyncio
-async def test_artifact_get_url_rejects_virtual_deliverable_view_for_non_html(
+async def test_artifact_get_url_supports_virtual_markdown_deliverable_view(
     task_continuation_db,
 ) -> None:
     result = await handle_artifact_tool(
@@ -460,8 +508,13 @@ async def test_artifact_get_url_rejects_virtual_deliverable_view_for_non_html(
         user_email="owner@example.com",
     )
 
-    assert result.is_error is True
-    assert result.output == "Artifact view is only supported for HTML artifacts: dlv_owner"
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["mode"] == "view"
+    assert (
+        "/api/v1/artifacts/virtual/deliverables/view/dlv_owner/Full-report.md"
+        in result.metadata["url"]
+    )
 
 
 @pytest.mark.asyncio

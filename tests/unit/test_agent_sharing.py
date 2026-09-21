@@ -654,6 +654,16 @@ def test_agent_management_settings_get_schema_and_update(
                     "available_workflow_ids": ["software-development"],
                     "default_workflow_id": "software-development",
                     "workflow_selection_mode": "use_default",
+                    "delegation": {
+                        "enabled": True,
+                        "allowed_agent_ids": [],
+                        "primary": {
+                            "enabled": True,
+                            "max_managed_depth": 1,
+                            "allowed_controller_agent_ids": ["controller-agent"],
+                        },
+                        "system": {"enabled": False},
+                    },
                 },
             },
         )
@@ -669,6 +679,16 @@ def test_agent_management_settings_get_schema_and_update(
         assert settings["workflow"]["default_workflow_id"] == "software-development"
         assert settings["workflow"]["workflow_selection_mode"] == "use_default"
         assert settings["executor"]["executor_id"] is None
+        assert settings["permissions"]["delegation"] == {
+            "enabled": True,
+            "allowed_agent_ids": [],
+            "primary": {
+                "enabled": True,
+                "max_managed_depth": 1,
+                "allowed_controller_agent_ids": ["controller-agent"],
+            },
+            "system": {"enabled": False},
+        }
         assert settings["enabled_skills"] == []
         assert settings["tools_state"]["config_state"] == "default_inherited"
         assert reread["settings"] == updated["settings"]
@@ -886,10 +906,33 @@ def test_agent_management_tool_assignment_crud_and_validation(tmp_path: Path) ->
                 "action": "create",
                 "name": "Knowledge agent",
                 "assigned_knowledgebases": [kb.knowledgebase_id],
+                "delegation": {
+                    "allowed_agent_ids": [],
+                    "primary": {"allowed_controller_agent_ids": []},
+                    "system": {"enabled": False},
+                },
             },
         )
         assert created_with_kb["agent"]["permissions"]["allowed_knowledgebases"] == [
             kb.knowledgebase_id
+        ]
+        assert created_with_kb["agent"]["permissions"]["delegation"]["allowed_agent_ids"] == []
+        delegation_updated = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "update",
+                "agent_id": created_with_kb["agent"]["agent_id"],
+                "delegation": {
+                    "allowed_agent_ids": ["system:explore"],
+                    "primary": {"allowed_controller_agent_ids": ["controller-agent"]},
+                    "system": {"enabled": True},
+                },
+            },
+        )
+        assert delegation_updated["agent"]["permissions"]["delegation"]["allowed_agent_ids"] == [
+            "system:explore"
         ]
         created_kb_state = await handle_agent_management_action(
             deps=deps,

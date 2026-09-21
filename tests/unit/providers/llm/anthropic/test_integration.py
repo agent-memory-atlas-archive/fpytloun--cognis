@@ -572,6 +572,131 @@ def test_frozen_native_chain_preserves_exact_parallel_round_trip() -> None:
     assert restored_bundle.wire_tools[0]["cache_control"]["ttl"] == "1h"
 
 
+def test_frozen_native_chain_drops_result_absent_from_native_envelope() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    context, bundle = build_native_chain(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        exposed_tools=tools,
+        alias_map={"bash": "bash"},
+        stable_id_map={"bash": "builtin-bash"},
+        argument_alias_map={},
+        thinking={},
+        credential_ref="$credential:test",
+    )
+    envelope = AnthropicNativeEnvelope(
+        native_blocks=(
+            {
+                "type": "tool_use",
+                "id": "toolu_native",
+                "name": bundle.bindings[0].wire_name,
+                "input": {},
+            },
+        ),
+        stop_reason="tool_use",
+        stop_details={},
+        usage={},
+        pending_client_message_id=None,
+        pending_server_message_id=None,
+        bundle_fingerprint=bundle.fingerprint,
+        provider_fingerprint=context.chain_id,
+        model_fingerprint=context.model,
+        thinking_fingerprint=context.thinking_fingerprint,
+    )
+
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "toolu_native", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "toolu_orphan", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+                "_anthropic_native_envelope": envelope.to_dict(),
+            },
+            {"role": "tool", "tool_call_id": "toolu_native", "content": "ok"},
+            {"role": "tool", "tool_call_id": "toolu_orphan", "content": "stale"},
+            {"role": "user", "content": "continue"},
+        ],
+        request_kwargs={
+            NATIVE_REQUEST_CONTEXT_KWARG: context.to_dict(),
+            NATIVE_TOOL_BUNDLE_KWARG: bundle.to_dict(),
+            "tools": tools,
+        },
+        credential_ref="$credential:test",
+    )
+
+    assert payload["messages"][0]["content"] == [dict(block) for block in envelope.native_blocks]
+    assert payload["messages"][1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "toolu_native", "content": "ok"},
+        {"type": "text", "text": "continue"},
+    ]
+
+
+def test_frozen_native_chain_without_client_tools_drops_orphan_result() -> None:
+    context, bundle = build_native_chain(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        exposed_tools=[],
+        alias_map={},
+        stable_id_map={},
+        argument_alias_map={},
+        thinking={},
+        credential_ref="$credential:test",
+    )
+    envelope = AnthropicNativeEnvelope(
+        native_blocks=({"type": "text", "text": "done"},),
+        stop_reason="end_turn",
+        stop_details={},
+        usage={},
+        pending_client_message_id=None,
+        pending_server_message_id=None,
+        bundle_fingerprint=bundle.fingerprint,
+        provider_fingerprint=context.chain_id,
+        model_fingerprint=context.model,
+        thinking_fingerprint=context.thinking_fingerprint,
+    )
+
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        messages=[
+            {
+                "role": "assistant",
+                "content": "done",
+                "_anthropic_native_envelope": envelope.to_dict(),
+            },
+            {"role": "tool", "tool_call_id": "toolu_orphan", "content": "stale"},
+            {"role": "user", "content": "continue"},
+        ],
+        request_kwargs={
+            NATIVE_REQUEST_CONTEXT_KWARG: context.to_dict(),
+            NATIVE_TOOL_BUNDLE_KWARG: bundle.to_dict(),
+        },
+        credential_ref="$credential:test",
+    )
+
+    assert payload["messages"] == [
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+    ]
+
+
 def test_frozen_native_chain_rejects_provider_thinking_and_bundle_corruption() -> None:
     context, bundle = build_native_chain(
         provider=_provider(),
@@ -771,7 +896,10 @@ def test_completed_historical_native_envelope_keeps_its_original_wire_identity()
     assert payload["messages"][0]["content"][0]["name"] == old_wire_name
 
 
-def test_native_replay_preserves_server_tool_blocks_without_creating_server_results() -> None:
+@pytest.mark.parametrize("from_audited_history", [False, True])
+def test_native_replay_preserves_server_tool_blocks_without_creating_server_results(
+    from_audited_history: bool,
+) -> None:
     context, bundle = build_native_chain(
         provider=_provider(),
         model="claude-test",
@@ -828,21 +956,39 @@ def test_native_replay_preserves_server_tool_blocks_without_creating_server_resu
         model_fingerprint=context.model,
         thinking_fingerprint=context.thinking_fingerprint,
     )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "toolu_1", "function": {"name": "weather", "arguments": "{}"}}],
+            "_anthropic_native_envelope": envelope.to_dict(),
+        },
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
+    ]
+    if from_audited_history:
+        from cognis.core.context import events_to_messages
+
+        messages = events_to_messages(
+            [
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "call_id": "toolu_1",
+                        "name": "weather",
+                        "arguments": {},
+                        "anthropic_native_envelope": envelope.to_dict(),
+                    },
+                },
+                {"type": "evaluation", "data": {"decision": "approve"}},
+                {"type": "lifecycle", "data": {"event": "intention_updated"}},
+                {"type": "tool_result", "data": {"call_id": "toolu_1", "result": "sunny"}},
+            ]
+        )
     _context, payload, _bundle = build_native_request(
         provider=_provider(),
         model="claude-test",
         model_info=ModelInfo(model_id="claude-test"),
-        messages=[
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": "toolu_1", "function": {"name": "weather", "arguments": "{}"}}
-                ],
-                "_anthropic_native_envelope": envelope.to_dict(),
-            },
-            {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
-        ],
+        messages=messages,
         request_kwargs={
             NATIVE_CONTINUATION_REQUIRED_KWARG: True,
             NATIVE_REQUEST_CONTEXT_KWARG: context.to_dict(),

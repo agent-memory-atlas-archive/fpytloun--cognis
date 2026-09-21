@@ -7,7 +7,12 @@ from enum import StrEnum
 from typing import Any, cast
 
 from cognis.core.agent_profiles import agent_profile_options
-from cognis.models.agent import AgentDefinition
+from cognis.models.agent import (
+    AgentDefinition,
+    AgentDelegationPolicy,
+    PrimaryDelegationPolicy,
+    SystemDelegationPolicy,
+)
 
 
 class OrchestrationTargetMode(StrEnum):
@@ -69,6 +74,29 @@ class OrchestrationTargetSnapshot:
         return self.delegate if mode is OrchestrationTargetMode.DELEGATE else self.managed
 
 
+def effective_delegation_policy(agent: AgentDefinition) -> AgentDelegationPolicy:
+    """Return the runtime policy, preserving the legacy master switch."""
+
+    permissions = agent.permissions
+    if permissions is not None and permissions.delegation is not None:
+        return permissions.delegation
+    enabled = permissions.can_delegate if permissions is not None else True
+    return AgentDelegationPolicy(
+        enabled=enabled,
+        primary=PrimaryDelegationPolicy(enabled=enabled, max_managed_depth=1),
+        system=SystemDelegationPolicy(enabled=enabled),
+    )
+
+
+def managed_depth_limit(agent: AgentDefinition) -> int:
+    """Return the configured managed-chain limit for a root controller."""
+
+    policy = effective_delegation_policy(agent)
+    if not policy.enabled or not policy.primary.enabled:
+        return 0
+    return policy.primary.max_managed_depth
+
+
 class OrchestrationTargetService:
     """Resolve effective targets from the registry without semantic routing heuristics."""
 
@@ -80,16 +108,25 @@ class OrchestrationTargetService:
         *,
         controller_agent: AgentDefinition,
         user_email: str,
+        managed_depth: int = 0,
+        inherited_managed_depth_limit: int | None = None,
     ) -> OrchestrationTargetSnapshot:
+        policy = effective_delegation_policy(controller_agent)
+        if not policy.enabled:
+            return OrchestrationTargetSnapshot()
         visible = await self._registry.list_all(
             owner_email=user_email,
             include_hidden=False,
             include_system=True,
             include_disabled=False,
         )
-        bound_secondary_ids = set(
-            await self._registry.list_secondary_bindings(controller_agent.agent_id)
+        allowed_ids = None if policy.allowed_agent_ids is None else set(policy.allowed_agent_ids)
+        depth_limit = (
+            policy.primary.max_managed_depth
+            if inherited_managed_depth_limit is None
+            else inherited_managed_depth_limit
         )
+        managed_creation_allowed = policy.primary.enabled and managed_depth < depth_limit
 
         delegate: list[OrchestrationTarget] = []
         managed: list[OrchestrationTarget] = []
@@ -97,10 +134,27 @@ class OrchestrationTargetService:
             if agent.hidden or agent.disabled or agent.status != "active":
                 continue
             if agent.agent_type == "secondary":
-                if agent.is_system or agent.agent_id in bound_secondary_ids:
+                if (
+                    policy.system.enabled
+                    and agent.is_system
+                    and (allowed_ids is None or agent.agent_id in allowed_ids)
+                ):
                     delegate.append(OrchestrationTarget.from_agent(agent))
                 continue
-            if agent.agent_type == "primary" and not agent.is_system:
+            target_policy = effective_delegation_policy(agent)
+            allowed_controllers = target_policy.primary.allowed_controller_agent_ids
+            is_self = agent.agent_id == controller_agent.agent_id
+            if (
+                managed_creation_allowed
+                and agent.agent_type == "primary"
+                and not agent.is_system
+                and (is_self or allowed_ids is None or agent.agent_id in allowed_ids)
+                and (
+                    is_self
+                    or allowed_controllers is None
+                    or controller_agent.agent_id in allowed_controllers
+                )
+            ):
                 managed.append(OrchestrationTarget.from_agent(agent))
 
         return OrchestrationTargetSnapshot(
@@ -115,6 +169,8 @@ class OrchestrationTargetService:
         target_agent_id: str | None,
         controller_agent: AgentDefinition,
         user_email: str,
+        managed_depth: int = 0,
+        inherited_managed_depth_limit: int | None = None,
     ) -> AgentDefinition:
         normalized = str(target_agent_id or "").strip()
         if not normalized:
@@ -131,6 +187,8 @@ class OrchestrationTargetService:
         snapshot = await self.snapshot(
             controller_agent=controller_agent,
             user_email=user_email,
+            managed_depth=managed_depth,
+            inherited_managed_depth_limit=inherited_managed_depth_limit,
         )
         if normalized not in {target.agent_id for target in snapshot.for_mode(mode)}:
             code = (
@@ -154,7 +212,10 @@ class OrchestrationTargetService:
             or target.hidden
             or target.disabled
             or target.status != "active"
-            or (mode is OrchestrationTargetMode.DELEGATE and target.agent_type != "secondary")
+            or (
+                mode is OrchestrationTargetMode.DELEGATE
+                and (target.agent_type != "secondary" or not target.is_system)
+            )
             or (
                 mode is OrchestrationTargetMode.MANAGED
                 and (target.agent_type != "primary" or target.is_system)

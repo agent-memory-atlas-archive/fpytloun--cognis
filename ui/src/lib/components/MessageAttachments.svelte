@@ -96,35 +96,6 @@
     lightboxIndex = null;
   }
 
-  function isHtmlAttachment(attachment: AttachmentRef): boolean {
-    return attachment.mime_type?.split(';', 1)[0]?.trim().toLowerCase() === 'text/html';
-  }
-
-  async function openViewAttachment(event: MouseEvent, attachment: AttachmentRef): Promise<void> {
-    event.preventDefault();
-    const popup = window.open('', '_blank');
-    if (popup) {
-      popup.opener = null;
-    }
-    try {
-      const url = await resolveAttachmentUrl(attachment, 'view');
-      if (!url) throw new Error('Unable to resolve artifact URL');
-      if (popup) {
-        popup.location.href = url;
-      } else {
-        window.open(url, '_blank', 'noopener,noreferrer');
-      }
-    } catch (error) {
-      console.error('Failed to open artifact view URL', error);
-      if (popup) {
-        popup.close();
-      }
-      if (attachment.url) {
-        window.open(attachment.url, '_blank', 'noopener,noreferrer');
-      }
-    }
-  }
-
   async function openDownloadAttachment(attachment: AttachmentRef): Promise<void> {
     const url = await resolveAttachmentUrl(attachment, 'download');
     if (url) window.open(url, '_blank', 'noopener,noreferrer');
@@ -133,11 +104,10 @@
   async function openPreview(attachment: AttachmentRef): Promise<void> {
     const request = ++previewRequest;
     const kind = previewKind(attachment);
-    if (kind === 'html') {
-      await openViewAttachment(new MouseEvent('click'), attachment);
-      return;
-    }
-    if (kind === 'video') {
+    if (kind === 'html' || kind === 'pdf') {
+      previewMediaUrl = await resolveAttachmentUrl(attachment, 'view');
+      if (request !== previewRequest) return;
+    } else if (kind === 'video') {
       previewMediaUrl = await resolveAttachmentUrl(attachment, 'download');
       if (request !== previewRequest) return;
     } else {
@@ -185,12 +155,11 @@
           <FileText class="h-4 w-4" />
         </span>
         <div class="min-w-0 flex-1">
-          {#if resolvedUrl(attachment, 'download') || isHtmlAttachment(attachment)}
+          {#if resolvedUrl(attachment, 'download')}
             <a
-              href={resolvedUrl(attachment, 'download') ?? '#'}
+              href={resolvedUrl(attachment, 'download') ?? ''}
               target="_blank"
               rel="noopener noreferrer"
-              onclick={isHtmlAttachment(attachment) ? (event) => { void openViewAttachment(event, attachment); } : undefined}
               class="block truncate text-sm font-medium text-slate-100 hover:text-sky-300"
             >
               {attachment.filename}
@@ -246,14 +215,17 @@
   </div>
 {/if}
 
-{#if previewAttachment && previewKind(previewAttachment) !== 'html'}
-  <AttachmentPreviewModal
-    attachment={previewAttachment}
-    kind={previewKind(previewAttachment) === 'video' ? 'video' : 'text'}
-    mediaUrl={previewMediaUrl}
-    onClose={() => { previewRequest += 1; previewAttachment = null; previewMediaUrl = null; }}
-    onDownload={() => { if (previewAttachment) void openDownloadAttachment(previewAttachment); }}
-  />
+{#if previewAttachment}
+  {@const activePreviewKind = previewKind(previewAttachment)}
+  {#if activePreviewKind}
+    <AttachmentPreviewModal
+      attachment={previewAttachment}
+      kind={activePreviewKind}
+      mediaUrl={previewMediaUrl}
+      onClose={() => { previewRequest += 1; previewAttachment = null; previewMediaUrl = null; }}
+      onDownload={() => { if (previewAttachment) void openDownloadAttachment(previewAttachment); }}
+    />
+  {/if}
 {/if}
 
 {#if lightboxIndex !== null && imageAttachments[lightboxIndex]}

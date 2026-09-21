@@ -116,7 +116,7 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(store.snapshot.conversationId).toBe('conv-1');
     expect(store.visibleItems.map((item) => item.id)).toEqual([
       'message:1',
-      'local-user:client-during-bootstrap',
+      'user:client-during-bootstrap',
     ]);
   });
 

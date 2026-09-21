@@ -23,6 +23,9 @@ export async function checkStandaloneBuild({
     if (!item) throw new Error(`Standalone manifest references missing import ${key}`);
     initialFiles.add(item.file);
     for (const css of item.css ?? []) initialFiles.add(css);
+    for (const asset of item.assets ?? []) {
+      if (/\.(woff2?|ttf|otf)$/.test(asset)) initialFiles.add(asset);
+    }
     for (const imported of item.imports ?? []) collectInitial(imported);
   }
   collectInitial(entryKey);

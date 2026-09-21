@@ -732,7 +732,7 @@ def test_runtime_profile_operations_are_introspectable() -> None:
     assert "replacement_profile_id" in delete_operation.input_schema["properties"]
 
 
-def test_settings_update_schema_exposes_supported_memory_fields() -> None:
+def test_settings_update_schema_exposes_supported_memory_and_delegation_fields() -> None:
     operation = next(
         operation
         for operation in MANAGE_AGENTS_TOOL.native_operations
@@ -743,3 +743,13 @@ def test_settings_update_schema_exposes_supported_memory_fields() -> None:
 
     assert settings_properties["memory_backend"] == {"type": "string"}
     assert settings_properties["memory_backend_options"] == {"type": "object"}
+    delegation = settings_properties["delegation"]
+    assert delegation["properties"]["allowed_agent_ids"]["type"] == ["array", "null"]
+    assert delegation["properties"]["primary"]["properties"]["max_managed_depth"] == {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 2,
+    }
+    assert delegation["properties"]["primary"]["properties"]["allowed_controller_agent_ids"][
+        "type"
+    ] == ["array", "null"]

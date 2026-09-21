@@ -39,6 +39,7 @@
   style:--rich-columns={columns || undefined}
   data-rich-block-type={type}
   data-rich-grid-layout={type === 'grid' ? gridLayout : undefined}
+  data-rich-metrics={children.length > 0 && children.every(child => child.type === 'metric') ? 'true' : undefined}
 >
   <RichBlockList blocks={children} {sources} {mediaUrlFor} />
 </div>

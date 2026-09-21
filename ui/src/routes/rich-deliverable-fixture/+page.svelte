@@ -2,246 +2,79 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
-  import {
-    defaultRichScenarioId,
-    getRichScenario,
-    requireRichScenario,
-    richGalleryScenarios,
-  } from '$lib/rich-scenarios/registry';
+  import { setViewerTheme } from '$lib/components/rich/viewer-theme';
+  import { defaultRichScenarioId, getRichScenario, requireRichScenario, richGalleryScenarios } from '$lib/rich-scenarios/registry';
 
-  const allowedWidths = new Set(['390', '768', '1280', '1440']);
-  const allowedThemes = new Set(['light', 'dark', 'system']);
-  const allowedSurfaces = new Set(['embedded', 'standalone']);
-  let requestedScenarioId = $derived(page.url.searchParams.get('scenario') ?? defaultRichScenarioId);
-  let scenario = $derived(getRichScenario(requestedScenarioId) ?? requireRichScenario(defaultRichScenarioId));
-  let width = $derived(allowedWidths.has(page.url.searchParams.get('width') ?? '')
-    ? page.url.searchParams.get('width')! : '1280');
-  let theme = $derived(allowedThemes.has(page.url.searchParams.get('theme') ?? '')
-    ? page.url.searchParams.get('theme')! : 'system');
-  let surface = $derived((allowedSurfaces.has(page.url.searchParams.get('surface') ?? '')
-    ? page.url.searchParams.get('surface') : 'embedded') as 'embedded' | 'standalone');
+  const widths = ['360', '390', '768', '1024', '1230', '1280', '1440'];
+  const themes = ['light', 'dark', 'system'];
+  const surfaces = ['embedded', 'standalone'];
+  let scenario = $derived(getRichScenario(page.url.searchParams.get('scenario') ?? '') ?? requireRichScenario(defaultRichScenarioId));
+  let width = $derived(widths.includes(page.url.searchParams.get('width') ?? '') ? page.url.searchParams.get('width')! : '1280');
+  let theme = $derived(themes.includes(page.url.searchParams.get('theme') ?? '') ? page.url.searchParams.get('theme')! : 'system');
+  let surface = $derived((surfaces.includes(page.url.searchParams.get('surface') ?? '') ? page.url.searchParams.get('surface') : 'embedded') as 'embedded' | 'standalone');
+  let capture = $derived(page.url.searchParams.get('capture') === 'viewer');
 
   $effect(() => {
-    const previousTheme = document.documentElement.dataset.resolvedTheme;
+    const queryTheme = page.url.searchParams.get('theme');
+    if (queryTheme === 'light' || queryTheme === 'dark' || queryTheme === 'system') setViewerTheme(queryTheme);
+    const previous = document.documentElement.dataset.resolvedTheme;
     if (theme === 'system') delete document.documentElement.dataset.resolvedTheme;
     else document.documentElement.dataset.resolvedTheme = theme;
     return () => {
-      if (previousTheme === undefined) delete document.documentElement.dataset.resolvedTheme;
-      else document.documentElement.dataset.resolvedTheme = previousTheme;
+      if (previous === undefined) delete document.documentElement.dataset.resolvedTheme;
+      else document.documentElement.dataset.resolvedTheme = previous;
     };
   });
 
-  function selectScenario(id: string) {
+  function select(key: string, value: string) {
     const url = new URL(page.url);
-    url.searchParams.set('scenario', id);
+    url.searchParams.set(key, value);
     void goto(`${url.pathname}${url.search}`, { keepFocus: true, noScroll: true });
   }
 </script>
 
-<svelte:head>
-  <title>Rich Deliverable Fixture · Cognis</title>
-</svelte:head>
+<svelte:head><title>Rich Deliverable Gallery · Cognis</title></svelte:head>
 
-<main class="fixture-page" data-testid="rich-deliverable-fixture-page">
-  <section class="fixture-hero">
-    <div>
-      <span>Visual QA</span>
-      <h1>Rich Deliverables</h1>
-      <p>Real-world fixture scenarios for browser-polishing the renderer beyond Markdown.</p>
-    </div>
-    <div class="fixture-tabs" role="tablist" aria-label="Rich deliverable scenarios">
-      {#each richGalleryScenarios as item}
-        <button
-          type="button"
-          role="tab"
-          aria-selected={item.id === scenario.id}
-          class:active={item.id === scenario.id}
-          data-scenario-id={item.id}
-          onclick={() => selectScenario(item.id)}
-        >
-          {item.title}
-        </button>
-      {/each}
-    </div>
-  </section>
-
-  <section
-    class="fixture-shell"
-    data-testid="rich-deliverable-fixture"
-    data-scenario={scenario.id}
-    data-theme={theme}
-    data-width={width}
-    data-surface={surface}
-    style={`--fixture-review-width: ${width}px`}
-  >
-    <div class="scenario-meta">
-      <span>{scenario.id}</span>
-      <p>{scenario.description}</p>
-    </div>
+<main class="fixture-page" class:capture data-testid="rich-deliverable-fixture-page">
+  {#if !capture}
+    <header class="gallery-toolbar" data-testid="rich-gallery-toolbar">
+      <strong>Rich gallery</strong>
+      <label class="scenario-picker">Scenario
+        <select aria-label="Scenario" value={scenario.id} onchange={event => select('scenario', event.currentTarget.value)}>
+          {#each richGalleryScenarios as item}<option value={item.id} data-scenario-id={item.id}>{item.title}</option>{/each}
+        </select>
+      </label>
+      <label>Theme<select aria-label="Preview theme" value={theme} onchange={event => select('theme', event.currentTarget.value)}>
+        {#each themes as value}<option value={value}>{value}</option>{/each}
+      </select></label>
+      <label>Width<select aria-label="Preview width" value={width} onchange={event => select('width', event.currentTarget.value)}>
+        {#each widths as value}<option value={value}>{value}px</option>{/each}
+      </select></label>
+      <label>Surface<select aria-label="Preview surface" value={surface} onchange={event => select('surface', event.currentTarget.value)}>
+        {#each surfaces as value}<option value={value}>{value}</option>{/each}
+      </select></label>
+    </header>
+  {/if}
+  <section class="fixture-shell" data-testid="rich-deliverable-fixture" data-scenario={scenario.id} data-theme={theme} data-width={width} data-surface={surface} style={`--fixture-review-width:${width}px`}>
     {#key scenario.id}
-      <RichDeliverable
-        title={scenario.title}
-        content={scenario.content}
-         payload={scenario.payload}
-         instanceId={`fixture-${scenario.id}`}
-         standaloneUrl={`/rich-deliverable-fixture?scenario=${encodeURIComponent(scenario.id)}&theme=${theme}&width=${width}&surface=standalone`}
-         {surface}
-      />
+      <RichDeliverable title={scenario.title} content={scenario.content} payload={scenario.payload} instanceId={`fixture-${scenario.id}`}
+        standaloneUrl={`/rich-deliverable-fixture?scenario=${encodeURIComponent(scenario.id)}&theme=${theme}&width=${width}&surface=standalone&capture=viewer`} {surface} />
     {/key}
   </section>
 </main>
 
 <style>
-  .fixture-page {
-    width: 100%;
-    min-width: 0;
-    max-width: 100%;
-    height: 100%;
-    min-height: 100%;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    background:
-      radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.18), transparent 28rem),
-      radial-gradient(circle at 88% 10%, rgb(16 185 129 / 0.13), transparent 26rem),
-      linear-gradient(180deg, #020617, #07111a 42%, #020617);
-    padding: clamp(1rem, 3vw, 2.5rem);
-  }
-
-  /* This QA harness previously stayed dark regardless of theme, which made
-     light-themed rich deliverables (bare/uncarded markdown, low-opacity
-     panels) impossible to visually verify correctly. Follow the resolved
-     theme like real embedding contexts (chat, standalone) do. */
-  @media (prefers-color-scheme: light) {
-    :global(:root:not([data-resolved-theme="dark"])) .fixture-page {
-      background:
-        radial-gradient(circle at 12% 0%, rgb(3 105 161 / 0.1), transparent 28rem),
-        radial-gradient(circle at 88% 10%, rgb(5 150 105 / 0.08), transparent 26rem),
-        linear-gradient(180deg, #f8fafc, #eef2f6 42%, #f8fafc);
-    }
-  }
-
-  .fixture-hero {
-    width: min(100%, 86rem);
-    min-width: 0;
-    max-width: 100%;
-    margin: 0 auto;
-  }
-
-  /* This QA harness acts as a wide-capable host, while embedded chat lanes
-     remain responsible for constraining their own renderers. */
-  .fixture-shell {
-    width: min(100%, var(--fixture-review-width, 100rem));
-    min-width: 0;
-    max-width: 100%;
-    margin: 0 auto;
-  }
-
-  .fixture-hero {
-    display: grid;
-    grid-template-columns: minmax(18rem, 1fr) minmax(20rem, 1.35fr);
-    gap: 1.5rem;
-    align-items: end;
-    margin-bottom: 1.5rem;
-  }
-
-  .fixture-hero span,
-  .scenario-meta span {
-    color: rgb(125 211 252);
-    font-size: 0.75rem;
-    font-weight: 850;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-  }
-
-  .fixture-hero h1 {
-    margin: 0.25rem 0;
-    color: rgb(248 250 252);
-    font-size: clamp(2.4rem, 7vw, 6rem);
-    letter-spacing: -0.07em;
-    line-height: 0.88;
-  }
-
-  .fixture-hero p,
-  .scenario-meta p {
-    margin: 0;
-    color: rgb(203 213 225);
-    line-height: 1.6;
-  }
-
-  .fixture-tabs {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 0.55rem;
-  }
-
-  .fixture-tabs button {
-    border: 1px solid rgb(148 163 184 / 0.16);
-    border-radius: 999px;
-    background: rgb(15 23 42 / 0.62);
-    color: rgb(203 213 225);
-    padding: 0.5rem 0.75rem;
-    font-size: 0.78rem;
-    font-weight: 750;
-  }
-
-  .fixture-tabs button.active,
-  .fixture-tabs button:hover {
-    border-color: rgb(56 189 248 / 0.45);
-    background: rgb(14 165 233 / 0.16);
-    color: rgb(248 250 252);
-  }
-
-  .fixture-shell {
-    display: grid;
-    gap: 1rem;
-  }
-
-  .scenario-meta {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    gap: 0.75rem;
-    border: 1px solid rgb(148 163 184 / 0.12);
-    border-radius: 1.25rem;
-    background: rgb(15 23 42 / 0.55);
-    padding: 1rem 1.15rem;
-  }
-
-  @media (max-width: 860px) {
-    .fixture-page {
-      padding: 0.5rem;
-    }
-
-    .fixture-hero {
-      grid-template-columns: 1fr;
-    }
-
-    .fixture-tabs {
-      justify-content: flex-start;
-    }
-  }
-
-  @media (prefers-color-scheme: light) {
-    :global(:root:not([data-resolved-theme="dark"])) {
-      .fixture-hero h1 { color: rgb(23 32 51); }
-      .fixture-hero p,
-      .scenario-meta p { color: rgb(51 65 85); }
-      .fixture-tabs button {
-        border-color: rgb(51 65 85 / 0.16);
-        background: rgb(255 255 255 / 0.7);
-        color: rgb(51 65 85);
-      }
-      .fixture-tabs button.active,
-      .fixture-tabs button:hover {
-        border-color: rgb(3 105 161 / 0.4);
-        background: rgb(224 242 254);
-        color: rgb(23 32 51);
-      }
-      .scenario-meta {
-        border-color: rgb(51 65 85 / 0.14);
-        background: rgb(255 255 255 / 0.65);
-      }
-    }
-  }
+  .fixture-page { width: 100%; min-width: 0; height: 100%; overflow-y: auto; background: #0e141e; color: #bcc5d3; }
+  .fixture-shell { width: min(100%, var(--fixture-review-width, 1280px)); min-width: 0; margin: auto; }
+  .capture .fixture-shell { width: 100%; }
+  .gallery-toolbar { display: flex; align-items: center; gap: 12px; min-height: 56px; box-sizing: border-box; padding: 6px 16px; border-bottom: 1px solid #64748b44; }
+  strong { font-size: 13px; white-space: nowrap; }
+  label { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 11px; }
+  .scenario-picker { flex: 1; }
+  select { min-width: 0; max-width: 100%; height: 36px; border: 1px solid #64748b66; border-radius: 5px; background: #1a2434; color: inherit; padding: 0 8px; font-size: 12px; }
+  .scenario-picker select { width: 100%; }
+  select:focus-visible { outline: 2px solid #159fef; outline-offset: 2px; }
+  :global(:root[data-resolved-theme="light"]) .fixture-page { background: #f6f8fb; color: #4c5c72; }
+  :global(:root[data-resolved-theme="light"]) select { background: white; }
+  @media (max-width: 700px) { .gallery-toolbar { flex-wrap: wrap; gap: 6px; padding: 6px 10px; } strong { display: none; } .scenario-picker { flex-basis: 100%; } select { height: 44px; } }
 </style>

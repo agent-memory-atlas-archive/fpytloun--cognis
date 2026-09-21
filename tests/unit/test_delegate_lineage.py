@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 from sqlalchemy import inspect, text
@@ -10,7 +11,68 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from cognis.bootstrap import _ensure_delegate_lineage_column
 from cognis.core.agent_loop import AgentLoop
+from cognis.core.canonical_history import CanonicalHistoryUnavailable
+from cognis.core.session import SessionManager
 from cognis.models.tool import ToolCall, ToolResult
+from cognis.tools.builtin.orchestration import OrchestrationMode
+
+
+@pytest.mark.asyncio
+async def test_lineage_copy_failure_marks_child_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_loop = object.__new__(AgentLoop)
+    manager = create_autospec(SessionManager, instance=True)
+    manager.session_factory = _SessionFactory()
+    manager.session_cache = object()
+    agent_loop.session_manager = manager
+    agent_loop.providers = SimpleNamespace()
+    monkeypatch.setattr(
+        "cognis.core.session_fork.fork_session_events",
+        AsyncMock(side_effect=CanonicalHistoryUnavailable("history unavailable")),
+    )
+    child = SimpleNamespace(
+        session_id="child-target",
+        intaris_session_id="child-target",
+        delegation_metadata={"source_session_id": "child-source", "operation": "fork"},
+    )
+    monkeypatch.setattr(
+        "cognis.core.agent_loop.handle_delegate_tool_call",
+        AsyncMock(return_value=(ToolResult(output="started"), child)),
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.get_session_row",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                session_id="child-source",
+                intaris_session_id="child-source",
+                parent_session_id="parent",
+                conversation_id="conversation",
+                user_email="user@example.com",
+            )
+        ),
+    )
+    result = await agent_loop._handle_delegate(
+        ToolCall(call_id="fork-call", name="delegate", arguments={"task": "Implement"}),
+        ctx=SimpleNamespace(
+            session=SimpleNamespace(
+                session_id="parent",
+                conversation_id="conversation",
+                user_email="user@example.com",
+            ),
+            conversation=SimpleNamespace(context=None),
+            agent=SimpleNamespace(),
+            orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
+            workspace_root_explicit=False,
+            working_directory_explicit=False,
+            current_turn_cycle_index=0,
+        ),
+        events_to_record=[],
+    )
+    assert result.is_error
+    assert json.loads(result.output)["code"] == "delegate_lineage_context_unavailable"
+    manager.mark_failed.assert_awaited_once_with(
+        "child-target",
+        result_summary="Delegate lineage context could not be copied",
+    )
 
 
 class _SessionFactory:

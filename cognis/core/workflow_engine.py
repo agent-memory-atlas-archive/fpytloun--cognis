@@ -4960,9 +4960,9 @@ class WorkflowEngine:
         history.  Events are written to Intaris (durable) and seeded into
         the session cache (avoids a cold load on context assembly).
 
-        Failures are logged but do not block step execution — the step
-        prompt still includes a structured summary from
-        ``_build_step_prompt`` as a fallback.
+        Full input requires complete history. Copy failures stop execution
+        instead of silently substituting the structured summary. Incomplete
+        targets remain fenced by their durable history-copy boundary.
         """
         if source_name is None:
             return False
@@ -4986,7 +4986,6 @@ class WorkflowEngine:
         copy_prefix: bool = True,
         event_filter: Callable[[Any], bool] | None = None,
         event_transform: Callable[[Any], Any | None] | None = None,
-        prefer_durable_source: bool = False,
     ) -> bool:
         """Copy events from one session into another session."""
         kwargs: dict[str, Any] = {}
@@ -4994,20 +4993,27 @@ class WorkflowEngine:
             kwargs["event_filter"] = event_filter
         if event_transform is not None:
             kwargs["event_transform"] = event_transform
-        if prefer_durable_source:
-            kwargs["prefer_durable_source"] = True
-        return await fork_session_events(
-            providers=self._providers,
-            session_cache=self._session_cache,
-            source_cognis_session_id=source_cognis_session_id,
-            source_intaris_session_id=source_intaris_session_id,
-            target_session=target_session,
-            source_label=source_label,
-            snapshot_source="fork",
-            snapshot_extras={"source_step": source_label},
-            copy_prefix=copy_prefix,
-            **kwargs,
-        )
+        from cognis.core.canonical_history import CanonicalHistoryUnavailable
+
+        try:
+            return await fork_session_events(
+                providers=self._providers,
+                session_cache=self._session_cache,
+                source_cognis_session_id=source_cognis_session_id,
+                source_intaris_session_id=source_intaris_session_id,
+                target_session=target_session,
+                source_label=source_label,
+                snapshot_source="fork",
+                snapshot_extras={"source_step": source_label},
+                copy_prefix=copy_prefix,
+                **kwargs,
+            )
+        except CanonicalHistoryUnavailable:
+            await self._session_manager.mark_failed(
+                target_session.session_id,
+                result_summary="Required workflow context could not be copied",
+            )
+            raise
 
     async def _resolve_step_runtime(
         self,
@@ -5532,7 +5538,6 @@ class WorkflowEngine:
             source_label=f"{source_name}:reuse_recovery",
             event_filter=lambda event: event.type not in {"assistant_thinking", "reasoning"},
             event_transform=self._sanitize_reuse_recovery_event,
-            prefer_durable_source=True,
         )
         if not seeded:
             raise RuntimeError(

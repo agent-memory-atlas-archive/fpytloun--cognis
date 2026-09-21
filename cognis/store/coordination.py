@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from prometheus_client import Histogram
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -37,6 +38,14 @@ async def database_now(session: AsyncSession) -> datetime:
     if now.tzinfo is None:
         return now.replace(tzinfo=UTC)
     return now.astimezone(UTC)
+
+
+LEASE_RENEWAL_DELAY_SECONDS = Histogram(
+    "cognis_lease_renewal_delay_seconds",
+    "How late a lease renewal ran relative to its schedule (loop stalls show up here)",
+    labelnames=("lease",),
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0),
+)
 
 
 @dataclass(frozen=True)

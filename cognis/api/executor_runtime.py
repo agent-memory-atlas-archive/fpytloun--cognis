@@ -611,7 +611,7 @@ async def persist_executor_resource_snapshot(
         if connection is not None and not _is_current_connection(app, executor_id, connection):
             return False
         async with app.state.session_factory() as session:
-            row = await get_executor_row(session, executor_id)
+            row = await get_executor_row(session, executor_id, defer_observed_tools=True)
             if row is None:
                 return False
             runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})
@@ -679,7 +679,7 @@ async def persist_executor_call_snapshot(
         if not _is_current_connection(app, executor_id, connection):
             return False
         async with app.state.session_factory() as session:
-            row = await get_executor_row(session, executor_id)
+            row = await get_executor_row(session, executor_id, defer_observed_tools=True)
             if row is None:
                 return False
             runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})

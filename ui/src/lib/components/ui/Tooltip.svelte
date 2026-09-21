@@ -11,12 +11,19 @@
    *   - On touch devices, reveals on tap — no longer unreachable.
    */
 
-  let { text, children, placement = 'top', class: className = '' } = $props<{
+  let {
+    text,
+    children,
+    placement = 'top',
+    class: className = '',
+    showOnTouch = true,
+  } = $props<{
     text: string;
     children: Snippet;
     placement?: 'top' | 'bottom' | 'left' | 'right';
     class?: string;
+    showOnTouch?: boolean;
   }>();
 </script>
 
-<Popover {text} {placement} class={className}>{@render children()}</Popover>
+<Popover {text} {placement} class={className} {showOnTouch}>{@render children()}</Popover>

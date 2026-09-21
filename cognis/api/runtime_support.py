@@ -11,6 +11,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 from prometheus_client import Counter, Histogram
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import NoInspectionAvailable
 
 from cognis.api.mcp_policy import invalid_mcp_config_reason
 from cognis.api.tool_inventory import (
@@ -483,6 +485,17 @@ def _executor_config_from_row(
     }
 
 
+async def _ensure_observed_tools_loaded(session: Any, row: Any) -> None:
+    """Load a deferred ``observed_tools`` column for one selected executor row."""
+
+    try:
+        state = sa_inspect(row)
+    except NoInspectionAvailable:
+        return
+    if "observed_tools" in state.unloaded:
+        await session.refresh(row, attribute_names=["observed_tools"])
+
+
 async def _resolve_eligible_executor_config(
     providers: Any,
     agent: AgentDefinition,
@@ -778,8 +791,13 @@ async def _resolve_eligible_executor_config(
                 raise RuntimeError(
                     "Agent must explicitly configure executor_id or executor_selector"
                 )
+            # Only the selected default needs its tool catalog; skip decoding
+            # every candidate's multi-megabyte ``observed_tools`` column.
             candidates = await list_executors(
-                session, owner_email=executor_owner_email, include_shared=True
+                session,
+                owner_email=executor_owner_email,
+                include_shared=True,
+                defer_observed_tools=True,
             )
             default_matches = [
                 row
@@ -801,6 +819,7 @@ async def _resolve_eligible_executor_config(
                 raise RuntimeError(
                     "No default executor is configured for this shared agent. Configure your executor on the agent page."
                 )
+            await _ensure_observed_tools_loaded(session, selected)
             return _executor_config_from_row(
                 selected,
                 executor_owner_email=executor_owner_email,

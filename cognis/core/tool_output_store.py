@@ -23,6 +23,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,24 @@ from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class RetentionResult:
+    expired_deleted: int = 0
+    size_cap_deleted: int = 0
+    cleanup_failed: bool = False
+    size_cap_failed: bool = False
+
+
+async def _maintenance_thread(operation: Any) -> RetentionResult:
+    stopped = threading.Event()
+    try:
+        return await asyncio.to_thread(operation, stopped)
+    finally:
+        # asyncio cancellation does not stop a worker thread. Check this before
+        # each subsequent deletion so lease loss stops issuing new requests.
+        stopped.set()
 
 
 class ToolOutputIntegrityError(RuntimeError):
@@ -213,6 +232,7 @@ class ToolOutputBackend(Protocol):
     async def delete(self, call_id: str) -> None: ...
     async def cleanup_expired(self, ttl_seconds: int) -> int: ...
     async def enforce_size_cap(self, max_size_bytes: int) -> int: ...
+    async def maintain(self, ttl_seconds: int, max_size_bytes: int) -> RetentionResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -322,28 +342,40 @@ class FilesystemToolOutputBackend:
         with contextlib.suppress(OSError):
             anchors_path.unlink(missing_ok=True)
 
-    def _sync_cleanup_expired(self, ttl_seconds: int) -> int:
+    def _sync_cleanup_expired(
+        self, ttl_seconds: int, stopped: threading.Event | None = None
+    ) -> int:
         deleted = 0
         now = time.time()
         try:
             for path in self._base_dir.iterdir():
+                if stopped is not None and stopped.is_set():
+                    break
                 try:
                     if not path.is_file() or not path.name.endswith(".txt"):
                         continue
                     if (now - path.stat().st_mtime) > ttl_seconds:
                         path.unlink(missing_ok=True)
                         deleted += 1
+                        if stopped is not None and stopped.is_set():
+                            break
                         self._base_dir.joinpath(path.stem + ".anchors.json").unlink(missing_ok=True)
                 except OSError:
+                    if stopped is not None:
+                        raise
                     continue
         except OSError:
+            if stopped is not None:
+                raise
             logger.warning("tool_output_store: cleanup_expired failed", exc_info=True)
         return deleted
 
     async def cleanup_expired(self, ttl_seconds: int) -> int:
         return await asyncio.to_thread(self._sync_cleanup_expired, ttl_seconds)
 
-    def _sync_enforce_size_cap(self, max_size_bytes: int) -> int:
+    def _sync_enforce_size_cap(
+        self, max_size_bytes: int, stopped: threading.Event | None = None
+    ) -> int:
         files: list[tuple[float, Path]] = []
         try:
             for path in self._base_dir.iterdir():
@@ -351,8 +383,12 @@ class FilesystemToolOutputBackend:
                     if path.is_file() and path.name.endswith(".txt"):
                         files.append((path.stat().st_mtime, path))
                 except OSError:
+                    if stopped is not None:
+                        raise
                     continue
         except OSError:
+            if stopped is not None:
+                raise
             return 0
         files.sort(key=lambda item: item[0])
 
@@ -366,15 +402,21 @@ class FilesystemToolOutputBackend:
                     total_size += anchors_path.stat().st_size
                 existing_files.append(path)
             except OSError:
+                if stopped is not None:
+                    raise
                 continue
         deleted = 0
         for path in existing_files:
+            if stopped is not None and stopped.is_set():
+                break
             if total_size <= max_size_bytes:
                 break
             try:
                 file_size = path.stat().st_size
                 path.unlink(missing_ok=True)
                 total_size -= file_size
+                if stopped is not None and stopped.is_set():
+                    break
                 anchors_path = self._base_dir / f"{path.stem}.anchors.json"
                 if anchors_path.exists():
                     anchor_size = anchors_path.stat().st_size
@@ -382,11 +424,31 @@ class FilesystemToolOutputBackend:
                     total_size -= anchor_size
                 deleted += 1
             except OSError:
+                if stopped is not None:
+                    raise
                 pass
         return deleted
 
     async def enforce_size_cap(self, max_size_bytes: int) -> int:
         return await asyncio.to_thread(self._sync_enforce_size_cap, max_size_bytes)
+
+    async def maintain(self, ttl_seconds: int, max_size_bytes: int) -> RetentionResult:
+        def run(stopped: threading.Event) -> RetentionResult:
+            result = RetentionResult()
+            try:
+                result.expired_deleted = self._sync_cleanup_expired(ttl_seconds, stopped)
+            except Exception:
+                result.cleanup_failed = True
+                logger.warning("Tool-output TTL cleanup failed", exc_info=True)
+            if not stopped.is_set():
+                try:
+                    result.size_cap_deleted = self._sync_enforce_size_cap(max_size_bytes, stopped)
+                except Exception:
+                    result.size_cap_failed = True
+                    logger.warning("Tool-output size-cap cleanup failed", exc_info=True)
+            return result
+
+        return await _maintenance_thread(run)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +679,85 @@ class S3ToolOutputBackend:
         except Exception:
             logger.warning("tool_output_store: S3 enforce_size_cap failed", exc_info=True)
             return 0
+
+    async def maintain(self, ttl_seconds: int, max_size_bytes: int) -> RetentionResult:
+        def run(stopped: threading.Event) -> RetentionResult:
+            result = RetentionResult()
+            pairs: dict[str, dict[str, Any]] = {}
+            try:
+                paginator = self._client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=self._bucket, Prefix="tool-outputs/"):
+                    if stopped.is_set():
+                        return result
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"].removeprefix("tool-outputs/")
+                        suffix = ".anchors.json" if key.endswith(".anchors.json") else ".txt"
+                        if not key.endswith(suffix):
+                            continue
+                        pair = pairs.setdefault(
+                            key.removesuffix(suffix),
+                            {
+                                "size": 0,
+                                "last_modified": obj["LastModified"],
+                                "text_time": None,
+                                "text_size": 0,
+                                "anchor_size": 0,
+                            },
+                        )
+                        pair["size"] += obj["Size"]
+                        pair["text_size" if suffix == ".txt" else "anchor_size"] += obj["Size"]
+                        if suffix == ".txt":
+                            pair["last_modified"] = obj["LastModified"]
+                            pair["text_time"] = obj["LastModified"].timestamp()
+            except Exception:
+                logger.warning("Tool-output inventory failed", exc_info=True)
+                return RetentionResult(cleanup_failed=True, size_cap_failed=True)
+            total_size = sum(pair["size"] for pair in pairs.values())
+            now = time.time()
+            failed: set[str] = set()
+            ordered = sorted(pairs.items(), key=lambda item: item[1]["last_modified"])
+            for phase in ("ttl", "size"):
+                for safe_id, pair in ordered:
+                    if stopped.is_set():
+                        return result
+                    if safe_id not in pairs or safe_id in failed:
+                        continue
+                    if phase == "ttl":
+                        if pair["text_time"] is None or now - pair["text_time"] <= ttl_seconds:
+                            continue
+                    elif total_size <= max_size_bytes:
+                        break
+                    try:
+                        self._client.delete_object(
+                            Bucket=self._bucket, Key=f"tool-outputs/{safe_id}.txt"
+                        )
+                        total_size -= pair["text_size"]
+                        pair["size"] -= pair["text_size"]
+                        pair["text_size"] = 0
+                        if stopped.is_set():
+                            return result
+                        self._client.delete_object(
+                            Bucket=self._bucket, Key=f"tool-outputs/{safe_id}.anchors.json"
+                        )
+                        total_size -= pair["anchor_size"]
+                        pair["size"] -= pair["anchor_size"]
+                        pair["anchor_size"] = 0
+                    except Exception:
+                        failed.add(safe_id)
+                        if phase == "ttl":
+                            result.cleanup_failed = True
+                        else:
+                            result.size_cap_failed = True
+                        logger.warning("Tool-output pair deletion failed", exc_info=True)
+                        continue
+                    pairs.pop(safe_id)
+                    if phase == "ttl":
+                        result.expired_deleted += 1
+                    else:
+                        result.size_cap_deleted += 1
+            return result
+
+        return await _maintenance_thread(run)
 
 
 # ---------------------------------------------------------------------------
@@ -936,3 +1077,7 @@ class ToolOutputStore:
     async def enforce_size_cap(self) -> int:
         """If storage exceeds max size, delete oldest outputs first."""
         return await self._backend.enforce_size_cap(self._max_size_bytes)
+
+    async def maintain(self) -> RetentionResult:
+        """Run one cancellation-aware pass; S3 uses a single inventory."""
+        return await self._backend.maintain(self._ttl_seconds, self._max_size_bytes)

@@ -3,6 +3,7 @@
   import type { ChartType as ChartJsType } from 'chart.js';
   import type Chart from 'chart.js/auto';
   import type { RichBlock } from '$lib/rich-deliverable';
+  import { observeViewerTheme } from './viewer-theme';
   import { chartPaletteColors, chartPointSummary, chartRangeOptions, chartXLabel, DEFAULT_CHART_THEME, formatChartValue, neutralChartConfig, normalizeChartData, type ChartThemeColors, type PinnedChartPoint } from '$lib/rich-data';
 
   export let block: RichBlock;
@@ -33,6 +34,7 @@
   let hoverPoint: PinnedChartPoint | null = null;
   let pinnedPoint: PinnedChartPoint | null = null;
   let destroyed = false;
+  let stopThemeObservation: (() => void) | undefined;
 
   $: ranges = chartRangeOptions(block);
   $: if (ranges.length > 0 && !ranges.some((range) => range.id === activeRange)) {
@@ -81,6 +83,7 @@
   $: if (!allowPinning && pinnedPoint) pinnedPoint = null;
 
   onMount(async () => {
+    stopThemeObservation = observeViewerTheme(wrapperEl, updateChart);
     const config = neutralChartConfig(block, activeRange, hiddenSeries, resolveChartTheme(wrapperEl), prefersReducedMotion());
     if (config && canvas && canRenderCanvas(canvas)) {
       const { default: Chart } = await import('chart.js/auto');
@@ -91,6 +94,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    stopThemeObservation?.();
     chart?.destroy();
   });
 
@@ -346,12 +350,10 @@
     position: relative;
     min-height: 16rem;
     height: 18rem;
-    border: 1px solid var(--rich-line);
-    border-radius: 1rem;
-    background:
-      linear-gradient(180deg, color-mix(in srgb, var(--rich-surface-wash) 82%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 50%, transparent)),
-      radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--rich-accent) 8%, transparent), transparent 40%);
-    padding: 1rem;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    padding: 0;
   }
 
   .rich-chart-canvas canvas {

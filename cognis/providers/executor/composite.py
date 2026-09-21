@@ -189,8 +189,13 @@ class CompositeExecutorProvider:
                 reports, key=lambda item: ((item.executor_type or ""), (item.executor_id or ""))
             )
 
+        # Populate forwarded handles from the established controller-owner bridge
+        # before resolving configured websocket executors below.  A controller
+        # holding the inventory lease may not be the controller that physically
+        # owns a given executor connection.
+        await self._websocket.list_active()
         async with self._session_factory() as session:
-            rows = await list_executors(session, owner_email=owner_email)
+            rows = await list_executors(session, owner_email=owner_email, defer_observed_tools=True)
 
         remote_tasks: list[Awaitable[LSPStatusReport]] = []
         for row in rows:

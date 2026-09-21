@@ -1925,7 +1925,7 @@ class ToolRouter:
         deadline = loop.time() + timeout_seconds
         while loop.time() < deadline:
             async with self._session_factory() as store_session:
-                row = await get_executor_row(store_session, executor_id)
+                row = await get_executor_row(store_session, executor_id, defer_observed_tools=True)
             if row is None:
                 return False
             runtime_metadata = getattr(row, "runtime_metadata", None) or {}

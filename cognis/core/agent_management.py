@@ -23,7 +23,12 @@ from cognis.core.agent_profiles import (
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.events import Event, EventType
 from cognis.logging import get_logger
-from cognis.models.agent import AgentCapabilities, AgentDefinition, AgentRuntimeProfile
+from cognis.models.agent import (
+    AgentCapabilities,
+    AgentDefinition,
+    AgentDelegationPolicy,
+    AgentRuntimeProfile,
+)
 from cognis.models.skill import AgentSkillRef
 from cognis.models.tool import stable_tool_id
 from cognis.providers.backends import get_backend
@@ -1107,6 +1112,13 @@ async def _create_agent(
         arguments.get("assigned_knowledgebases", []),
         "assigned_knowledgebases",
     )
+    permissions: dict[str, Any] = {}
+    if assigned_knowledgebases:
+        permissions["allowed_knowledgebases"] = assigned_knowledgebases
+    if "delegation" in arguments:
+        permissions["delegation"] = AgentDelegationPolicy.model_validate(
+            _object(arguments["delegation"], "delegation")
+        ).model_dump(mode="json")
 
     async with deps.session_factory() as session:
         if await get_agent(session, agent_id) is not None:
@@ -1145,11 +1157,7 @@ async def _create_agent(
                 "allow_tools": sorted(assignable_ids),
                 "deny_tools": denied_static_ids,
             },
-            permissions=(
-                {"allowed_knowledgebases": assigned_knowledgebases}
-                if assigned_knowledgebases
-                else None
-            ),
+            permissions=permissions or None,
             llm_config=None,
             execution=None,
             avatar_image_id=_optional_string(avatar_image_id),
@@ -1173,6 +1181,12 @@ async def _update_agent(
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     previous_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     updates = _agent_updates(arguments)
+    if "delegation" in arguments:
+        permissions = dict(row.permissions) if isinstance(row.permissions, dict) else {}
+        permissions["delegation"] = AgentDelegationPolicy.model_validate(
+            _object(arguments["delegation"], "delegation")
+        ).model_dump(mode="json")
+        updates["permissions"] = permissions
     if arguments.get("generate_avatar"):
         updates["avatar_image_id"] = await _generate_avatar(deps, actor_email, arguments)
     if not updates:
@@ -1704,6 +1718,7 @@ async def _settings_updates(
             "allowed_knowledgebases",
             "allowed_secrets",
             "allowed_credentials",
+            "delegation",
             "can_delegate",
             "max_delegation_depth",
         }:
@@ -1725,6 +1740,7 @@ def _settings_field_names() -> set[str]:
         "voice",
         "memory_backend",
         "memory_backend_options",
+        "delegation",
     }
 
 
@@ -1845,6 +1861,10 @@ def _apply_tools_setting(
 def _apply_permissions_setting(permissions: dict[str, Any], field: str, value: Any) -> None:
     if field == "tool_permissions":
         permissions[field] = _object(value, field)
+    elif field == "delegation":
+        permissions[field] = AgentDelegationPolicy.model_validate(_object(value, field)).model_dump(
+            mode="json"
+        )
     elif field in {"allowed_secrets", "allowed_credentials", "allowed_knowledgebases"}:
         permissions[field] = _validated_string_list(value, field)
     elif field == "can_delegate":

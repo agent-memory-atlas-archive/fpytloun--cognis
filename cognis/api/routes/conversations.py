@@ -1737,18 +1737,14 @@ async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
         row = await get_conversation(session, conversation_id)
         row = _require_visible_conversation(request, row)
         user_email = row.user_email
-        was_unread = row.last_message_at is not None and (
-            row.last_read_at is None or row.last_message_at > row.last_read_at
-        )
         await mark_conversation_read(session, conversation_id)
-        if was_unread:
-            payload = {
-                "type": "conversation_updated",
-                "conversation_id": row.conversation_id,
-                "has_unread": False,
-                "last_read_at": row.last_read_at.isoformat() if row.last_read_at else None,
-                "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
-            }
+        payload = {
+            "type": "conversation_updated",
+            "conversation_id": row.conversation_id,
+            "has_unread": False,
+            "last_read_at": row.last_read_at.isoformat() if row.last_read_at else None,
+            "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
+        }
         await session.commit()
     if payload is not None:
         ws_manager = getattr(request.app.state, "ws_manager", None)

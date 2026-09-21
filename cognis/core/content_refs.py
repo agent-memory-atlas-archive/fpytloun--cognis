@@ -213,7 +213,10 @@ async def get_accessible_deliverable_ref(
                 "control_link_id": controlling_link.link_id,
                 "managed_descendant_depth": int(link.depth) - int(controlling_link.depth) + 1,
             }
-    await hydrate_deliverable_payload(deliverable, artifact_store)
+    try:
+        await hydrate_deliverable_payload(deliverable, artifact_store)
+    except FileNotFoundError:
+        return None
     content_bytes = deliverable.content.encode("utf-8")
     return DeliverableContentRef(
         deliverable=deliverable,
@@ -253,7 +256,10 @@ async def get_deliverable_ref_unscoped(
         creator_agent_id = creator.agent_id
     else:
         return None
-    await hydrate_deliverable_payload(deliverable, artifact_store)
+    try:
+        await hydrate_deliverable_payload(deliverable, artifact_store)
+    except FileNotFoundError:
+        return None
     content_bytes = deliverable.content.encode("utf-8")
     return DeliverableContentRef(
         deliverable=deliverable,

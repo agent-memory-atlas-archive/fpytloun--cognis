@@ -89,17 +89,17 @@ def orchestration_surface_policy(
 
     surface = classify_orchestration_surface(context)
     if surface == OrchestrationSurface.MANAGED_AGENT_CONVERSATION:
-        platform_data = context.platform_data if context is not None else {}
-        depth = int(platform_data.get("managed_depth") or 1)
         return OrchestrationSurfacePolicy(
             surface=surface,
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
-            expose_managed_conversation_tools=depth < 2,
+            # Target filtering removes create/fork at the inherited depth
+            # boundary while preserving control of existing links.
+            expose_managed_conversation_tools=True,
             allow_managed_conversation_wait_false=False,
             expose_managed_conversation_wait_option=False,
             managed_conversation_wait_default=True,
-            expose_task_tools=True,
+            expose_task_tools=False,
             expose_workflow_tools=False,
             expose_compose_workflow_tool=False,
         )

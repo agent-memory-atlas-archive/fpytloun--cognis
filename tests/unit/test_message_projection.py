@@ -166,6 +166,114 @@ def test_anthropic_projection_escapes_system_notice_closing_tags() -> None:
     assert "bad </ system-notice> text" in result.messages[-1]["content"]
 
 
+def test_anthropic_projection_defers_notice_until_after_tool_result() -> None:
+    provider = SimpleNamespace(config={"preset": "anthropic"})
+
+    result = project_messages_for_provider(
+        [
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "system", "content": "runtime update"},
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "done"},
+        ],
+        provider=provider,
+        llm_api="chat_completions",
+    )
+
+    assert [message["role"] for message in result.messages[-3:]] == [
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert "runtime update" in result.messages[-1]["content"]
+    assert result.diagnostics["tool_boundary_notices_deferred"] == 1
+
+
+def test_anthropic_projection_defers_notice_until_parallel_results_complete() -> None:
+    provider = SimpleNamespace(config={"preset": "anthropic"})
+
+    result = project_messages_for_provider(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                    for call_id in ("toolu_1", "toolu_2")
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "first"},
+            {"role": "developer", "content": "runtime update"},
+            {"role": "tool", "tool_call_id": "toolu_2", "content": "second"},
+            {"role": "user", "content": "continue"},
+        ],
+        provider=provider,
+        llm_api="chat_completions",
+    )
+
+    assert [message["role"] for message in result.messages[-5:]] == [
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+        "user",
+    ]
+    assert [message.get("tool_call_id") for message in result.messages[-4:-2]] == [
+        "toolu_1",
+        "toolu_2",
+    ]
+    assert "runtime update" in result.messages[-2]["content"]
+    assert result.diagnostics["tool_boundary_notices_deferred"] == 1
+
+
+def test_anthropic_projection_keeps_notice_after_completed_tool_group_in_place() -> None:
+    provider = SimpleNamespace(config={"preset": "anthropic"})
+
+    result = project_messages_for_provider(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "done"},
+            {"role": "system", "content": "runtime update"},
+            {"role": "user", "content": "continue"},
+        ],
+        provider=provider,
+        llm_api="chat_completions",
+    )
+
+    assert [message["role"] for message in result.messages[-4:]] == [
+        "assistant",
+        "tool",
+        "user",
+        "user",
+    ]
+    assert "runtime update" in result.messages[-2]["content"]
+    assert result.diagnostics["tool_boundary_notices_deferred"] == 0
+
+
 def test_responses_projection_leaves_messages_unchanged() -> None:
     provider = SimpleNamespace(config={"preset": "anthropic"})
     messages = [

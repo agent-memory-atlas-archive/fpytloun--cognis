@@ -163,6 +163,54 @@ def _install_stub_llm(client: TestClient) -> _StubLLMProvider:
 # ---------------------------------------------------------------------------
 
 
+def test_tts_resynthesis_survives_old_generation_cleanup(monkeypatch, tmp_path):
+    from cognis.core.artifact_maintenance import ArtifactMaintenanceService
+    from cognis.store.queries import get_tts_cache_entry, mark_artifact_deleted
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client))
+        asyncio.run(_seed_stub_provider(client))
+        asyncio.run(_seed_tts_routing(client))
+        _install_stub_llm(client)
+        headers = _auth_headers(client.app)
+        payload = {"text": "Generation race.", "message_id": "msg_race", "voice": "nova"}
+        first = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
+        assert first.status_code == 200
+
+        async def tombstone():
+            async with client.app.state.session_factory() as db:
+                cached = await get_tts_cache_entry(
+                    db, message_id="msg_race", voice="nova", model="tts-1"
+                )
+                old_id = cached.artifact_id
+                await mark_artifact_deleted(db, old_id)
+                await db.commit()
+                return old_id
+
+        old_id = asyncio.run(tombstone())
+        second = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
+        assert second.status_code == 200 and not second.json()["cached"]
+        service = ArtifactMaintenanceService(
+            session_factory=client.app.state.session_factory,
+            artifact_store=client.app.state.artifact_store,
+        )
+        asyncio.run(service.run_once())
+
+        async def verify():
+            async with client.app.state.session_factory() as db:
+                cached = await get_tts_cache_entry(
+                    db, message_id="msg_race", voice="nova", model="tts-1"
+                )
+                assert cached.artifact_id != old_id
+                assert await client.app.state.artifact_store.async_exists(
+                    "tts", cached.artifact_id, cached.artifact_filename
+                )
+
+        asyncio.run(verify())
+        third = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
+        assert third.status_code == 200 and third.json()["cached"]
+
+
 def test_tts_synthesize_cache_miss_then_hit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

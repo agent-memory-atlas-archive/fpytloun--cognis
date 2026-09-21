@@ -27,7 +27,7 @@
     {#if blockText(block, 'timestamp') || blockText(block, 'time')}<time>{blockText(block, 'timestamp') || blockText(block, 'time')}</time>{/if}
   </div>
   <div>
-    <strong>{@html renderInlineMarkdown(valueText(block.value ?? blockText(block)))}</strong>
+    <strong class="rich-metric-value">{@html renderInlineMarkdown(valueText(block.value ?? blockText(block)))}</strong>
     {#if blockText(block, 'delta')}<em>{@html renderInlineMarkdown(blockText(block, 'delta'))}</em>{/if}
   </div>
   {#if blockDescription(block)}<p>{@html renderInlineMarkdown(blockDescription(block))}</p>{/if}

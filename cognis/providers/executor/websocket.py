@@ -44,7 +44,7 @@ from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.providers.executor.forwarding import ForwardedExecutorConnection
 from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now_expression
-from cognis.store.models import CoordinationLeaseRow, ExecutorRow
+from cognis.store.models import CoordinationLeaseRow, ExecutorRow, executor_observed_tools_deferred
 from cognis.tools.executor.lsp.runtime import (
     LSP_STATUS_CAPABILITY,
     LSPStatusReport,
@@ -2088,7 +2088,11 @@ class WebSocketExecutorProvider:
                 controller = await self._cluster_directory.get_ready(lease.owner_id)
                 if controller is None or not controller.internal_url:
                     continue
-                row = await session.get(ExecutorRow, executor_id)
+                row = await session.get(
+                    ExecutorRow,
+                    executor_id,
+                    options=[executor_observed_tools_deferred()],
+                )
                 if row is None or row.status != "active":
                     continue
                 capabilities = ExecutorCapabilities.model_validate(
@@ -2221,7 +2225,7 @@ class WebSocketExecutorProvider:
             )
 
         self._connections[executor_id] = conn
-        EXECUTOR_WS_CONNECTIONS.inc()
+        EXECUTOR_WS_CONNECTIONS.set(len(self._connections))
 
         # Update or create handle
         if executor_id not in self._handles:
@@ -2297,8 +2301,7 @@ class WebSocketExecutorProvider:
         if connection is not None and conn is not connection:
             return
         conn = self._connections.pop(executor_id, None)
-        if conn is not None:
-            EXECUTOR_WS_CONNECTIONS.dec()
+        EXECUTOR_WS_CONNECTIONS.set(len(self._connections))
         handle = self._handles.get(executor_id)
         if handle is not None:
             handle.status = "disconnected"

@@ -439,6 +439,29 @@ def test_standalone_generated_css_uses_semantic_colors_across_theme_sensitive_co
 
 
 @pytest.mark.asyncio
+async def test_missing_payload_exports_return_structured_errors(
+    task_continuation_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    share = deliverable_links.signed_deliverable_view_link(
+        task_continuation_db.artifact_store,
+        "dlv_owner",
+        base_url="http://testserver",
+        ttl_seconds=60,
+    )
+    token = _share_token(share.url)
+    await task_continuation_db.artifact_store.async_delete_object("deliverables", "dlv_owner")
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        for suffix in ("", "/view", "/download.pdf"):
+            response = client.get(f"/api/v1/deliverables/dlv_owner{suffix}")
+            assert response.status_code == 404
+            assert response.json()["detail"]["code"] == "not_found"
+        for suffix in ("view", "download.pdf"):
+            response = client.get(f"/api/v1/deliverables/share/{token}/{suffix}")
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "deliverable_payload_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_managed_deliverable_has_no_owner_global_browser_or_public_fallback(
     task_continuation_db: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -1626,6 +1649,57 @@ def test_standalone_html_consumes_semantic_hero_without_duplicate_title_or_schem
     assert ">subtitle<" not in rendered
     assert "<dt>Audience</dt><dd>Engineering</dd>" in rendered
     assert "block-hero" not in rendered
+
+
+def test_standalone_html_renders_semantic_header_once_and_summary_key_values() -> None:
+    rendered = render_standalone_html(
+        _row(
+            title="Release readiness",
+            rich_payload={
+                "metadata": {
+                    "viewer_identity": {
+                        "label": "Prepared for Engineering",
+                        "icon": {"name": "info", "alt": "Information"},
+                    }
+                },
+                "blocks": [
+                    {
+                        "type": "hero",
+                        "title": "Release readiness",
+                        "badges": [{"label": "Verified", "tone": "success"}],
+                    },
+                    {
+                        "type": "key_value",
+                        "variant": "summary",
+                        "items": [{"label": "Risk", "value": "Low", "tone": "positive"}],
+                    },
+                ],
+            },
+        )
+    )
+
+    assert rendered.count('class="viewer-identity"') == 1
+    assert "Prepared for Engineering" in rendered
+    assert 'class="tone-success"' in rendered
+    assert 'class="block block-kv" data-variant="summary"' in rendered
+    assert 'class="tone-positive"' in rendered
+    assert 'aria-label="Prepared for Engineering"' in rendered
+
+
+def test_standalone_html_omits_viewer_identity_chrome_when_absent() -> None:
+    rendered = render_standalone_html(
+        _row(rich_payload={"blocks": [{"type": "hero", "title": "No identity"}]})
+    )
+
+    assert 'class="viewer-identity"' not in rendered
+
+
+def test_standalone_html_preserves_legacy_key_value_object_map() -> None:
+    rendered = render_standalone_html(
+        _row(rich_payload={"blocks": [{"type": "key_value", "items": {"Owner": "Platform"}}]})
+    )
+
+    assert "<dt>Owner</dt><dd>Platform</dd>" in rendered
 
 
 def test_standalone_html_preserves_leading_hero_children_exactly_once() -> None:

@@ -2318,7 +2318,7 @@ async def test_proxy_refresh_updates_forwarded_capabilities() -> None:
         async def scalars(self, _query: Any) -> Any:
             return SimpleNamespace(all=lambda: [lease])
 
-        async def get(self, _model: Any, _executor_id: str) -> Any:
+        async def get(self, _model: Any, _executor_id: str, **_: Any) -> Any:
             return row
 
     async def _controller(_owner_id: str) -> SimpleNamespace:
@@ -2545,7 +2545,7 @@ async def test_forwarded_refresh_invalidation_race_never_republishes_closed_prox
         async def scalars(self, _query: Any) -> Any:
             return SimpleNamespace(all=lambda: [lease])
 
-        async def get(self, _model: Any, _executor_id: str) -> Any:
+        async def get(self, _model: Any, _executor_id: str, **_: Any) -> Any:
             return row
 
     async def ready_controller(_owner_id: str) -> SimpleNamespace:

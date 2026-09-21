@@ -4587,7 +4587,7 @@ async def test_tool_router_handles_artifact_get_view_url_and_clamps_ttl(
 
 
 @pytest.mark.asyncio
-async def test_tool_router_rejects_artifact_view_url_for_non_html(
+async def test_tool_router_supports_artifact_view_url_for_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Session:
@@ -4635,8 +4635,9 @@ async def test_tool_router_rejects_artifact_view_url_for_non_html(
         None,
     )
 
-    assert result.is_error is True
-    assert "Artifact view is only supported for HTML artifacts: txt_4" in result.output
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["mode"] == "view"
 
 
 @pytest.mark.asyncio

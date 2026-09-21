@@ -3606,6 +3606,129 @@ def test_litellm_provider_estimator_identity_tracks_version_and_backend(
     )
 
 
+def _large_messages(marker: str = "") -> list[dict[str, object]]:
+    body = ("lorem ipsum dolor sit amet " * 2000) + marker
+    return [
+        {"role": "user", "content": body},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": '{"cmd": "ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": body},
+    ]
+
+
+def test_litellm_provider_count_messages_tokens_memoises_identical_transcripts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    calls: list[int] = []
+
+    def _fake_counter(**kwargs: object) -> int:
+        calls.append(1)
+        return 4321
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.token_counter", _fake_counter)
+
+    messages = _large_messages()
+    assert provider.count_messages_tokens(messages, "claude-opus-5") == 4321
+    # Marker keys the projection code stamps must not defeat the memo: litellm
+    # skips non-string, non-content-list values entirely.
+    stamped = [
+        {**message, "_token_estimate": 7, "_projected_compacted": True, "_audit": {"x": 1}}
+        for message in messages
+    ]
+    assert provider.count_messages_tokens(stamped, "claude-opus-5") == 4321
+    assert len(calls) == 1
+
+    # String-valued keys are counted by litellm, so they must change the key.
+    named = [{**message, "name": "bob"} for message in messages]
+    provider.count_messages_tokens(named, "claude-opus-5")
+    assert len(calls) == 2
+
+    provider.count_messages_tokens(_large_messages("changed"), "claude-opus-5")
+    assert len(calls) == 3
+    provider.count_messages_tokens(messages, "claude-sonnet-5")
+    assert len(calls) == 4
+    assert provider.token_estimator_identity("claude-opus-5").endswith(
+        ":anthropic:litellm_native:v1"
+    )
+
+
+def test_litellm_provider_count_memo_skips_small_inputs_and_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    calls: list[int] = []
+
+    def _fake_counter(**kwargs: object) -> int:
+        calls.append(1)
+        return 5
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.token_counter", _fake_counter)
+    small = [{"role": "user", "content": "hello"}]
+    provider.count_messages_tokens(small, "claude-opus-5")
+    provider.count_messages_tokens(small, "claude-opus-5")
+    assert len(calls) == 2
+    assert provider._count_memo == {}
+
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.token_counter",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    provider.count_messages_tokens(_large_messages(), "claude-opus-5")
+    assert provider._count_memo == {}, "fallback estimates must never be memoised"
+
+
+def test_litellm_provider_count_tokens_memo_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.providers.llm import litellm as litellm_module
+
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.token_counter", lambda **_: 1)
+    limit = litellm_module._COUNT_MEMO_MAX_ENTRIES
+    for index in range(limit + 10):
+        provider.count_tokens(f"{index}:" + "x" * 40_000, "claude-opus-5")
+    assert len(provider._count_memo) == limit
+    provider.clear_count_memo()
+    assert provider._count_memo == {}
+
+
+def test_litellm_provider_count_memo_matches_real_litellm_visibility() -> None:
+    """The memo key must see exactly what litellm counts."""
+
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    base = _large_messages()
+    stamped = [
+        {**message, "_token_estimate": 7, "_projected_compacted": True, "_meta": {"k": "v"}}
+        for message in base
+    ]
+    named = [{**message, "name": "bob"} for message in base]
+    direct = LiteLLMProvider(object())  # type: ignore[arg-type]
+    direct.clear_count_memo()
+
+    assert provider.count_messages_tokens(base, "claude-opus-5") == direct.count_messages_tokens(
+        base, "claude-opus-5"
+    )
+    # Hit path (stamped) must equal an un-memoised count of the stamped input.
+    fresh = LiteLLMProvider(object())  # type: ignore[arg-type]
+    assert provider.count_messages_tokens(stamped, "claude-opus-5") == fresh.count_messages_tokens(
+        stamped, "claude-opus-5"
+    )
+    fresh_named = LiteLLMProvider(object())  # type: ignore[arg-type]
+    assert provider.count_messages_tokens(
+        named, "claude-opus-5"
+    ) == fresh_named.count_messages_tokens(named, "claude-opus-5")
+
+
 def test_litellm_provider_count_tokens_falls_back_for_gemini_on_counter_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

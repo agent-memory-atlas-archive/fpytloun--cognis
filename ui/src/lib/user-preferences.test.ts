@@ -28,6 +28,25 @@ describe('dashboard workspace window preference', () => {
   });
 });
 
+describe('conversation sidebar display preferences', () => {
+  it('enables sections and preserves the current density for legacy payloads', () => {
+    const preferences = normalizeUserPreferences({ display: {}, chat: {} });
+    expect(preferences.display.conversation_sidebar_sections).toBe(true);
+    expect(preferences.display.conversation_sidebar_dense).toBe(false);
+  });
+
+  it('preserves explicit sidebar preferences', () => {
+    const preferences = normalizeUserPreferences({
+      display: {
+        conversation_sidebar_sections: false,
+        conversation_sidebar_dense: true,
+      },
+    });
+    expect(preferences.display.conversation_sidebar_sections).toBe(false);
+    expect(preferences.display.conversation_sidebar_dense).toBe(true);
+  });
+});
+
 describe('chat composer preference', () => {
   it('defaults legacy payloads to Enter-to-send', () => {
     expect(DEFAULT_USER_PREFERENCES.chat.enter_to_send).toBe(true);

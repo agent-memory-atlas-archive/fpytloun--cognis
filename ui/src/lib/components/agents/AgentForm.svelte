@@ -45,6 +45,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     knowledgebases = [],
     skills = [],
     intarisMcpServers = [],
+    agents = [],
     secondaryAgents = [],
     secondaryBindings = [],
     saving = false,
@@ -67,6 +68,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     knowledgebases?: KnowledgebaseModel[];
     skills?: Skill[];
     intarisMcpServers?: IntarisMCPServer[];
+    agents?: Agent[];
     secondaryAgents?: Agent[];
     secondaryBindings?: string[];
     saving?: boolean;
@@ -85,7 +87,8 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   const sections = $derived.by(() => [
     { id: 'identity', label: 'Identity', suffix: errors.name ? '!' : '' },
     { id: 'providers', label: 'Providers & models', suffix: errors.reasoningEffort ? '!' : '' },
-    { id: 'tools', label: 'Tools & access', count: tools.length },
+    { id: 'tools', label: 'Tools', count: tools.length },
+    { id: 'access', label: 'Access & delegation' },
     ...(!isSystemAsset || editableFieldSet.has('agent_profiles')
       ? [{ id: 'profiles', label: 'Profiles', count: form.agentProfiles.length, suffix: errors.agentProfiles ? '!' : '' }]
       : []),
@@ -204,6 +207,35 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     }
     onBindingsChange?.(localBindings);
   }
+
+  function toggleAllowedAgent(agentId: string): void {
+    form.allowedAgentIds = form.allowedAgentIds.includes(agentId)
+      ? form.allowedAgentIds.filter((id: string) => id !== agentId)
+      : [...form.allowedAgentIds, agentId];
+  }
+
+  function toggleAllowedController(agentId: string): void {
+    form.allowedControllerAgentIds = form.allowedControllerAgentIds.includes(agentId)
+      ? form.allowedControllerAgentIds.filter((id: string) => id !== agentId)
+      : [...form.allowedControllerAgentIds, agentId];
+  }
+
+  const primaryAgentOptions = $derived(
+    agents.filter((agent: Agent) => agent.agent_type === 'primary' && !agent.is_system && agent.status === 'active')
+  );
+  const systemSpecialistOptions = $derived(
+    agents.filter((agent: Agent) => agent.agent_type === 'secondary' && agent.is_system && agent.status === 'active')
+  );
+  const unavailableAllowedAgentIds = $derived(
+    form.allowedAgentIds.filter(
+      (agentId: string) =>
+        !primaryAgentOptions.some((agent: Agent) => agent.agent_id === agentId)
+        && !systemSpecialistOptions.some((agent: Agent) => agent.agent_id === agentId)
+    )
+  );
+  const unavailableControllerAgentIds = $derived(
+    form.allowedControllerAgentIds.filter((agentId: string) => !primaryAgentOptions.some((agent: Agent) => agent.agent_id === agentId))
+  );
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
@@ -777,8 +809,8 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       </div>
       {#snippet executorSettings()}
       <Card class="p-5">
-        <h2 class="mb-1 text-lg font-semibold text-white">Tools & access</h2>
-        <p class="mb-5 text-sm text-slate-400">Choose where this agent works, which tools it can use, and which resources it can access.</p>
+        <h2 class="mb-1 text-lg font-semibold text-white">Execution access</h2>
+        <p class="mb-5 text-sm text-slate-400">Choose where this agent works and which executors it can access.</p>
         <div class="mb-4 grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Executor</span>
@@ -888,7 +920,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         {/snippet}
 
-      <div hidden={activeSection !== 'tools'} id={`${editorId}-panel-tools`} role="tabpanel" aria-labelledby={`${editorId}-tab-tools`} tabindex="0" class="space-y-5">
+      <div hidden={activeSection !== 'access'} id={`${editorId}-panel-access`} role="tabpanel" aria-labelledby={`${editorId}-tab-access`} tabindex="0" class="space-y-5">
       {@render executorSettings()}
       <Card class="p-5">
         <!-- Stage 36: Additional executors (multi-executor agents) -->
@@ -969,17 +1001,163 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           {/each}
         </div>
 
-        <div class="grid gap-4 md:grid-cols-2">
+        <div class="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+          <div>
+            <p class="text-sm font-medium text-slate-100">Delegation</p>
+            <p class="mt-1 text-xs text-slate-400">
+              Primary agents receive managed conversations or tasks. System specialists receive
+              bounded synchronous delegate calls and cannot delegate further.
+            </p>
+          </div>
           <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-            <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
-            Can delegate
+            <input bind:checked={form.delegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
+            Allow this agent to assign work to other agents
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Max delegation depth</span>
-            <Input bind:value={form.maxDelegationDepth} type="number" disabled={readonly} />
+          <div class="grid gap-4 md:grid-cols-2">
+            <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
+              <input bind:checked={form.primaryDelegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+              Primary-agent managed work and tasks
+            </label>
+            <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
+              <input bind:checked={form.systemDelegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+              Bounded system-specialist delegation
+            </label>
+          </div>
+          <label class="block space-y-2 text-sm font-medium text-slate-200">
+            <span>Maximum managed depth</span>
+            <select
+              bind:value={form.maxManagedDepth}
+              class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              disabled={readonly || !form.delegationEnabled || !form.primaryDelegationEnabled}
+            >
+              <option value={0}>0 — disabled</option>
+              <option value={1}>1 — one worker level</option>
+              <option value={2}>2 — coordinator and worker</option>
+            </select>
           </label>
+          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
+            <input bind:checked={form.restrictDelegationTargets} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+            Restrict allowed target agents
+          </label>
+          {#if form.restrictDelegationTargets}
+            <div class="space-y-3">
+              <p class="text-sm font-medium text-slate-200">Allowed target agents</p>
+              <p class="text-xs text-slate-400">This agent can always assign work to itself. An empty selection disables every other target.</p>
+              {#if form.agentId}
+                <div class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100">
+                  <span class="font-medium">Self</span>
+                  <span class="ml-2 font-mono text-xs text-emerald-200/80">{form.agentId}</span>
+                  <span class="ml-2 text-xs text-emerald-200/70">always allowed</span>
+                </div>
+              {/if}
+              <div class="grid gap-2 md:grid-cols-2">
+                {#each primaryAgentOptions.filter((agent: Agent) => agent.agent_id !== form.agentId) as agent}
+                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id} · primary</span></span>
+                  </label>
+                {/each}
+                {#each systemSpecialistOptions as agent}
+                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id} · system specialist</span></span>
+                  </label>
+                {/each}
+              </div>
+              {#if unavailableAllowedAgentIds.length > 0}
+                <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
+                  <p class="text-xs font-medium text-amber-100">Unavailable configured targets</p>
+                  <div class="mt-2 flex flex-wrap gap-2">
+                    {#each unavailableAllowedAgentIds as agentId}
+                      <label class="flex items-center gap-2 rounded-lg border border-amber-500/20 px-2 py-1 font-mono text-xs text-amber-100">
+                        <input checked class="h-3.5 w-3.5 rounded border-amber-400" type="checkbox" onchange={() => toggleAllowedAgent(agentId)} disabled={readonly} />
+                        {agentId}
+                      </label>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {/if}
+          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
+            <input bind:checked={form.restrictControllers} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
+            Restrict agents allowed to target this primary agent
+          </label>
+          {#if form.restrictControllers}
+            <div class="space-y-3">
+              <p class="text-sm font-medium text-slate-200">Allowed controller agents</p>
+              <p class="text-xs text-slate-400">Self is always allowed. An empty selection prevents every other agent from targeting this agent.</p>
+              <div class="grid gap-2 md:grid-cols-2">
+                {#each primaryAgentOptions.filter((agent: Agent) => agent.agent_id !== form.agentId) as agent}
+                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+                    <input checked={form.allowedControllerAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedController(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id}</span></span>
+                  </label>
+                {/each}
+              </div>
+              {#if unavailableControllerAgentIds.length > 0}
+                <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
+                  <p class="text-xs font-medium text-amber-100">Unavailable configured controllers</p>
+                  <div class="mt-2 flex flex-wrap gap-2">
+                    {#each unavailableControllerAgentIds as agentId}
+                      <label class="flex items-center gap-2 rounded-lg border border-amber-500/20 px-2 py-1 font-mono text-xs text-amber-100">
+                        <input checked class="h-3.5 w-3.5 rounded border-amber-400" type="checkbox" onchange={() => toggleAllowedController(agentId)} disabled={readonly} />
+                        {agentId}
+                      </label>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {/if}
         </div>
 
+        {#if credentials.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed credentials</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each credentials as credential}
+                <label class="flex items-center gap-2 text-sm text-slate-200">
+                  <input checked={form.allowedCredentials.includes(credential.credential_id)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleCredential(credential.credential_id)} disabled={readonly} />
+                  {credential.label}<span class="text-xs text-slate-400">({credential.kind})</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        {#if knowledgebases.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed knowledgebases</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each knowledgebases as kb}
+                <label class="flex items-start gap-2 text-sm text-slate-200">
+                  <input checked={form.allowedKnowledgebases.includes(kb.knowledgebase_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleKnowledgebase(kb.knowledgebase_id)} disabled={readonly} />
+                  <span><span>{kb.name}</span><span class="block font-mono text-xs text-slate-500">{kb.knowledgebase_id}</span></span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        {#if secrets.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed secrets</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each secrets as secret}
+                <label class="flex items-center gap-2 text-sm text-slate-200">
+                  <input checked={form.allowedSecrets.includes(secret.name)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleSecret(secret.name)} disabled={readonly} />
+                  {secret.name}<span class="text-xs text-slate-400">({secret.scope})</span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </Card>
+      </div>
+
+      <div hidden={activeSection !== 'tools'} id={`${editorId}-panel-tools`} role="tabpanel" aria-labelledby={`${editorId}-tab-tools`} tabindex="0" class="space-y-5">
+      <Card class="p-5">
         <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
           <p class="text-sm font-medium text-amber-100">Optional built-in tools</p>
           <p class="mt-1 text-xs text-amber-100/70">These privileged controller tools are off by default and are not enabled by wildcard tool access.</p>
@@ -1133,72 +1311,6 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 </div>
               </div>
             {/if}
-          </div>
-        {/if}
-
-        {#if credentials.length > 0}
-          <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed credentials</p>
-            <div class="grid gap-2 md:grid-cols-2">
-              {#each credentials as credential}
-                <label class="flex items-center gap-2 text-sm text-slate-200">
-                  <input
-                    checked={form.allowedCredentials.includes(credential.credential_id)}
-                    class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                    type="checkbox"
-                    onchange={() => toggleCredential(credential.credential_id)}
-                    disabled={readonly}
-                  />
-                  {credential.label}
-                  <span class="text-xs text-slate-400">({credential.kind})</span>
-                </label>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
-        {#if knowledgebases.length > 0}
-          <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed knowledgebases</p>
-            <div class="grid gap-2 md:grid-cols-2">
-              {#each knowledgebases as kb}
-                <label class="flex items-start gap-2 text-sm text-slate-200">
-                  <input
-                    checked={form.allowedKnowledgebases.includes(kb.knowledgebase_id)}
-                    class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
-                    type="checkbox"
-                    onchange={() => toggleKnowledgebase(kb.knowledgebase_id)}
-                    disabled={readonly}
-                  />
-                  <span>
-                    <span>{kb.name}</span>
-                    <span class="block font-mono text-xs text-slate-500">{kb.knowledgebase_id}</span>
-                  </span>
-                </label>
-              {/each}
-            </div>
-          </div>
-        {/if}
-
-        <!-- Allowed secrets -->
-        {#if secrets.length > 0}
-          <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed secrets</p>
-            <div class="grid gap-2 md:grid-cols-2">
-              {#each secrets as secret}
-                <label class="flex items-center gap-2 text-sm text-slate-200">
-                  <input
-                    checked={form.allowedSecrets.includes(secret.name)}
-                    class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                    type="checkbox"
-                    onchange={() => toggleSecret(secret.name)}
-                    disabled={readonly}
-                  />
-                  {secret.name}
-                  <span class="text-xs text-slate-400">({secret.scope})</span>
-                </label>
-              {/each}
-            </div>
           </div>
         {/if}
 

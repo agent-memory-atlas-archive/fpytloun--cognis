@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from cognis.api.chat_v2.schemas import MessageTimelineItem, RuntimeActiveTurn
+from cognis.api.chat_v2.schemas import MessageTimelineItem, RuntimeActiveTurn, RuntimeAuthority
 from cognis.core import chat_v2_runtime_relay as relay_module
 from cognis.core.chat_v2_runtime_relay import (
     ACTIVE_TTL_SECONDS,
@@ -1157,6 +1157,52 @@ async def test_callback_exceptions_are_isolated_per_message(
     assert applied[-1] == "second"
     assert "sensitive" not in caplog.text
     assert "first" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age_seconds, accepted", [(0, True), (31, False), (-6, False)])
+async def test_authority_hydration_checks_freshness(age_seconds: int, accepted: bool) -> None:
+    redis = _FakeRedis()
+    relay = _relay(redis)
+    envelope = _envelope()
+    authority = RuntimeAuthority(
+        direct_request_id=envelope.direct_request_id,
+        turn_id=envelope.turn_id,
+        fencing_token=envelope.fencing_token,
+        lifecycle="active",
+    )
+    envelope = envelope.model_copy(
+        update={
+            "authority": authority,
+            "generated_at": datetime.now(UTC) - timedelta(seconds=age_seconds),
+        }
+    )
+    redis.get_value = envelope.encoded()
+    hydrated = await relay.hydrate_latest_authority(envelope.conversation_id, authority)
+    assert (hydrated is not None) is accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age_seconds", [31, -6])
+async def test_hydration_rejects_expired_or_future_envelopes(age_seconds: int) -> None:
+    redis = _FakeRedis()
+    relay = _relay(redis)
+    envelope = _envelope().model_copy(
+        update={"generated_at": datetime.now(UTC) - timedelta(seconds=age_seconds)}
+    )
+    redis.get_value = envelope.encoded()
+    assert await relay.hydrate_latest(_context()) is None
+
+
+@pytest.mark.asyncio
+async def test_hydration_remains_available_to_new_subscriber_after_live_delivery() -> None:
+    redis = _FakeRedis()
+    relay = _relay(redis)
+    payload = _envelope().encoded()
+    assert await relay.receive(payload)
+    redis.get_value = payload
+    assert await relay.hydrate_latest(_context()) is not None
+    assert not await relay.receive(payload)
 
 
 @pytest.mark.asyncio

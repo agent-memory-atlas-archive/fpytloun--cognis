@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
+from cognis.core.maintenance_lease import run_periodic_maintenance
 from cognis.logging import get_logger
+from cognis.store.coordination import DatabaseLeaseStore
 
 logger = get_logger(__name__)
 
@@ -27,11 +29,18 @@ class ToolOutputMaintenanceResult:
 class ToolOutputMaintenanceService:
     """Periodically enforce tool-output TTL and storage-size limits."""
 
-    def __init__(self, tool_output_store: Any, *, interval_seconds: float = 300.0) -> None:
+    def __init__(
+        self,
+        tool_output_store: Any,
+        *,
+        interval_seconds: float = 300.0,
+        lease_store: DatabaseLeaseStore | None = None,
+    ) -> None:
         self._tool_output_store = tool_output_store
         self._interval_seconds = interval_seconds
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._lease_store = lease_store
 
     async def start(self) -> None:
         """Start an immediate background pass followed by periodic maintenance."""
@@ -58,22 +67,11 @@ class ToolOutputMaintenanceService:
         """Run one failure-isolated retention and size-cap pass."""
 
         started_at = monotonic()
-        expired_deleted = 0
-        size_cap_deleted = 0
-        cleanup_failed = False
-        size_cap_failed = False
-
-        try:
-            expired_deleted = await self._tool_output_store.cleanup_expired()
-        except Exception:
-            cleanup_failed = True
-            logger.warning("tool output TTL maintenance failed", exc_info=True)
-
-        try:
-            size_cap_deleted = await self._tool_output_store.enforce_size_cap()
-        except Exception:
-            size_cap_failed = True
-            logger.warning("tool output size-cap maintenance failed", exc_info=True)
+        retention = await self._tool_output_store.maintain()
+        expired_deleted = retention.expired_deleted
+        size_cap_deleted = retention.size_cap_deleted
+        cleanup_failed = retention.cleanup_failed
+        size_cap_failed = retention.size_cap_failed
 
         duration_seconds = monotonic() - started_at
         if expired_deleted or size_cap_deleted or duration_seconds >= 1.0:
@@ -99,12 +97,10 @@ class ToolOutputMaintenanceService:
         )
 
     async def _run_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await self.run_once()
-            except Exception:
-                logger.warning("tool output maintenance failed", exc_info=True)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._interval_seconds)
-            except TimeoutError:
-                continue
+        await run_periodic_maintenance(
+            self.run_once,
+            stop=self._stop,
+            interval_seconds=self._interval_seconds,
+            resource_key="maintenance:tool-outputs",
+            lease_store=self._lease_store,
+        )

@@ -351,7 +351,7 @@ import X from 'lucide-svelte/icons/x';
     <div class={`flex h-full w-full min-w-0 overflow-hidden ${shellSpacingClass}`}>
       {#if !isChatWindowMode}
       <aside
-        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-t-3xl border border-b-0 border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
+        class={`mb-3 hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}

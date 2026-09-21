@@ -1252,13 +1252,11 @@ async def test_channel_inbound_matrix_thread_source_ref_forks_original_backing_s
     assert message.platform_data["thread_fork_anchor_lookup"] == "source_ref"
     assert session_manager._read_history_events.await_args_list[0].kwargs == {
         "last_n": 5000,
-        "allow_missing_stream": True,
     }
     assert session_manager._read_history_events.await_args_list[1].args == (old_session,)
     assert session_manager._read_history_events.await_args_list[1].kwargs == {
         "after_seq": 9,
         "limit": 1000,
-        "allow_missing_stream": True,
     }
 
 
@@ -1556,7 +1554,6 @@ async def test_channel_inbound_matrix_thread_missing_source_stream_submits_fresh
     session_manager._read_history_events.assert_awaited_once_with(
         source_session,
         last_n=5000,
-        allow_missing_stream=True,
     )
     session_manager.create_conversation_with_root_session.assert_awaited_once()
     assert message.platform_data["fresh_thread_context"] is True

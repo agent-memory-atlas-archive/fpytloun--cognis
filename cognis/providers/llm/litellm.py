@@ -11,6 +11,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import uuid
 from collections import Counter as CollectionsCounter
 from collections import deque
@@ -31,6 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
+from cognis.core.observability import record_attributed_llm_request
 from cognis.core.tool_exposure import LLMApiMode, ToolDiscoveryMode, ToolExposureContract
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
@@ -367,6 +369,44 @@ try:
     _LITELLM_DISTRIBUTION_VERSION = importlib.metadata.version("litellm")
 except importlib.metadata.PackageNotFoundError:
     _LITELLM_DISTRIBUTION_VERSION = "unknown"
+
+# Exact token counts of a multi-megabyte transcript cost ~1 s and the same
+# transcript is counted several times per cycle (projection snapshot, calibration,
+# cross-turn pruning). Memoise by the tokenizer's *observed* input: litellm's
+# ``_count_messages`` counts every string-valued key, ``tool_calls`` (function
+# arguments) and list-valued ``content``; every other value is skipped, so
+# internal marker keys (ints, dicts, bools) must not affect the key.
+_COUNT_MEMO_MIN_BYTES = 32 * 1024
+_COUNT_MEMO_MAX_ENTRIES = 64
+
+
+def _tokenizer_visible_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    visible: dict[str, Any] = {}
+    for key, value in message.items():
+        if value is None:
+            continue
+        if (
+            isinstance(value, str)
+            or key == "tool_calls"
+            or key == "content"
+            and isinstance(value, list)
+        ):
+            visible[key] = value
+    return visible
+
+
+def _count_memo_key(model: str, identity: str, payload: Any) -> tuple[str, str, str] | None:
+    """Return a memo key for ``payload`` or ``None`` when it is too small to bother."""
+
+    try:
+        serialized = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    if len(serialized) < _COUNT_MEMO_MIN_BYTES:
+        return None
+    digest = hashlib.blake2b(serialized.encode("utf-8"), digest_size=20).hexdigest()
+    return (model, identity, digest)
+
 
 _PROMPT_CACHE_KEY_VERSION = "v1"
 _DEFAULT_CAPABILITY_FALLBACK_TTL_SECONDS = 3600.0
@@ -882,6 +922,11 @@ async def _observe_llm_stream_request(
         }
         LLM_REQUESTS_TOTAL.labels(**labels).inc()
         LLM_REQUEST_DURATION.labels(**labels).observe(duration)
+        record_attributed_llm_request(
+            status=status,
+            provider_id=provider_id,
+            model=model,
+        )
         token_values = _record_llm_token_metrics(
             usage,
             provider_id=provider_id,
@@ -2256,6 +2301,8 @@ class LiteLLMProvider:
         self._codex_model_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._anthropic_subscription_model_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._tokenizer_backend_cache: dict[str, tuple[str, str]] = {}
+        self._count_memo: dict[tuple[str, str, str], int] = {}
+        self._count_memo_lock = threading.Lock()
         # In-process cache of (provider_id, resolved_model) pairs for which
         # response_format-style structured JSON has been observed to break
         # (either via empty Responses API reply or a JSON-validator
@@ -6436,20 +6483,57 @@ class LiteLLMProvider:
             if performance_payload is not None:
                 yield {"choices": [], "performance": performance_payload}
 
+    def _count_memo_get(self, key: tuple[str, str, str] | None) -> int | None:
+        if key is None:
+            return None
+        with self._count_memo_lock:
+            count = self._count_memo.get(key)
+            if count is not None:
+                # Refresh LRU position.
+                self._count_memo.pop(key, None)
+                self._count_memo[key] = count
+            return count
+
+    def _count_memo_put(self, key: tuple[str, str, str] | None, count: int) -> None:
+        if key is None:
+            return
+        with self._count_memo_lock:
+            self._count_memo.pop(key, None)
+            self._count_memo[key] = count
+            while len(self._count_memo) > _COUNT_MEMO_MAX_ENTRIES:
+                self._count_memo.pop(next(iter(self._count_memo)))
+
+    def clear_count_memo(self) -> None:
+        with self._count_memo_lock:
+            self._count_memo.clear()
+
     def count_tokens(self, text: str, model: str) -> int:
         family = self._tokenizer_family(model)
+        memo_key: tuple[str, str, str] | None = None
         try:
             if family == "openai":
                 import tiktoken
 
+                memo_key = _count_memo_key(model, "tiktoken", text)
+                cached = self._count_memo_get(memo_key)
+                if cached is not None:
+                    self._record_tokenizer_backend(model, family, "tiktoken")
+                    return cached
                 encoding = tiktoken.encoding_for_model(model)
                 count = len(encoding.encode(text))
                 self._record_tokenizer_backend(model, family, "tiktoken")
+                self._count_memo_put(memo_key, count)
                 return count
             if family in {"anthropic", "gemini"}:
+                memo_key = _count_memo_key(model, "litellm_native", text)
+                cached = self._count_memo_get(memo_key)
+                if cached is not None:
+                    self._record_tokenizer_backend(model, family, "litellm_native")
+                    return cached
                 messages = [{"role": "user", "content": text}]
                 count = int(litellm.token_counter(model=model, messages=messages))
                 self._record_tokenizer_backend(model, family, "litellm_native")
+                self._count_memo_put(memo_key, count)
                 return count
         except Exception:
             pass
@@ -6468,8 +6552,18 @@ class LiteLLMProvider:
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int:
         family = self._tokenizer_family(model)
         try:
+            memo_key = _count_memo_key(
+                model,
+                "litellm_native",
+                [_tokenizer_visible_message(message) for message in messages],
+            )
+            cached = self._count_memo_get(memo_key)
+            if cached is not None:
+                self._record_tokenizer_backend(model, family, "litellm_native")
+                return cached
             count = int(litellm.token_counter(model=model, messages=messages))
             self._record_tokenizer_backend(model, family, "litellm_native")
+            self._count_memo_put(memo_key, count)
             return count
         except Exception:
             serialized = "\n".join(
