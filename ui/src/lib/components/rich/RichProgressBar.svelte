@@ -29,6 +29,7 @@
 <style>
   .rich-progress {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--rich-space-2);
     width: 100%;
@@ -59,10 +60,11 @@
 
   .rich-progress-label {
     flex: 0 0 auto;
+    max-width: 100%;
     color: var(--rich-muted);
     font-size: var(--rich-fs-2xs);
     font-weight: var(--rich-fw-semibold);
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+    white-space: normal;
   }
 </style>

@@ -203,7 +203,7 @@ test.describe('rich deliverable visual fixture', () => {
     await page.goto('/rich-deliverable-fixture');
 
     const fixture = page.getByTestId('rich-deliverable-fixture');
-    await expect(page.getByRole('heading', { name: 'Rich Deliverables' })).toBeVisible();
+    await expect(page.getByTestId('rich-gallery-toolbar').getByText('Rich gallery', { exact: true })).toBeVisible();
     await expect(fixture).toHaveAttribute('data-scenario', 'research-answer');
     await expect(page.getByTestId('rich-deliverable')).toBeVisible();
     await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(0);
@@ -301,8 +301,8 @@ test.describe('rich deliverable visual fixture', () => {
       blockList: getComputedStyle(full.querySelector('.rich-block-list')!).color,
     }));
     expect(colors.richText, JSON.stringify(colors)).not.toBe('');
-    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(23, 32, 51)');
-    expect(colors.blockList, JSON.stringify(colors)).toBe('rgb(51, 65, 85)');
+    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(14, 22, 34)');
+    expect(colors.blockList, JSON.stringify(colors)).toBe('rgb(76, 92, 114)');
   });
 
   test('gives every registered block type dedicated visual treatment (design-system polish pass)', async ({ page }) => {
@@ -737,7 +737,13 @@ test.describe('multiple rich deliverables', () => {
       // to open their TOC at all). It is now purely width-driven: hidden at
       // >=1280px (sticky sidebar has no need for a trigger), shown below
       // that -- one per embedded report -- regardless of surface.
-      await expect(page.getByRole('button', { name: 'Open table of contents' })).toHaveCount(2);
+      await expect(page.getByRole('button', { name: 'Open table of contents' })).toHaveCount(
+        viewport.width >= 1280 ? 0 : 2
+      );
+      if (viewport.width >= 1280) {
+        await expect(page.getByTestId('rich-deliverable-toc').nth(0)).toBeVisible();
+        await expect(page.getByTestId('rich-deliverable-toc').nth(1)).toBeVisible();
+      }
       const ids = await page.locator('[id]').evaluateAll((elements) =>
         elements.map((element) => element.id).filter(Boolean)
       );
@@ -801,7 +807,7 @@ test.describe('multiple rich deliverables', () => {
         const mobileGridColumns = await metricGrid.evaluate((element) => getComputedStyle(element).gridTemplateColumns);
         const mobileAnchorDisplay = await metricGrid.locator('.rich-block-anchor').first()
           .evaluate((element) => getComputedStyle(element).display);
-        expect(mobileGridColumns.split(' ').length).toBe(1);
+        expect(mobileGridColumns.split(' ').length).toBe(2);
         expect(mobileAnchorDisplay).toBe('block');
       }
 

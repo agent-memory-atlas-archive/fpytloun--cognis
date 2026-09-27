@@ -30,7 +30,7 @@ for (const theme of ['dark', 'light'] as const) {
     expect(geometry.body.x).toBe(374);
     expect(geometry.body.width).toBe(816);
     expect(geometry.h1.fontSize).toBe('44px');
-    expect(geometry.prose.width).toBe(580);
+    expect(geometry.prose.width).toBe(630);
     expect(geometry.copy.width).toBe(34);
     expect(await viewer.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
     await viewer.getByRole('button', { name: 'Close table of contents' }).click();

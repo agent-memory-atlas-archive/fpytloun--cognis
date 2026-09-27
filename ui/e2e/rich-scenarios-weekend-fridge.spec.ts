@@ -41,7 +41,7 @@ test('fridge comparison preserves product names next to their illustrations in d
   const richText = await fixture.locator('.rich-block-list').first().evaluate((element) =>
     getComputedStyle(element).getPropertyValue('--rich-text').trim(),
   );
-  expect(['rgb(248 250 252)', '#f8fafc']).toContain(richText);
+  expect(richText).toBe('#eaf1f9');
 
   const nordhavenCard = fixture.getByRole('heading', { name: 'Nordhaven 430 Graphite' })
     .first()

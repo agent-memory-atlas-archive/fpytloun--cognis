@@ -307,7 +307,9 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await page.goto('/chat/conv-task-chat?view=work', { waitUntil: 'domcontentloaded' });
     const infoAction = page.getByTestId('chat-header-info');
     await expect(infoAction).toHaveAttribute('aria-controls', 'conversation-info-drawer');
+    await page.getByRole('button', { name: 'Expand conversation filters' }).click();
     await expect(page.getByRole('button', { name: 'Task', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Collapse conversation filters' }).click();
     if (await infoAction.getAttribute('aria-expanded') !== 'true') {
       await infoAction.click();
     }
@@ -438,7 +440,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await expect(infoDialog.locator('#conversation-info-drawer')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
     await expect(infoDialog.getByTestId('sheet-header-surface')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
     await expect(infoDialog.getByTestId('sheet-content-surface')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
-    await expect(infoDialog.getByTestId('shared-inspector-tabs')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+    await expect(infoDialog.getByTestId('shared-inspector-tabs')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
     expect(await infoDialog.getByRole('button', { name: 'Dismiss' }).evaluate(
       (node) => getComputedStyle(node).backgroundColor,
     )).toMatch(/^rgba\(/);

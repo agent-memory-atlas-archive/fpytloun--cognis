@@ -25,7 +25,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await expect(fixture.locator('[data-rich-block-type="source_list"]')).toBeVisible();
     await expect(fixture.locator('.rich-block-list').first().evaluate((element) =>
       getComputedStyle(element).getPropertyValue('--rich-text').trim()
-    )).resolves.toBe(colorScheme === 'light' ? '#172033' : '#f8fafc');
+    )).resolves.toBe(colorScheme === 'light' ? '#172033' : '#eaf1f9');
 
     const disclosure = fixture.locator('[data-rich-block-type="accordion"] details').first();
     await disclosure.locator('summary').focus();
@@ -62,5 +62,5 @@ test('uses the resolved standalone theme instead of the OS preference', async ({
 
   await expect(page.locator('.rich-block-list').first().evaluate((element) =>
     getComputedStyle(element).getPropertyValue('--rich-text').trim()
-  )).resolves.toBe('#f8fafc');
+  )).resolves.toBe('#eaf1f9');
 });

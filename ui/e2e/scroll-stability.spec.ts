@@ -317,11 +317,13 @@ test('long-rich-deliverable: preview TOC navigation remains usable across host b
   await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
   await page.setViewportSize({ width: 1024, height: 844 });
   await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
-  // The preview iframe keeps its bounded reading width, so its own responsive
-  // TOC remains a drawer when only the host viewport crosses a breakpoint.
-  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
+  // The widened preview changes the open TOC from a drawer to a sidebar.
+  await expect(deliverable).toHaveAttribute('data-inline-toc-layout', 'sidebar');
+  await expect(frame.getByTestId('rich-deliverable-toc')).toBeVisible();
+  await expect(frame.getByTestId('rich-deliverable-toc').getByRole('button', { name: 'Section 6' })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
   await frame.getByRole('dialog', { name: 'Table of contents' })
     .getByRole('button', { name: 'Close table of contents' }).click();
   await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);

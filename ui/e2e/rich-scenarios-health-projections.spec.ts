@@ -50,12 +50,17 @@ test.describe('health and projection rich scenarios', () => {
     const document = page.getByTestId('rich-deliverable-inline-document');
     const body = page.getByTestId('rich-deliverable-body');
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-scenario', 'wearable-recovery');
-    await expect(page.getByRole('button', { name: 'Open table of contents' })).toBeVisible();
     await expect(rich).toHaveAttribute('data-inline-toc-layout', 'sidebar');
+    await expect(page.getByTestId('rich-deliverable-toc')).toBeVisible();
+    await rich.locator('.rich-toc > header button[aria-label="Close table of contents"]').click();
+    await expect(page.getByRole('button', { name: 'Open table of contents' })).toBeVisible();
 
     const closedWidth = await body.evaluate((element) => element.getBoundingClientRect().width);
-    const documentWidth = await document.evaluate((element) => element.getBoundingClientRect().width);
-    expect(closedWidth / documentWidth).toBeGreaterThan(0.95);
+    const documentContentWidth = await document.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return element.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+    });
+    expect(closedWidth).toBeCloseTo(documentContentWidth, 0);
 
     await page.getByRole('button', { name: 'Open table of contents' }).click();
     await expect(page.getByTestId('rich-deliverable-toc')).toBeVisible();
@@ -67,7 +72,7 @@ test.describe('health and projection rich scenarios', () => {
     await expect(page.getByRole('button', { name: 'Open table of contents' })).toBeFocused();
     const restoredWidth = await body.evaluate((element) => element.getBoundingClientRect().width);
     expect(restoredWidth).toBeGreaterThan(closedWidth - 1);
-    expect(restoredWidth / documentWidth).toBeGreaterThan(0.95);
+    expect(restoredWidth).toBeCloseTo(documentContentWidth, 0);
   });
 
   for (const scenario of scenarios) {
@@ -75,7 +80,7 @@ test.describe('health and projection rich scenarios', () => {
       await page.setViewportSize({ width: 1440, height: 1000 });
       await loadScenario(page, scenario.id);
 
-      await expect(page.getByText(scenario.title, { exact: true }).first()).toBeVisible();
+      await expect(page.getByTestId('rich-deliverable').getByRole('heading', { name: scenario.title, exact: true })).toBeVisible();
       await expect(page.getByText(scenario.safety, { exact: false }).first()).toBeVisible();
       await expect(page.getByText(scenario.source, { exact: true }).first()).toBeVisible();
       await expect(page.getByRole('link', { name: scenario.source }).last()).toHaveAttribute(

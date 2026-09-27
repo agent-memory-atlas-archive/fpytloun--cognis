@@ -1139,7 +1139,7 @@
   color: rgb(226 232 240);
 }
 
-.rich-metric-heading { align-items: center; justify-content: space-between; }
+.rich-metric-heading { align-items: center; justify-content: space-between; flex-wrap: wrap; }
 .rich-metric-heading .rich-icon { width: 1.7rem; height: 1.7rem; margin-right: -.25rem; }
 .rich-metric-heading time { margin-left: auto; color: var(--rich-muted); font-size: var(--rich-fs-2xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
