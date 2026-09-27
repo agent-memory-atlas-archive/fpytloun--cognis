@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -15,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.cursors import ChatCursorError
 from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
 from cognis.api.chat_v2.event_store_refs import session_read_ref, session_read_refs
@@ -988,6 +988,7 @@ async def _execute_runtime_command(
                 agent=agent,
                 user_email=user_email,
                 runtime_plan=plan,
+                admission_lock_held=True,
             )
             if command_result is None:
                 raise api_exception(422, "invalid_command", "Slash command was not handled")

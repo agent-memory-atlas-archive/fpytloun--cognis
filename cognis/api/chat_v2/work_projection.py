@@ -7,7 +7,6 @@ and does not inspect executor or repository state.
 
 from __future__ import annotations
 
-import json
 import ntpath
 import posixpath
 import re
@@ -17,6 +16,7 @@ from hashlib import sha256
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.schemas import (
     ActivityOverviewDetail,
     ArtifactTimelineItem,
@@ -36,6 +36,7 @@ from cognis.api.chat_v2.schemas import (
     WorkstreamRef,
     WorkSummary,
 )
+from cognis.core.diff_stats import count_diff_lines
 from cognis.models.tool import ToolDefinition, ToolMutationKind
 
 _MAX_ARGUMENT_TEXT = 500
@@ -1027,13 +1028,7 @@ def _diff_totals(diffs: Iterable[FileDiffRef]) -> tuple[int, int]:
     additions = 0
     deletions = 0
     for diff in diffs:
-        counted_additions = 0
-        counted_deletions = 0
-        for line in diff.diff.splitlines():
-            if line.startswith("+") and not line.startswith("+++"):
-                counted_additions += 1
-            elif line.startswith("-") and not line.startswith("---"):
-                counted_deletions += 1
+        counted_additions, counted_deletions = count_diff_lines(diff.diff)
         additions += diff.additions if diff.additions is not None else counted_additions
         deletions += diff.deletions if diff.deletions is not None else counted_deletions
     return additions, deletions

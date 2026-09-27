@@ -74,6 +74,7 @@ class TaskModel(BaseModel):
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     interaction_mode_override: str | None = None
+    escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     workflow_id: str | None = None
     project_id: str | None = None

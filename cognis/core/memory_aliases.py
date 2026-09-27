@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+from cognis import json_codec as json
 
 MEMORY_ALIASES_METADATA = "memory_aliases"
 _ALIAS_RE = re.compile(r"^m([1-9][0-9]*)$")

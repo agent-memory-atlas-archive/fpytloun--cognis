@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.rendering.rich_visuals import rich_payload_has_noncanonical_chart
 
 DELIVERABLE_STORAGE_NAMESPACE = "deliverables"

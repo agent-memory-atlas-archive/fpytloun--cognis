@@ -78,6 +78,20 @@ input with retry semantics. It does not append another `user_message`; Cognis
 records a `model_recovery` system notice (`Retrying turn…`) before the new
 assistant attempt. Retry is allowed only for failed, inactive turns.
 
+Admission validation resolves the retry execution ID through the scheduler's
+canonical `system_notice` / `model_recovery` / `scope=turn` events and their
+`retry_source_turn_id` links until it finds the original user event. Every link
+must lead backward in event sequence within the same detached session snapshot.
+Missing, ambiguous, cyclic, or non-causal lineage fails closed. Tool output and
+arbitrary message metadata cannot substitute for a retry notice. Profile-switch
+boundaries still belong to the current execution ID, not its original admission.
+This read-only snapshot validation adds no writes, locks, transactions, or
+cancellation handling; notice publication and idempotency remain scheduler-owned.
+The existing durable notice format works after restart and across controllers.
+Retry notices are retained as canonical history rather than prompt-prefix
+entries. Redis cache schema v4 forces older snapshots, which omitted those
+notices, to be rebuilt from Intaris. No durable event migration is needed.
+
 Session events also carry a context-lane envelope in their event data. Historical
 pre-lane events are interpreted as `lane="main"`.
 
@@ -456,9 +470,25 @@ not need to reproduce a prior warm-cache projection byte-for-byte.
 
 ### Compaction Strategy
 
+Cross-turn assembly targets steady usage using compatible calibrated accounting.
+Normal then pressure projection preserve protected instructions and unrecoverable
+evidence. Assembly percentage recommendations do not authorize compaction.
+The pre-model gate owns automatic compaction after full model-facing projection
+fails the existing hard-policy or loop-pressure check. Post-turn compaction
+requires an actual unresolved projection snapshot, never an assembly-only hint.
+Projection policy is refreshed from the resolved model budget even on reuse;
+telemetry and enforcement must refer to that same selected policy.
+
+The agent loop owns each automatic compaction occurrence for the duration of
+the attempt. A zero-turn result is normalized to skipped before returning to
+callers; its terminal lifecycle event is persisted in Intaris before publication,
+using the same occurrence ID as the start. The existing session compaction lease,
+direct-turn fence, cancellation owner, and terminal-event idempotency contract
+remain unchanged. No schema or client protocol change is required.
+
 Compaction owns durable user/assistant history growth and provider-overflow
-recovery when projection cannot make the prompt safe. When context approaches
-the compaction threshold, compaction creates a new Intaris session within the
+recovery when projection cannot make the prompt safe. When projected context
+exceeds the effective hard boundary, compaction creates a new Intaris session within the
 same conversation. The old session is marked completed with
 ``completion_reason="compacted"``. The compaction summary is stored as a
 ``compaction_summary`` event in the old session's Intaris stream and injected as
@@ -479,15 +509,16 @@ Two compaction paths:
   signed thinking blocks is within-turn only and is not replayed across the
   manual rotation boundary.
 
-- **Automatic**: When context assembly or provider-overflow recovery indicates
-  durable context pressure, ``_auto_compact()`` compacts, rotates the session,
+- **Automatic pressure recovery**: When model-facing projection cannot satisfy
+  the existing hard boundaries, or provider-overflow recovery indicates
+  durable pressure, ``_auto_compact()`` compacts and the caller rotates the session,
   and emits a ``SESSION_COMPACTED`` event for client notification. LLM
   compaction has a bounded timeout (300 s); on timeout the mechanical fallback
   is called directly. On non-timeout failure, ``compact()`` already attempted
   its own retry and fallback internally, so ``_auto_compact`` returns ``None``
   cleanly.
 
-Guard: automatic compaction only fires when ``_finalize_step()`` succeeded
+Guard: post-turn automatic compaction only fires when ``_finalize_step()`` succeeded
 (events recorded). This prevents data loss where the turn's events would be
 lost if compaction rotated away from the session before events were saved.
 

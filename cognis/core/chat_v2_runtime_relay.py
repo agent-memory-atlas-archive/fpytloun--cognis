@@ -8,7 +8,6 @@ import binascii
 import contextlib
 import hashlib
 import hmac
-import json
 import secrets
 import zlib
 from collections import OrderedDict, deque
@@ -22,6 +21,7 @@ from typing import Annotated, Any, Literal, TypeVar
 from prometheus_client import Counter, Gauge, Histogram
 from pydantic import Field, ValidationError, model_validator
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.schemas import (
     BoundaryReceipt,
     RuntimeActiveTurn,

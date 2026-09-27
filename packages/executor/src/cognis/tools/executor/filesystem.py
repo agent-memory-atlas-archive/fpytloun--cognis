@@ -7,7 +7,6 @@ import base64
 import contextlib
 import difflib
 import hashlib
-import json
 import mimetypes
 import os
 import re
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.file_freshness import get_file_freshness_tracker

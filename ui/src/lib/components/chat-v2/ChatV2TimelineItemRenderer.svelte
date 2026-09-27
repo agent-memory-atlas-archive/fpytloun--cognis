@@ -63,7 +63,7 @@
   const renderItem = $derived(toRenderItem(item, renderMarkdownContent));
 </script>
 
-{#if renderItem}
+{#if renderItem && !(item.kind === 'message' && item.notice_resolved)}
   <TimelineItemRenderer
     item={renderItem}
     {agent}

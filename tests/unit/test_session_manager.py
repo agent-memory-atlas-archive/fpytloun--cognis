@@ -97,6 +97,18 @@ class _Guardrails:
         self.recorded_events: list[tuple[str, list[SessionEvent], str | None]] = []
         self.record_event_contexts: list[tuple[str | None, str | None, str | None]] = []
 
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        user_email: str | None = None,
+        agent_id: str = "system",
+        agent_owner_email: str | None = None,
+    ) -> SimpleNamespace:
+        if self.fail:
+            raise RuntimeError("intaris unavailable")
+        return SimpleNamespace(policy=self.last_policy, details=self.last_details)
+
     async def create_session(
         self,
         session_id: str,
@@ -138,8 +150,9 @@ class _Guardrails:
         user_id: str | None = None,
         details: dict | None = None,
         policy: dict | None = None,
+        agent_owner_email: str | None = None,
     ) -> None:
-        del agent_id, user_id
+        del agent_id, user_id, agent_owner_email
         if self.fail:
             raise RuntimeError("intaris unavailable")
         self.last_details = dict(details) if details is not None else None
@@ -538,6 +551,51 @@ async def test_session_manager_creates_conversation_and_root_session_atomically(
         assert stored_session is not None
         assert stored_session.intaris_session_id == root_session.session_id
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_yolo_sync_persists_conversation_policy_and_restores_agent_default(tmp_path) -> None:
+    engine, session_factory = await _session_factory(
+        tmp_path, capabilities={"maximum_outcome": "escalate"}
+    )
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+    )
+    assert providers.guardrails.last_policy["maximum_outcome"] == "escalate"
+    await manager.set_conversation_yolo(conversation, root, enabled=True)
+    assert providers.guardrails.last_policy["maximum_outcome"] == "approve"
+    async with session_factory() as db_session:
+        stored = await get_conversation(db_session, conversation.conversation_id)
+        assert stored.context_data["maximum_outcome_override"] == "approve"
+    await manager.set_conversation_yolo(conversation, root, enabled=False)
+    assert providers.guardrails.last_policy["maximum_outcome"] == "escalate"
+    async with session_factory() as db_session:
+        stored = await get_conversation(db_session, conversation.conversation_id)
+        assert "maximum_outcome_override" not in stored.context_data
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_yolo_sync_failure_does_not_persist_override(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+    )
+    providers.guardrails.fail = True
+    with pytest.raises(RuntimeError, match="intaris unavailable"):
+        await manager.set_conversation_yolo(conversation, root, enabled=True)
+    async with session_factory() as db_session:
+        stored = await get_conversation(db_session, conversation.conversation_id)
+        assert "maximum_outcome_override" not in (stored.context_data or {})
     await engine.dispose()
 
 

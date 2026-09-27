@@ -6,7 +6,7 @@ from cognis.api.chat_v2.schemas import (
     TimelineScope,
     ToolCallTimelineItem,
 )
-from cognis.api.chat_v2.work_projection import build_work_projection
+from cognis.api.chat_v2.work_projection import _diff_totals, build_work_projection
 from cognis.models.tool import (
     NativeToolOperation,
     ToolDefinition,
@@ -14,6 +14,15 @@ from cognis.models.tool import (
     ToolSource,
     declared_default_semantics,
 )
+
+
+def test_work_projection_counts_header_like_content_inside_hunks() -> None:
+    diff = FileDiffRef(
+        path="src/example.py",
+        diff="--- a/src/example.py\n+++ b/src/example.py\n"
+        "@@ -1 +1 @@\n---deleted content\n+++added content\n",
+    )
+    assert _diff_totals([diff]) == (1, 1)
 
 
 def _source(seq: int) -> SourceRef:

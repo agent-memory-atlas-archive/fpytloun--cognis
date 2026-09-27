@@ -9,9 +9,11 @@ import os
 import signal
 import sys
 import tarfile
+import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 from packaging.version import Version
 
 from cognis.executor import __main__ as executor_main
@@ -27,6 +29,31 @@ def _load_script(name: str, path: Path) -> object:
 
 
 _HOME_BREW_DIR = Path(__file__).parents[2] / "packaging" / "homebrew"
+
+
+def test_chart_defaults_to_published_controller_image_tag() -> None:
+    root = Path(__file__).parents[2]
+    with (root / "pyproject.toml").open("rb") as stream:
+        version = tomllib.load(stream)["project"]["version"]
+    chart = yaml.safe_load((root / "deploy/helm/cognis/Chart.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load((root / "deploy/helm/cognis/values.yaml").read_text(encoding="utf-8"))
+    assert chart["appVersion"] == f"v{version}"
+    assert values["image"]["repository"] == "ghcr.io/fpytloun/cognis"
+    assert values["image"]["tag"] == ""
+
+
+def test_tag_workflow_requires_reviewed_draft_before_upload() -> None:
+    workflow = (
+        Path(__file__).parents[2] / ".github" / "workflows" / "executor-release.yml"
+    ).read_text(encoding="utf-8")
+    assert "gh release create" not in workflow
+    assert "--generate-notes" not in workflow
+    assert 'gh release view "$RELEASE_TAG" --json isDraft' in workflow
+    assert workflow.index("Wait for reviewed draft release") < workflow.index(
+        'gh release upload "$RELEASE_TAG"'
+    )
+
+
 build_executor_asset = _load_script(
     "cognis_test_build_executor_asset", _HOME_BREW_DIR / "build_executor_asset.py"
 )

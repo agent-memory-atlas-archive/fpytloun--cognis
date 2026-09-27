@@ -174,13 +174,9 @@ def _target_ready(target: ResolvedExecutorTarget, ws_provider: Any | None) -> bo
         return False
     if target.executor_type not in {"websocket", "subprocess"} or ws_provider is None:
         return True
-    connection = ws_provider.get_connection(target.executor_id)
-    if connection is None or not getattr(
-        connection, "connected", getattr(connection, "present", True)
-    ):
-        return False
-    handle = getattr(ws_provider, "get_handle", lambda _id: None)(target.executor_id)
-    return handle is None or getattr(handle, "status", "ready") == "ready"
+    # Transport readiness includes lazy cross-replica proxies whose physical
+    # executor is ready before the controller bridge is opened.
+    return ws_provider.get_ready_connection(target.executor_id) is not None
 
 
 async def ensure_active_executor_pin(

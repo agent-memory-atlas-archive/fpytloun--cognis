@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
+
+from cognis import json_codec as json
 
 PROJECT_INSTRUCTIONS_DYNAMIC_SOURCE = "project_instructions_dynamic"
 PROJECT_METADATA_DYNAMIC_SOURCE = "project_metadata_dynamic"

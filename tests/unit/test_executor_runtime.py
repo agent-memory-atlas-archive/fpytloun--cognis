@@ -48,6 +48,36 @@ def test_fast_path_local_inference_requires_matching_generation_flags_and_endpoi
     assert executor_runtime._fast_path_local_inference_enabled(row, metadata) is False
 
 
+@pytest.mark.asyncio
+async def test_catalog_validation_runs_off_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = _executor_row(owner_email="alice@example.com")
+    queue = SimpleNamespace(enqueue_tools=AsyncMock())
+    app = _app_with_ws_connection()
+    app.state.tool_classification_queue = queue
+    observed_tools = [{"name": "read", "description": "Read", "parameters": {}}]
+    validated = [SimpleNamespace(name="read")]
+    offload = AsyncMock(return_value=validated)
+    monkeypatch.setattr(executor_runtime, "run_cpu_bound", offload)
+    monkeypatch.setattr(
+        executor_runtime,
+        "update_executor_runtime_state",
+        AsyncMock(return_value=row),
+    )
+
+    result = await executor_runtime._persist_runtime_state(
+        app,
+        "remote-1",
+        runtime_state="active",
+        applied_config_version=1,
+        observed_tools=observed_tools,
+        runtime_metadata={},
+    )
+
+    assert result is row
+    offload.assert_awaited_once_with(executor_runtime._validate_observed_tools, observed_tools)
+    queue.enqueue_tools.assert_awaited_once_with(validated, owner_email="alice@example.com")
+
+
 class _RuntimeSession:
     async def commit(self) -> None:
         return None
@@ -331,6 +361,7 @@ async def test_legacy_applied_generation_fast_path_persists_desired_floor(
 ) -> None:
     runtime_metadata = {
         "local_inference_enabled": True,
+        "capabilities": {"tools": ["read"]},
         "ollama_runtime": {
             "runtime_type": "ollama",
             "port": 11434,
@@ -346,6 +377,8 @@ async def test_legacy_applied_generation_fast_path_persists_desired_floor(
         runtime_state="active",
         runtime_metadata=runtime_metadata,
     )
+    persisted = AsyncMock(return_value=row)
+    executor_reads: list[dict[str, object]] = []
 
     class _Connection:
         connected = True
@@ -366,10 +399,12 @@ async def test_legacy_applied_generation_fast_path_persists_desired_floor(
                 )
             ),
             tool_classification_queue=None,
+            executor_connection_ownership=object(),
         )
     )
 
-    async def _get_executor_row(*_: object, **__: object) -> SimpleNamespace:
+    async def _get_executor_row(*_: object, **kwargs: object) -> SimpleNamespace:
+        executor_reads.append(kwargs)
         return row
 
     async def _normalize(
@@ -387,11 +422,24 @@ async def test_legacy_applied_generation_fast_path_persists_desired_floor(
         "normalize_executor_desired_config_version",
         _normalize,
     )
+    monkeypatch.setattr(executor_runtime, "_persist_runtime_state", persisted)
+    monkeypatch.setattr(
+        executor_runtime,
+        "_connection_ownership_is_current",
+        AsyncMock(return_value=True),
+    )
 
     assert await executor_runtime.reconcile_executor(app, "remote-1") is True
     assert row.desired_config_version == 1
     assert row.applied_config_version == 1
     assert executor_local_inference_config_confirmed(row) is True
+    persisted.assert_awaited_once()
+    assert persisted.await_args.args == (app, "remote-1")
+    assert persisted.await_args.kwargs["connection"] is connection
+    assert persisted.await_args.kwargs["runtime_state"] == "active"
+    assert persisted.await_args.kwargs["applied_config_version"] == 1
+    assert "observed_tools" not in persisted.await_args.kwargs
+    assert executor_reads == [{"defer_observed_tools": True}]
 
 
 @pytest.mark.asyncio

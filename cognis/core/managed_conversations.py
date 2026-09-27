@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
+from cognis import json_codec as json
 from cognis.core.chat_modes import CHAT_MODES, ChatMode
 from cognis.logging import get_logger
 from cognis.models.session import next_event_page_after_seq

@@ -63,3 +63,15 @@ describe('chat composer preference', () => {
     }).chat.enter_to_send).toBe(false);
   });
 });
+
+describe('notification content preference', () => {
+  it('includes content by default for legacy preferences', () => {
+    expect(normalizeUserPreferences({ display: {}, chat: {} }).notifications.include_content).toBe(true);
+  });
+
+  it('preserves the privacy-oriented opt-out', () => {
+    expect(normalizeUserPreferences({
+      notifications: { include_content: false },
+    }).notifications.include_content).toBe(false);
+  });
+});

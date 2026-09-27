@@ -20,7 +20,6 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import json
 import mimetypes
 import os
 import re
@@ -32,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.channels.adapters.signal_cli_runtime import (
     _ATTACHMENT_TIMEOUT_S,
     _MAX_ATTACHMENT_BYTES,

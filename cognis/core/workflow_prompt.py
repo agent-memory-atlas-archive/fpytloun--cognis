@@ -6,12 +6,12 @@ task material in user-role context and controller policy in system-role context.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
 
+from cognis import json_codec as json
 from cognis.models.workflow import CompletionDeliveryPolicy, StepDefinition
 
 

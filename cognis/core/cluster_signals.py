@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import json
 import random
 from collections import OrderedDict
 from datetime import datetime
@@ -24,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 
+from cognis import json_codec as json
 from cognis.core.agent_registry import SYSTEM_AGENTS
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
@@ -396,7 +396,16 @@ class ClusterSignalService:
         if not self.enabled:
             return
         async with self._session_factory() as session:
-            executor = await session.get(ExecutorRow, executor_id)
+            executor = (
+                await session.execute(
+                    select(
+                        ExecutorRow.owner_email,
+                        ExecutorRow.updated_at,
+                        ExecutorRow.desired_config_version,
+                        ExecutorRow.applied_config_version,
+                    ).where(ExecutorRow.executor_id == executor_id)
+                )
+            ).one_or_none()
         if executor is None:
             return
         await self.publish(

@@ -50,6 +50,7 @@ describe('slash command helpers', () => {
       '/model',
       '/thinking',
       '/fast',
+      '/yolo',
       '/profile',
       '/skill',
       '/executor',

@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
-import json
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext

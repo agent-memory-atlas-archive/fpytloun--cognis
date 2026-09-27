@@ -183,7 +183,8 @@ async def test_probe_returns_typed_validation_errors_without_mutation(
         AsyncMock(return_value=ExecutorPolicy()),
     )
     monkeypatch.setattr(executor_ws, "is_executor_type_allowed", lambda *_args: code != -32006)
-    monkeypatch.setattr(executor_ws, "get_executor_row", AsyncMock(return_value=row))
+    lookup = AsyncMock(return_value=row)
+    monkeypatch.setattr(executor_ws, "get_executor_row", lookup)
 
     await executor_ws.handle_executor_websocket(
         ws,
@@ -196,3 +197,5 @@ async def test_probe_returns_typed_validation_errors_without_mutation(
     assert ws.close_calls == [(close_code, reason)]
     provider.register_connection.assert_not_called()
     provider.unregister_connection.assert_not_called()
+    for call in lookup.await_args_list:
+        assert call.kwargs["defer_observed_tools"] is True

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 from typing import Any, Literal, cast
 
 from pydantic import Field, ValidationError
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.cycles import cycle_states_from_items
 from cognis.api.chat_v2.item_keys import (
     KIND_RANK,
@@ -16,6 +16,7 @@ from cognis.api.chat_v2.item_keys import (
     thinking_item_id,
 )
 from cognis.api.chat_v2.normalizer import NormalizedChatEvent
+from cognis.api.chat_v2.notice_metadata import notice_metadata
 from cognis.api.chat_v2.schemas import (
     ArtifactTimelineItem,
     AssistantDeliverableTimelineItem,
@@ -32,6 +33,7 @@ from cognis.api.chat_v2.schemas import (
     NoticeTimelineItem,
     QuestionSetTimelineItem,
     QuestionSpec,
+    RecapTimelineItem,
     SourceRef,
     StrictModel,
     TaskTimelineItem,
@@ -72,12 +74,70 @@ def project_timeline(events: Iterable[NormalizedChatEvent]) -> TimelineProjectio
     """Project normalized events into a canonical Chat v2 timeline window."""
 
     normalized_events = _fill_missing_assistant_turn_cycles(list(events))
+    successful_compactions = {
+        event.data.get("compaction_id")
+        for event in normalized_events
+        if event.kind == "compaction"
+        and event.data.get("status", "compacted") == "compacted"
+        and event.data.get("timeline_visible") is not False
+    } - {None}
+    # Scheduler-owned terminal turn errors also terminate any unmatched start
+    # from that turn (e.g. controller loss before its terminal append).
+    failed_turns = {
+        event.data.get("turn_id")
+        for event in normalized_events
+        if event.data.get("event") == "turn_error"
+    } - {None}
+    latest_occurrence_by_source: dict[str, tuple[int, str]] = {}
+    for event in normalized_events:
+        occurrence = event.data.get("compaction_id")
+        if (
+            event.kind == "compaction"
+            and isinstance(occurrence, str)
+            and event.data.get("event") == "session_compaction_started"
+        ):
+            source = event.source_ref.session_id
+            position = event.source_ref.seq
+            if position >= latest_occurrence_by_source.get(source, (-1, ""))[0]:
+                latest_occurrence_by_source[source] = (position, occurrence)
     items_by_id: dict[str, TimelineItem] = {}
     evaluations_by_call_id: dict[str, tuple[dict[str, Any], SourceRef]] = {}
     delegation_folds = _DelegationFolds()
     warnings: list[ProjectionWarning] = []
 
     for event in normalized_events:
+        later_occurrence = latest_occurrence_by_source.get(event.source_ref.session_id)
+        if (
+            event.kind == "compaction"
+            and event.data.get("status") == "running"
+            and (
+                event.data.get("turn_id") in failed_turns
+                or (
+                    later_occurrence is not None
+                    and later_occurrence[0] > event.source_ref.seq
+                    and later_occurrence[1] != event.data.get("compaction_id")
+                )
+            )
+        ):
+            event = event.model_copy(
+                update={
+                    "data": {
+                        **event.data,
+                        "status": "failed",
+                        "fallback_reason": "Compaction interrupted or superseded by a later occurrence.",
+                    }
+                }
+            )
+        # Compatibility for persisted pressure notices written before lifecycle
+        # cards became authoritative. Never hide uncorrelated failure notices.
+        if (
+            event.kind == "system_message"
+            and event.data.get("compaction_id") in successful_compactions
+            and str(event.data.get("message") or event.data.get("content") or "").startswith(
+                "Context window is critically full"
+            )
+        ):
+            continue
         item = _project_event(event, items_by_id, evaluations_by_call_id, delegation_folds)
         if item is HIDDEN_EVENT:
             continue
@@ -249,6 +309,8 @@ def _project_event(
         return _assistant_deliverable_item(event)
     if event.kind == "file_diff":
         return _file_diff_item(event)
+    if event.kind == "recap":
+        return _recap_item(event)
     if event.kind == "notice":
         return _notice_item(event)
     if event.kind == "compaction":
@@ -284,20 +346,8 @@ def _message_item(event: NormalizedChatEvent, *, role: str) -> MessageTimelineIt
         notice_scope=_str_or_none(data.get("scope")),
         retry_reason=_str_or_none(data.get("retry_reason")),
         retry_source_turn_id=_str_or_none(data.get("retry_source_turn_id")),
-        reason_class=_str_or_none(data.get("reason_class")),
-        provider_id=_str_or_none(data.get("provider_id")),
-        model=_str_or_none(data.get("model")),
-        retry_after_seconds=_nonnegative_float(data.get("retry_after_seconds")),
-        provider_retry_after_seconds=_nonnegative_float(data.get("provider_retry_after_seconds")),
-        retry_at=_str_or_none(data.get("retry_at")),
+        **notice_metadata(data),
         attempt=_nonnegative_int(data.get("attempt")),
-        max_attempts=_nonnegative_int(data.get("max_attempts")),
-        attempts=_nonnegative_int(data.get("attempts")),
-        attempts_per_cycle=_nonnegative_int(data.get("attempts_per_cycle")),
-        continuation_attempts=_nonnegative_int(data.get("continuation_attempts")),
-        recoverable=data.get("recoverable") if isinstance(data.get("recoverable"), bool) else None,
-        follow_up_conversation_id=_str_or_none(data.get("follow_up_conversation_id")),
-        follow_up_session_id=_str_or_none(data.get("follow_up_session_id")),
         partial=bool(data.get("partial", False)),
         attachments=_attachments(data.get("attachments")),
         chat_mode=_chat_mode(data),
@@ -861,6 +911,29 @@ def _file_diff_item(event: NormalizedChatEvent) -> FileDiffTimelineItem:
     )
 
 
+def _recap_item(event: NormalizedChatEvent) -> RecapTimelineItem:
+    data = event.data
+    raw_stats = data.get("stats")
+    stats = raw_stats if isinstance(raw_stats, dict) else {}
+    return RecapTimelineItem(
+        id=f"recap:{event.source_ref.session_id}:{event.source_ref.seq}",
+        sort_key=_sort_key(event),
+        source_refs=[event.source_ref],
+        created_at=event.timestamp,
+        updated_at=event.timestamp,
+        text=str(data.get("text") or ""),
+        source_session_id=str(data.get("source_session_id") or event.source_ref.session_id),
+        source_seq=int(data.get("source_seq") or event.source_ref.seq),
+        auto=data.get("auto") is True,
+        stats_version=int(data.get("stats_version") or 1),
+        file_diffs_omitted=stats.get("file_diffs_omitted") is True,
+        scope="recent_window" if data.get("scope") == "recent_window" else "legacy",
+        deliverables=list(stats.get("deliverables") or []),
+        artifacts=list(stats.get("artifacts") or []),
+        files=list(stats.get("files") or []),
+    )
+
+
 def _notice_item(event: NormalizedChatEvent) -> NoticeTimelineItem:
     data = event.data
     notice_id = str(data.get("notice_id") or data.get("id") or _fallback_id(event))
@@ -900,8 +973,8 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
     )
     raw_status = _str_or_none(data.get("status"))
     status = cast(
-        Literal["compacted", "failed", "skipped"],
-        raw_status if raw_status in {"compacted", "failed", "skipped"} else "compacted",
+        Literal["running", "compacted", "failed", "skipped"],
+        raw_status if raw_status in {"running", "compacted", "failed", "skipped"} else "compacted",
     )
     turns_compacted = data.get("turns_compacted")
     return CompactionTimelineItem(
@@ -986,6 +1059,12 @@ def _upsert_item(items_by_id: dict[str, TimelineItem], item: TimelineItem) -> No
     if existing is None:
         items_by_id[item.id] = item
         return
+    if existing.kind == "compaction" and item.kind == "compaction":
+        if existing.status != "running" and item.status == "running":
+            existing.source_refs = _merged_source_refs(existing, *item.source_refs)
+            return
+        item.sort_key = min(existing.sort_key, item.sort_key)
+        item.created_at = existing.created_at or item.created_at
     # Later projections with the same stable ID are authoritative, but retain
     # source refs from earlier events for audit/debug provenance.
     item.source_refs = _merged_source_refs(existing, *item.source_refs)

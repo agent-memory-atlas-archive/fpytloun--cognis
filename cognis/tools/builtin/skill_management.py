@@ -565,7 +565,7 @@ def materialize_loaded_skill_context(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the protected context and activation metadata for a loaded skill."""
 
-    import json
+    from cognis import json_codec as json
 
     asset_manifest = _skill_asset_llm_manifest(asset_refs)
     protected_context_parts = [
@@ -839,8 +839,7 @@ async def _refresh_skill_steps_if_needed(
 
 
 async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import list_skills
 
     async with session_factory() as session:
@@ -872,8 +871,7 @@ async def _handle_skill_load(
     This is the primary way the model accesses skill content.  Always
     returns the latest published version.
     """
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import get_skill_scoped, list_skills
 
     skill_id = str(arguments.get("skill_id") or arguments.get("skill") or "").strip()
@@ -978,8 +976,7 @@ def _skill_asset_llm_manifest(asset_refs: list[Any]) -> list[dict[str, Any]]:
 async def _handle_skill_get(
     session_factory: Any, user_email: str, arguments: dict[str, Any]
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import get_skill_scoped, list_skill_versions
 
     skill_id = str(arguments.get("skill_id", "")).strip()
@@ -1034,8 +1031,7 @@ async def _handle_skill_get(
 async def _handle_skill_versions(
     session_factory: Any, user_email: str, arguments: dict[str, Any]
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import get_skill_scoped, list_skill_versions
 
     skill_id = str(arguments.get("skill_id", "")).strip()
@@ -1073,8 +1069,7 @@ async def _handle_skill_write(
     artifact_store: Any | None,
     current_agent_id: str | None = None,
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import (
         create_skill,
         get_next_version_number,
@@ -1318,8 +1313,7 @@ async def _handle_skill_patch(
 ) -> ToolResult:
     """Apply an explicit partial patch to the current immutable skill version."""
 
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import (
         get_next_version_number,
         get_skill_scoped,
@@ -1519,8 +1513,7 @@ async def _handle_skill_asset_write(
     llm: Any | None,
     artifact_store: Any | None,
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import (
         get_next_version_number,
         get_skill_scoped,
@@ -1655,8 +1648,7 @@ async def _handle_skill_asset_delete(
     llm: Any | None,
     artifact_store: Any | None,
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import (
         get_next_version_number,
         get_skill_scoped,
@@ -1825,8 +1817,7 @@ async def _handle_skill_import_url(
     *,
     artifact_store: Any | None,
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import create_skill, set_current_version
     from cognis.tools.skill_import import import_skill_from_url
 
@@ -2022,8 +2013,7 @@ async def _handle_skill_export(
 async def _handle_skill_restore_version(
     session_factory: Any, user_email: str, arguments: dict[str, Any]
 ) -> ToolResult:
-    import json
-
+    from cognis import json_codec as json
     from cognis.store.queries import (
         get_skill_scoped,
         list_skill_versions,

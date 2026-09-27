@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -14,6 +13,7 @@ from fastapi import APIRouter, Query, Request
 from sqlalchemy import and_, case, func, or_, select, tuple_
 from sqlalchemy.orm import aliased
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.event_store import (
     SessionHistoryUnavailableError,
     require_session_history,

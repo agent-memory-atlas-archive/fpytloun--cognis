@@ -85,6 +85,15 @@ When a task runs with a workflow, Cognis records:
 - gate condition evaluation details, including values, operators, outcomes, and branch/action taken
 - final completion or failure state
 
+Deterministic steps expose structured outputs and execution details in **Output**:
+tool arguments use the recorded redacted audit, while conditions show the expression,
+boolean result, and selected route. New deterministic tool executions also record
+tool calls and results in **Logs**. Historical runs without these events retain
+their recorded output details; they are not re-executed to populate logs.
+
+From a task's logs, **View session** opens a delegate's logs. **Back** returns to
+the parent session, including when the task is opened in the dashboard modal.
+
 Step timing is accumulated across attempts so diagrams and task details show the
 total time spent on a step, not only the latest retry. Latest-attempt duration can
 still appear as secondary metadata when a view needs that distinction.

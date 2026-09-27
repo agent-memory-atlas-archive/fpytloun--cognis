@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from cognis import json_codec as json
 
 _MAX_OUTPUT_BYTES = 256_000
 _MAX_ERROR_CHARS = 4_000

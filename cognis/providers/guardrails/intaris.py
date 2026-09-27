@@ -269,6 +269,10 @@ class IntarisProvider:
                 headers=self._headers(agent_id, user_id),
             )
             response.raise_for_status()
+            if (policy or {}).get("maximum_outcome") is not None and (
+                response.json().get("policy") or {}
+            ).get("maximum_outcome") != (policy or {}).get("maximum_outcome"):
+                raise ValueError("Intaris did not acknowledge maximum_outcome.")
 
         async def _do() -> None:
             response = await self.client.post(
@@ -307,6 +311,10 @@ class IntarisProvider:
                     },
                 )
             response.raise_for_status()
+            if (policy or {}).get("maximum_outcome") is not None:
+                # Intaris responds to intention declaration with {"ok": true};
+                # check the persisted session before accepting a permissive policy.
+                await _verify_existing_session()
 
         await self._call_with_retry(
             _do,
@@ -327,6 +335,7 @@ class IntarisProvider:
         user_id: str | None = None,
         details: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
+        agent_owner_email: str | None = None,
     ) -> None:
         logger.info(
             "intaris: update_session_policy",
@@ -337,7 +346,7 @@ class IntarisProvider:
             response = await self.client.patch(
                 f"/api/v1/session/{session_id}",
                 json={"details": details or {}, "policy": policy or {}},
-                headers=self._headers(agent_id, user_id),
+                headers=self._headers(agent_id, user_id, agent_owner_email),
             )
             if not response.is_success:
                 logger.error(
@@ -350,6 +359,10 @@ class IntarisProvider:
                     },
                 )
             response.raise_for_status()
+            if (response.json().get("policy") or {}).get("maximum_outcome") != (policy or {}).get(
+                "maximum_outcome"
+            ):
+                raise ValueError("Intaris did not acknowledge maximum_outcome.")
 
         await self._call_with_retry(
             _do,
@@ -496,11 +509,20 @@ class IntarisProvider:
             breaker=self.session_breaker,
         )
 
-    async def get_session(self, session_id: str) -> IntarisSession:
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        user_email: str | None = None,
+        agent_id: str = "system",
+        agent_owner_email: str | None = None,
+    ) -> IntarisSession:
         async def _do() -> IntarisSession:
             response = await self.client.get(
                 f"/api/v1/session/{session_id}",
-                headers=self._headers(user_email=current_user_email.get()),
+                headers=self._headers(
+                    agent_id, user_email or current_user_email.get(), agent_owner_email
+                ),
             )
             response.raise_for_status()
             return IntarisSession.model_validate(response.json())

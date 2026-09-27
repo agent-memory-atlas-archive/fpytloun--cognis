@@ -43,6 +43,12 @@ _SETTINGS_SCHEMA: dict[str, Any] = {
         "voice": {"type": ["string", "null"]},
         "memory_backend": {"type": "string"},
         "memory_backend_options": {"type": "object"},
+        "escalation_timeout_seconds": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": 86400,
+            "description": "Seconds to wait for an agent escalation; null inherits the global timeout.",
+        },
         "delegation": {
             "type": "object",
             "additionalProperties": False,

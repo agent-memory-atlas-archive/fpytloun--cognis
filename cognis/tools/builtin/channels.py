@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import typing
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -11,6 +10,7 @@ from typing import Any, Literal
 from sqlalchemy import String, and_, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.channels.addressing import ADDRESS_KINDS
 from cognis.channels.bindings import ManagedChannelBindingLookup, NoManagedChannelBindingLookup
 from cognis.channels.constants import (

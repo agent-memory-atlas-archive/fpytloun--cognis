@@ -28,7 +28,20 @@ export function valueText(value: unknown): string {
 }
 
 export function tableRows(block: RichBlock): Record<string, unknown>[] {
-  return objectList(block.rows ?? block.data);
+  const rows = block.rows ?? block.data;
+  if (!Array.isArray(rows)) return [];
+  const columns = tableColumns(block, []);
+  return rows.flatMap((row): Record<string, unknown>[] => {
+    if (Array.isArray(row)) {
+      return [Object.fromEntries(row.map((cell, index) => [columns[index]?.key ?? String(index), cell]))];
+    }
+    if (!row || typeof row !== 'object') return [];
+    const record = row as Record<string, unknown>;
+    const values = Array.isArray(record.values)
+      ? Object.fromEntries(record.values.map((cell, index) => [columns[index]?.key ?? String(index), cell]))
+      : {};
+    return [{ ...values, ...record }];
+  });
 }
 
 export function tableColumns(block: RichBlock, currentRows: Record<string, unknown>[]): ColumnDef[] {

@@ -456,7 +456,8 @@ textarea:focus-visible,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    /* A nonzero duration creates transitions for otherwise static SVG geometry. */
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }

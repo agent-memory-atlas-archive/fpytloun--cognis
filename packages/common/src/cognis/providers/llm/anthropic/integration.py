@@ -8,12 +8,13 @@ transport payload and the exact compiled tool bundle used for the call.
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from cognis import json_codec as json
 from cognis.models.config import ModelInfo
 from cognis.providers.llm.anthropic.contracts import (
     CLAUDE_CODE_VERSION,
@@ -38,6 +39,8 @@ CCH_POSITIONS = (4, 7, 20)
 NATIVE_REQUEST_CONTEXT_KWARG = "cognis_anthropic_request_context"
 NATIVE_TOOL_BUNDLE_KWARG = "cognis_anthropic_tool_bundle"
 NATIVE_CONTINUATION_REQUIRED_KWARG = "cognis_anthropic_continuation_required"
+
+logger = logging.getLogger(__name__)
 
 
 class AnthropicContinuationRejected(RuntimeError):
@@ -245,6 +248,7 @@ def build_native_request(
         require_active_continuation=require_active_continuation,
     )
     system, anthropic_messages = _convert_messages(replay_messages)
+    anthropic_messages = _drop_orphan_tool_results(anthropic_messages)
     if context.auth_policy is AnthropicAuthPolicy.OAUTH:
         first_user_text = _first_user_text(anthropic_messages)
         system = [
@@ -294,6 +298,54 @@ def build_native_request(
         if request_kwargs.get(key) is not None:
             payload[key] = request_kwargs[key]
     return context, payload, bundle
+
+
+def _drop_orphan_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove tool results that Anthropic cannot associate with the prior assistant turn."""
+
+    sanitized: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "user":
+            sanitized.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            sanitized.append(message)
+            continue
+        previous = sanitized[-1] if sanitized else None
+        allowed_ids = {
+            str(block["id"])
+            for block in (previous or {}).get("content", [])
+            if isinstance(block, Mapping)
+            and block.get("type") == "tool_use"
+            and isinstance(block.get("id"), str)
+            and block["id"]
+        }
+        retained: list[dict[str, Any]] = []
+        seen_result_ids: set[str] = set()
+        dropped_ids: list[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                retained.append(block)
+                continue
+            call_id = block.get("tool_use_id")
+            if (
+                isinstance(call_id, str)
+                and call_id in allowed_ids
+                and call_id not in seen_result_ids
+            ):
+                retained.append(block)
+                seen_result_ids.add(call_id)
+            elif isinstance(call_id, str) and call_id:
+                dropped_ids.append(call_id)
+        if dropped_ids:
+            logger.warning(
+                "Dropping orphan Anthropic tool results before provider request",
+                extra={"extra_data": {"tool_use_ids": dropped_ids}},
+            )
+        if retained:
+            sanitized.append({**message, "content": retained})
+    return sanitized
 
 
 def _prepare_native_replay_messages(

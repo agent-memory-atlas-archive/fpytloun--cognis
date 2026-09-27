@@ -5,7 +5,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
@@ -18,6 +20,8 @@ from cognis.core.web_push import (
     WebPushService,
     _generate_vapid_private_key,
     _public_key_from_pem,
+    _push_body,
+    _serialize_push_payload,
     _to_sec1_pem,
     _validate_py_vapid_key,
     load_web_push_config,
@@ -33,6 +37,147 @@ def _pkcs8_private_key() -> str:
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["cancelled", "queued_turn_cancelled", "turn_cancelled"])
+async def test_cancelled_turn_does_not_create_push(code: str) -> None:
+    service = object.__new__(WebPushService)
+    service._session_factory = AsyncMock()
+    assert (
+        await service._event_payload(
+            Event(
+                type=EventType.TURN_ERROR,
+                data={"conversation_id": "conv-cancel", "error_code": code},
+            )
+        )
+        is None
+    )
+    service._session_factory.assert_not_called()
+
+
+def test_push_payload_is_bounded_by_utf8_bytes() -> None:
+    payload = _serialize_push_payload(
+        {
+            "title": "Cognis",
+            "body": "🚀" * 2_000,
+            "url": "/chat/conv_1?notification=notif_1",
+            "actions": [
+                {"action": "approve", "title": "Approve"},
+                {"action": "deny", "title": "Deny"},
+            ],
+        }
+    )
+
+    assert len(payload.encode("utf-8")) <= 3_800
+    assert json.loads(payload)["body"].endswith("...")
+
+
+def test_push_body_strips_markdown_presentation() -> None:
+    body = _push_body(
+        "## Result\n"
+        "**Correct.** [Read more](https://example.com)\n"
+        "- [x] `pytest` passed\n"
+        "> ~~Old~~ *new* text"
+    )
+
+    assert body == "Result Correct. Read more pytest passed Old new text"
+    assert not any(token in body for token in ("##", "**", "`", "[", "]", "~~"))
+
+
+def test_push_body_preserves_plain_text_operators_and_identifiers() -> None:
+    body = _push_body("Latency < 3 ms and errors > 0 for foo_bar_baz; 2 * 3 = 6.")
+
+    assert body == "Latency < 3 ms and errors > 0 for foo_bar_baz; 2 * 3 = 6."
+
+
+def test_push_body_handles_entities_and_escaped_markers_as_literal_text() -> None:
+    body = _push_body(r"\*literal\* and &#42;&#42;encoded&#42;&#42;")
+
+    assert body == "*literal* and **encoded**"
+
+
+def test_push_body_preserves_markers_inside_code() -> None:
+    body = _push_body(
+        "`**literal**` and:\n```\n~~literal~~\n- [x] literal\n```\n\n    - [x] indented"
+    )
+
+    assert body == "**literal** and: ~~literal~~ - [x] literal - [x] indented"
+
+
+def test_push_body_preserves_escaped_and_encoded_strike_markers() -> None:
+    body = _push_body(r"\~\~literal\~\~ and &#126;&#126;encoded&#126;&#126;")
+
+    assert body == "~~literal~~ and ~~encoded~~"
+
+
+def test_push_body_strips_markdown_before_truncating() -> None:
+    body = _push_body(f"### Verdict\n**{'word ' * 149}word**")
+
+    assert body.startswith("Verdict word")
+    assert body.endswith("...")
+    assert len(body) == 500
+    assert "**" not in body
+
+
+def test_send_to_user_normalizes_title_and_body_to_plain_text() -> None:
+    captured: dict[str, object] = {}
+
+    class _Scalars:
+        def all(self) -> list[object]:
+            return [object()]
+
+    class _Result:
+        def scalars(self) -> _Scalars:
+            return _Scalars()
+
+        def scalar_one_or_none(self) -> None:
+            return None
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def execute(self, _statement: object) -> _Result:
+            return _Result()
+
+    service = WebPushService(
+        session_factory=_Session,  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=True,
+            public_key="public-key",
+            private_key="private-key",
+            subject="mailto:test@example.com",
+        ),
+    )
+
+    async def _send_one(_row: object, payload: str) -> str:
+        captured["payload"] = json.loads(payload)
+        return "sent"
+
+    service._send_one = _send_one  # type: ignore[method-assign]
+    asyncio.run(
+        service.send_to_user(
+            user_email="user@example.com",
+            title="**LaForge**",
+            body="## Result\n**Complete**",
+            url="/chat/conversation-a",
+            tag="conversation-a",
+            kind="message",
+        )
+    )
+
+    assert captured["payload"] == {
+        "title": "LaForge",
+        "body": "Result Complete",
+        "url": "/chat/conversation-a",
+        "tag": "conversation-a",
+        "kind": "message",
+    }
 
 
 def test_generated_vapid_key_uses_sec1_format(tmp_path: Path) -> None:
@@ -321,6 +466,9 @@ def test_send_to_user_serializes_completion_timestamp() -> None:
         def scalars(self) -> _Scalars:
             return _Scalars()
 
+        def scalar_one_or_none(self) -> None:
+            return None
+
     class _Session:
         async def __aenter__(self) -> _Session:
             return self
@@ -373,3 +521,62 @@ def test_send_to_user_serializes_completion_timestamp() -> None:
         "conversation_id": "conversation-a",
         "occurred_at": "2026-08-26T21:00:00+00:00",
     }
+
+
+def test_send_to_user_hides_content_when_user_disables_it() -> None:
+    captured: dict[str, object] = {}
+
+    class _Scalars:
+        def all(self) -> list[object]:
+            return [object()]
+
+    class _StateResult:
+        def scalar_one_or_none(self) -> object:
+            return SimpleNamespace(value={"notifications": {"include_content": False}})
+
+    class _SubscriptionsResult:
+        def scalars(self) -> _Scalars:
+            return _Scalars()
+
+    class _Session:
+        calls = 0
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def execute(self, _statement: object) -> object:
+            self.calls += 1
+            return _SubscriptionsResult() if self.calls == 1 else _StateResult()
+
+    service = WebPushService(
+        session_factory=_Session,  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=True,
+            public_key="public-key",
+            private_key="private-key",
+            subject="mailto:test@example.com",
+        ),
+    )
+
+    async def _send_one(_row: object, payload: str) -> str:
+        captured["payload"] = json.loads(payload)
+        return "sent"
+
+    service._send_one = _send_one  # type: ignore[method-assign]
+    asyncio.run(
+        service.send_to_user(
+            user_email="user@example.com",
+            title="Cognis",
+            body="Complete assistant reply",
+            fallback_body="New reply in this chat.",
+            url="/chat/conversation-a",
+            tag="conversation-a",
+            kind="message",
+        )
+    )
+
+    assert captured["payload"]["body"] == "New reply in this chat."  # type: ignore[index]

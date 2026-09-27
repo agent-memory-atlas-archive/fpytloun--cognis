@@ -12,6 +12,7 @@ into its native format (WS JSON, REST response, CLI output, etc.).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import uuid
@@ -56,6 +57,7 @@ _EXECUTION_PATH_CONTEXT_KEYS = frozenset({"workspace_root", "working_directory"}
 _EXACT_SYSTEM_SLASH_COMMANDS = frozenset(
     {
         "/compact",
+        "/recap",
         "/summarize",
         "/new",
         "/reset",
@@ -70,6 +72,7 @@ _EXACT_SYSTEM_SLASH_COMMANDS = frozenset(
         "/info",
         "/lsp",
         "/help",
+        "/yolo",
     }
 )
 _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
@@ -78,6 +81,7 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/model",
         "/thinking",
         "/fast",
+        "/yolo",
         "/profile",
         "/skill",
         "/executor",
@@ -198,6 +202,9 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
     _SlashCommandMetadata("/model", "List or switch LLM model", True, True),
     _SlashCommandMetadata("/thinking", "Set reasoning effort", True, True),
     _SlashCommandMetadata("/fast", "Enable or disable fast model mode", True, True),
+    _SlashCommandMetadata(
+        "/yolo", "DANGEROUS: allow evaluated denials in this chat; /yolo off to reset", True
+    ),
     _SlashCommandMetadata("/profile", "List or switch agent runtime profile", True, True),
     _SlashCommandMetadata("/skill", "List or load a skill into this session", True, True),
     _SlashCommandMetadata("/executor", "Show or switch active executor", True, True),
@@ -218,6 +225,7 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
         True,
     ),
     _SlashCommandMetadata("/compact", "Compact conversation"),
+    _SlashCommandMetadata("/recap", "Summarize work in this conversation"),
     _SlashCommandMetadata("/summarize", "Alias for /compact"),
     _SlashCommandMetadata("/fork", "Fork conversation; add text to start the fork", True),
     _SlashCommandMetadata("/task", "Create a background task", True),
@@ -338,6 +346,7 @@ class CommandDispatcher:
         pause_waiter: Any,
         notification_service: Any,
         turn_scheduler: Any | None = None,
+        recap_service: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._session_manager = session_manager
@@ -347,6 +356,7 @@ class CommandDispatcher:
         self._pause_waiter = pause_waiter
         self._notification_service = notification_service
         self._turn_scheduler = turn_scheduler
+        self._recap_service = recap_service
 
     @property
     def _task_queue(self) -> Any | None:
@@ -362,8 +372,17 @@ class CommandDispatcher:
         *,
         session: SessionModel | None = None,
     ) -> None:
-        if event_type == EventType.SESSION_COMPACTION_FINISHED:
-            persist_terminal = getattr(self._agent_loop(), "persist_compaction_terminal", None)
+        if event_type in {
+            EventType.SESSION_COMPACTION_STARTED,
+            EventType.SESSION_COMPACTION_FINISHED,
+        }:
+            persist_terminal = getattr(
+                self._agent_loop(),
+                "persist_compaction_lifecycle"
+                if event_type == EventType.SESSION_COMPACTION_STARTED
+                else "persist_compaction_terminal",
+                None,
+            )
             if callable(persist_terminal):
                 if session is None:
                     raise RuntimeError("Cannot persist terminal compaction event without a session")
@@ -382,6 +401,30 @@ class CommandDispatcher:
             return
         async with hold_session_lock(session_id):
             yield
+
+    @contextlib.asynccontextmanager
+    async def _hold_turn_admission_lock(self, conversation_id: str) -> AsyncIterator[None]:
+        """Serialize lifecycle commands with turn admission for one conversation."""
+
+        lock_getter = getattr(self._turn_scheduler, "turn_admission_lock", None)
+        if not callable(lock_getter):
+            yield
+            return
+        async with lock_getter(conversation_id):
+            yield
+
+    async def _has_busy_turn(self, conversation_id: str, *, fallback: bool) -> bool:
+        """Read authoritative turn ownership while holding the admission lock."""
+
+        if self._turn_scheduler is None:
+            return fallback
+        durable_running = getattr(self._turn_scheduler, "durable_running_turn_state", None)
+        if callable(durable_running) and await durable_running(conversation_id) is not None:
+            return True
+        has_active_turn = getattr(self._turn_scheduler, "has_active_turn", None)
+        if callable(has_active_turn):
+            return fallback or bool(has_active_turn(conversation_id))
+        return fallback
 
     async def _reload_runtime_if_available(
         self,
@@ -799,22 +842,51 @@ class CommandDispatcher:
         has_active_turn: bool = False,
         has_busy_turn: bool | None = None,
         runtime_plan: RuntimeSelectionPlan | None = None,
+        admission_lock_held: bool = False,
     ) -> CommandResult | None:
         """Dispatch a slash command. Returns None if not a command."""
         stripped = normalize_slash_command_message(command)
         if not stripped.startswith("/"):
             return None
         has_busy_turn = has_active_turn if has_busy_turn is None else has_busy_turn
+        if stripped == "/recap":
+            if self._recap_service is None:
+                return CommandResult(type="error", text="Recap is unavailable.")
+            if await self._has_busy_turn(conversation.conversation_id, fallback=has_busy_turn):
+                return CommandResult(type="error", text="Wait for the current turn to finish.")
+            text = await self._recap_service.generate(
+                conversation, session, agent_owner_email=agent.owner_email
+            )
+            return CommandResult(type="recap", text=text)
+        if stripped == "/yolo" or stripped.startswith("/yolo "):
+            option = stripped.removeprefix("/yolo").strip().lower()
+            if option not in {"", "on", "off"}:
+                return CommandResult(type="error", text="Usage: /yolo [on|off]")
+            if admission_lock_held:
+                return await self._handle_yolo(
+                    conversation, session, option, has_busy_turn=has_busy_turn
+                )
+            async with self._hold_turn_admission_lock(conversation.conversation_id):
+                return await self._handle_yolo(
+                    conversation, session, option, has_busy_turn=has_busy_turn
+                )
 
         # /compact or /summarize
         if stripped in ("/compact", "/summarize"):
-            if has_busy_turn:
-                return CommandResult(
-                    type="error",
-                    text="Cannot compact while a turn is active. Wait for it to finish or cancel it.",
-                    data={"code": "turn_active"},
-                )
-            return await self._handle_compact(conversation, session, agent, user_email)
+            # Keep the admission boundary held through summary publication and
+            # session rotation. A concurrent message then reloads the rotated
+            # session before launch instead of starting on the retired session.
+            async with self._hold_turn_admission_lock(conversation.conversation_id):
+                if await self._has_busy_turn(conversation.conversation_id, fallback=has_busy_turn):
+                    return CommandResult(
+                        type="error",
+                        text=(
+                            "Cannot compact while a turn is active. "
+                            "Wait for it to finish or cancel it."
+                        ),
+                        data={"code": "turn_active"},
+                    )
+                return await self._handle_compact(conversation, session, agent, user_email)
 
         # /new, /reset, /clear
         if stripped in ("/new", "/reset", "/clear"):
@@ -1111,6 +1183,7 @@ class CommandDispatcher:
                         "reason": "manual_request",
                         "compaction_id": compaction_id,
                     },
+                    session=session,
                 )
                 try:
                     model_context = await self._compaction_model_context(session, agent, user_email)
@@ -1120,6 +1193,25 @@ class CommandDispatcher:
                         trigger="manual",
                         model_context=model_context,
                     )
+                except asyncio.CancelledError:
+                    try:
+                        await self._publish_compaction_event(
+                            EventType.SESSION_COMPACTION_FINISHED,
+                            {
+                                "conversation_id": conversation_id,
+                                "session_id": session.session_id,
+                                "trigger": "manual",
+                                "status": "failed",
+                                "reason": "cancelled",
+                                "compaction_id": compaction_id,
+                            },
+                            session=session,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to record cancelled manual compaction", exc_info=True
+                        )
+                    raise
                 except Exception:
                     await self._publish_compaction_event(
                         EventType.SESSION_COMPACTION_FINISHED,
@@ -1655,6 +1747,48 @@ class CommandDispatcher:
         if command_name == "/implement":
             return "system:software-development"
         return None
+
+    async def _handle_yolo(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        option: str,
+        *,
+        has_busy_turn: bool,
+    ) -> CommandResult:
+        if await self._has_busy_turn(conversation.conversation_id, fallback=has_busy_turn):
+            return CommandResult(
+                type="error",
+                text="Cannot change outcome policy while a turn is active.",
+                data={"code": "turn_active"},
+            )
+        try:
+            await self._session_manager.set_conversation_yolo(
+                conversation, session, enabled=option != "off"
+            )
+        except Exception:
+            logger.exception(
+                "Could not synchronize Intaris outcome policy",
+                extra={"extra_data": {"conversation_id": conversation.conversation_id}},
+            )
+            return CommandResult(
+                type="error",
+                text="Outcome policy could not be synchronized with Intaris; no change was confirmed.",
+                data={"code": "outcome_policy_sync_failed"},
+            )
+        return self._mark_command_result(
+            CommandResult(
+                type="system_message",
+                text=(
+                    "DANGER: Yolo mode is active for this conversation. Intaris still evaluates "
+                    "and audits calls, but policy may allow denied calls. Use /yolo off to reset."
+                    if option != "off"
+                    else "Yolo mode is off for this conversation."
+                ),
+                data={"maximum_outcome_override": "approve" if option != "off" else None},
+            ),
+            "/yolo",
+        )
 
     async def _handle_chat_mode(
         self,
@@ -3470,7 +3604,8 @@ Available commands:
   /executor [id]     Show active executor + assigned pool, or switch active
   /model [name]      List available models or switch model
    /thinking [level]  Show or set reasoning effort
-   /fast [on|off]     Enable or disable fast model mode
+    /fast [on|off]     Enable or disable fast model mode
+   /yolo [on|off]     DANGEROUS: allow evaluated denials in this conversation
   /profile [id]      List or switch this agent's runtime profile
   /skill [name|id]   List available skills or load one for this session
   /context           Show context window usage

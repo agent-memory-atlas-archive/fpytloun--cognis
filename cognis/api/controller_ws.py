@@ -6,7 +6,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import json
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +13,7 @@ from typing import Any
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from cognis import __version__
+from cognis import json_codec as json
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.logging import get_logger
 from cognis.models.tool import ToolCall

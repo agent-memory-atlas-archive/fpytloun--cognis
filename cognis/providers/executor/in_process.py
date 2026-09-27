@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -13,6 +12,7 @@ from typing import Any, cast
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.executor.lsp_runtime import (
     LSPStatusReport,
     build_lsp_manager,

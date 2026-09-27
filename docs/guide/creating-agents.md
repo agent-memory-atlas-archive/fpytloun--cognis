@@ -52,6 +52,44 @@ For a first agent, keep personality instructions short and practical. Add more c
 - primary-agent inbound controller restrictions
 - managed-conversation depth
 
+### Intaris evaluation outcomes
+
+Agent settings can select a **minimum evaluation outcome** (`deny`, `escalate`, or
+`approve`) and a **maximum evaluation outcome** (`deny`, `escalate`, or `approve`).
+In this ordering, deny is the strictest outcome. The minimum selects a stricter
+result; the maximum can turn a denial into an escalation or approval. When both
+apply, the stricter minimum wins. These settings affect calls actually evaluated
+by Intaris, not tools explicitly denied or allowed by Cognis permissions. They
+require the Intaris guardrails backend.
+
+**Maximum allow is dangerous (yolo):** evaluated critical and denied calls may
+execute. Intaris retains the original result, risk, and policy override in its
+audit and analysis. It does not bypass disabled tools, plan-mode write
+restrictions, inactive sessions, or a failed Intaris evaluation.
+
+Use `/yolo` to enable maximum allow in the current conversation only;
+`/yolo off` restores the agent default. The setting survives Intaris session
+rotation, does not change other conversations or the agent default, and cannot
+change while a turn is active. Cognis confirms the Intaris policy update before
+acknowledging the command.
+The current conversation header and session details display an amber warning
+while either its conversation override or its agent default enables yolo mode.
+Unattended tasks never wait for escalation and deny calls that would otherwise
+need approval, even if the agent's maximum outcome permits them.
+
+### Escalation timeout
+
+Set **Escalation timeout (seconds)** in agent settings or via `manage_agents`
+`settings_update`. Empty inherits the global `session.escalation_timeout_seconds`
+setting (300 seconds by default). Tasks can override the agent via their
+creation/edit UI, API, or `create_task` and `update_task` tools. Valid overrides
+are whole seconds from 1 to 86400; setting a task override to `null` restores
+inheritance. Precedence is task, then agent, then global.
+
+The effective timeout is recorded when an escalation is created, so changing
+settings cannot extend an already pending approval. Expired escalations are
+denied; unattended tasks never wait for one.
+
 Agents combine curated tool assignment with runtime availability. The effective
 tool set is:
 

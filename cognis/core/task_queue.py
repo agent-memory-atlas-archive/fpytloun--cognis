@@ -330,6 +330,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         interaction_mode_override: str | None = None,
+        escalation_timeout_seconds: int | None = None,
         session_policy: SessionPolicy | dict[str, Any] | None = None,
         workflow_id: str | None = None,
         project_id: str | None = None,
@@ -393,6 +394,7 @@ class TaskQueue:
                 completion_mode_family=completion_delivery.completion_mode_family,
                 allow_silent_completion=completion_delivery.allow_silent_completion,
                 interaction_mode_override=interaction_mode_override,
+                escalation_timeout_seconds=escalation_timeout_seconds,
                 session_policy=(
                     session_policy.model_dump()
                     if isinstance(session_policy, SessionPolicy)
@@ -492,6 +494,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         interaction_mode_override: str | None = None,
+        escalation_timeout_seconds: int | None = None,
         session_policy: SessionPolicy | dict[str, Any] | None = None,
         workflow_id: str | None = None,
         project_id: str | None = None,
@@ -514,6 +517,7 @@ class TaskQueue:
             delivery=delivery,
             completion_delivery=completion_delivery,
             interaction_mode_override=interaction_mode_override,
+            escalation_timeout_seconds=escalation_timeout_seconds,
             session_policy=session_policy,
             workflow_id=workflow_id,
             project_id=project_id,
@@ -1932,6 +1936,7 @@ def _row_to_task_model(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
+        escalation_timeout_seconds=getattr(row, "escalation_timeout_seconds", None),
         session_policy=SessionPolicy.model_validate(getattr(row, "session_policy", None) or {}),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),

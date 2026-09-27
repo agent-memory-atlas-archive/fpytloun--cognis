@@ -332,6 +332,13 @@ class UserChatPreferences(BaseModel):
     group_tool_calls: bool = True
     keep_assistant_messages_separate: bool = False
     show_internal_tool_calls: bool = False
+    auto_recap: bool = False
+
+
+class UserNotificationPreferences(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    include_content: bool = True
 
 
 class UserPreferencesResponse(BaseModel):
@@ -339,6 +346,7 @@ class UserPreferencesResponse(BaseModel):
 
     display: UserDisplayPreferences = Field(default_factory=UserDisplayPreferences)
     chat: UserChatPreferences = Field(default_factory=UserChatPreferences)
+    notifications: UserNotificationPreferences = Field(default_factory=UserNotificationPreferences)
 
 
 class UserPreferencesUpdateRequest(UserPreferencesResponse):
@@ -966,6 +974,7 @@ class IntarisSessionDetailResponse(BaseModel):
     intention: str | None = None
     summary: str | None = None
     status: str
+    maximum_outcome: Literal["deny", "escalate", "approve"] | None = None
     total_calls: int
     approved_count: int
     denied_count: int
@@ -1432,6 +1441,7 @@ class TaskCreateRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+    escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     source_type: str = "api"
     source_ref: str | None = None
@@ -1473,6 +1483,7 @@ class TaskUpdateRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+    escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     session_policy: SessionPolicy | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
@@ -1694,6 +1705,7 @@ class TaskResponse(BaseModel):
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = None
+    escalation_timeout_seconds: int | None = None
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     workflow_id: str | None = None
     project_id: str | None = None

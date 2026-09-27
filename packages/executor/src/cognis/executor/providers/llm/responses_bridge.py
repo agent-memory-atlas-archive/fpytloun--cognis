@@ -8,7 +8,6 @@ expected by the rest of the controller.
 from __future__ import annotations
 
 import hashlib
-import json
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator
@@ -17,6 +16,7 @@ from typing import Any
 
 from prometheus_client import Counter
 
+from cognis import json_codec as json
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.config import ModelInfo

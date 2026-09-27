@@ -118,6 +118,53 @@ describe('RichDeliverable evidence interactions', () => {
     expect(within(sourcedMatrix as HTMLElement).getByRole('link', { name: /\[1\] Manufacturer specification/ })).toHaveAttribute('href', 'https://example.test/spec');
   });
 
+  it('renders and sorts labeled positional comparison rows without dropping cells', async () => {
+    const { container } = render(RichDeliverable, {
+      content: 'Fallback',
+      payload: {
+        blocks: [{
+          type: 'comparison_matrix',
+          columns: ['Severity', 'Component', 'Recommended action'],
+          rows: [
+            { label: 'Upgrade A', values: ['HIGH', 'ArgoCD', 'Stage upgrade'] },
+            { label: 'Upgrade B', values: ['MEDIUM', 'Harbor', 'Back up first'] },
+          ],
+        }],
+      },
+    });
+    const matrix = container.querySelector('[data-rich-block-type="comparison_matrix"]') as HTMLElement;
+    const cells = within(matrix).getAllByRole('cell');
+    expect(cells.map((cell) => cell.textContent)).toEqual([
+      'HIGH', 'ArgoCD', 'Stage upgrade', 'MEDIUM', 'Harbor', 'Back up first',
+    ]);
+    await fireEvent.click(within(matrix).getByRole('button', { name: 'Sort by Component' }));
+    expect(within(matrix).getAllByRole('row')[1]).toHaveTextContent('ArgoCD');
+  });
+
+  it('keeps section prose, card evidence and verdicts, and callout text from a workload report', () => {
+    const { container } = render(RichDeliverable, {
+      title: 'Workload review',
+      content: 'Fallback',
+      payload: { blocks: [
+        { type: 'section', heading: 'Deployed this run', body: 'Both upgrades are live and verified.' },
+        { type: 'claim_cards', title: 'Skipped before mutation', cards: [
+          { claim: 'Infra doc correction not applied', evidence: 'Historical records must remain unchanged.', verdict: 'Correctly deferred' },
+          { claim: 'Kernel dist-upgrade not performed', evidence: 'No established host-access path.', verdict: 'Blocked on tooling' },
+        ] },
+        { type: 'callout', variant: 'warning', text: 'Residual follow-ups require an approved window.' },
+      ] },
+    });
+    const section = container.querySelector('[data-rich-block-type="section"]') as HTMLElement;
+    expect(section).toHaveTextContent('Both upgrades are live and verified.');
+    const cards = container.querySelector('[data-rich-block-type="claim_cards"]') as HTMLElement;
+    expect(within(cards).getAllByRole('article')).toHaveLength(2);
+    expect(cards).toHaveTextContent('Historical records must remain unchanged.');
+    expect(cards).toHaveTextContent('Correctly deferred');
+    expect(cards).toHaveTextContent('No established host-access path.');
+    expect(within(cards).queryByLabelText('Confidence Unknown')).toBeNull();
+    expect(container.querySelector('[data-rich-block-type="callout"]')).toHaveTextContent('Residual follow-ups require an approved window.');
+  });
+
   it('renders source citations for a direct research answer', () => {
     render(RichDeliverable, {
       content: 'Fallback',

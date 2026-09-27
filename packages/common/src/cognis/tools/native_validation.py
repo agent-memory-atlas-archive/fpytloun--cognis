@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, cast
 
+from cognis import json_codec as json
 from cognis.models.tool import NativeToolOperation
 
 

@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import getpass
 import hashlib
-import json
 import logging
 import os
 import platform
@@ -23,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from websockets.exceptions import ConnectionClosed
 
+from cognis import json_codec as json
 from cognis.executor.component_registry import component_available, load_component
 from cognis.executor.inference_types import json_safe_inference_payload
 from cognis.executor.resources import ExecutorResourceCollector

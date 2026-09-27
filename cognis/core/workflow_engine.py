@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import hashlib
 import html
-import json
 import os
 import re
 import uuid
@@ -24,6 +23,7 @@ from typing import Any, Literal, cast
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.agent_loop import (
     CHAT_POLICY,
     CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
@@ -1562,6 +1562,7 @@ class WorkflowEngine:
                     template=step_def.condition.if_,
                     rendered=selected,
                 ),
+                "condition_expression": step_def.condition.if_,
                 "selected_branch": branch,
                 "selected_target": target_name,
                 "next_step_index": next_index,
@@ -1781,6 +1782,18 @@ class WorkflowEngine:
                 arguments=rendered_args,
                 execution_scope_id=step_run_id,
             )
+            await self._record_deterministic_tool_event(
+                ctx,
+                call_identity,
+                SessionEvent(
+                    type="tool_call",
+                    data={
+                        "call_id": call_identity,
+                        "name": config.tool,
+                        "arguments": runtime_info["render"].get("rendered", {}),
+                    },
+                ),
+            )
             with scoped_runtime_context(
                 user_email=task.created_by,
                 agent_id=agent.agent_id,
@@ -1792,6 +1805,8 @@ class WorkflowEngine:
             ):
                 dispatch = self._agent_loop.execute_controller_tool(ctx, tool_call)
                 result: ToolResult
+                # An interruption is not a durable tool result: read-only
+                # recovery can replay this call under the same identity.
                 if config.timeout_seconds is not None:
                     result = await asyncio.wait_for(dispatch, timeout=config.timeout_seconds)
                 else:
@@ -1805,6 +1820,23 @@ class WorkflowEngine:
                     ctx,
                     tool_call,
                     result,
+                )
+                await self._record_deterministic_tool_event(
+                    ctx,
+                    call_identity,
+                    SessionEvent(
+                        type="tool_result",
+                        data={
+                            "call_id": call_identity,
+                            "name": config.tool,
+                            "result": result.output,
+                            "is_error": result.is_error,
+                            "has_full_output": (result.metadata or {}).get(
+                                "has_full_output", False
+                            ),
+                            "recovery_call_id": (result.metadata or {}).get("recovery_call_id"),
+                        },
+                    ),
                 )
 
             result_context = self._deterministic_tool_result_context(
@@ -1889,6 +1921,24 @@ class WorkflowEngine:
             )
         finally:
             await runtime.cleanup()
+
+    async def _record_deterministic_tool_event(
+        self, ctx: StepContext, call_identity: str, event: SessionEvent
+    ) -> None:
+        """Record the step-owned audit event without redispatching the tool on retry."""
+        appended = await self._providers.guardrails.record_events(
+            session_id=ctx.session.intaris_session_id,
+            events=with_session_events_turn_id([event], call_identity),
+            source="cognis",
+            idempotency_key=f"{ctx.session.intaris_session_id}:{call_identity}:{event.type}",
+            user_email=ctx.conversation.user_email,
+            agent_id=ctx.agent.agent_id,
+            agent_owner_email=ctx.agent.owner_email,
+        )
+        if not appended.ok:
+            raise RuntimeError("Deterministic tool event could not be durably recorded.")
+        if self._session_cache is not None:
+            await self._session_cache.invalidate_canonical(ctx.session.session_id)
 
     async def _fail_deterministic_step(
         self,

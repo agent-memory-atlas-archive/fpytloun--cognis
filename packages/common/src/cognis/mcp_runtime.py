@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import mimetypes
 import os
 import re
@@ -24,6 +23,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from cognis import __version__ as COGNIS_VERSION
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.tool import (
     MCPServerConfig,

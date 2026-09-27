@@ -1221,6 +1221,10 @@ function itemTurnIdOf(item: TimelineItem): string | null {
 function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): TimelineItem {
   if (existing.kind !== incoming.kind) return incoming;
   const sort_key = existing.sort_key <= incoming.sort_key ? existing.sort_key : incoming.sort_key;
+  if (existing.kind === 'compaction' && incoming.kind === 'compaction') {
+    if (existing.status !== 'running' && incoming.status === 'running') return existing;
+    return { ...existing, ...incoming, sort_key };
+  }
   if (existing.kind === 'tool_call' && incoming.kind === 'tool_call') {
     const existingTerminal = isTerminalStatus(existing.status);
     const incomingTerminal = isTerminalStatus(incoming.status);
@@ -1281,6 +1285,7 @@ function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): Time
     if (existing.role !== incoming.role) {
       return incoming;
     }
+    if (existing.notice_resolved) return existing;
     if (existing.role === 'assistant' && existing.status === 'complete' && incoming.status === 'running') {
       return existing;
     }

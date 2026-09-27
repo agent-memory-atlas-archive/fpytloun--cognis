@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+from cognis import json_codec as json
 
 EVIDENCE_PROTOCOL = "mnemory.trusted-evidence.v1"
 EVIDENCE_PATH = "/api/evidence/remember/v1"

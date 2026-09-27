@@ -10,8 +10,7 @@ bundle Chromium.
 
 Homebrew is the recommended installation method for macOS. The public tap is
 available at [fpytloun/homebrew-tap](https://github.com/fpytloun/homebrew-tap).
-The `cognis-executor` formula will become installable after the first release
-publishes its immutable macOS assets and formula:
+The `cognis-executor` formula installs from published, immutable macOS assets:
 
 ```bash
 brew tap fpytloun/tap
@@ -20,8 +19,8 @@ cognis-executor configure
 brew services start cognis-executor
 ```
 
-Before that first formula release, use the public GitHub development path or
-the local immutable-asset flow below.
+For development, use the public GitHub checkout or the local immutable-asset
+flow below.
 
 ## Configure and operate
 
@@ -98,16 +97,16 @@ hardware for each architecture. Generate a development formula with explicit
 
 ```bash
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture arm64 --output "$PWD/cognis-executor-0.16.0-macos-arm64.tar.gz"
+  --architecture arm64 --output "$PWD/cognis-executor-0.17.0-macos-arm64.tar.gz"
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture x86_64 --output "$PWD/cognis-executor-0.16.0-macos-x86_64.tar.gz"
-arm_sha="$(shasum -a 256 cognis-executor-0.16.0-macos-arm64.tar.gz | awk '{print $1}')"
-intel_sha="$(shasum -a 256 cognis-executor-0.16.0-macos-x86_64.tar.gz | awk '{print $1}')"
+  --architecture x86_64 --output "$PWD/cognis-executor-0.17.0-macos-x86_64.tar.gz"
+arm_sha="$(shasum -a 256 cognis-executor-0.17.0-macos-arm64.tar.gz | awk '{print $1}')"
+intel_sha="$(shasum -a 256 cognis-executor-0.17.0-macos-x86_64.tar.gz | awk '{print $1}')"
 python3 packaging/homebrew/generate_formula.py --development \
-  --version 0.16.0 \
-  --arm64-url "file://$PWD/cognis-executor-0.16.0-macos-arm64.tar.gz" \
+  --version 0.17.0 \
+  --arm64-url "file://$PWD/cognis-executor-0.17.0-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-url "file://$PWD/cognis-executor-0.16.0-macos-x86_64.tar.gz" \
+  --x86-64-url "file://$PWD/cognis-executor-0.17.0-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source ./CognisExecutor.rb
@@ -119,10 +118,10 @@ public repository URL:
 ```bash
 python3 packaging/homebrew/generate_formula.py --development \
   --head-url https://github.com/fpytloun/cognis.git \
-  --version 0.16.0 \
-  --arm64-asset "$PWD/cognis-executor-0.16.0-macos-arm64.tar.gz" \
+  --version 0.17.0 \
+  --arm64-asset "$PWD/cognis-executor-0.17.0-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-asset "$PWD/cognis-executor-0.16.0-macos-x86_64.tar.gz" \
+  --x86-64-asset "$PWD/cognis-executor-0.17.0-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source --HEAD ./CognisExecutor.rb

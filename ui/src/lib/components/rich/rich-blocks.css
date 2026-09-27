@@ -169,6 +169,7 @@
   width: 100%;
   min-width: 0;
   max-width: 100%;
+  overflow-wrap: anywhere;
   /* Defensive baseline: any bare element without its own explicit color rule
      (e.g. a <strong> added to a block without a dedicated selector) should
      inherit the token system's text color rather than an arbitrary ambient
@@ -1174,7 +1175,7 @@
     animation-duration: 0.001ms !important;
     animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }

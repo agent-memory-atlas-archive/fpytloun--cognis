@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import uuid
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.channels.constants import (
     EXPLICIT_CHANNEL_DELIVERY_SOURCES,
     MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS,

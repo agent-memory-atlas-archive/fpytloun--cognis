@@ -200,6 +200,7 @@ class MessageTimelineItem(TimelineItemBase):
     notice_id: str | None = None
     notice_kind: str | None = None
     notice_scope: str | None = None
+    notice_resolved: bool = False
     retry_reason: str | None = None
     retry_source_turn_id: str | None = None
     reason_class: str | None = None
@@ -389,6 +390,29 @@ class FileDiffTimelineItem(TimelineItemBase):
     title: str | None = None
 
 
+class RecapArtifact(StrictModel):
+    """Artifact metadata carried by a persisted conversation recap."""
+
+    id: str
+    title: str
+    mime_type: str
+    size_bytes: int = Field(ge=0)
+
+
+class RecapTimelineItem(TimelineItemBase):
+    kind: Literal["recap"] = "recap"
+    text: str
+    source_session_id: str
+    source_seq: int = Field(ge=1)
+    auto: bool = False
+    stats_version: int = 1
+    file_diffs_omitted: bool = False
+    scope: Literal["legacy", "recent_window"] = "legacy"
+    deliverables: list[dict[str, str]] = Field(default_factory=list)
+    artifacts: list[RecapArtifact] = Field(default_factory=list)
+    files: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class NoticeTimelineItem(TimelineItemBase):
     kind: Literal["notice"] = "notice"
     level: Literal["info", "warning"]
@@ -438,6 +462,7 @@ TimelineItem = Annotated[
     | ArtifactTimelineItem
     | AssistantDeliverableTimelineItem
     | FileDiffTimelineItem
+    | RecapTimelineItem
     | NoticeTimelineItem
     | CompactionTimelineItem
     | ErrorTimelineItem,

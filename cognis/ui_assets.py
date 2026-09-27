@@ -10,7 +10,6 @@ Provides two mechanisms:
 
 from __future__ import annotations
 
-import json
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -19,6 +18,8 @@ from typing import Any
 
 from starlette.responses import FileResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+from cognis import json_codec as json
 
 STANDALONE_ASSET_URL_PREFIX = "/api/v1/deliverables/standalone-assets"
 _STANDALONE_ENTRY_KEY = "src/standalone.ts"

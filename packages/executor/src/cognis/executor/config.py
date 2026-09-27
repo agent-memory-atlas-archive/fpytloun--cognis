@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 import tempfile
@@ -14,6 +13,8 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
+
+from cognis import json_codec as json
 
 CONFIG_SCHEMA_VERSION = 1
 CONFIG_FILENAME = "config.json"

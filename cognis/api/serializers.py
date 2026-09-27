@@ -487,6 +487,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         completion_mode_family=task.completion_delivery.completion_mode_family,
         allow_silent_completion=task.completion_delivery.allow_silent_completion,
         interaction_mode_override=task.interaction_mode_override,
+        escalation_timeout_seconds=task.escalation_timeout_seconds,
         session_policy=task.session_policy,
         workflow_id=task.workflow_id,
         project_id=task.project_id,

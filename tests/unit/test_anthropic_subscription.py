@@ -30,8 +30,15 @@ def test_bundled_anthropic_model_catalog_includes_current_aliases() -> None:
     assert "claude-mythos-5" in ids
     assert "claude-opus-4-8" in ids
     assert "claude-opus-5" in ids
+    assert "claude-opus-5-5" in ids
     assert "claude-sonnet-5" in ids
     assert "claude-haiku-4-5" in ids
+    opus_5_5 = next(entry for entry in entries if entry["model_id"] == "claude-opus-5-5")
+    assert opus_5_5["context_window"] == 1_000_000
+    assert opus_5_5["max_input_tokens"] == 872_000
+    assert opus_5_5["max_output_tokens"] == 128_000
+    assert opus_5_5["input_cost_per_mtok"] == 4.0
+    assert opus_5_5["output_cost_per_mtok"] == 20.0
     assert all(entry["supports_strict_tools"] is True for entry in entries)
     assert all(entry["supports_pause_turn"] is True for entry in entries)
 

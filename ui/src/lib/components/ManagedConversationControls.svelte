@@ -55,7 +55,7 @@
       {/if}
       <Button size="sm" variant="secondary" disabled={busy !== null || conversationState === 'closed' || active} onclick={() => { instructionOpen = !instructionOpen; }}>Send instruction</Button>
       <Button size="sm" variant="secondary" disabled={busy !== null || conversationState === 'closed' || active} onclick={() => onSend('Continue')}>Continue</Button>
-      <Button size="sm" variant="secondary" disabled={busy !== null || conversationState === 'closed' || active} onclick={onTakeControl}>{busy === 'take-control' ? 'Forking…' : 'Take control'}</Button>
+      <Button size="sm" variant="secondary" disabled={busy !== null || active || Boolean(conversation.managed_agent?.follow_up_conversation_id)} onclick={onTakeControl}>{busy === 'take-control' ? 'Forking…' : 'Take control'}</Button>
     </div>
   </div>
   {#if active}<p class="mt-2 text-xs text-sky-100/70">Stop the current turn before sending an instruction or taking control.</p>{/if}

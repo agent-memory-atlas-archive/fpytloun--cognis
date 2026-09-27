@@ -4,6 +4,20 @@
 
 ### Implemented runtime completion boundaries
 
+Transient recovery notices belong to one wait occurrence, not the entire turn.
+The agent loop assigns a fresh notice ID for each model retry or Intaris wait.
+A model retry retires on the first non-error stream activity or stream exit;
+an Intaris wait retires on success, timeout, or cancellation. Retirement emits
+the same ID with `notice_resolved=true`. Runtime buffers retain this hidden
+tombstone until turn settlement so partial merges and reconnect hydration cannot
+resurrect it. A newer retry uses a different ID. Durable continuation and
+terminal error history is not removed. Retry timing and error metadata share
+the canonical/runtime projection contract.
+
+These notices are best-effort event-bus presentation effects, not Intaris writes
+or database transactions. Existing turn cancellation and execution fencing remain
+authoritative; no new lock, retry policy, or external operation is introduced.
+
 Tool admission ends the preceding assistant stream. The cumulative relay snapshot
 retains its text as complete until canonical synchronization replaces it.
 Canonical assistant phases supersede earlier runtime phases by message identity,
@@ -26,6 +40,31 @@ fence still invalidates the envelope. This ordering adds no database operation
 to the streaming path.
 
 ## Purpose
+
+### Durable compaction occurrences (projection v6)
+
+The compaction owner persists start before publishing runtime state, under the
+existing compaction lease and direct-turn fence. Intaris owns occurrence history;
+no Cognis metadata table duplicates it. Append retries use occurrence/status
+idempotency keys. Failed/skipped transitions retain the existing terminal append
+contract; successful rotation publishes the successor context seed under the
+same ID. Cancellation during summarization records a terminal failure before
+propagating cancellation; scheduler terminal errors reconcile unmatched starts
+when both are in the replay window. A later distinct started occurrence in the
+same source session also proves supersession of an unmatched earlier start,
+including idle checkpoints without a turn ID. Stale owners never write terminal
+state after losing their fence; replay derives that interrupted presentation.
+
+Runtime mid-turn cards use the active assistant phase; pre-turn cards retain
+their earlier ordering band. Canonical updates retain the first occurrence
+position and terminal state wins over delayed starts. The UI applies the same
+terminal precedence. Version v6 invalidates older cached projections.
+
+Legacy standalone pressure notices are read-compatible: suppress only those
+correlated with successful compaction in the projected window. Keep this reader
+while such persisted events remain supported; never rewrite their audit data.
+The change affects presentation and one durable lifecycle append, not projection
+budgets, compaction selection, session-rotation transactions, or tool execution.
 
 ### User admission identity
 

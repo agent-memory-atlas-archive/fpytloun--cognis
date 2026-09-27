@@ -24,7 +24,6 @@ import contextlib
 import hashlib
 import html
 import inspect
-import json
 import re
 import uuid
 from collections import OrderedDict, defaultdict, deque
@@ -41,6 +40,7 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.schemas import RuntimeAuthority, RuntimeLifecycle
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.audio.transcription import transcribe_audio_bytes
@@ -54,6 +54,7 @@ from cognis.core.attachment_utils import (
     normalize_attachment_refs,
     strip_attachment_payload_bytes,
 )
+from cognis.core.canonical_history import CanonicalHistoryUnavailable
 from cognis.core.chat_modes import (
     ChatMode,
     ResolvedChatMode,
@@ -195,6 +196,7 @@ from cognis.store.models import (
     FollowUpDedupeRow,
     FollowUpIntentRow,
     ManagedConversationLink,
+    NotificationRow,
 )
 from cognis.store.queries import get_setting_value
 
@@ -2450,13 +2452,16 @@ class TurnScheduler:
         retry_attempt: int,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
     ) -> None:
-        """Persist and broadcast the visible notice for a user-initiated retry turn."""
+        """Persist the canonical lineage notice before executing a retry turn."""
 
         reason = normalize_retry_reason(retry_reason)
         text = retry_notice_text(reason)
-        source_turn_id = retry_source_turn_id or turn_id
+        if not retry_source_turn_id:
+            raise CanonicalHistoryUnavailable("Retry turn has no source turn identity")
         attempt = max(1, retry_attempt)
-        notice_id = f"retry:{source_turn_id}:{turn_id}:{attempt}"
+        # Admission is one durable edge per retry execution. Controller attempts
+        # may change the visible reason, but must not append competing edges.
+        notice_id = f"retry:{turn_id}"
         data: dict[str, Any] = {
             "content": text,
             "text": text,
@@ -2470,50 +2475,34 @@ class TurnScheduler:
             "retry_reason": reason.value,
             "attempt": attempt,
         }
-        try:
-            event = SessionEvent(type="system_message", data=data)
-            session_id = session.session_id
-            intaris_session_id = getattr(session, "intaris_session_id", None) or session_id
-            idempotency_key = (
-                f"{intaris_session_id}:retry_turn:{source_turn_id}:{turn_id}:{attempt}"
-            )
-            append_result = await self._providers.guardrails.record_events(
-                session_id=intaris_session_id,
-                events=[event],
-                source="cognis",
-                idempotency_key=idempotency_key,
-                user_email=user_email,
-                agent_id=agent.agent_id,
-                agent_owner_email=getattr(agent, "owner_email", user_email),
-            )
-            if not append_result.ok:
-                raise RuntimeError("Intaris did not persist retry turn notice")
-            if append_result.count > 0:
-                await self._session_cache.append_recorded_events(session, [event], append_result)
-                await self._notify_observers_system_message(
-                    conversation_id,
-                    text,
-                    notice_id=notice_id,
-                    kind="model_recovery",
-                    scope="turn",
-                    turn_id=turn_id,
-                    retry_reason=reason.value,
-                    retry_source_turn_id=retry_source_turn_id,
-                    attempt=attempt,
-                    turn_observers=turn_observers,
-                )
-        except Exception:
-            logger.warning(
-                "turn_scheduler: failed to persist retry turn notice",
-                extra={
-                    "extra_data": {
-                        "conversation_id": conversation_id,
-                        "session_id": getattr(session, "session_id", None),
-                        "turn_id": turn_id,
-                        "retry_source_turn_id": retry_source_turn_id,
-                    }
-                },
-                exc_info=True,
+        event = SessionEvent(type="system_message", data=data)
+        session_id = session.session_id
+        intaris_session_id = getattr(session, "intaris_session_id", None) or session_id
+        idempotency_key = f"{intaris_session_id}:retry_turn:{turn_id}"
+        append_result = await self._providers.guardrails.record_events(
+            session_id=intaris_session_id,
+            events=[event],
+            source="cognis",
+            idempotency_key=idempotency_key,
+            user_email=user_email,
+            agent_id=agent.agent_id,
+            agent_owner_email=getattr(agent, "owner_email", user_email),
+        )
+        if not append_result.ok:
+            raise CanonicalHistoryUnavailable("Retry turn notice was not persisted")
+        if append_result.count > 0:
+            await self._session_cache.append_recorded_events(session, [event], append_result)
+            await self._notify_observers_system_message(
+                conversation_id,
+                text,
+                notice_id=notice_id,
+                kind="model_recovery",
+                scope="turn",
+                turn_id=turn_id,
+                retry_reason=reason.value,
+                retry_source_turn_id=retry_source_turn_id,
+                attempt=attempt,
+                turn_observers=turn_observers,
             )
 
     async def _persist_admitted_user_message(
@@ -3039,8 +3028,8 @@ class TurnScheduler:
 
         conversation, session, agent, bootstrap_wait_for_intention = runtime
         session.channel_default_agent_profile_id = channel_default_agent_profile_id
-        if _trusted_evidence_admission is None:
-            cognis_session_id = getattr(session, "session_id", None) or conversation_id
+        rebuild_trusted_evidence_admission = _trusted_evidence_admission is None
+        if rebuild_trusted_evidence_admission:
             effective_evidence_origin = admission_origin or fail_closed_evidence_origin()
             evidence_selected = is_evidence_enabled_for_owner(
                 enabled=getattr(
@@ -3073,59 +3062,64 @@ class TurnScheduler:
             if evidence_selected and evidence_eligible and callable(self._session_factory):
                 async with self._session_factory() as database_session:
                     evidence_admitted_at = (await database_now(database_session)).isoformat()
-            _trusted_evidence_admission = build_evidence_admission(
-                key=bytes(
-                    getattr(
-                        getattr(self, "_agent_loop", None),
-                        "trusted_evidence_admission_key",
-                        b"",
-                    )
-                ),
-                admitted=evidence_selected and evidence_eligible,
-                owner_id=getattr(agent, "owner_email", None),
-                policy_fingerprint=str(
-                    getattr(
-                        getattr(self, "_agent_loop", None),
-                        "trusted_evidence_policy_fingerprint",
-                        "",
-                    )
-                    or ""
-                ),
-                event_binding=build_evidence_event_binding(
-                    intaris_session_id=(
-                        getattr(session, "intaris_session_id", None) or cognis_session_id
+
+            def _build_current_evidence_admission() -> TrustedEvidenceAdmission:
+                current_session_id = getattr(session, "session_id", None) or conversation_id
+                return build_evidence_admission(
+                    key=bytes(
+                        getattr(
+                            getattr(self, "_agent_loop", None),
+                            "trusted_evidence_admission_key",
+                            b"",
+                        )
                     ),
-                    cognis_session_id=cognis_session_id,
-                    conversation_id=conversation.conversation_id,
-                    turn_id=admitted_turn_id,
-                    user_id=user_email,
-                    owner_id=getattr(agent, "owner_email", user_email),
-                    source="user_input",
-                    role="user",
-                    prompt_visibility="user_visible",
-                    prompt_provenance={"kind": effective_evidence_origin.prompt_provenance},
-                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    attachment_refs_value=attachment_refs_to_dicts(
-                        normalized_attachments,
-                        include_url=False,
+                    admitted=evidence_selected and evidence_eligible,
+                    owner_id=getattr(agent, "owner_email", None),
+                    policy_fingerprint=str(
+                        getattr(
+                            getattr(self, "_agent_loop", None),
+                            "trusted_evidence_policy_fingerprint",
+                            "",
+                        )
+                        or ""
                     ),
-                ),
-                admitted_at=evidence_admitted_at,
-                max_attempts=int(
-                    getattr(
-                        getattr(self, "_agent_loop", None),
-                        "trusted_evidence_max_attempts",
-                        8,
-                    )
-                ),
-                max_age_seconds=int(
-                    getattr(
-                        getattr(self, "_agent_loop", None),
-                        "trusted_evidence_max_age_seconds",
-                        3600,
-                    )
-                ),
-            )
+                    event_binding=build_evidence_event_binding(
+                        intaris_session_id=(
+                            getattr(session, "intaris_session_id", None) or current_session_id
+                        ),
+                        cognis_session_id=current_session_id,
+                        conversation_id=conversation.conversation_id,
+                        turn_id=admitted_turn_id,
+                        user_id=user_email,
+                        owner_id=getattr(agent, "owner_email", user_email),
+                        source="user_input",
+                        role="user",
+                        prompt_visibility="user_visible",
+                        prompt_provenance={"kind": effective_evidence_origin.prompt_provenance},
+                        content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                        attachment_refs_value=attachment_refs_to_dicts(
+                            normalized_attachments,
+                            include_url=False,
+                        ),
+                    ),
+                    admitted_at=evidence_admitted_at,
+                    max_attempts=int(
+                        getattr(
+                            getattr(self, "_agent_loop", None),
+                            "trusted_evidence_max_attempts",
+                            8,
+                        )
+                    ),
+                    max_age_seconds=int(
+                        getattr(
+                            getattr(self, "_agent_loop", None),
+                            "trusted_evidence_max_age_seconds",
+                            3600,
+                        )
+                    ),
+                )
+
+            _trusted_evidence_admission = _build_current_evidence_admission()
 
         async def _refresh_managed_runtime_for_admission() -> TurnError | None:
             nonlocal conversation, session, agent, bootstrap_wait_for_intention
@@ -3362,22 +3356,26 @@ class TurnScheduler:
             else:
                 self._escalation_notice_pause_ids.pop(conversation_id, None)
 
-            pending_questions = self._pause_waiter.list_pending(
-                conversation_id=conversation_id,
-                pause_type="step_question",
+            pending_questions = await self._reconcile_direct_pending_pauses(
+                self._pause_waiter.list_pending(
+                    conversation_id=conversation_id,
+                    pause_type="step_question",
+                )
             )
-            if any(pause.task_id is None for pause in pending_questions):
+            if pending_questions:
                 return TurnError(
                     code="pending_question",
                     message="Answer the pending question before sending a new message.",
                     recoverable=True,
                 )
             for pause_type in ("auth_challenge", "credential_request"):
-                pending_inputs = self._pause_waiter.list_pending(
-                    conversation_id=conversation_id,
-                    pause_type=pause_type,
+                pending_inputs = await self._reconcile_direct_pending_pauses(
+                    self._pause_waiter.list_pending(
+                        conversation_id=conversation_id,
+                        pause_type=pause_type,
+                    )
                 )
-                if any(pause.task_id is None for pause in pending_inputs):
+                if pending_inputs:
                     return TurnError(
                         code="pending_input_request",
                         message="Answer the pending input request before sending a new message.",
@@ -3440,6 +3438,10 @@ class TurnScheduler:
             }
             if admission_origin is not None:
                 metadata["evidence_origin"] = serialize_evidence_origin(admission_origin)
+            if _trusted_evidence_admission is None:
+                raise RuntimeError(
+                    "Trusted evidence admission must be resolved before turn admission"
+                )
             metadata[TRUSTED_EVIDENCE_ADMISSION_KEY] = serialize_evidence_admission(
                 _trusted_evidence_admission
             )
@@ -3447,51 +3449,83 @@ class TurnScheduler:
                 metadata["user_message_metadata"] = user_message_metadata
             if contextual_messages:
                 metadata["contextual_messages"] = contextual_messages
-            async with self._admission_drain_lock:
-                if not self._accepting_turns and not durable_replacement_admission:
+            async with self._turn_lock(conversation_id):
+                # Lifecycle commands such as /compact hold this boundary through
+                # session rotation. Reload after waiting so the durable request
+                # is always bound to the current session, never the retired one.
+                refreshed_runtime = await self._load_conversation_runtime(
+                    conversation_id,
+                    user_message=bootstrap_content,
+                )
+                if refreshed_runtime is None:
                     return TurnError(
-                        code="controller_draining",
-                        message="This controller is draining and cannot accept new turns.",
-                        recoverable=True,
-                        transient=True,
+                        code="not_found",
+                        message="Conversation not found",
+                        recoverable=False,
                     )
-                try:
-                    admission = await self._direct_turn_store.admit(
-                        conversation_id=conversation_id,
-                        session_id=getattr(session, "session_id", None),
-                        agent_id=agent.agent_id,
-                        user_id=user_email,
-                        idempotency_scope=scope,
-                        idempotency_key=stable_key,
-                        payload={
-                            "schema_version": 1,
-                            "content": content,
-                            "attachments": [
-                                item.model_dump(mode="json") for item in normalized_attachments
-                            ],
-                            "metadata": metadata,
-                            "channel_delivery": (
-                                channel_delivery.model_dump(mode="json")
-                                if channel_delivery is not None
-                                else None
-                            ),
-                            "retry_reason": (
-                                normalize_retry_reason(retry_reason).value if is_retry else None
-                            ),
-                        },
-                        request_id=durable_request_id or queued_message_id,
-                        turn_id=admitted_turn_id,
-                        admission_guard=durable_admission_guard,
-                        transaction_participant=admission_transaction_participant,
-                    )
-                except DirectTurnAdmissionRejected:
+                conversation, session, agent, bootstrap_wait_for_intention = refreshed_runtime
+                if conversation.status in {"archived", "deleted"}:
                     return TurnError(
-                        code="managed_admission_conflict",
-                        message="Managed conversation admission fence changed.",
-                        recoverable=True,
-                        transient=True,
-                        turn_id=admitted_turn_id,
+                        code="conflict",
+                        message="Conversation is not active",
+                        recoverable=False,
                     )
+                if session.status in BLOCKED_STATES:
+                    return TurnError(
+                        code="session_ended",
+                        message="This session has ended. Use /new to start a fresh conversation.",
+                        recoverable=False,
+                    )
+                if rebuild_trusted_evidence_admission:
+                    _trusted_evidence_admission = _build_current_evidence_admission()
+                    metadata[TRUSTED_EVIDENCE_ADMISSION_KEY] = serialize_evidence_admission(
+                        _trusted_evidence_admission
+                    )
+                async with self._admission_drain_lock:
+                    if not self._accepting_turns and not durable_replacement_admission:
+                        return TurnError(
+                            code="controller_draining",
+                            message="This controller is draining and cannot accept new turns.",
+                            recoverable=True,
+                            transient=True,
+                        )
+                    try:
+                        admission = await self._direct_turn_store.admit(
+                            conversation_id=conversation_id,
+                            session_id=getattr(session, "session_id", None),
+                            agent_id=agent.agent_id,
+                            user_id=user_email,
+                            idempotency_scope=scope,
+                            idempotency_key=stable_key,
+                            payload={
+                                "schema_version": 1,
+                                "content": content,
+                                "attachments": [
+                                    item.model_dump(mode="json") for item in normalized_attachments
+                                ],
+                                "metadata": metadata,
+                                "channel_delivery": (
+                                    channel_delivery.model_dump(mode="json")
+                                    if channel_delivery is not None
+                                    else None
+                                ),
+                                "retry_reason": (
+                                    normalize_retry_reason(retry_reason).value if is_retry else None
+                                ),
+                            },
+                            request_id=durable_request_id or queued_message_id,
+                            turn_id=admitted_turn_id,
+                            admission_guard=durable_admission_guard,
+                            transaction_participant=admission_transaction_participant,
+                        )
+                    except DirectTurnAdmissionRejected:
+                        return TurnError(
+                            code="managed_admission_conflict",
+                            message="Managed conversation admission fence changed.",
+                            recoverable=True,
+                            transient=True,
+                            turn_id=admitted_turn_id,
+                        )
             self._durable_turn_observers[admission.request.request_id] = tuple(turn_observers or ())
             if durable_admission_observer is not None:
                 try:
@@ -3532,7 +3566,7 @@ class TurnScheduler:
             return None
 
         if _durable_request_id is not None and self._turn_lock(conversation_id).locked():
-            raise LocalDirectTurnBusy(_durable_request_id)
+            raise LocalDirectTurnBusy(_durable_request_id, reason="conversation_lock")
         async with self._turn_lock(conversation_id):
             refresh_error = await _refresh_managed_runtime_for_admission()
             if refresh_error is not None:
@@ -3708,7 +3742,7 @@ class TurnScheduler:
                 if _durable_request_id is not None:
                     # Release the durable lease rather than renewing ownership
                     # indefinitely while another local lifecycle holds the lock.
-                    raise LocalDirectTurnBusy(_durable_request_id)
+                    raise LocalDirectTurnBusy(_durable_request_id, reason="session_lock")
                 await self._agent_loop.wait_for_session_unlock(session.session_id)
             refreshed_runtime = await self._load_conversation_runtime(
                 conversation_id,
@@ -3896,6 +3930,26 @@ class TurnScheduler:
                 )
                 return error
         return None
+
+    async def _reconcile_direct_pending_pauses(self, pauses: Sequence[Any]) -> list[Any]:
+        """Remove replica-local pauses already settled in durable notification state."""
+        direct_pauses = [pause for pause in pauses if pause.task_id is None]
+        if not direct_pauses:
+            return []
+
+        settled_pause_ids: set[str] = set()
+        async with self._session_factory() as session:
+            for pause in direct_pauses:
+                notification = await session.get(NotificationRow, pause.pause_id)
+                if notification is not None and notification.status not in {
+                    "pending",
+                    "resolving",
+                }:
+                    settled_pause_ids.add(pause.pause_id)
+
+        for pause_id in settled_pause_ids:
+            self._pause_waiter.discard_unwatched(pause_id)
+        return [pause for pause in direct_pauses if pause.pause_id not in settled_pause_ids]
 
     async def begin_drain(self) -> dict[str, int]:
         """Close admission while preserving already accepted queued turns."""
@@ -4791,7 +4845,9 @@ class TurnScheduler:
         if not isinstance(executor_id, str) or not isinstance(expected_instance, str):
             return "unconfirmed"
         async with self._session_factory() as db_session:
-            executor_row = await queries.get_executor_row(db_session, executor_id)
+            executor_row = await queries.get_executor_row(
+                db_session, executor_id, defer_observed_tools=True
+            )
         metadata = (
             executor_row.runtime_metadata
             if executor_row is not None and isinstance(executor_row.runtime_metadata, dict)
@@ -5018,11 +5074,8 @@ class TurnScheduler:
                 channel_account_id=metadata.get("channel_account_id"),
                 channel_delivery=payload.channel_delivery,
                 is_retry=bool(metadata.get("is_retry")) or recovered_after_user_append,
-                retry_source_turn_id=(
-                    row.turn_id
-                    if recovery_context is not None
-                    else metadata.get("retry_source_turn_id")
-                ),
+                retry_source_turn_id=metadata.get("retry_source_turn_id")
+                or (row.turn_id if recovery_context is not None else None),
                 retry_reason=(
                     retry_reason_from_interruption(interruption_reason)
                     if recovery_context is not None
@@ -5049,6 +5102,26 @@ class TurnScheduler:
             task = self._active_turns.get(row.conversation_id)
             if task is not None:
                 await asyncio.shield(task)
+        except asyncio.CancelledError:
+            from cognis.core.cancellation import join_owned_task
+
+            control = self._turn_controls.get(row.conversation_id)
+            task = self._active_turns.get(row.conversation_id)
+            if control is not None and control.turn_id == row.turn_id and task is not None:
+                control.cancel_event.set()
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await join_owned_task(task)
+                except Exception:
+                    # Cancellation is already the owner's terminal outcome.
+                    # A failed child finalizer must not turn Stop into a retry.
+                    logger.exception(
+                        "cancelled direct-turn child cleanup failed",
+                        extra={"extra_data": {"request_id": row.request_id}},
+                    )
+            raise
         finally:
             getattr(self, "_relay_generation_contexts", {}).pop(row.conversation_id, None)
             self._durable_request_by_conversation.pop(row.conversation_id, None)
@@ -5559,7 +5632,11 @@ class TurnScheduler:
                 else:
                     control.cancel_event.set()
                 active_task = self._active_turns.get(conversation_id)
-                if active_task is not None and not active_task.done():
+                if (
+                    active_task is not None
+                    and not active_task.done()
+                    and not active_task.cancelling()
+                ):
                     active_task.cancel()
             session_id = self._turn_sessions.get(conversation_id)
         cleared_queue = bool(queued_to_cancel)
@@ -6550,7 +6627,7 @@ class TurnScheduler:
             else:
                 control.cancel_event.set()
             active_task = self._active_turns.get(conversation_id)
-            if active_task is not None and not active_task.done():
+            if active_task is not None and not active_task.done() and not active_task.cancelling():
                 active_task.cancel()
             return True
 
@@ -9447,7 +9524,7 @@ class TurnScheduler:
             self._user_turn_counts[user_email] = self._user_turn_counts.get(user_email, 0) + 1
         task_holder: dict[str, asyncio.Task[None]] = {}
 
-        async def _runner() -> None:
+        async def _execute() -> None:
             owner_task = task_holder["task"]
             await self._run_turn(
                 conversation=conversation,
@@ -9491,9 +9568,36 @@ class TurnScheduler:
                 channel_delivery=channel_delivery,
             )
 
+        def _release_finished_owner(finished: asyncio.Task[None]) -> None:
+            # Persistence or cancellation can interrupt _run_turn's async
+            # finalizer. Local ownership must never outlive the actual task.
+            if self._active_turns.get(conversation_id) is not finished:
+                return
+            self._active_turns.pop(conversation_id, None)
+            if self._turn_controls.get(conversation_id) is control:
+                self._turn_controls.pop(conversation_id, None)
+                self._turn_sessions.pop(conversation_id, None)
+                self._boundary_action_generations.pop(conversation_id, None)
+                if not system_initiated:
+                    count = self._user_turn_counts.get(user_email, 1)
+                    if count <= 1:
+                        self._user_turn_counts.pop(user_email, None)
+                    else:
+                        self._user_turn_counts[user_email] = count - 1
+            if self._direct_turn_runtime is not None:
+                self._track_best_effort_task(asyncio.create_task(self._direct_turn_runtime.wake()))
+
+        async def _runner() -> None:
+            try:
+                await _execute()
+            finally:
+                _release_finished_owner(task_holder["task"])
+
         task = asyncio.create_task(_runner())
         task_holder["task"] = task
         self._active_turns[conversation_id] = task
+        # Also cover cancellation before the coroutine ever starts.
+        task.add_done_callback(_release_finished_owner)
 
     async def _run_turn(
         self,
@@ -9787,7 +9891,7 @@ class TurnScheduler:
                 )
             )
 
-            if is_retry and normalize_retry_reason(retry_reason) is RetryReason.MANUAL_RETRY:
+            if is_retry and retry_source_turn_id is not None:
                 await self._persist_retry_turn_notice(
                     conversation_id=conversation_id,
                     session=session,

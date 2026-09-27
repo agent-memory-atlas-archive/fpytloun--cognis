@@ -2845,7 +2845,7 @@ def _escalation_context_for_display(payload: dict[str, Any]) -> list[dict[str, s
         answers.append({"question": "Action", "answer": tool_name})
     arguments = payload.get("arguments_display")
     if isinstance(arguments, dict) and arguments:
-        import json
+        from cognis import json_codec as json
 
         answers.append(
             {

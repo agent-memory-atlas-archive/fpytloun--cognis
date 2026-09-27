@@ -14,12 +14,12 @@ semantic keyword fallback when all JSON extraction layers fail.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, cast
 
 from prometheus_client import Counter
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)

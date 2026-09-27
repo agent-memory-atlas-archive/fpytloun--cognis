@@ -76,6 +76,9 @@ export interface AgentFormState {
   memoryMode: string;
   memoryBackendOptions: Record<string, unknown>;
   guardrailsBackend: 'intaris' | 'none';
+  minimumOutcome: '' | 'deny' | 'escalate' | 'approve';
+  maximumOutcome: '' | 'deny' | 'escalate' | 'approve';
+  escalationTimeoutSeconds: string;
   agentProfiles: AgentRuntimeProfileFormState[];
   defaultAgentProfileId: string;
   availableWorkflowIds: string[];
@@ -312,6 +315,9 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     memoryMode: 'full_auto',
     memoryBackendOptions: {},
     guardrailsBackend: 'intaris',
+    minimumOutcome: '',
+    maximumOutcome: '',
+    escalationTimeoutSeconds: '',
     agentProfiles: [],
     defaultAgentProfileId: '',
     availableWorkflowIds: systemWorkflowIds,
@@ -428,6 +434,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     memoryBackendOptions: { ...(agent.capabilities?.memory_backend_options ?? {}) },
     guardrailsBackend:
       agent.capabilities?.guardrails_backend === 'none' ? 'none' : 'intaris',
+    minimumOutcome: agent.capabilities?.minimum_outcome ?? '',
+    maximumOutcome: agent.capabilities?.maximum_outcome ?? '',
+    escalationTimeoutSeconds: agent.capabilities?.escalation_timeout_seconds?.toString() ?? '',
     agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
     defaultAgentProfileId:
       typeof agent.default_agent_profile_id === 'string' ? agent.default_agent_profile_id : '',
@@ -713,7 +722,14 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
             ...form.memoryBackendOptions,
             ...(form.memoryMode ? { mode: form.memoryMode } : {})
           },
-      guardrails_backend: form.guardrailsBackend
+      guardrails_backend: form.guardrailsBackend,
+      ...(form.guardrailsBackend === 'intaris' && form.minimumOutcome
+        ? { minimum_outcome: form.minimumOutcome } : {}),
+      ...(form.guardrailsBackend === 'intaris' && form.maximumOutcome
+        ? { maximum_outcome: form.maximumOutcome } : {}),
+      ...(form.escalationTimeoutSeconds
+        ? { escalation_timeout_seconds: Number(form.escalationTimeoutSeconds) }
+        : {})
     },
     agent_profiles: agentProfiles,
     default_agent_profile_id: defaultAgentProfileId,

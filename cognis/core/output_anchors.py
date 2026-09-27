@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from cognis import json_codec as json
 
 AnchorFormat = Literal[
     "text",

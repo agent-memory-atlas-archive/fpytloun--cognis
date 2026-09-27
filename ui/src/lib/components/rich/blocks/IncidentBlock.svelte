@@ -6,8 +6,9 @@
   export let block: RichBlock;
   export let type = 'incident_timeline';
 
-  $: entries = objectList(block.items ?? block.entries ?? block.timeline ?? block.data);
-  $: checklist = objectList(block.checklist ?? block.remediation ?? block.actions);
+  $: isChecklist = type === 'checklist' || type === 'incident_checklist';
+  $: entries = objectList((isChecklist ? undefined : block.items) ?? block.entries ?? block.timeline ?? block.data);
+  $: checklist = objectList(block.checklist ?? block.remediation ?? block.actions ?? (isChecklist ? block.items : undefined));
 </script>
 
 <section class="rich-incident" data-rich-block-type={type}>
@@ -53,8 +54,8 @@
       <h5>{@html renderInlineMarkdown(String(block.checklist_title ?? 'Remediation checklist'))}</h5>
       {#each checklist as item, index}
         <label class:done={item.done === true || item.checked === true || item.status === 'done'}>
-          <input type="checkbox" checked={item.done === true || item.checked === true || item.status === 'done'} aria-label={stripMarkdown(String(item.title ?? item.label ?? `Checklist item ${index + 1}`))} />
-          <span>{@html renderInlineMarkdown(String(item.title ?? item.label ?? item.action ?? `Checklist item ${index + 1}`))}</span>
+          <input type="checkbox" checked={item.done === true || item.checked === true || item.status === 'done'} aria-label={stripMarkdown(String(item.title ?? item.label ?? item.action ?? item.text ?? `Checklist item ${index + 1}`))} />
+          <span>{@html renderInlineMarkdown(String(item.title ?? item.label ?? item.action ?? item.text ?? `Checklist item ${index + 1}`))}</span>
           {#if item.owner}<em>{@html renderInlineMarkdown(String(item.owner))}</em>{/if}
           {#if item.status}<strong>{@html renderInlineMarkdown(String(item.status))}</strong>{/if}
         </label>
@@ -139,7 +140,7 @@
 
   .rich-incident-timeline li {
     display: grid;
-    grid-template-columns: minmax(4rem, auto) 1fr;
+    grid-template-columns: 10rem minmax(0, 1fr);
     gap: 0.8rem;
     border: 1px solid var(--rich-line);
     border-radius: var(--rich-radius-sm);
@@ -149,6 +150,11 @@
   }
 
   .rich-incident-timeline li > span {
+    display: flex;
+    align-items: center;
+    align-self: start;
+    min-height: 44px;
+    overflow-wrap: anywhere;
     color: var(--rich-accent-soft);
     font-size: 0.8rem;
     font-weight: 850;
@@ -158,10 +164,22 @@
   .rich-incident-timeline summary {
     display: flex;
     align-items: center;
+    min-height: 44px;
     justify-content: space-between;
     gap: 0.75rem;
     cursor: pointer;
     color: var(--rich-text);
+  }
+
+  @media (max-width: 600px) {
+    .rich-incident-timeline li {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 0.3rem;
+    }
+
+    .rich-incident-timeline li > span {
+      min-height: 0;
+    }
   }
 
   .rich-incident-timeline summary em {

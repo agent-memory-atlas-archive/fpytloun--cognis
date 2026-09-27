@@ -10,6 +10,11 @@ Provider configuration is stored in the Cognis database. All provider settings a
 
 ## Supported presets
 
+To check publicly documented Claude and GPT model changes from a Cognis
+checkout without provider credentials, see the
+[model-support preflight](model-support-preflight.md). This is a repository
+maintenance check, not a test of account-specific model access.
+
 The UI includes guided forms for:
 
 - **OpenAI** for direct OpenAI API access

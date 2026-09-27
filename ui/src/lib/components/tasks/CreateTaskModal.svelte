@@ -42,6 +42,7 @@
       completion_mode_family: 'default' | 'direct';
       allow_silent_completion: boolean;
       interaction_mode_override: 'none' | 'explicit_gates' | 'step_requests' | null;
+      escalation_timeout_seconds: number | null;
       session_policy: ReturnType<typeof policyFromText>;
       status: string;
     }) => void;
@@ -73,6 +74,7 @@
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
+    escalation_timeout_seconds: '',
     allow_policy_text: '',
     deny_policy_text: ''
   });
@@ -95,6 +97,9 @@
       completion_mode_family: form.completion_mode_family,
       allow_silent_completion: form.allow_silent_completion,
       interaction_mode_override: form.interaction_mode_override || null,
+      escalation_timeout_seconds: form.escalation_timeout_seconds
+        ? Number(form.escalation_timeout_seconds)
+        : null,
       session_policy: policyFromText(form.allow_policy_text, form.deny_policy_text),
       status: 'draft'
     });
@@ -157,7 +162,6 @@
         <label for="task-title" class="text-xs font-medium uppercase tracking-widest text-slate-400">Title</label>
         <Input id="task-title" bind:value={form.title} placeholder="Task title" />
       </div>
-
       <div class="space-y-1">
         <label for="task-desc" class="text-xs font-medium uppercase tracking-widest text-slate-400">Description</label>
         <textarea
@@ -266,6 +270,21 @@
         </select>
         <p class="text-xs text-slate-500">Workflow default allows clarification in selected planning steps. Fully autonomous disables dynamic questions.</p>
       </div>
+
+      <label class="block space-y-1 text-sm text-slate-200" for="task-escalation-timeout">
+        <span>Escalation timeout (seconds)</span>
+        <input
+          id="task-escalation-timeout"
+          type="number"
+          min="1"
+          max="86400"
+          step="1"
+          bind:value={form.escalation_timeout_seconds}
+          placeholder="Inherit agent or global timeout"
+          class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+        />
+        <span class="block text-xs text-slate-500">Pending escalations are denied when this time elapses. Fully autonomous tasks deny immediately.</span>
+      </label>
 
       <SessionPolicyEditor
         bind:allowText={form.allow_policy_text}

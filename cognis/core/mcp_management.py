@@ -12,7 +12,7 @@ from sqlalchemy import delete, select, update
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.models.tool import MCP_SERVER_IDS_KEY, MCPServerConfig, effective_mcp_auth_config
 from cognis.ownership import is_shared_owner_email
-from cognis.store.models import ExecutorRow, MCPServerRow
+from cognis.store.models import ExecutorRow, MCPServerRow, executor_observed_tools_deferred
 from cognis.store.queries import (
     create_mcp_server,
     get_executor_row,
@@ -105,7 +105,13 @@ async def _owned_websocket_executor(
     deps: MCPManagementDependencies, owner: str, executor_id: str
 ) -> Any:
     async with deps.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=owner, include_shared=False)
+        row = await get_executor_row(
+            session,
+            executor_id,
+            owner_email=owner,
+            include_shared=False,
+            defer_observed_tools=True,
+        )
     if row is None or row.executor_type != "websocket" or is_shared_owner_email(row.owner_email):
         raise MCPManagementError("Owned WebSocket executor not found")
     return row
@@ -133,7 +139,10 @@ async def handle_mcp_management_action(
     if action == "executors_list":
         async with deps.session_factory() as session:
             executor_rows = await list_executors(
-                session, owner_email=actor_email, include_shared=False
+                session,
+                owner_email=actor_email,
+                include_shared=False,
+                defer_observed_tools=True,
             )
         return {
             "executors": [
@@ -291,7 +300,10 @@ async def handle_mcp_management_action(
             if locked_server is None:
                 raise MCPManagementError("MCP server not found")
             await session.execute(
-                select(ExecutorRow).where(ExecutorRow.owner_email == actor_email).with_for_update()
+                select(ExecutorRow)
+                .where(ExecutorRow.owner_email == actor_email)
+                .options(executor_observed_tools_deferred())
+                .with_for_update()
             )
             references = await mcp_server_referenced_by_executors(
                 session, server_id, owner_email=actor_email, include_shared=False
@@ -348,6 +360,7 @@ async def handle_mcp_management_action(
                         ExecutorRow.executor_id == executor_id,
                         ExecutorRow.owner_email == actor_email,
                     )
+                    .options(executor_observed_tools_deferred())
                     .with_for_update()
                 )
             ).scalar_one_or_none()

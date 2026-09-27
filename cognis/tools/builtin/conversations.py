@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import base64
-import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from cognis import json_codec as json
 from cognis.api.serializers import conversation_to_response, serialize_event_rows
 from cognis.core.agent_registry import AgentRegistry
 from cognis.core.artifact_inputs import safe_attachment_metadata

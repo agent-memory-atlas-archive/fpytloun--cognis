@@ -302,17 +302,50 @@ async def test_intaris_recovery_is_emitted_as_transient_system_notice(
     )
 
     assert streamed == []
-    event = loop.event_bus.publish.await_args.args[0]
+    assert loop.event_bus.publish.await_count == 2
+    event = loop.event_bus.publish.await_args_list[0].args[0]
     assert event.type == EventType.SYSTEM_NOTICE
     assert event.data == {
         "conversation_id": "conv-1",
         "session_id": "sess-1",
         "turn_id": "turn-1",
         "message": "Paused while Intaris recovers. Retrying for up to 5 seconds.",
-        "notice_id": "intaris-recovery:turn-1:intaris_append",
+        "notice_id": event.data["notice_id"],
         "kind": "intaris_recovery",
         "scope": "transient_retry",
     }
+    resolved = loop.event_bus.publish.await_args_list[1].args[0]
+    assert resolved.data["notice_id"] == event.data["notice_id"]
+    assert resolved.data["notice_resolved"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_intaris_wait_retires_notice_on_unsuccessful_exit(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    loop = object.__new__(AgentLoop)
+    health = AsyncMock(return_value=SimpleNamespace(status="unhealthy"))
+    if cancelled:
+        health.side_effect = [SimpleNamespace(status="unhealthy"), asyncio.CancelledError()]
+    loop.providers = SimpleNamespace(guardrails=SimpleNamespace(health=health))
+    loop.event_bus = SimpleNamespace(publish=AsyncMock())
+    monkeypatch.setattr(agent_loop_module, "_INTARIS_RETRY_POLL_SECONDS", 0.01)
+    with pytest.raises(asyncio.CancelledError if cancelled else TimeoutError):
+        await loop._wait_for_intaris_recovery(
+            SimpleNamespace(
+                cancel_event=None,
+                conversation=SimpleNamespace(conversation_id="conv-1"),
+                session=_SessionStub(session_id="sess-1"),
+                turn_id="turn-1",
+            ),
+            operation="intaris_append",
+            max_wait_seconds=1,
+        )
+    notices = [call.args[0].data for call in loop.event_bus.publish.await_args_list]
+    assert len(notices) == 2
+    assert notices[0]["notice_id"] == notices[1]["notice_id"]
+    assert notices[1]["notice_resolved"] is True
 
 
 @pytest.mark.asyncio
@@ -1701,6 +1734,59 @@ def test_stream_accumulator_collects_responses_usage_with_choices() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancel_during_handoff_cleanup_releases_session_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+    executing = asyncio.Event()
+    cleaning = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def execute(*args, **kwargs):
+        executing.set()
+        await asyncio.Future()
+
+    async def recover(*args):
+        cleaning.set()
+        await finish.wait()
+
+    monkeypatch.setattr(loop, "_execute_step", execute)
+    monkeypatch.setattr(loop, "_recover_pending_managed_join_handoffs", recover)
+    task = asyncio.create_task(loop.run_step(ctx))
+    await asyncio.wait_for(executing.wait(), 2)
+    task.cancel()
+    await asyncio.wait_for(cleaning.wait(), 2)
+    for _ in range(2):
+        task.cancel()
+        await asyncio.sleep(0)
+    assert not task.done()
+    assert loop.session_is_locked("sess-1")
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert not loop.session_is_locked("sess-1")
+    await asyncio.wait_for(loop.wait_for_session_unlock("sess-1"), 2)
+
+
+@pytest.mark.asyncio
 async def test_run_step_uses_configured_default_step_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2617,6 +2703,18 @@ async def test_pause_waiter_resolve_unknown() -> None:
     waiter = PauseWaiter()
     result = waiter.resolve("unknown", PauseResolution(decision="approve"))
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pause_waiter_does_not_discard_active_wait() -> None:
+    waiter = PauseWaiter()
+    waiter.register(PendingPause(pause_id="p-active", pause_type="step_question"))
+    wait_task = asyncio.create_task(waiter.wait("p-active", timeout=1))
+    await asyncio.sleep(0)
+
+    assert waiter.discard_unwatched("p-active") is False
+    assert waiter.resolve("p-active", PauseResolution(decision="continue")) is True
+    assert (await wait_task).decision == "continue"
 
 
 def test_pause_waiter_pending_count() -> None:
@@ -11178,14 +11276,14 @@ def test_post_turn_auto_compaction_runs_when_projection_pressure_unresolved() ->
     assert _should_run_post_turn_auto_compaction(ctx, context_result)
 
 
-def test_post_turn_auto_compaction_preserves_conservative_fallback_without_projection() -> None:
+def test_post_turn_auto_compaction_requires_projection_evidence() -> None:
     ctx = SimpleNamespace(
         policy=CHAT_POLICY,
         last_projection_exceeded_selected_budget=None,
     )
     context_result = SimpleNamespace(recommend_compaction=True)
 
-    assert _should_run_post_turn_auto_compaction(ctx, context_result)
+    assert not _should_run_post_turn_auto_compaction(ctx, context_result)
 
 
 def test_pre_turn_compaction_history_gate_skips_empty_history() -> None:
@@ -11226,8 +11324,10 @@ def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> 
 
 
 @pytest.mark.asyncio
-async def test_pre_turn_pressure_delegates_history_decision_to_compaction_strategy(
+@pytest.mark.parametrize("projected_tokens", [10000, 200000, 300000])
+async def test_auto_compaction_requires_actual_projected_hard_pressure(
     monkeypatch: pytest.MonkeyPatch,
+    projected_tokens: int,
 ) -> None:
     class _HardPressureAssembler:
         async def assemble(self, **_: object) -> SimpleNamespace:
@@ -11261,6 +11361,12 @@ async def test_pre_turn_pressure_delegates_history_decision_to_compaction_strate
             ]
 
     fake_llm = _RecordingSingleTextLLM()
+    monkeypatch.setattr(
+        fake_llm,
+        "count_messages_tokens",
+        lambda *_args, **_kwargs: projected_tokens,
+        raising=False,
+    )
     event_bus = _NoopEventBus()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -11303,15 +11409,19 @@ async def test_pre_turn_pressure_delegates_history_decision_to_compaction_strate
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
-    assert output.summary == "Done."
-    assert len(fake_llm.calls) == 1
-    assert auto_compact_saw_model_call[0] is False
-    assert auto_compact_skip_few_events[0] is True
-    assert any(
-        getattr(event, "type", None) == EventType.SYSTEM_NOTICE
-        and "Continuing with prompt projection" in str(event.data.get("message"))
-        for event in event_bus.events
-    )
+    if projected_tokens == 300000:
+        assert auto_compact_saw_model_call
+        assert not any(auto_compact_saw_model_call)
+        assert not fake_llm.calls
+    else:
+        assert output.summary == "Done."
+        assert len(fake_llm.calls) == 1
+        assert not auto_compact_saw_model_call
+        assert not any(
+            message.get("_context_pressure_reminder")
+            or "prioritize consolidating" in str(message.get("content", ""))
+            for message in fake_llm.calls[0]
+        )
 
 
 def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() -> None:
@@ -11399,7 +11509,17 @@ def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() ->
     assert projected.messages[4]["content"] == "new result"
 
 
-def test_projection_pressure_uses_projected_candidate_not_raw_transcript() -> None:
+@pytest.mark.parametrize(
+    ("model", "window", "input_limit", "expected_budget", "expected_steady"),
+    [
+        ("test-model", 100000, 100000, 96000, 84480),
+        ("gpt-6-astra", 400000, 272000, 250240, 220211),
+        ("claude-opus-5", 1000000, 872000, 839232, 320000),
+    ],
+)
+def test_projection_pressure_uses_projected_candidate_not_raw_transcript(
+    model: str, window: int, input_limit: int, expected_budget: int, expected_steady: int
+) -> None:
     loop = object.__new__(AgentLoop)
     loop.providers = SimpleNamespace(
         llm=SimpleNamespace(
@@ -11422,8 +11542,8 @@ def test_projection_pressure_uses_projected_candidate_not_raw_transcript() -> No
         pressure_mode="normal",
     )
     ctx = SimpleNamespace(
-        current_model="test-model",
-        current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
+        current_model=model,
+        current_model_info=SimpleNamespace(max_input_tokens=input_limit, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
         session=_SessionStub(session_id="sess-1"),
@@ -11441,13 +11561,17 @@ def test_projection_pressure_uses_projected_candidate_not_raw_transcript() -> No
         ctx,
         messages=messages,
         tool_schemas=[],
-        resolved_model="test-model",
-        max_context_tokens=100_000,
+        resolved_model=model,
+        max_context_tokens=window,
     )
 
     assert projected.mode == "normal"
     assert ctx.projection_state.pressure_mode == PressureMode.normal
     assert ctx.projection_state.skip_count == 1
+    assert projected.policy == ctx.projection_state.policy
+    assert projected.policy.available_prompt_tokens == projected.snapshot.available_prompt_tokens
+    assert projected.policy.available_prompt_tokens == expected_budget
+    assert projected.policy.steady_target_tokens == expected_steady
 
 
 def test_projection_critical_demotes_after_projected_estimate_under_band() -> None:
@@ -16057,6 +16181,9 @@ async def test_rate_limit_retry_notice_includes_countdown_metadata() -> None:
     assert retry_notice["attempt"] == 1
     assert retry_notice["max_attempts"] == 1
     assert retry_notice["recoverable"] is True
+    resolved = [notice for notice in notices if notice.get("notice_resolved")]
+    assert len(resolved) == 1
+    assert resolved[0]["notice_id"] == retry_notice["notice_id"]
 
 
 @pytest.mark.asyncio

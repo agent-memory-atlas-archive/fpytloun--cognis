@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis import json_codec as json
 from cognis.core.local_model_providers import (
     LocalModelProviderResolver,
     LocalModelProviderService,

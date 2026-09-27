@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Protocol, cast
+
+from cognis import json_codec as json
 
 if TYPE_CHECKING:
     from cognis.core.agent_profiles import ResolvedAgentProfile

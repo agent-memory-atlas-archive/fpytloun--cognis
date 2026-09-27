@@ -18,7 +18,7 @@ from cognis.core.executor_pool import (
     ExecutorPool,
     ResolvedExecutorTarget,
 )
-from cognis.models.agent import AgentRuntimeProfile
+from cognis.models.agent import AgentPermissions, AgentRuntimeProfile
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolSource
 from cognis.tools.introspection import (
@@ -69,7 +69,7 @@ def _ctx(
             agent_type="primary",
             owner_email="user@example.com",
             tools={},
-            permissions={},
+            permissions=AgentPermissions(),
             skills={},
         ),
         policy=SimpleNamespace(

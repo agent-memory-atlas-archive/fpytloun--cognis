@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+
+from cognis import json_codec as json
 
 MAX_EVENT_NOTIFICATION_ID_LENGTH = 512
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -18,6 +17,7 @@ from prometheus_client import Counter, Gauge, Histogram
 from sqlalchemy import select
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from cognis import json_codec as json
 from cognis.core.executor_connection_ownership import (
     EXECUTOR_CONNECTION_LEASE_TTL_SECONDS,
     ExecutorConnectionOwner,

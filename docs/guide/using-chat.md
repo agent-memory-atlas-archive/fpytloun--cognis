@@ -177,12 +177,29 @@ responds:
 
 ## Session management and compaction
 
+Between turns, Cognis projects older recoverable tool results toward the steady
+context target. The trigger and requested savings use the session's compatible
+provider/model token calibration, including tool-schema overhead. Within-turn
+burst and hard limits remain separate and unchanged. Protected instructions or
+unrecoverable evidence can prevent reaching the steady target; projection does
+not discard them merely to meet it.
+
+Automatic compaction follows model-facing projection, not an independent 85%
+threshold. A prompt above steady can continue if it fits the effective hard
+boundary. A zero-turn compaction attempt is reported as skipped.
+See [Context management](context-management.md) for the budgets, projection
+modes, evidence rules, and worked examples.
+
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
 
 Cognis stops execution if required history is unavailable or incomplete. A
 profile switch must retain the current turn and its recorded switch boundary.
 Cache invalidation must not silently turn an existing conversation into an
 empty prompt. Retry the turn after the event store is available again.
+
+Retry reuses your original saved instruction without adding a duplicate user
+message. Cognis verifies the saved retry link back to that instruction; if the
+link or original instruction is missing, it still stops rather than guessing.
 
 Forks read the complete source history and confirm all required writes before
 returning success. Interrupted copies are not usable as complete conversation
@@ -194,6 +211,24 @@ apply.
 Use `/compact` to compact the current conversation manually. Manual compaction
 runs immediately and rotates to the new active session before the next user
 message is recorded.
+
+Use `/recap` in a web or channel chat to add a brief recent-work recap. It uses
+up to 30 conversation messages combined: user messages (including updates
+sent mid-turn) and the last assistant reply per turn. An existing session
+compaction summary is used as background when available. Tool outputs are not
+included in the recap model's conversation input; they only provide
+deterministic activity counts and links.
+Deliverables, artifacts, and file changes cover the same recent window. Unlike
+compaction, a recap is a timeline card only: it does not enter the agent's
+context or rotate the session. Its work evidence opens existing detail views.
+In web chat, you can enable
+**Automatically recap web chats** in chat preferences. Automatic recaps run
+quietly after five idle minutes only when new activity since the last published
+recap contains completed, meaningful work. They are limited to one published
+recap per 30 minutes and do not run in tasks or channels or send notifications.
+Recently due recaps are recovered after controller restarts for up to two hours;
+older conversations are not backfilled, and enabling the preference does not
+recap conversations that were already idle.
 
 Long-lived ambient chats, such as web direct chats with an agent and external
 channel conversations, can also checkpoint after an idle gap. By default, if the

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from fnmatch import fnmatchcase
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -42,6 +42,17 @@ class AgentCapabilities(BaseModel):
     memory_backend: str = "mnemory"
     memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     guardrails_backend: str = "intaris"
+    minimum_outcome: Literal["deny", "escalate", "approve"] | None = None
+    maximum_outcome: Literal["deny", "escalate", "approve"] | None = None
+    escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_outcome_backend(self) -> AgentCapabilities:
+        if self.guardrails_backend == "none" and (
+            self.minimum_outcome is not None or self.maximum_outcome is not None
+        ):
+            raise ValueError("Evaluation outcome bounds require the Intaris guardrails backend")
+        return self
 
     @field_validator("memory_backend")
     @classmethod

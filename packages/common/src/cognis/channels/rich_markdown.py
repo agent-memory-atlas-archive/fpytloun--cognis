@@ -609,6 +609,8 @@ def _render_timeline(
                 continue
             marker = _scalar(item.get("time") or item.get("timestamp") or item.get("step"))
             title = _title(item) or f"Item {index}"
+            if block.get("type") == "steps":
+                title = re.sub(rf"^{index}[.)]\s+", "", title, count=1)
             description = _text(item.get("content") or item.get("description"))
             status = _scalar(item.get("status") or item.get("tone"))
             prefix = f"{marker} — " if marker else ""
@@ -672,14 +674,23 @@ def _render_incident(
     *,
     context: ProjectionContext,
 ) -> list[str]:
-    parts = _render_timeline(block, context=context)
-    checklist = block.get("checklist") or block.get("remediation") or block.get("actions")
+    is_checklist = block.get("type") in {"checklist", "incident_checklist"}
+    timeline_block = (
+        {key: value for key, value in block.items() if key != "items"} if is_checklist else block
+    )
+    parts = _render_timeline(timeline_block, context=context)
+    checklist = (
+        block.get("checklist")
+        or block.get("remediation")
+        or block.get("actions")
+        or (block.get("items") if is_checklist else None)
+    )
     if isinstance(checklist, list):
         values: list[str] = []
         for item in checklist:
             if not isinstance(item, dict):
                 continue
-            title = _title(item) or _text(item.get("action"))
+            title = _title(item) or _text(item.get("action")) or _text(item.get("text"))
             done = (
                 item.get("done") is True
                 or item.get("checked") is True
@@ -723,7 +734,22 @@ def _render_table(block: dict[str, Any], *, context: ProjectionContext) -> str:
     normalized_rows: list[list[str]] = []
     for row in rows:
         if isinstance(row, dict):
-            normalized_rows.append([_table_cell_text(row.get(key)) for key in keys])
+            positional_values = row.get("values")
+            normalized_rows.append(
+                [
+                    _table_cell_text(
+                        row.get(key)
+                        if key in row
+                        else (
+                            positional_values[index]
+                            if isinstance(positional_values, list)
+                            and index < len(positional_values)
+                            else None
+                        )
+                    )
+                    for index, key in enumerate(keys)
+                ]
+            )
         elif isinstance(row, list):
             normalized_rows.append([_table_cell_text(value) for value in row])
         else:
@@ -783,7 +809,9 @@ def _render_claims(
     context: ProjectionContext,
     depth: int,
 ) -> list[str]:
-    claims = _objects(block.get("claims") or block.get("items") or block.get("data"))
+    claims = _objects(
+        block.get("claims") or block.get("items") or block.get("cards") or block.get("data")
+    )
     parts: list[str] = []
     for index, claim in enumerate(claims, start=1):
         title = _text(claim.get("title") or claim.get("claim")) or f"Claim {index}"
@@ -795,6 +823,12 @@ def _render_claims(
             claim_parts.append(f"_{label}_")
         if summary:
             claim_parts.append(_markdown_or_plain(summary, context))
+        evidence_text = _text(claim.get("evidence"))
+        if evidence_text:
+            claim_parts.append(f"Evidence: {_markdown_or_plain(evidence_text, context)}")
+        verdict = _text(claim.get("verdict"))
+        if verdict:
+            claim_parts.append(f"Verdict: {verdict}")
         if confidence:
             claim_parts.append(f"Confidence: {confidence}")
         for evidence in _objects(claim.get("evidence") or claim.get("snippets")):

@@ -2133,6 +2133,9 @@ async def test_legacy_null_selector_source_resolves_and_canonicalizes_on_sqlite(
         ]
 
     class _ReadyWebSocket:
+        def get_ready_connection(self, executor_id: str) -> SimpleNamespace | None:
+            return self.get_connection(executor_id)
+
         def get_connection(self, executor_id: str) -> SimpleNamespace | None:
             return SimpleNamespace(connected=True) if executor_id == "ready-selector" else None
 
@@ -2216,6 +2219,9 @@ async def test_legacy_missing_selector_reconnect_preserves_pin_on_sqlite(
         return list(rows)
 
     class _ReadyWebSocket:
+        def get_ready_connection(self, executor_id: str) -> SimpleNamespace | None:
+            return self.get_connection(executor_id)
+
         def get_connection(self, executor_id: str) -> SimpleNamespace | None:
             return SimpleNamespace(connected=True) if executor_id in ready_ids else None
 

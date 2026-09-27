@@ -11,7 +11,6 @@ Required credentials:
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -21,6 +20,7 @@ import httpx
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
+from cognis import json_codec as json
 from cognis.channels.markdown_rendering import markdown_to_chat_text
 from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import GOOGLE_CHAT_META

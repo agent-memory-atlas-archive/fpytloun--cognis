@@ -1365,7 +1365,7 @@ def build_step_runtime_factory(
     onto the providers container.
     """
 
-    async def factory(
+    async def build_once(
         agent: AgentDefinition,
         user_email: str,
         *,
@@ -1452,59 +1452,19 @@ def build_step_runtime_factory(
                     exc_info=True,
                 )
 
-        try:
-            executor_config = await _resolve_eligible_executor_config(
-                providers,
-                executor_agent,
-                user_email,
-                policy,
-                conversation_active_executor_id=conversation_active_executor_id,
-                conversation_active_executor_expires_at=conversation_active_executor_expires_at,
-                conversation_active_executor_generation=conversation_active_executor_generation,
-                conversation_active_executor_unavailable_since=conversation_active_executor_unavailable_since,
-                conversation_active_executor_source=conversation_active_executor_source,
-                conversation_id=conversation_id,
-                task_id=task_id,
-            )
-        except TransientExecutorUnavailable as exc:
-            recovery_ws_provider = getattr(getattr(providers, "executor", None), "websocket", None)
-            if (
-                recovery_ws_provider is None
-                or session_factory is None
-                or not exc.executor_id
-                or not (conversation_id or task_id)
-            ):
-                raise
-            window = await begin_executor_recovery(
-                session_factory,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                executor_id=exc.executor_id,
-            )
-            connection = (
-                await recovery_ws_provider.wait_for_connection(
-                    exc.executor_id,
-                    timeout=window.remaining_seconds(),
-                    cancel_event=cancel_event,
-                    execution_fence=execution_fence,
-                )
-                if window.remaining_seconds() > 0
-                else None
-            )
-            if connection is None:
-                raise ExecutorRecoveryTimeout(window, phase="runtime_admission") from exc
-            return await factory(
-                agent,
-                user_email,
-                executor_agent=executor_agent,
-                access_context=access_context,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                cancel_event=cancel_event,
-                execution_fence=execution_fence,
-                _executor_pin_fallback_notice=_executor_pin_fallback_notice,
-                _executor_pin_fallback_retried=_executor_pin_fallback_retried,
-            )
+        executor_config = await _resolve_eligible_executor_config(
+            providers,
+            executor_agent,
+            user_email,
+            policy,
+            conversation_active_executor_id=conversation_active_executor_id,
+            conversation_active_executor_expires_at=conversation_active_executor_expires_at,
+            conversation_active_executor_generation=conversation_active_executor_generation,
+            conversation_active_executor_unavailable_since=conversation_active_executor_unavailable_since,
+            conversation_active_executor_source=conversation_active_executor_source,
+            conversation_id=conversation_id,
+            task_id=task_id,
+        )
         _executor_pin_fallback_notice = None
 
         # Stage 36: resolve the agent's full executor pool (primary + additional)
@@ -2025,6 +1985,49 @@ def build_step_runtime_factory(
                     selection_source=selection_source,
                     hard_bound=hard_bound_executor,
                 )
+            raise TransientExecutorUnavailable(
+                f"Selected executor '{executor_id}' is not connected or not ready",
+                executor_id=executor_id,
+            )
+
+        raise RuntimeError(f"Executor type '{resolved_type}' is not supported for agent execution")
+
+    async def factory(
+        agent: AgentDefinition, user_email: str, **kwargs: Any
+    ) -> ResolvedStepRuntime:
+        cancel_event = kwargs.get("cancel_event")
+        execution_fence = kwargs.get("execution_fence")
+        conversation_id = kwargs.get("conversation_id")
+        task_id = kwargs.get("task_id")
+        recovery_ws_provider = getattr(getattr(providers, "executor", None), "websocket", None)
+        loop = asyncio.get_running_loop()
+        recovery_deadline: float | None = None
+        window = None
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise asyncio.CancelledError
+            if execution_fence is not None:
+                await execution_fence.assert_current()
+            if (
+                window is not None
+                and recovery_deadline is not None
+                and loop.time() >= recovery_deadline
+            ):
+                raise ExecutorRecoveryTimeout(window, phase="runtime_admission")
+            try:
+                return await build_once(agent, user_email, **kwargs)
+            except TransientExecutorUnavailable as exc:
+                if (
+                    recovery_ws_provider is None
+                    or session_factory is None
+                    or not exc.executor_id
+                    or not (conversation_id or task_id)
+                ):
+                    raise
+                executor_id = exc.executor_id
+
+            # Leave the exception scope before waiting or retrying: its traceback
+            # owns decoded executor catalogs from the failed admission attempt.
             window = await begin_executor_recovery(
                 session_factory,
                 conversation_id=conversation_id,
@@ -2032,8 +2035,11 @@ def build_step_runtime_factory(
                 executor_id=executor_id,
             )
             remaining = window.remaining_seconds()
+            # Use the DB-authoritative remaining duration, then account for
+            # elapsed wait/backoff locally without assuming synchronized clocks.
+            recovery_deadline = loop.time() + remaining
             connection = (
-                await ws_provider.wait_for_connection(
+                await recovery_ws_provider.wait_for_connection(
                     executor_id,
                     timeout=remaining,
                     cancel_event=cancel_event,
@@ -2042,22 +2048,21 @@ def build_step_runtime_factory(
                 if remaining > 0
                 else None
             )
-            if connection is None:
+            remaining = recovery_deadline - loop.time()
+            if connection is None or remaining <= 0:
                 raise ExecutorRecoveryTimeout(window, phase="runtime_admission")
-            return await factory(
-                agent,
-                user_email,
-                executor_agent=executor_agent,
-                access_context=access_context,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                cancel_event=cancel_event,
-                execution_fence=execution_fence,
-                _executor_pin_fallback_notice=_executor_pin_fallback_notice,
-                _executor_pin_fallback_retried=_executor_pin_fallback_retried,
-            )
-
-        raise RuntimeError(f"Executor type '{resolved_type}' is not supported for agent execution")
+            # Transport readiness can precede DB/policy readiness. Avoid a hot
+            # retry loop while keeping cancellation and the durable deadline.
+            delay = min(0.1, remaining)
+            if cancel_event is None:
+                await asyncio.sleep(delay)
+            else:
+                try:
+                    await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                else:
+                    raise asyncio.CancelledError
 
     return factory
 

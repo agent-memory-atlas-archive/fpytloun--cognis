@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import json
 import os
 from contextlib import suppress
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from time import monotonic, perf_counter
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.tools.executor.lsp.types import (
     Diagnostic,

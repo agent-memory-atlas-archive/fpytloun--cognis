@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import os
 import random
 from datetime import UTC, datetime
@@ -15,6 +14,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.local_model_runtime import (
     LocalModelRuntimeManager,
     LocalModelRuntimeUnavailable,

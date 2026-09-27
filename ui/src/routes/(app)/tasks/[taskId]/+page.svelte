@@ -148,6 +148,7 @@ import Target from 'lucide-svelte/icons/target';
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
+    escalation_timeout_seconds: '',
     allow_policy_text: '',
     deny_policy_text: ''
   });
@@ -1450,6 +1451,7 @@ import Target from 'lucide-svelte/icons/target';
         completion_mode_family: task.completion_mode_family,
         allow_silent_completion: task.allow_silent_completion,
         interaction_mode_override: task.interaction_mode_override ?? '',
+        escalation_timeout_seconds: task.escalation_timeout_seconds?.toString() ?? '',
         allow_policy_text: policyText(task.session_policy, 'allow_policies'),
         deny_policy_text: policyText(task.session_policy, 'deny_policies')
       };
@@ -1558,6 +1560,9 @@ import Target from 'lucide-svelte/icons/target';
         completion_mode_family: editForm.completion_mode_family,
         allow_silent_completion: editForm.allow_silent_completion,
         interaction_mode_override: editForm.interaction_mode_override || null,
+        escalation_timeout_seconds: editForm.escalation_timeout_seconds
+          ? Number(editForm.escalation_timeout_seconds)
+          : null,
         session_policy: policyFromText(editForm.allow_policy_text, editForm.deny_policy_text)
       });
       task = await api.tasks.detail(updatedTask.task_id);
@@ -2865,6 +2870,21 @@ import Target from 'lucide-svelte/icons/target';
             <option value="none">Fully autonomous</option>
           </select>
           <span class="block text-xs text-slate-500">Fully autonomous disables dynamic clarification questions for this task.</span>
+        </label>
+
+        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <span>Escalation timeout (seconds)</span>
+          <input
+            type="number"
+            min="1"
+            max="86400"
+            step="1"
+            bind:value={editForm.escalation_timeout_seconds}
+            disabled={!isEditable}
+            placeholder="Inherit agent or global timeout"
+            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50"
+          />
+          <span class="block text-xs text-slate-500">Pending approvals are denied at this deadline. Empty inherits the agent or global timeout; fully autonomous tasks deny immediately.</span>
         </label>
 
         <div class="mt-4">

@@ -18,6 +18,10 @@ from cognis.models.session import EventAppendResult, SessionModel
 
 class _Cache:
     get_context_snapshot = SessionCache.get_context_snapshot
+    _context_snapshot = staticmethod(SessionCache._context_snapshot)
+
+    async def acquire_context_snapshot(self, session: SessionModel):
+        return self.get_context_snapshot(session.session_id)
 
     def __init__(self) -> None:
         self.entry = CachedSessionState(

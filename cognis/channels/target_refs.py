@@ -12,7 +12,6 @@ import base64
 import binascii
 import hashlib
 import hmac
-import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -22,6 +21,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from cognis import json_codec as json
 
 _AAD = b"cognis/channel-target-ref/v1"
 _CURSOR_AAD = b"cognis/channel-message-cursor/v1"

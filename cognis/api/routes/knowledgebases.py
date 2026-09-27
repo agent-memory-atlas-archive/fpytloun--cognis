@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Annotated, Any, Literal, NoReturn, cast
 from urllib.parse import quote
@@ -11,6 +10,7 @@ from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.responses import StreamingResponse
 
+from cognis import json_codec as json
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.knowledgebase.access import KnowledgebaseAccessContext
 from cognis.knowledgebase.service import (

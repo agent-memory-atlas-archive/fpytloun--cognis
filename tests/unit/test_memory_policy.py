@@ -194,16 +194,18 @@ def test_management_rejects_new_or_changed_unavailable_backend_configuration() -
         "guardrails_backend": "intaris",
     }
 
-    assert (
-        _validated_memory_capabilities(
-            current,
-            {
-                "memory_backend": "future-memory",
-                "memory_backend_options": {"future_option": True},
-            },
-        )
-        == current
-    )
+    assert _validated_memory_capabilities(
+        current,
+        {
+            "memory_backend": "future-memory",
+            "memory_backend_options": {"future_option": True},
+        },
+    ) == {
+        **current,
+        "minimum_outcome": None,
+        "maximum_outcome": None,
+        "escalation_timeout_seconds": None,
+    }
 
     with pytest.raises(AgentManagementError, match="Unknown memory_backend 'typo-memory'"):
         _validated_memory_capabilities(current, {"memory_backend": "typo-memory"})

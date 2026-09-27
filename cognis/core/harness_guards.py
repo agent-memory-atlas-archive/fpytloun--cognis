@@ -33,10 +33,11 @@ the ``reason`` codes; do not rename them lightly.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+from cognis import json_codec as json
 
 logger = logging.getLogger(__name__)
 

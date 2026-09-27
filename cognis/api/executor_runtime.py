@@ -7,6 +7,7 @@ import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis.core.cpu_offload import run_cpu_bound
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.logging import get_logger
@@ -242,7 +243,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
     async with lock:
         while True:
             async with app.state.session_factory() as session:
-                row = await get_executor_row(session, executor_id)
+                row = await get_executor_row(session, executor_id, defer_observed_tools=True)
             if row is None or row.executor_type != "websocket" or row.status != "active":
                 _logger.info(
                     "executor_runtime: skipping reconcile for %s (not found, not websocket, or inactive)",
@@ -290,16 +291,25 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 "active",
                 "degraded",
             }:
-                observed_tools = list(getattr(row, "observed_tools", None) or [])
                 runtime_metadata = getattr(row, "runtime_metadata", None) or {}
+                observed_tool_names = _cached_observed_tool_names(runtime_metadata)
+                if observed_tool_names is None:
+                    # Compatibility for rows written before capabilities were
+                    # persisted in runtime metadata. The next fast-path write
+                    # stores the compact names and avoids future catalog loads.
+                    async with app.state.session_factory() as session:
+                        legacy_row = await get_executor_row(session, executor_id)
+                    observed_tool_names = [
+                        str(tool.get("name", ""))
+                        for tool in list(getattr(legacy_row, "observed_tools", None) or [])
+                        if tool.get("name")
+                    ]
                 local_inference_enabled = _fast_path_local_inference_enabled(
                     row,
                     runtime_metadata,
                 )
                 capabilities = ExecutorCapabilities(
-                    tools=[
-                        str(tool.get("name", "")) for tool in observed_tools if tool.get("name")
-                    ],
+                    tools=observed_tool_names,
                     inference=local_inference_enabled,
                     local_inference=local_inference_enabled,
                     inference_models=[],
@@ -320,7 +330,6 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                         connection=current_conn,
                         runtime_state=str(getattr(row, "runtime_state", "active")),
                         applied_config_version=applied_version,
-                        observed_tools=observed_tools,
                         runtime_metadata=runtime_metadata,
                     )
                     if persisted is None:
@@ -413,7 +422,6 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     connection=current_conn,
                     runtime_state="blocked",
                     applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
-                    observed_tools=list(getattr(row, "observed_tools", None) or []),
                     runtime_metadata=runtime_metadata,
                 )
                 return False
@@ -519,7 +527,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
             )
 
             async with app.state.session_factory() as session:
-                refreshed = await get_executor_row(session, executor_id)
+                refreshed = await get_executor_row(session, executor_id, defer_observed_tools=True)
             if refreshed is None:
                 return False
             if int(getattr(refreshed, "desired_config_version", 0) or 0) > applied_version:
@@ -545,7 +553,7 @@ async def _persist_runtime_state(
     connection: Any | None = None,
     runtime_state: str,
     applied_config_version: int,
-    observed_tools: list[dict[str, Any]],
+    observed_tools: list[dict[str, Any]] | None = None,
     runtime_metadata: dict[str, Any],
 ) -> Any | None:
     async with app.state.session_factory() as session:
@@ -579,9 +587,7 @@ async def _persist_runtime_state(
     if queue is None or row is None or not observed_tools:
         return row
     try:
-        tool_defs = [
-            ToolDefinition.model_validate(item) for item in observed_tools if isinstance(item, dict)
-        ]
+        tool_defs = await run_cpu_bound(_validate_observed_tools, observed_tools)
         await queue.enqueue_tools(tool_defs, owner_email=getattr(row, "owner_email", None))
     except Exception:
         _logger.warning(
@@ -592,6 +598,12 @@ async def _persist_runtime_state(
             exc_info=True,
         )
     return row
+
+
+def _validate_observed_tools(observed_tools: list[dict[str, Any]]) -> list[ToolDefinition]:
+    return [
+        ToolDefinition.model_validate(item) for item in observed_tools if isinstance(item, dict)
+    ]
 
 
 async def persist_executor_resource_snapshot(
@@ -840,7 +852,6 @@ async def _mark_reconcile_unavailable(app: Any, row: Any) -> None:
         row.executor_id,
         runtime_state="stale",
         applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
-        observed_tools=list(getattr(row, "observed_tools", None) or []),
         runtime_metadata=runtime_metadata,
     )
 
@@ -865,7 +876,6 @@ async def _mark_reconcile_failed(app: Any, executor_id: str, exc: Exception) -> 
         executor_id,
         runtime_state="blocked",
         applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
-        observed_tools=list(getattr(row, "observed_tools", None) or []),
         runtime_metadata=runtime_metadata,
     )
 
@@ -924,7 +934,6 @@ async def _persist_mcp_credential_revision(
         connection=connection,
         runtime_state=str(getattr(row, "runtime_state", "active") or "active"),
         applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
-        observed_tools=list(getattr(row, "observed_tools", None) or []),
         runtime_metadata=runtime_metadata,
     )
 
@@ -1312,6 +1321,16 @@ def _ollama_runtime_capability(value: Any) -> OllamaRuntimeCapability | None:
         return OllamaRuntimeCapability.model_validate(value)
     except Exception:
         return None
+
+
+def _cached_observed_tool_names(runtime_metadata: dict[str, Any]) -> list[str] | None:
+    capabilities = runtime_metadata.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    tools = capabilities.get("tools")
+    if not isinstance(tools, list) or any(not isinstance(item, str) for item in tools):
+        return None
+    return list(tools)
 
 
 def _fast_path_local_inference_enabled(

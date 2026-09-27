@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.tools.executor.browser.assets import load_asset
 from cognis.tools.executor.browser.install import (

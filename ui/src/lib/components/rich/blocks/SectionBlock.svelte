@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { renderInlineMarkdown } from '$lib/markdown';
+  import { renderInlineMarkdown, renderMarkdown } from '$lib/markdown';
   import { blockChildren, blockText, blockTitle, type RichBlock, type RichMediaUrlFor } from '$lib/rich-deliverable';
   import RichBlockList from '../RichBlockList.svelte';
 
@@ -9,6 +9,7 @@
   export let mediaUrlFor: RichMediaUrlFor = () => '';
 
   $: children = blockChildren(block);
+  $: body = blockText(block, 'content') || blockText(block, 'body') || blockText(block, 'text');
 </script>
 
 <section class="rich-panel" data-rich-block-type={type}>
@@ -19,5 +20,6 @@
       {#if blockText(block, 'subtitle')}<p>{@html renderInlineMarkdown(blockText(block, 'subtitle'))}</p>{/if}
     </header>
   {/if}
+  {#if body}<div class="rich-markdown">{@html renderMarkdown(body)}</div>{/if}
   <div class="rich-stack"><RichBlockList blocks={children} {sources} {mediaUrlFor} /></div>
 </section>

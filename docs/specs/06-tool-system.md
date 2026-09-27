@@ -104,6 +104,19 @@ execution policy or mutation classification.
 
 `describe_tool` resolves callable names or stable tool IDs only inside the
 current session's effective authorization-filtered inventory.
+For single-operation tools, omit `operation`. If a caller supplies a different
+operation name, description returns the sole authoritative operation and
+explicit `requested_operation` / `resolved_operation` correction metadata.
+This is read-only schema recovery, not an execution alias. Multi-operation
+tools still require an exact operation name, or omission for the full descriptor.
+
+`call_tool` requires a `tool` identifier and an `arguments` object. The envelope
+is validated against its canonical schema before target resolution; malformed
+envelopes return `invalid_tool_arguments` with correction guidance, not
+`tool_not_available`. Extra top-level target parameters are rejected rather
+than silently discarded. Target authorization and normal execution validation
+remain unchanged.
+
 `validate_tool_call` preflights proposed arguments against the same schema and
 registered domain validators without execution. Normal controller and executor
 execution uses the same contracts. Remote execution also compares controller

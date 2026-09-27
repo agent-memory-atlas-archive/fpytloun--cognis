@@ -26,6 +26,7 @@
   let {
     detail,
     sessionId = detail.session_id ?? detail.intaris_session_id,
+    yoloMode = false,
     contextUsage = detail.context_usage,
     tokenUsage = detail.token_usage ?? detail.context_usage?.last_llm_usage,
     performance = detail.last_generation,
@@ -45,6 +46,7 @@
   } = $props<{
     detail: SessionDetailsData;
     sessionId?: string;
+    yoloMode?: boolean;
     contextUsage?: ContextUsage | null;
     tokenUsage?: TokenUsage | null;
     performance?: GenerationPerformanceSnapshot | null;
@@ -200,6 +202,16 @@
       {/if}
     </div>
   </div>
+  {#if yoloMode}
+    <div
+      role="alert"
+      data-testid="session-details-yolo-warning"
+      class="mt-3 rounded-xl border border-amber-500/70 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
+    >
+      <strong class="font-bold uppercase tracking-wide">Yolo mode active</strong>
+      <p class="mt-1">Dangerous: Intaris still evaluates and audits calls, but policy may allow evaluated denials. Task restrictions still apply.</p>
+    </div>
+  {/if}
   {#if detail.summary || detail.intention}
     {@const narrative = detail.summary ?? detail.intention ?? ''}
     <details class="group mt-3" data-testid="session-narrative">

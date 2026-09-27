@@ -7,13 +7,13 @@ request is about to cross the HTTP boundary.
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from cognis import json_codec as json
 from cognis.providers.llm.anthropic.contracts import (
     CLAUDE_CODE_VERSION,
     AnthropicAuthPolicy,

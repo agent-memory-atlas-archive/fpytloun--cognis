@@ -71,6 +71,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/security-and-privacy.md': '/docs/security-and-privacy',
   'docs/guide/settings.md': '/docs/settings',
   'docs/guide/using-chat.md': '/docs/using-chat',
+  'docs/guide/context-management.md': '/docs/context-management',
   'docs/guide/projects.md': '/docs/projects',
   'docs/guide/managing-tasks.md': '/docs/managing-tasks',
   'docs/guide/schedules.md': '/docs/schedules',
@@ -93,6 +94,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
 const GITHUB_REPO_URL = 'https://github.com/fpytloun/cognis';
 const DOC_REPO_URLS = new Set([
   'compose.local.yml',
+  'docs/guide/model-support-preflight.md',
   'deploy/helm/cognis',
   'deploy/systemd',
   'deploy/systemd/README.md'

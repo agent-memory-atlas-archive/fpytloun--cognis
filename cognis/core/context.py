@@ -6,7 +6,7 @@ import asyncio
 import copy
 import datetime
 import html
-import json
+import math
 import re
 from hashlib import sha256
 from pathlib import Path
@@ -17,6 +17,7 @@ from prometheus_client import Counter
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.agent_profiles import (
     agent_switch_eligible_profiles,
     render_agent_profile_context,
@@ -38,6 +39,7 @@ from cognis.core.context_budget import (
     resolve_context_budget,
 )
 from cognis.core.context_projection import (
+    PressureMode,
     ProjectionPolicy,
     ProjectionResult,
     build_compacted_tool_result_placeholder,
@@ -1361,7 +1363,7 @@ class ContextAssembler:
 
         # Capture history and prefix together before any further provider await.
         # A successful refresh is not a lease on the mutable cache.
-        context_snapshot = self.session_cache.get_context_snapshot(session.session_id)
+        context_snapshot = await self.session_cache.acquire_context_snapshot(session)
         context_snapshot.require_turn(
             required_turn_id,
             user_event=require_user_event,
@@ -1884,6 +1886,9 @@ class ContextAssembler:
             self._finalize_assembled_messages,
             messages=messages,
             resolved_model=resolved_model,
+            calibration_ratio=self._projection_calibration_ratio(
+                session.session_id, resolved_model, provider_id
+            ),
             max_context_tokens=max_context_tokens,
             available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
@@ -2067,7 +2072,7 @@ class ContextAssembler:
             allow_empty_memory=True,
             memory_policy=memory_policy,
         )
-        context_snapshot = self.session_cache.get_context_snapshot(session.session_id)
+        context_snapshot = await self.session_cache.acquire_context_snapshot(session)
         context_snapshot.require_turn(
             required_turn_id,
             user_event=require_user_event,
@@ -2376,6 +2381,9 @@ class ContextAssembler:
             self._finalize_assembled_messages,
             messages=messages,
             resolved_model=resolved_model,
+            calibration_ratio=self._projection_calibration_ratio(
+                session.session_id, resolved_model, provider_id
+            ),
             max_context_tokens=max_context_tokens,
             available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
@@ -3296,6 +3304,24 @@ class ContextAssembler:
             )
         return immutable_prefix, system_prompt_tokens, tool_schema_tokens
 
+    def _projection_calibration_ratio(
+        self, session_id: str, model: str, provider_id: str | None
+    ) -> float:
+        """Capture compatible calibration on the event loop before CPU offload."""
+        apply_calibration = getattr(self.session_cache, "apply_prompt_token_calibration", None)
+        if not callable(apply_calibration):
+            return 1.0
+        identity_fn = getattr(self.llm, "token_estimator_identity", None)
+        identity = str(identity_fn(model)) if callable(identity_fn) else "unknown:v1"
+        _, calibration = apply_calibration(
+            session_id,
+            raw_prompt_tokens=1,
+            provider_id=provider_id,
+            model=model,
+            estimator_identity=identity,
+        )
+        return float(calibration["applied_ratio"]) if calibration is not None else 1.0
+
     def _finalize_assembled_messages(
         self,
         *,
@@ -3305,6 +3331,7 @@ class ContextAssembler:
         available_prompt_tokens: int,
         max_prompt_tokens: int,
         tool_schema_tokens: int,
+        calibration_ratio: float = 1.0,
     ) -> tuple[
         list[dict[str, Any]],
         ProjectionResult,
@@ -3326,6 +3353,7 @@ class ContextAssembler:
             available_prompt_tokens=available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
+            calibration_ratio=calibration_ratio,
         )
         projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
 
@@ -3347,6 +3375,7 @@ class ContextAssembler:
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
+        prompt_tokens = math.ceil(prompt_tokens * calibration_ratio)
         return (
             messages,
             projection,
@@ -3365,6 +3394,7 @@ class ContextAssembler:
         available_prompt_tokens: int,
         max_prompt_tokens: int,
         tool_schema_tokens: int,
+        calibration_ratio: float = 1.0,
     ) -> tuple[list[dict[str, Any]], ProjectionResult]:
         """Project only enough history to return to the steady prompt target."""
 
@@ -3377,19 +3407,42 @@ class ContextAssembler:
         raw_prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
-        if raw_prompt_tokens <= policy.steady_target_tokens:
+        # Projection savings and pruning counters use raw estimator units.
+        # Convert the budget, not just the trigger, so a calibrated overage
+        # requests enough raw savings without double-scaling message counters.
+        raw_steady_target = math.floor(policy.steady_target_tokens / calibration_ratio)
+        if raw_prompt_tokens <= raw_steady_target:
             projection = ProjectionResult(messages=list(messages), mutable_start_index=0)
         else:
-            projection = project_messages(
-                messages,
-                policy=policy,
-                token_counter=lambda text: self.llm.count_tokens(text, resolved_model),
-                required_savings_tokens=raw_prompt_tokens - policy.steady_target_tokens,
-            )
+            # Critical projection is a hard-pressure fallback that may discard
+            # unrecoverable evidence. Do not use it for routine pre-turn sizing.
+            for mode in (PressureMode.normal, PressureMode.pressure):
+                policy = ProjectionPolicy.from_budget(
+                    max_context_tokens=max_context_tokens,
+                    available_prompt_tokens=available_prompt_tokens,
+                    phase="cross_turn",
+                    pressure_mode=mode,
+                )
+                projection = project_messages(
+                    messages,
+                    policy=policy,
+                    token_counter=lambda text: self.llm.count_tokens(text, resolved_model),
+                    required_savings_tokens=raw_prompt_tokens - raw_steady_target,
+                )
+                remaining = (
+                    self.llm.count_messages_tokens(projection.messages, resolved_model)
+                    + tool_schema_tokens
+                )
+                if remaining <= raw_steady_target:
+                    break
         pruned_messages = self._prune_messages(
             messages=projection.messages,
             resolved_model=resolved_model,
-            max_prompt_tokens=max_prompt_tokens,
+            max_prompt_tokens=(
+                max(1, math.floor(max_prompt_tokens / calibration_ratio))
+                if max_prompt_tokens > 0
+                else max_prompt_tokens
+            ),
             tool_schema_tokens=tool_schema_tokens,
         )
         return pruned_messages, projection_result_from_messages(pruned_messages)

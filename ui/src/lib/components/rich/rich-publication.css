@@ -95,11 +95,14 @@
   &[data-rich-density="dense"] .rich-hero-badges { margin-bottom: 16px; }
   &[data-rich-density="dense"] .rich-hero:not(.has-media) :is(h1,h2) { margin-bottom: 12px; }
   & .rich-markdown {
-    max-width: min(68ch, 580px); font: 400 16.5px/1.72 var(--rich-font-sans);
+    min-width: 0; max-width: 100%; font: 400 16.5px/1.72 var(--rich-font-sans);
     color: var(--rich-text-secondary); text-wrap: pretty;
     border: 0; border-radius: 0; padding: 0; box-shadow: none; background: transparent;
   }
-  & .rich-markdown > p { margin: 0 0 20px; max-width: none; }
+  & .rich-markdown > :not(table):not(.markdown-table-wrap):not(pre) { max-width: 70ch; }
+  & .rich-markdown > p { margin: 0 0 20px; }
+  & .rich-markdown .markdown-table-wrap { max-width: 100%; overflow-x: auto; }
+  & .rich-markdown :is(th, td) { min-width: 9rem; overflow-wrap: break-word; word-break: normal; }
   & .rich-markdown > :last-child { margin-bottom: 0; }
   & [data-rich-block-type="section"].rich-panel {
     margin: 30px 0 0; padding: 40px 0 0; border: 0; border-top: 1px solid var(--rich-line);
@@ -123,6 +126,11 @@
   & .rich-table-sort-button { color: var(--rich-muted); font: inherit; letter-spacing: inherit; text-transform: inherit; }
   & td { padding: 16px 14px; vertical-align: top; }
   & :is(th,td) { border-bottom: 1px solid var(--rich-line); background: transparent; }
+  & tbody tr:nth-child(even) { background: color-mix(in srgb, var(--rich-text) 3%, transparent); }
+  & tbody tr:hover { background: color-mix(in srgb, var(--rich-accent) 9%, transparent); }
+  & :is(.rich-claim-card, .rich-claim-card > *, .rich-claim-card header, .rich-claim-sources) {
+    min-width: 0; overflow-wrap: anywhere;
+  }
   &[data-rich-density="dense"] td { padding: 12px 14px; }
   & :not(pre) > code {
     font: 500 .88em/1.4 var(--rich-font-mono); color: var(--rich-accent-soft);
@@ -130,6 +138,15 @@
   }
   & .rich-kv-summary { padding: 0; margin: 0; border: 1px solid var(--rich-line); border-radius: 10px; background: var(--rich-surface-raised); overflow: hidden; }
   & .rich-kv-summary dl { grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap: 0; }
+  & .rich-kv-summary dl:has(> div:nth-child(6):last-child) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  & .rich-timeline:not(.rich-steps) li { display: grid; grid-template-columns: 10rem minmax(0, 1fr); gap: 1rem; align-items: start; padding: 1rem; }
+  & .rich-timeline li > div { min-width: 0; }
+  & .rich-timeline li > span { overflow-wrap: anywhere; }
+  & .rich-timeline li p { margin: .4rem 0 0; }
+  @media (max-width: 600px) {
+    & .rich-timeline:not(.rich-steps) li { grid-template-columns: minmax(0, 1fr); gap: .4rem; }
+    & .rich-kv-summary dl:has(> div:nth-child(6):last-child) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
   & .rich-kv-summary dl > div { padding: 16px 18px; border-right: 1px solid var(--rich-line); background: transparent; border-radius: 0; }
   & .rich-kv-summary, & .rich-kv-summary dl > div { box-shadow: none; }
   & .rich-kv-summary dl > div:last-child { border-right: 0; }
@@ -139,6 +156,11 @@
   & .rich-kv dd { overflow-wrap: anywhere; }
   & :is(.rich-table-card, .rich-kv, .rich-chart-card, .rich-dashboard) > h4 {
     font: 600 17px/1.4 var(--rich-font-sans); text-transform: none; letter-spacing: -.015em; margin: 0 0 12px;
+  }
+  & .rich-kv-summary > h4 {
+    margin: 0;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--rich-line);
   }
   & .rich-kv:not(.rich-kv-summary) dl > div {
     border: 0; border-top: 1px solid var(--rich-line); border-radius: 0;

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -12,6 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 from pydantic_core import PydanticCustomError
 
+from cognis import json_codec as json
 from cognis.models.local_models import OllamaRuntimeCapability
 
 

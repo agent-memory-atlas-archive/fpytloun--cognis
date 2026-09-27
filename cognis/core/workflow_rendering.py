@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -15,6 +14,7 @@ from jinja2 import StrictUndefined, nodes
 from jinja2.exceptions import SecurityError, TemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
+from cognis import json_codec as json
 from cognis.models.workflow import DeterministicOutputConfig, StepOutput
 
 MAX_RENDER_INPUT_BYTES = 256_000

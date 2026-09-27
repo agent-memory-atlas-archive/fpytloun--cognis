@@ -142,6 +142,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
             intention=intaris_session.intention,
             summary=summary,
             status=intaris_session.status,
+            maximum_outcome=(intaris_session.policy or {}).get("maximum_outcome"),
             total_calls=intaris_session.total_calls,
             approved_count=intaris_session.approved_count,
             denied_count=intaris_session.denied_count,

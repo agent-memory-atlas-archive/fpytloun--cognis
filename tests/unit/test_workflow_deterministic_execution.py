@@ -99,7 +99,12 @@ async def _engine_runtime(
     event_bus = EventBus()
     workflow_engine = WorkflowEngine(
         session_factory=session_factory,
-        providers=SimpleNamespace(llm=AsyncMock()),
+        providers=SimpleNamespace(
+            llm=AsyncMock(),
+            guardrails=SimpleNamespace(
+                record_events=AsyncMock(return_value=SimpleNamespace(ok=True))
+            ),
+        ),
         agent_loop=agent_loop or _DeterministicAgentLoop(),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
@@ -144,7 +149,7 @@ def _mock_tool_runtime(
         "_reuse_or_create_step_session",
         AsyncMock(
             return_value=(
-                SimpleNamespace(conversation_id="conversation-1"),
+                SimpleNamespace(conversation_id="conversation-1", user_email="user@example.com"),
                 SimpleNamespace(
                     session_id="session-1",
                     intaris_session_id="intaris-1",
@@ -878,9 +883,11 @@ async def test_registry_validated_backward_cycle_reactivates_and_stops_at_jump_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("audit_case", ["success", "interrupted", "rejected"])
 async def test_read_only_tool_output_drives_condition_and_target_executor(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
+    audit_case: str,
 ) -> None:
     raw_output = '{"messages":[{"id":"m1"}]}'
     agent_loop = _DeterministicAgentLoop(
@@ -924,7 +931,7 @@ async def test_read_only_tool_output_drives_condition_and_target_executor(
         owner_email="user@example.com",
         name="Agent",
     )
-    conversation = SimpleNamespace(conversation_id="conversation-1")
+    conversation = SimpleNamespace(conversation_id="conversation-1", user_email="user@example.com")
     session = SimpleNamespace(
         session_id="session-1",
         intaris_session_id="intaris-1",
@@ -947,7 +954,12 @@ async def test_read_only_tool_output_drives_condition_and_target_executor(
                 type="tool_call",
                 tool_call={
                     "tool": "fetch_messages",
-                    "args": {"limit": 10, "target_executor": "executor-b"},
+                    "args": {
+                        "limit": 10,
+                        "target_executor": "executor-b",
+                        "private_value": "hidden",
+                    },
+                    "redact_args": ["private_value"],
                 },
             ),
             StepDefinition(
@@ -968,13 +980,61 @@ async def test_read_only_tool_output_drives_condition_and_target_executor(
     )
 
     try:
+        recorder = engine._providers.guardrails.record_events
+
+        async def append(**kwargs: object) -> object:
+            assert kwargs["user_email"] == "user@example.com"
+            assert kwargs["agent_id"] == "agent-1"
+            assert kwargs["agent_owner_email"] == "user@example.com"
+            return SimpleNamespace(ok=audit_case != "rejected")
+
+        recorder.side_effect = append
+        if audit_case == "interrupted":
+            original_dispatch = agent_loop.execute_controller_tool
+            monkeypatch.setattr(
+                agent_loop, "execute_controller_tool", AsyncMock(side_effect=asyncio.CancelledError)
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await engine.execute_workflow(task, workflow)
+            assert [call.kwargs["events"][0].type for call in recorder.await_args_list] == [
+                "tool_call"
+            ]
+            interrupted_key = recorder.await_args_list[0].kwargs["idempotency_key"]
+            monkeypatch.setattr(agent_loop, "execute_controller_tool", original_dispatch)
+            recorder.reset_mock()
+            cleanup.reset_mock()
+
         result = await engine.execute_workflow(task, workflow)
 
+        if audit_case == "rejected":
+            assert result.status == TaskStatus.FAILED
+            assert agent_loop.calls == []
+            return
         assert result.status == TaskStatus.COMPLETED
         assert len(agent_loop.calls) == 1
+        recorded = engine._providers.guardrails.record_events.await_args_list
+        assert len(recorded) == 2
+        call_event = recorded[0].kwargs["events"][0]
+        result_event = recorded[1].kwargs["events"][0]
+        assert call_event.type == "tool_call"
+        assert call_event.data["arguments"]["limit"] == 10
+        assert call_event.data["arguments"]["private_value"] == "[redacted]"
+        assert result_event.type == "tool_result"
+        assert result_event.data["result"] == raw_output
+        assert result_event.data["call_id"] == call_event.data["call_id"]
+        assert result_event.data["turn_id"] == call_event.data["call_id"]
+        assert recorded[0].kwargs["idempotency_key"] == (
+            f"intaris-1:{call_event.data['call_id']}:tool_call"
+        )
+        assert recorded[1].kwargs["idempotency_key"] == (
+            f"intaris-1:{call_event.data['call_id']}:tool_result"
+        )
+        if audit_case == "interrupted":
+            assert recorded[0].kwargs["idempotency_key"] == interrupted_key
         assert agent_loop.calls[0].arguments == {
             "limit": 10,
             "target_executor": "executor-b",
+            "private_value": "hidden",
         }
         assert result.workflow_state is not None
         assert result.workflow_state.step_outputs["fetch"]["outputs"]["messages"] == [{"id": "m1"}]

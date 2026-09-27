@@ -2482,7 +2482,19 @@ async def managed_conversation_take_control(
 ) -> ManagedConversationActionResponse:
     user, link = await _require_managed_conversation(request, conversation_id)
     if link.conversation_state == "closed":
-        raise api_exception(409, "closed", "Agent work is closed")
+        control_metadata = link.control_metadata or {}
+        follow_up_conversation_id = control_metadata.get("follow_up_conversation_id")
+        if isinstance(follow_up_conversation_id, str):
+            result = {"conversation_id": follow_up_conversation_id}
+            follow_up_session_id = control_metadata.get("follow_up_session_id")
+            if isinstance(follow_up_session_id, str):
+                result["session_id"] = follow_up_session_id
+            return await _managed_action_response(
+                request,
+                conversation_id,
+                "taken_over",
+                result,
+            )
     _require_inactive_managed_conversation(request, link, conversation_id)
 
     from cognis.core.session import _to_conversation_model, _to_session_model

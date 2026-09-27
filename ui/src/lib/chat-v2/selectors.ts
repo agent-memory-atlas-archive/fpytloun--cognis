@@ -29,12 +29,14 @@ export const TIMELINE_KIND_RENDER_POLICY = {
   artifact: true,
   assistant_deliverable: true,
   file_diff: true,
+  recap: true,
   notice: true,
   compaction: true,
   error: true,
 } as const satisfies Record<TimelineItem['kind'], boolean>;
 
 export function isRenderableTimelineItem(item: TimelineItem): boolean {
+  if (item.kind === 'message' && item.notice_resolved) return false;
   return TIMELINE_KIND_RENDER_POLICY[item.kind];
 }
 
@@ -44,6 +46,7 @@ export function selectRenderableTimeline(items: TimelineItem[]): TimelineItem[] 
 
 export function isPinnedTransientNotice(item: TimelineItem): boolean {
   if (item.stable !== false) return false;
+  if (item.kind === 'message' && item.notice_resolved) return false;
   if (item.kind === 'error') return true;
   return item.kind === 'message'
     && item.role === 'system'

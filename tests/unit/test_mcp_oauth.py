@@ -1315,7 +1315,11 @@ async def test_executor_loopback_uses_default_executor_when_not_configured(
         return server
 
     async def fake_list_executors(*args, **kwargs):
-        assert kwargs == {"owner_email": "alice@example.com", "include_shared": True}
+        assert kwargs == {
+            "owner_email": "alice@example.com",
+            "include_shared": True,
+            "defer_observed_tools": True,
+        }
         return [
             SimpleNamespace(
                 executor_id="default-inprocess",

@@ -98,15 +98,27 @@ jobs:
         run: |
           shasum -a 256 -c cognis-executor-*-macos-arm64.sha256
           shasum -a 256 -c cognis-executor-*-macos-x86_64.sha256
+      - name: Wait for reviewed draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # Publishing a release triggers PyPI and Docker. Never create one from a tag push.
+          for attempt in $(seq 1 40); do
+            if gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Reviewed draft release not found for $RELEASE_TAG" >&2
+          exit 1
       - name: Upload release assets without replacement
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --generate-notes
-          fi
           gh release upload "$RELEASE_TAG" dist/cognis-executor-*.tar.gz dist/cognis-executor-*.sha256
       - name: Emit formula metadata
         env:

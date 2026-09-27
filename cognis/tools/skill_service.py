@@ -5,13 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
-import json
 import mimetypes
 import posixpath
 import zipfile
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.skill import SkillAssetRef, SkillExportData, SkillToolSpec
 from cognis.models.workflow import StepDefinition

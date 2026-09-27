@@ -2924,7 +2924,7 @@
               <p class="text-sm text-slate-400">No providers configured yet.</p>
             {/each}
           </div>
-        </Card>
+      </Card>
 
         <div bind:this={providerEditorEl}>
         <Card class="space-y-5 p-5">
@@ -3527,7 +3527,7 @@
         <div class="mt-5 flex justify-end">
           <Button onclick={saveRouting} disabled={!isAdmin || busy}>Save routing</Button>
         </div>
-      </Card>
+        </Card>
     {:else if activeTab === 'secrets'}
       <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
         <Card class="p-5">
@@ -3707,6 +3707,24 @@
             {/if}
             <Button onclick={refreshPushStatus} disabled={pushBusy} variant="secondary">Refresh status</Button>
           </div>
+          <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+            <input
+              type="checkbox"
+              checked={$userPreferences.notifications.include_content}
+              disabled={busy}
+              class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+              onchange={(event) => void updateUserPreferences({
+                ...$userPreferences,
+                notifications: { include_content: event.currentTarget.checked }
+              })}
+            />
+            <span>
+              <span class="block font-medium text-slate-100">Show notification content</span>
+              <span class="mt-1 block text-xs leading-5 text-slate-500">
+                Include replies, questions, results, and action context in system notifications. Disable this to show generic attention notices.
+              </span>
+            </span>
+          </label>
         </Card>
 
         <div class="space-y-5">
@@ -3849,6 +3867,19 @@
           </div>
 
            <div class="space-y-3">
+             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+               <input
+                 type="checkbox"
+                 checked={$userPreferences.chat.auto_recap}
+                 disabled={busy}
+                 class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                 onchange={(event) => void updateChatPreference('auto_recap', event.currentTarget.checked)}
+               />
+               <span>
+                 <span class="block font-medium text-slate-100">Automatically recap web chats</span>
+                 <span class="mt-1 block text-xs leading-5 text-slate-500">After meaningful work and a quiet period, add a short recap to the chat timeline. Never sends a notification.</span>
+               </span>
+             </label>
              <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
                <input
                  type="checkbox"

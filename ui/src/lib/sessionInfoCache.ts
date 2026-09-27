@@ -14,6 +14,7 @@ export interface SessionInfoData {
   intention: string | null;
   summary: string | null;
   status: string;
+  maximum_outcome?: 'deny' | 'escalate' | 'approve' | null;
   total_calls: number;
   approved_count: number;
   denied_count: number;

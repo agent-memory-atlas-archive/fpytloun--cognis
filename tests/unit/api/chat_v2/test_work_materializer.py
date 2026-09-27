@@ -49,6 +49,7 @@ from cognis.api.chat_v2.work_materializer import (
     _advance_projection_target,
     _bounded_item,
     _decode_persisted_work_item,
+    _diff_counts,
     _file_path_id,
     _merged_tool_status,
     _old_file_path_id,
@@ -115,6 +116,15 @@ from cognis.store.models import (
     WorkSessionProjectionRow,
 )
 from cognis.store.work_live_invalidation import register_live_work_waker
+
+
+def test_work_materializer_counts_header_like_content_inside_hunks() -> None:
+    diff = FileDiffRef(
+        path="src/example.py",
+        diff="--- a/src/example.py\n+++ b/src/example.py\n"
+        "@@ -1 +1 @@\n---deleted content\n+++added content\n",
+    )
+    assert _diff_counts(diff) == (1, 1)
 
 
 def test_materializer_version_rebuilds_filtered_work_evidence() -> None:

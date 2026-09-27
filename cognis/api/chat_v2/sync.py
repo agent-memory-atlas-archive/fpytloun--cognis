@@ -60,9 +60,8 @@ from cognis.models.config import GenerationPerformanceSnapshot
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-# v5: legacy scheduler user admissions have a turn-scoped fallback identity.
-# Reset previously cached event-sequence IDs instead of retaining both copies.
-PROJECTION_VERSION = "chat-v2-projection-v5"
+# v6: durable compaction starts and correlated legacy pressure-notice retirement.
+PROJECTION_VERSION = "chat-v2-projection-v6"
 _projection_version = PROJECTION_VERSION
 SNAPSHOT_SESSION_EVENT_LIMIT = 5_000
 SNAPSHOT_WINDOW_EVENT_LIMIT = 800

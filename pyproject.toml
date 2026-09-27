@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.16.0"
+version = "0.17.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }
@@ -45,6 +45,7 @@ dependencies = [
     "python-dateutil>=2.9.0",
     "jinja2>=3.1.6",
     "Markdown>=3.7",
+    "markdown-it-py>=4.0.0",
     "pypdf>=5.4.0",
     "Pillow>=11.0.0",
     "weasyprint>=63.0",
@@ -59,7 +60,7 @@ dependencies = [
     "psutil>=6.1.0",
     "youtube-transcript-api>=1.2.0",
     "pyotp>=2.9.0",
-    "cognis-common==0.16.0",
+    "cognis-common==0.17.0",
 ]
 
 [project.optional-dependencies]

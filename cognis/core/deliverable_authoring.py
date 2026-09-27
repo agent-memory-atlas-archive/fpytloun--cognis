@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.channels.rich_markdown import render_rich_markdown
 from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.artifact import ArtifactStatus

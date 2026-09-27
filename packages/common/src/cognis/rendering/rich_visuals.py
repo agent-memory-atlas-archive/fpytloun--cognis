@@ -765,6 +765,11 @@ def _chart_y_domain(model: ChartModel) -> tuple[float, float]:
     ):
         padding = (high - low) * 0.08
         low, high = low - padding, high + padding
+        if min(values) >= 0:
+            low = max(0.0, low)
+            if low == 0 and high > 0:
+                unit = 10 ** math.floor(math.log10(high / 4))
+                high = math.ceil(high / unit) * unit
     return low, high
 
 
@@ -813,13 +818,24 @@ def _append_axes(
             f'text-anchor="end">{html.escape(_number(tick_value))}</text>'
         )
     label_step = max(1, math.ceil(len(model.labels) / 8))
+    selected: list[tuple[int, float, float]] = []
     for index, (label, x) in enumerate(zip(model.labels, x_values, strict=True)):
-        if index % label_step == 0 or index == len(model.labels) - 1:
-            parts.append(
-                f'<text class="chart-axis-label" x="{x:.2f}" '
-                f'y="{layout.top + layout.plot_height + 22:.2f}" text-anchor="middle">'
-                f"{html.escape(label[:18])}</text>"
-            )
+        # Categorical dates retain their authored, evenly spaced positions.
+        # Suppress labels that would collide, without altering the data path.
+        if index % label_step != 0 and index != len(model.labels) - 1:
+            continue
+        half_width = min(len(label), 18) * 3.25
+        if selected and x - half_width < selected[-1][1] + selected[-1][2] + 18:
+            if index != len(model.labels) - 1:
+                continue
+            selected.pop()  # Reserve the last timestamp over a nearby intermediate label.
+        selected.append((index, x, half_width))
+    for index, x, _ in selected:
+        parts.append(
+            f'<text class="chart-axis-label" x="{x:.2f}" '
+            f'y="{layout.top + layout.plot_height + 22:.2f}" text-anchor="middle">'
+            f"{html.escape(model.labels[index][:18])}</text>"
+        )
     x_title = _axis_title(model.x_axis)
     if x_title:
         parts.append(

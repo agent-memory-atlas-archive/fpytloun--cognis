@@ -416,6 +416,7 @@ export interface MessageTimelineItem extends TimelineItemBase {
   notice_id?: string | null;
   notice_kind?: string | null;
   notice_scope?: string | null;
+  notice_resolved?: boolean;
   retry_reason?: string | null;
   retry_source_turn_id?: string | null;
   reason_class?: string | null;
@@ -597,6 +598,20 @@ export interface FileDiffTimelineItem extends TimelineItemBase {
   title?: string | null;
 }
 
+export interface RecapTimelineItem extends TimelineItemBase {
+  kind: 'recap';
+  text: string;
+  source_session_id: string;
+  source_seq: number;
+  auto: boolean;
+  stats_version: number;
+  file_diffs_omitted: boolean;
+  scope: 'legacy' | 'recent_window';
+  deliverables: Array<{ id: string; title: string }>;
+  artifacts: Array<{ id: string; title: string; mime_type: string; size_bytes: number }>;
+  files: Array<{ path: string; additions?: number | null; deletions?: number | null }>;
+}
+
 export interface AssistantDeliverableTimelineItem extends TimelineItemBase {
   kind: 'assistant_deliverable';
   deliverable_id: string;
@@ -656,6 +671,7 @@ export type TimelineItem =
   | ArtifactTimelineItem
   | AssistantDeliverableTimelineItem
   | FileDiffTimelineItem
+  | RecapTimelineItem
   | NoticeTimelineItem
   | CompactionTimelineItem
   | ErrorTimelineItem;

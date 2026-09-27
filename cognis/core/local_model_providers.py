@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis import json_codec as json
 from cognis.models.executor_inference import (
     executor_local_inference_configured,
     resolve_executor_local_inference_config,

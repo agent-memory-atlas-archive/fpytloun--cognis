@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.tool import NativeToolOperation
 
 

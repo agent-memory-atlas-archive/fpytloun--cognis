@@ -825,7 +825,7 @@ def _coerce_text_field(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
-        import json
+        from cognis import json_codec as json
 
         try:
             return json.dumps(value, ensure_ascii=True, sort_keys=True)

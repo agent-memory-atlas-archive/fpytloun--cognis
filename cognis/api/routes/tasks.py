@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +15,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from cognis import json_codec as json
 from cognis.api.attention_actions import list_attention_rows_by_task, project_attention_summary
 from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.common import (
@@ -1364,6 +1364,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 interaction_mode_override=payload.interaction_mode_override,
+                escalation_timeout_seconds=payload.escalation_timeout_seconds,
                 session_policy=payload.session_policy,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
@@ -1386,6 +1387,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 interaction_mode_override=payload.interaction_mode_override,
+                escalation_timeout_seconds=payload.escalation_timeout_seconds,
                 session_policy=payload.session_policy,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
@@ -2047,6 +2049,9 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 and payload.interaction_mode_override is None
             ):
                 row.interaction_mode_override = None
+            if "escalation_timeout_seconds" in payload.model_fields_set:
+                row.escalation_timeout_seconds = payload.escalation_timeout_seconds
+                updates.pop("escalation_timeout_seconds", None)
             if "session_policy" in updates:
                 row.session_policy = updates.pop("session_policy")
             if (
@@ -2892,6 +2897,7 @@ def _row_to_task(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
+        escalation_timeout_seconds=getattr(row, "escalation_timeout_seconds", None),
         session_policy=SessionPolicy.model_validate(getattr(row, "session_policy", None) or {}),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),

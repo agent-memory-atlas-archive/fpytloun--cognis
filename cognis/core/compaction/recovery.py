@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
 from prometheus_client import Counter
 
+from cognis import json_codec as json
 from cognis.core.compaction.input_format import tool_result_recovery_hint
 
 COMPACTION_HANDLES_CAPPED = Counter(

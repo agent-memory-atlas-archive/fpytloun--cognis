@@ -312,6 +312,7 @@ def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_p
             "user_email": "user@example.com",
             "title": "Research Agent",
             "body": "New reply in Launch planning.",
+            "fallback_body": "New reply in Launch planning.",
             "url": "/chat/conv_1",
             "tag": "conv_1",
             "kind": "message",
@@ -439,13 +440,13 @@ def test_turn_error_web_chat_creates_push_payload(monkeypatch: object, tmp_path:
             "user_email": "user@example.com",
             "title": "Research Agent",
             "body": "Reply failed in Launch planning.",
+            "fallback_body": "Reply failed in Launch planning.",
             "url": "/chat/conv_error",
             "tag": "conv_error",
             "kind": "message",
             "conversation_id": "conv_error",
         }
-        assert stopped is not None
-        assert stopped["body"] == "Reply stopped in Launch planning."
+        assert stopped is None
 
 
 def test_turn_completed_push_payload_omits_avatar_when_signing_fails(

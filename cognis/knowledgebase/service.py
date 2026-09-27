@@ -7,7 +7,6 @@ import base64
 import builtins
 import contextlib
 import hashlib
-import json
 import logging
 import mimetypes
 import re
@@ -22,6 +21,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.knowledgebase.access import (

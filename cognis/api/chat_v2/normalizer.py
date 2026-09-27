@@ -41,6 +41,7 @@ NormalizedEventKind = Literal[
     "evaluation",
     "notice",
     "compaction",
+    "recap",
     "error",
     "unknown",
 ]
@@ -81,7 +82,9 @@ VISIBLE_LIFECYCLE_EVENTS: frozenset[str] = frozenset(
         "turn_error",
         "user_interaction_resolved",
         "session_compaction_finished",
+        "session_compaction_started",
         "session_recovered",
+        "conversation_recap",
     }
 )
 _CANCELLED_TURN_ERROR_CODES: frozenset[str] = frozenset(
@@ -282,6 +285,8 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
 
     if event_type == "lifecycle":
         lifecycle_event = str(data.get("event") or data.get("type") or "")
+        if lifecycle_event == "conversation_recap":
+            return "recap"
         if lifecycle_event in {"task_result", "task_failed", "task_cancelled", "workflow_composed"}:
             return "task"
         if lifecycle_event == "assistant_deliverable":
@@ -295,7 +300,7 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
             return "error"
         if lifecycle_event == "user_interaction_resolved":
             return "user_interaction"
-        if lifecycle_event == "session_compaction_finished":
+        if lifecycle_event in {"session_compaction_started", "session_compaction_finished"}:
             return "compaction"
         if lifecycle_event == "session_recovered":
             return "notice"

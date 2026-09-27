@@ -13,11 +13,11 @@ Tool taxonomy:
 from __future__ import annotations
 
 import copy
-import json
 import logging
 from enum import StrEnum
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.channels.constants import MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS
 from cognis.core.agent_profiles import (
     normalize_agent_profile_id,
@@ -478,6 +478,12 @@ CREATE_TASK_TOOL = ToolDefinition(
                     "requested fully autonomous execution; otherwise omit to use the workflow default."
                 ),
             },
+            "escalation_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400,
+                "description": "Optional task escalation wait in seconds. Overrides the agent and global timeout.",
+            },
             "session_policy": {
                 "type": "object",
                 "description": (
@@ -632,6 +638,12 @@ UPDATE_TASK_TOOL = ToolDefinition(
                     "Optional replacement Intaris session policy with allow_policies "
                     "and deny_policies."
                 ),
+            },
+            "escalation_timeout_seconds": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "maximum": 86400,
+                "description": "Optional timeout override in seconds. Null clears it to inherit the agent/global timeout.",
             },
         },
         "required": ["task_id"],

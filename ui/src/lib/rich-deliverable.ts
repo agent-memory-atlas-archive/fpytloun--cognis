@@ -238,7 +238,7 @@ export function blockText(block: Record<string, unknown>, key = 'content'): stri
 
 /**
  * Body text for blocks with no separate summary/dek display slot (e.g.
- * callout). Authors frequently use `summary`/`dek`/`description` instead of
+ * callout). Authors use `text`/`body`/`summary`/`dek`/`description` instead of
  * `content` -- these must never be silently dropped. Only use this for
  * blocks where `summary`/`dek`/`description` aren't already rendered
  * elsewhere, or the same text would appear twice.
@@ -246,6 +246,8 @@ export function blockText(block: Record<string, unknown>, key = 'content'): stri
 export function blockBody(block: Record<string, unknown>): string {
   return (
     blockText(block, 'content')
+    || blockText(block, 'text')
+    || blockText(block, 'body')
     || blockText(block, 'summary')
     || blockText(block, 'dek')
     || blockText(block, 'description')
@@ -270,7 +272,7 @@ export function blockType(block: Record<string, unknown>): string {
 }
 
 export function blockTitle(block: Record<string, unknown>): string {
-  return blockText(block, 'title') || blockText(block, 'label') || blockText(block, 'name');
+  return blockText(block, 'title') || blockText(block, 'label') || blockText(block, 'name') || blockText(block, 'heading');
 }
 
 /**

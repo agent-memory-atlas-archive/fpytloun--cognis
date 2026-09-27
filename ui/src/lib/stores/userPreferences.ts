@@ -1,5 +1,5 @@
 import { browser } from '$app/environment';
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 
 import { api } from '$lib/api/client';
 import { reportError } from '$lib/errors';
@@ -82,11 +82,18 @@ export async function loadUserPreferences(userEmail?: string | null): Promise<Us
 }
 
 export async function saveUserPreferences(next: UserPreferences): Promise<UserPreferences> {
+  const previous = get(store);
   const normalized = normalizeUserPreferences(next);
   store.set(normalized);
   cachePreferences(normalized, loadedUserEmail);
-  const saved = normalizeUserPreferences(await api.userPreferences.update(normalized));
-  store.set(saved);
-  cachePreferences(saved, loadedUserEmail);
-  return saved;
+  try {
+    const saved = normalizeUserPreferences(await api.userPreferences.update(normalized));
+    store.set(saved);
+    cachePreferences(saved, loadedUserEmail);
+    return saved;
+  } catch (error) {
+    store.set(previous);
+    cachePreferences(previous, loadedUserEmail);
+    throw error;
+  }
 }

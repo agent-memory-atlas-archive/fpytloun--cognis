@@ -156,7 +156,7 @@ class MacOSServiceManager(ServiceManager):
         if completed.returncode:
             return _failure("status", completed)
         try:
-            import json
+            from cognis import json_codec as json
 
             records = json.loads(completed.stdout)
         except (ValueError, TypeError):

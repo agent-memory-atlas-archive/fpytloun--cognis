@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from io import BytesIO
@@ -12,6 +11,7 @@ from typing import Any, cast
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis import json_codec as json
 from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.deliverable import RICH_DELIVERABLE_MAX_BYTES, RichPayloadValidationError
 from cognis.store.queries import get_artifact_record, mark_artifacts_attached

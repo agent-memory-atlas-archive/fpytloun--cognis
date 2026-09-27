@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import os
 import re
 import tempfile
@@ -29,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from cognis import json_codec as json
 from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.logging import get_logger
 

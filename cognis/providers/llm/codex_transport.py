@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.providers.llm.codex import CODEX_RESPONSES_URL, CodexAuth
 from cognis.providers.llm.transport import strip_controller_transport_kwargs
 

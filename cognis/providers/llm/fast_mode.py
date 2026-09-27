@@ -22,7 +22,7 @@ def enrich_fast_mode(
         preset == "anthropic"
         and urlsplit(str(endpoint)).hostname == "api.anthropic.com"
         and config.get("protocol", "auto") != "litellm"
-        and model in {"claude-opus-5", "claude-opus-4-8"}
+        and model in {"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"}
     )
     if native_claude and entry.get("supports_fast_mode") is not False:
         result.update(supports_fast_mode=True, fast_mode_parameter="speed", fast_mode_tier="fast")

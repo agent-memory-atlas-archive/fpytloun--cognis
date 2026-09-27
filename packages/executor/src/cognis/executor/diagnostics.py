@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 import socket
@@ -15,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.executor.config import ConfigError, ExecutorSettings, validate_controller_url
 
 

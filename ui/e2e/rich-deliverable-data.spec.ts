@@ -6,7 +6,7 @@ test.describe('rich deliverable interactive data blocks', () => {
   test('supports chart, dashboard, and incident interactions in production preview', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 2200 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /interactive operations dashboard/i }).click();
+    await page.getByLabel('Scenario').selectOption('interactive-data-dashboard');
 
     const fixture = page.getByTestId('rich-deliverable-fixture');
     await expect(fixture).toHaveAttribute('data-scenario', 'interactive-data-dashboard');

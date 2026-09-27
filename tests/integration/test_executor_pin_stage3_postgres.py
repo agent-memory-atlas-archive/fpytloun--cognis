@@ -25,7 +25,7 @@ class _ReadyConnection:
 
 
 class _ReadyProvider:
-    def get_connection(self, executor_id: str) -> _ReadyConnection | None:
+    def get_ready_connection(self, executor_id: str) -> _ReadyConnection | None:
         return _ReadyConnection() if executor_id.startswith("replacement-") else None
 
 

@@ -105,7 +105,15 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Understand streaming replies, tool activity, approvals, and delegation.',
     category: 'workspace',
     sourcePath: 'docs/guide/using-chat.md',
-    relatedSlugs: ['getting-started', 'managing-tasks', 'creating-agents']
+    relatedSlugs: ['getting-started', 'context-management', 'managing-tasks', 'creating-agents']
+  },
+  {
+    slug: 'context-management',
+    title: 'Context management',
+    description: 'Understand prompt budgets, projection, compaction, and evidence preservation.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/context-management.md',
+    relatedSlugs: ['using-chat', 'configuring-providers']
   },
   {
     slug: 'managing-tasks',
@@ -255,6 +263,7 @@ export const ONBOARDING_DOC_SLUGS = [
   'security-and-privacy',
   'settings',
   'using-chat',
+  'context-management',
   'projects',
   'managing-tasks',
   'schedules',

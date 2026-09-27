@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import json
 import re
 import time
 from datetime import UTC, datetime
@@ -14,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.channels.markdown_rendering import markdown_to_slack_mrkdwn
 from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import SLACK_META

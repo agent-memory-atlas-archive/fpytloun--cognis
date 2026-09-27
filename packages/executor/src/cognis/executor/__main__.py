@@ -274,7 +274,7 @@ def _doctor(args: argparse.Namespace) -> int:
 
 
 def _show_config(args: argparse.Namespace) -> int:
-    import json
+    from cognis import json_codec as json
 
     settings = _settings_from_args(args, _read_file_settings())
     paths = get_config_paths()

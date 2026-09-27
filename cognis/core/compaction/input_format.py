@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.message_envelope import render_user_event_content
 

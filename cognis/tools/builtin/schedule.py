@@ -6,10 +6,10 @@ The agent can create, inspect, list, update, delete, and trigger schedules.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.api.serializers import agent_to_response
 from cognis.core.agent_profiles import normalize_agent_profile_id, resolve_agent_profile
 from cognis.core.workflow_registry import SYSTEM_WORKFLOWS

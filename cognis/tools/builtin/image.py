@@ -7,12 +7,12 @@ Routed via ToolRoute.IMAGE in the tool router.
 from __future__ import annotations
 
 import contextlib
-import json
 import mimetypes
 from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.models.config import ImageGenerationResult, ImageInput
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolResult, ToolSource

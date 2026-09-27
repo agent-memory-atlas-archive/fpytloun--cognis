@@ -11,7 +11,6 @@ import base64
 import contextlib
 import hashlib
 import hmac
-import json
 import os
 import re
 import secrets
@@ -26,6 +25,7 @@ import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.mcp_oauth_network import OAuthDestinationTransport, resolve_oauth_destination
 from cognis.core.notifications import NotificationService, NotificationType
 from cognis.logging import get_logger
@@ -1196,6 +1196,7 @@ class MCPOAuthService:
                         session,
                         owner_email=user_email,
                         include_shared=True,
+                        defer_observed_tools=True,
                     )
                     websocket_rows = [
                         row
@@ -1216,6 +1217,7 @@ class MCPOAuthService:
                         oauth_executor_id,
                         owner_email=user_email,
                         include_shared=True,
+                        defer_observed_tools=True,
                     )
                 if executor_row is None:
                     raise MCPOAuthError(f"OAuth executor {oauth_executor_id} was not found")

@@ -6,8 +6,12 @@ import asyncio
 import base64
 import hashlib
 import html
-import json
+import os
 import re
+import shutil
+import signal
+import subprocess
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +25,7 @@ import markdown  # type: ignore[import-untyped]
 from bs4 import BeautifulSoup, Comment
 from bs4.element import PageElement
 
+from cognis import json_codec as json
 from cognis.rendering.rich_visuals import (
     MediaResolver,
     RenderTarget,
@@ -33,11 +38,12 @@ from cognis.rendering.rich_visuals import (
 )
 from cognis.ui_assets import resolve_standalone_manifest, standalone_asset_url
 
-RENDERER_VERSION = "standalone-deliverable-v13"
+RENDERER_VERSION = "standalone-deliverable-v18"
 HTML_CACHE_FILENAME = "render.html"
 PDF_CACHE_FILENAME = "render.pdf"
 PDF_INPUT_MAX_BYTES = 20 * 1024 * 1024
 PDF_RENDER_TIMEOUT_SECONDS = 20.0
+_PDF_DIAGRAM_SEMAPHORE = asyncio.Semaphore(2)
 
 _ALLOWED_TAGS = {
     "a",
@@ -609,8 +615,15 @@ async def render_pdf_bytes(html_document: str) -> RenderedPdf:
 
     if len(html_document.encode("utf-8")) > PDF_INPUT_MAX_BYTES:
         raise DeliverableRenderError("render_input_too_large")
-
     try:
+        if "block-mermaid" in html_document:
+            async with _PDF_DIAGRAM_SEMAPHORE:
+                html_document = await asyncio.wait_for(
+                    asyncio.to_thread(_embed_pdf_mermaid, html_document),
+                    timeout=50,
+                )
+        if len(html_document.encode("utf-8")) > PDF_INPUT_MAX_BYTES:
+            raise DeliverableRenderError("render_input_too_large")
         content = await asyncio.wait_for(
             asyncio.to_thread(_render_pdf_sync, html_document),
             timeout=PDF_RENDER_TIMEOUT_SECONDS,
@@ -626,6 +639,105 @@ async def render_pdf_bytes(html_document: str) -> RenderedPdf:
     return RenderedPdf(content=content)
 
 
+def _embed_pdf_mermaid(document: str) -> str:
+    """Rasterize authored Mermaid before WeasyPrint; retain source on failure."""
+    if "block-mermaid" not in document:
+        return document
+    soup = BeautifulSoup(document, "html.parser")
+    nodes = soup.select(".block-mermaid > pre")
+    for pre in nodes[:3]:
+        source = html.unescape(pre.get_text())
+        if not source.strip() or len(source.encode("utf-8")) > 32_768:
+            continue
+        try:
+            png = _render_mermaid_png(source)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > 2_000_000:
+            continue
+        image = soup.new_tag("img")
+        image["src"] = f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
+        section = pre.find_parent("section")
+        heading = section.find(["h2", "h3", "h4"]) if section else None
+        image["alt"] = "Diagram illustrating " + (
+            heading.get_text(" ", strip=True) if heading else "the described flow"
+        )
+        image["class"] = "pdf-mermaid-image"
+        pre.replace_with(image)
+    return str(soup)
+
+
+def _render_mermaid_png(source: str) -> bytes:
+    binary = os.environ.get("COGNIS_MERMAID_CLI") or shutil.which("mmdc")
+    if not binary:
+        raise ValueError("Mermaid CLI unavailable")
+    with tempfile.TemporaryDirectory(prefix="cognis-pdf-mermaid-") as directory:
+        root = Path(directory)
+        source_path = root / "diagram.mmd"
+        output_path = root / "diagram.png"
+        config_path = root / "puppeteer.json"
+        mermaid_config = root / "mermaid.json"
+        source_path.write_text(source, encoding="utf-8")
+        config_path.write_text(
+            '{"args":["--no-sandbox","--disable-setuid-sandbox",'
+            '"--disable-dev-shm-usage","--proxy-server=http://127.0.0.1:9",'
+            '"--proxy-bypass-list=<-loopback>"]}',
+            encoding="utf-8",
+        )
+        mermaid_config.write_text(
+            '{"securityLevel":"strict","secure":["securityLevel","maxTextSize","maxEdges"],'
+            '"maxTextSize":32768,"maxEdges":500}',
+            encoding="utf-8",
+        )
+        environment = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": directory,
+            "XDG_CONFIG_HOME": directory,
+            "PUPPETEER_EXECUTABLE_PATH": os.environ.get(
+                "PUPPETEER_EXECUTABLE_PATH", "/usr/bin/chromium"
+            ),
+            "PUPPETEER_SKIP_DOWNLOAD": "true",
+        }
+        options: dict[str, Any] = {}
+        if os.geteuid() == 0:
+            for path in (root, source_path, config_path, mermaid_config):
+                os.chown(path, 65534, 65534)
+            options.update(user=65534, group=65534)
+        process = subprocess.Popen(
+            [
+                binary,
+                "-i",
+                str(source_path),
+                "-o",
+                str(output_path),
+                "-p",
+                str(config_path),
+                "-c",
+                str(mermaid_config),
+                "-b",
+                "white",
+                "--size",
+                "1200",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+            **options,
+        )
+        try:
+            _, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            raise ValueError("Mermaid render timed out") from None
+        if process.returncode or not output_path.is_file():
+            raise ValueError(f"Mermaid render failed: {stderr[-200:].decode(errors='replace')}")
+        if output_path.stat().st_size > 2_000_000:
+            raise ValueError("Mermaid image too large")
+        return output_path.read_bytes()
+
+
 def _render_pdf_sync(html_document: str) -> bytes:
     from weasyprint import HTML  # type: ignore[import-untyped]
     from weasyprint.text.fonts import FontConfiguration  # type: ignore[import-untyped]
@@ -637,13 +749,40 @@ def _render_pdf_sync(html_document: str) -> bytes:
     font_config = FontConfiguration()
     return cast(
         bytes,
-        HTML(string=html_document, url_fetcher=_blocked_url_fetcher).write_pdf(
+        HTML(string=html_document, url_fetcher=_RestrictedResourceFetcher()).write_pdf(
             font_config=font_config
         ),
     )
 
 
+class _RestrictedResourceFetcher:
+    """Adapt allowlisted bytes to WeasyPrint's response API (68+)."""
+
+    _fail_on_errors = False
+
+    def __call__(self, url: str) -> Any:
+        from weasyprint.urls import URLFetcherResponse  # type: ignore[import-untyped]
+
+        resource = _blocked_url_fetcher(url)
+        return URLFetcherResponse(
+            url=url,
+            body=resource["string"],
+            headers={"Content-Type": resource["mime_type"]},
+        )
+
+
 def _blocked_url_fetcher(url: str) -> dict[str, object]:
+    publication_fonts = {
+        "cognis-asset:archivo": "archivo.woff2",
+        "cognis-asset:jetbrains-mono": "jetbrains-mono.woff2",
+    }
+    if url in publication_fonts:
+        return {
+            "string": (
+                Path(__file__).parent / "assets" / "publication" / publication_fonts[url]
+            ).read_bytes(),
+            "mime_type": "font/woff2",
+        }
     if url == "cognis-asset:emoji-font":
         return {
             "string": _EMOJI_FONT_PATH.read_bytes(),
@@ -809,14 +948,14 @@ def _render_intro(
     title = _block_title(block) or _text(meta, "title") or fallback_title
     subtitle = _text(block, "subtitle") or _text(block, "dek") or _text(meta, "subtitle")
     eyebrow = _text(block, "eyebrow") or _text(meta, "eyebrow")
-    badges = block.get("tags") or block.get("badges") or meta.get("badges")
+    badges = block.get("badges") or block.get("tags") or meta.get("badges")
     badge_html = _render_badges(badges)
     viewer_identity_html = _render_viewer_identity(meta.get("viewer_identity"))
     subtitle_html = f'<p class="subtitle">{html.escape(subtitle)}</p>' if subtitle else ""
     eyebrow_html = f'<p class="eyebrow">{html.escape(eyebrow)}</p>' if eyebrow else ""
     return (
-        f"{viewer_identity_html}{eyebrow_html}<h1>{html.escape(title)}</h1>"
-        f"{subtitle_html}{badge_html}"
+        f"{viewer_identity_html}{eyebrow_html}{badge_html}<h1>{html.escape(title)}</h1>"
+        f"{subtitle_html}"
     )
 
 
@@ -975,7 +1114,7 @@ def _render_block_content(
             '<section class="block block-section block-hero-section">'
             f"{media_html}{_eyebrow(block)}{_heading(title)}"
             f"{f'<p class="subtitle">{html.escape(subtitle)}</p>' if subtitle else ''}"
-            f"{_render_badges(block.get('tags') or block.get('badges'))}"
+            f"{_render_badges(block.get('badges') or block.get('tags'))}"
             f"{body}{child_html}</section>"
         )
     if block_type in {"kv", "key_value"}:
@@ -1866,7 +2005,9 @@ def _render_evidence_report(
     context: PublicationContext | None,
 ) -> str:
     available = _resolve_sources(block.get("sources"), sources) or sources
-    claims = _object_list(block.get("claims") or block.get("items") or block.get("data"))
+    claims = _object_list(
+        block.get("claims") or block.get("items") or block.get("cards") or block.get("data")
+    )
     cards = []
     for index, claim in enumerate(claims, start=1):
         label = _text(claim, "label") or _text(claim, "category") or "Claim"
@@ -1876,6 +2017,8 @@ def _render_evidence_report(
             or _text(claim, "summary")
             or (_text(claim, "claim") if _text(claim, "title") else "")
         )
+        evidence_text = _text(claim, "evidence")
+        verdict = _text(claim, "verdict")
         confidence = _confidence_text(claim.get("confidence", claim.get("score")))
         snippets = _object_list(claim.get("evidence") or claim.get("snippets"))
         evidence_html = "".join(
@@ -1890,6 +2033,8 @@ def _render_evidence_report(
             '<article class="claim-card">'
             f'<p class="eyebrow">{html.escape(label)}</p><h3>{html.escape(title)}</h3>'
             f"{f'<p>{html.escape(summary)}</p>' if summary else ''}"
+            f"{f'<div class="claim-evidence"><strong>Evidence</strong>{_markdown_to_html(evidence_text)}</div>' if evidence_text else ''}"
+            f"{f'<p class="claim-verdict"><strong>Verdict:</strong> {html.escape(verdict)}</p>' if verdict else ''}"
             f"{f'<p class="confidence">Confidence: {html.escape(confidence)}</p>' if confidence else ''}"
             f"{evidence_html}"
             f"{context.cite(refs, available, token=claim) if context else _render_source_links(refs, available)}"
@@ -1919,8 +2064,12 @@ def _render_named_list(title: str, value: object) -> str:
 
 
 def _render_incident(block: dict[str, Any], *, child_html: str, heading: str) -> str:
+    is_checklist = block.get("type") in {"checklist", "incident_checklist"}
     entries = _object_list(
-        block.get("items") or block.get("entries") or block.get("timeline") or block.get("data")
+        (None if is_checklist else block.get("items"))
+        or block.get("entries")
+        or block.get("timeline")
+        or block.get("data")
     )
     timeline = []
     for index, entry in enumerate(entries, start=1):
@@ -1949,11 +2098,19 @@ def _render_incident(block: dict[str, Any], *, child_html: str, heading: str) ->
             "</div></li>"
         )
     checklist = _object_list(
-        block.get("checklist") or block.get("remediation") or block.get("actions")
+        block.get("checklist")
+        or block.get("remediation")
+        or block.get("actions")
+        or (block.get("items") if is_checklist else None)
     )
     checklist_items = []
     for index, item in enumerate(checklist, start=1):
-        title = _block_title(item) or _text(item, "action") or f"Checklist item {index}"
+        title = (
+            _block_title(item)
+            or _text(item, "action")
+            or _text(item, "text")
+            or f"Checklist item {index}"
+        )
         done = (
             item.get("done") is True or item.get("checked") is True or item.get("status") == "done"
         )
@@ -2409,7 +2566,8 @@ def _render_table(block: dict[str, Any], *, number: int | None = None) -> str:
         if caption or label
         else ""
     )
-    return f"<table>{caption_html}<thead><tr>{head}</tr></thead><tbody>{''.join(f'<tr>{row}</tr>' for row in body_rows)}</tbody></table>"
+    short = ' class="short-table"' if len(rows) <= 4 else ""
+    return f"<table{short}>{caption_html}<thead><tr>{head}</tr></thead><tbody>{''.join(f'<tr>{row}</tr>' for row in body_rows)}</tbody></table>"
 
 
 def _render_table_cell(cell: object) -> str:
@@ -2478,8 +2636,16 @@ def _render_matrix(
     for row, refs, evidence in zip(rows, row_refs, row_evidence, strict=True):
         recommended = row.get("recommended") in {True, "true", "yes", "recommended", "winner"}
         cells = ""
+        positional_values = row.get("values")
         for index, key in enumerate(header_values):
-            value = html.escape(_scalar_text(row.get(key)))
+            cell = row.get(key)
+            if (
+                key not in row
+                and isinstance(positional_values, list)
+                and index < len(positional_values)
+            ):
+                cell = positional_values[index]
+            value = html.escape(_scalar_text(cell))
             marker = (
                 '<strong class="recommendation">Recommended</strong>'
                 if recommended and (key in {"option", "name", "title"} or index == 0)
@@ -2512,7 +2678,8 @@ def _render_matrix(
         if caption or label
         else ""
     )
-    return f"<table>{caption_html}<thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+    short = ' class="short-table"' if len(rows) <= 4 else ""
+    return f"<table{short}>{caption_html}<thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
 
 def _render_items_as_definitions(block: dict[str, Any]) -> str:
@@ -2549,6 +2716,8 @@ def _render_timeline(block: dict[str, Any]) -> str:
             continue
         marker = _scalar_text(item.get("time")) or _scalar_text(item.get("step")) or str(index)
         title = _block_title(item) or f"Item {index}"
+        if block.get("type") == "steps":
+            title = re.sub(rf"^{re.escape(marker)}[.)]\s+", "", title, count=1)
         content = _text(item, "content") or _text(item, "description")
         status = _scalar_text(item.get("status")) or _scalar_text(item.get("tone"))
         rendered.append(
@@ -3007,6 +3176,8 @@ _STANDALONE_INTERACTIONS = r"""
 
 
 _CSS = """
+@font-face { font-family: "Archivo Print"; src: url('cognis-asset:archivo'); font-weight: 400; }
+@font-face { font-family: "JetBrains Print"; src: url('cognis-asset:jetbrains-mono'); font-weight: 400; }
 @font-face { font-family: "Noto Emoji Vendored"; src: __EMOJI_FONT_SOURCE__; font-style: normal; font-weight: 400; font-display: block; }
 :root {
   color-scheme: light;
@@ -3422,10 +3593,10 @@ img, svg { max-width: 100%; height: auto; }
   @bottom-center { content: counter(page) " / " counter(pages); color: #69747f; font-size: 8pt; }
 }
 @media print {
-  :root { font-family: "DejaVu Sans", Arial, sans-serif; font-size: 9.5pt; }
+  :root { font-family: "Archivo Print", "DejaVu Sans", sans-serif; font-size: 10pt; }
   body { background: white; color: #111; overflow-wrap: normal; }
   .page { width: auto; margin: 0; padding: 0; }
-  .document-header { margin-bottom: 5mm; padding: 0 0 4mm; border-bottom: 1.5pt solid #111; }
+  .document-header { margin-bottom: 5mm; padding: 0 0 4mm; border-bottom: .5pt solid #d8dee7; }
   .document-header nav, .action { display: none; }
   h1 { font-family: inherit; font-size: 25pt; line-height: 1.04; }
   .presentation-pulse h1 { font-family: "DejaVu Serif", Georgia, serif; }
@@ -3434,8 +3605,8 @@ img, svg { max-width: 100%; height: auto; }
   .document { padding: 0; box-shadow: none; }
   .document-layout { display: block; }
   .toc-backdrop, .toc-drawer-header { display: none; }
-  .document-toc { position: static; display: block; max-height: none; overflow: visible; margin: 0 0 6mm; border: .5pt solid #bbb; padding: 3mm 4mm; }
-  .toc-title { display: block; margin: 0 0 2mm; color: #111; font-family: "DejaVu Serif", Georgia, serif; font-size: 13pt; letter-spacing: 0; text-transform: none; bookmark-level: none; }
+  .document-toc { position: static; display: block; max-height: none; overflow: visible; margin: 0 0 5mm; border: 0; border-bottom: .5pt solid #d8dee7; padding: 0 0 3mm; font-size: 8pt; }
+  .toc-title { display: block; margin: 0 0 2mm; color: #52627a; font-family: "JetBrains Print", monospace; font-size: 8pt; letter-spacing: .08em; text-transform: none; bookmark-level: none; }
   .document-toc li { line-height: 1.25; }
   .document-toc li > ol { border-left: .5pt solid #bbb; }
   h1 { bookmark-level: 1; }
@@ -3485,7 +3656,32 @@ img, svg { max-width: 100%; height: auto; }
   .bibliography-dedicated { break-before: page; page-break-before: always; }
   .bibliography-compact { margin-top: 5mm; padding-top: 3mm; }
   .bibliography-compact ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 7mm; }
-  th { background: #e6e6e6; color: #111; }
+  th { background: #f1f5f9; color: #52627a; }
+  th, td { overflow-wrap: normal; word-break: normal; hyphens: none; padding: 2mm; }
+  tbody tr:nth-child(even) { background: #f7f9fb; }
+  table.short-table, .block:has(> table.short-table) { break-inside: avoid; }
+  .block-chart { break-inside: avoid; }
+  .chart-data summary { display: none !important; }
+  .pdf-mermaid-image { display: block; width: 100%; max-height: 120mm; object-fit: contain; }
+  .recommendation { display: block; margin-top: 1.5mm; color: #006649; font-size: 7pt; }
+  tr.recommended { background: #eaf7f1; }
+  .block-callout.tone-positive { border-left-color: #007457; background: #edf8f3; }
+  code, dt, .eyebrow { font-family: "JetBrains Print", monospace; }
+  .block-kv[data-variant="summary"] dl { grid-template-columns: repeat(3, minmax(0, 1fr)); break-inside: avoid; }
+  .block-timeline li { padding: 2mm 0; break-inside: avoid; }
+  .block-timeline li div p { margin: 1mm 0 0; }
+  .block-steps li { margin-bottom: 1mm; }
+  .block-kv[data-variant="summary"] dl > div[class] { padding: 3mm; border-top: 0; }
+  .block-kv[data-variant="summary"] .tone-positive dd { color: #006649; }
+  .block-kv[data-variant="summary"] .tone-warning dd { color: #92400e; }
+  .block-kv[data-variant="summary"] .tone-critical dd { color: #ad1616; }
+  .block-kv[data-variant="summary"] dt { font-size: 7pt; line-height: 1.4; }
+  .block-kv[data-variant="summary"] dd { font-size: 10pt; }
+  .badges { display: block; margin: 0 0 4mm; }
+  .badges span { display: inline-block; margin: 0 1mm 1mm 0; font-family: "JetBrains Print", monospace; font-size: 7pt; border-radius: 2pt; box-shadow: none; outline: none; }
+  .badges .tone-success, .badges .tone-positive { color: #006649; background: #ddf7ec; }
+  .badges .tone-warning { color: #92400e; background: #fff3cd; }
+  .badges .tone-info { color: #005a85; background: #e0f2fe; }
   a { color: #111; text-decoration: underline; }
   a[href^="http"]::after { content: ""; }
   .presentation-pulse .document-header { margin-bottom: 4mm; padding-bottom: 3mm; }

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased, defer
 
+from cognis import json_codec as json
 from cognis.core.trusted_evidence import (
     TRUSTED_EVIDENCE_ADMISSION_KEY,
     deserialize_evidence_admission,

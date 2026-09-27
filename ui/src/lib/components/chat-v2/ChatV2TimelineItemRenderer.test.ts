@@ -224,6 +224,18 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
     expect(screen.getByText('Connection interrupted')).toBeTruthy();
   });
 
+  it('removes a resolved retry even when its pinned slot remains mounted', async () => {
+    const item = {
+      ...message('system', 'Retry details'),
+      notice_kind: 'model_recovery', notice_scope: 'retry',
+      retry_at: '2999-01-01T00:00:00Z', stable: false
+    };
+    const view = render(ChatV2TimelineItemRenderer, { item, scope, pinnedTransient: true });
+    expect(screen.getByText('Connection interrupted')).toBeTruthy();
+    await view.rerender({ item: { ...item, notice_resolved: true }, scope, pinnedTransient: true });
+    expect(view.container.querySelector('article')).toBeNull();
+  });
+
   it('does not truncate long notice text', () => {
     const longNotice = `Technical detail ${'x'.repeat(300)}`;
     render(ChatV2TimelineItemRenderer, { item: message('system', longNotice), scope });

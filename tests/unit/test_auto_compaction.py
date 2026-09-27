@@ -102,6 +102,37 @@ class _RejectedGuardrails:
         return type("AppendResult", (), {"ok": False, "first_seq": 0, "last_seq": 0})()
 
 
+@pytest.mark.asyncio
+async def test_compaction_transition_cannot_append_after_ownership_loss() -> None:
+    from unittest.mock import AsyncMock
+
+    from cognis.core.compaction.publication import (
+        CompactionOwnershipLost,
+        CompactionPublicationGuard,
+        compaction_publication_guard,
+    )
+
+    guardrails = _FakeGuardrails()
+    guardrails.record_events = AsyncMock()
+    loop = _minimal_agent_loop(
+        compaction=_FakeCompactionStrategy(),
+        session_cache=_FakeSessionCache(entry=_cache_entry_with_events(5)),
+        guardrails=guardrails,
+    )
+    guard = CompactionPublicationGuard(
+        token="lost-owner", check=AsyncMock(side_effect=CompactionOwnershipLost("lost"))
+    )
+    token = compaction_publication_guard.set(guard)
+    try:
+        with pytest.raises(CompactionOwnershipLost):
+            await loop.persist_compaction_lifecycle(
+                _session(), {"compaction_id": "compact-lost", "status": "running"}
+            )
+    finally:
+        compaction_publication_guard.reset(token)
+    guardrails.record_events.assert_not_awaited()
+
+
 class _FakeLLM:
     def __init__(self) -> None:
         self.resolve_calls: list[dict[str, object]] = []
@@ -320,7 +351,41 @@ def _minimal_agent_loop(
 
 
 @pytest.mark.asyncio
-async def test_rejected_terminal_compaction_append_is_not_published() -> None:
+@pytest.mark.parametrize("explicit_run", [True, False])
+async def test_zero_turn_compaction_publishes_terminal_status(explicit_run: bool) -> None:
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(event: Event) -> None:
+        published.append(event)
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(
+        compaction=_FakeCompactionStrategy(
+            result=CompactionResult(compacted=True, method="llm", turns_compacted=0)
+        ),
+        session_cache=_FakeSessionCache(entry=_cache_entry_with_events(5)),
+        event_bus=bus,
+    )
+    result = await loop._auto_compact(
+        _step_context(),
+        run=CompactionRunContext(trigger="pre_turn_auto", reason="context_compaction_threshold")
+        if explicit_run
+        else None,
+    )
+    assert result is not None and not result.compacted
+    assert [event.type for event in published] == [
+        EventType.SESSION_COMPACTION_STARTED,
+        EventType.SESSION_COMPACTION_FINISHED,
+    ]
+    assert published[0].data["compaction_id"] == published[1].data["compaction_id"]
+    assert published[1].data["status"] == "skipped"
+    assert published[1].data["fallback_reason"] == "no_compactable_history"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject_start", [True, False])
+async def test_rejected_compaction_append_is_not_published(reject_start: bool) -> None:
     compaction = _FakeCompactionStrategy(
         result=CompactionResult(compacted=False, method="no_compactable_history")
     )
@@ -332,11 +397,18 @@ async def test_rejected_terminal_compaction_append_is_not_published() -> None:
         published.append(event)
 
     bus.subscribe_all(capture)
+
+    class RejectTransition:
+        async def record_events(self, *, session_id: str, events: list, **kwargs: Any) -> Any:
+            reject = reject_start or events[0].data["status"] != "running"
+            delegate = _RejectedGuardrails() if reject else _FakeGuardrails()
+            return await delegate.record_events(session_id=session_id, events=events, **kwargs)
+
     loop = _minimal_agent_loop(
         compaction=compaction,
         session_cache=cache,
         event_bus=bus,
-        guardrails=_RejectedGuardrails(),
+        guardrails=RejectTransition(),
     )
 
     with pytest.raises(RuntimeError, match="rejected compaction event"):
@@ -348,7 +420,58 @@ async def test_rejected_terminal_compaction_append_is_not_published() -> None:
             ),
         )
 
-    assert [event.type for event in published] == [EventType.SESSION_COMPACTION_STARTED]
+    assert [item.type for item in published] == (
+        [] if reject_start else [EventType.SESSION_COMPACTION_STARTED]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["summary", "model_context", "fallback"])
+async def test_cancelling_compaction_persists_terminal_occurrence(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    started = asyncio.Event()
+    entered = asyncio.Event()
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(item: Event) -> None:
+        published.append(item)
+        if item.type == EventType.SESSION_COMPACTION_STARTED:
+            started.set()
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(
+        compaction=_FakeCompactionStrategy(slow=60),
+        session_cache=_FakeSessionCache(entry=_cache_entry_with_events(5)),
+        event_bus=bus,
+    )
+
+    async def block(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await asyncio.Event().wait()
+
+    if stage == "model_context":
+        monkeypatch.setattr(loop, "_resolve_compaction_model_context", block)
+    elif stage == "fallback":
+        monkeypatch.setattr("cognis.core.agent_loop.AUTO_COMPACTION_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(loop.compaction_strategy, "compact_with_fallback", block)
+    task = asyncio.create_task(
+        loop._auto_compact(
+            _step_context(),
+            run=CompactionRunContext(trigger="tool_loop_pressure", reason="pressure"),
+            emit_timeout_notice=False,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    if stage != "summary":
+        await asyncio.wait_for(entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert published[-1].data["status"] == "failed"
+    assert published[-1].data["fallback_reason"] == "cancelled"
+    assert published[-1].data["compaction_id"] == published[0].data["compaction_id"]
 
 
 def _step_context(session: SessionModel | None = None) -> StepContext:

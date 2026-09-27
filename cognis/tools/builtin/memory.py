@@ -10,9 +10,9 @@ by the LLM.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.core.memory_aliases import (
     MEMORY_ALIASES_METADATA,
     MemoryAliasBinding,

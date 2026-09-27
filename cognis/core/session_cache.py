@@ -16,7 +16,6 @@ import asyncio
 import collections
 import contextlib
 import hashlib
-import json
 import math
 import os
 import secrets
@@ -28,6 +27,7 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge
 
+from cognis import json_codec as json
 from cognis.core.canonical_history import (
     CanonicalHistoryUnavailable,
     read_complete_history,
@@ -245,110 +245,117 @@ _REDIS_DEFAULT_TTL = 3600  # 1 hour
 
 def _serialize_entry(entry: CachedSessionState, *, include_events: bool = True) -> str:
     """Serialize the Redis-storable subset of a cache entry to JSON."""
-    return json.dumps(
-        {
-            "session_id": entry.session_id,
-            "intaris_session_id": entry.intaris_session_id,
-            "events": [
-                {
-                    "seq": e.seq,
-                    "type": e.type,
-                    "data": e.data,
-                    "source": e.source,
-                    "ts": e.ts,
-                }
-                for e in entry.events
-            ]
-            if include_events
-            else [],
-            "last_event_seq": entry.last_event_seq,
-            "last_compaction_seq": entry.last_compaction_seq,
-            "last_compaction_summary": entry.last_compaction_summary,
-            "auto_compaction_cooldown_turns": entry.auto_compaction_cooldown_turns,
-            "intention": entry.intention,
-            "intention_updated_at": entry.intention_updated_at,
-            "initialized": entry.initialized,
-            "prefix_entries": [
-                {
-                    "role": item.role,
-                    "source": item.source,
-                    "content": item.content,
-                    "seq": item.seq,
-                }
-                for item in entry.prefix_entries
-            ],
-            "context_snapshot_seq": entry.context_snapshot_seq,
-            "context_snapshot_source": entry.context_snapshot_source,
-            "memory_policy_fingerprint": entry.memory_policy_fingerprint,
-            "memory_policy_mode": entry.memory_policy_mode,
-            "prefix_repair_needed": entry.prefix_repair_needed,
-            "last_repair_attempt_at": entry.last_repair_attempt_at,
-            "last_prompt_tokens": entry.last_prompt_tokens,
-            "max_context_tokens": entry.max_context_tokens,
-            "max_input_tokens": entry.max_input_tokens,
-            "available_prompt_tokens": entry.available_prompt_tokens,
-            "context_model": entry.context_model,
-            "context_provider_id": entry.context_provider_id,
-            "reserve_output_tokens": entry.reserve_output_tokens,
-            "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
-            "last_llm_usage": entry.last_llm_usage,
-            "last_generation_performance": entry.last_generation_performance,
-            "context_metadata": entry.context_metadata,
-            "runtime_metadata_revision": entry.runtime_metadata_revision,
-            "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
-            "model_override": entry.model_override,
-            "model_override_provider_id": entry.model_override_provider_id,
-            "reasoning_effort_override": entry.reasoning_effort_override,
-            "fast_mode_override": entry.fast_mode_override,
-            "loaded_skill_ids": sorted(entry.loaded_skill_ids),
-            "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
-            "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
-            "activated_skill_ids": sorted(entry.activated_skill_ids),
-            "activated_skill_tool_ids_by_skill": {
-                skill_id: sorted(tool_ids)
-                for skill_id, tool_ids in sorted(entry.activated_skill_tool_ids_by_skill.items())
-            },
-            "activated_skill_tool_ids": sorted(entry.activated_skill_tool_ids),
-            "discovered_tool_handles": [
-                _serialize_discovered_tool_handle(item)
-                for item in sorted(
-                    entry.discovered_tool_handles.values(), key=lambda item: item.tool_id
-                )
-            ],
-            "project_contexts": [
-                {
-                    "project_root": item.project_root,
-                    "status": item.status,
-                    "source_path": item.source_path,
-                    "content": item.content,
-                    "content_hash": item.content_hash,
-                    "working_directory": item.working_directory,
-                    "seq": item.seq,
-                }
-                for item in sorted(
-                    entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
-                )
-            ],
-            "project_metadata_contexts": [
-                {
-                    "project_id": item.project_id,
-                    "project_name": item.project_name,
-                    "project_root": item.project_root,
-                    "source_id": item.source_id,
-                    "content": item.content,
-                    "content_hash": item.content_hash,
-                    "working_directory": item.working_directory,
-                    "seq": item.seq,
-                }
-                for item in sorted(
-                    entry.project_metadata_contexts.values(),
-                    key=lambda item: (item.seq, item.project_id),
-                )
-            ],
-            "memory_aliases": entry.memory_aliases.snapshot(),
+    return json.dumps(_entry_payload(entry, include_events=include_events), separators=(",", ":"))
+
+
+def _entry_payload(
+    entry: CachedSessionState,
+    *,
+    include_events: bool = True,
+) -> dict[str, Any]:
+    """Build the Redis-storable subset without an encode/decode round trip."""
+
+    return {
+        "session_id": entry.session_id,
+        "intaris_session_id": entry.intaris_session_id,
+        "events": [
+            {
+                "seq": e.seq,
+                "type": e.type,
+                "data": e.data,
+                "source": e.source,
+                "ts": e.ts,
+            }
+            for e in entry.events
+        ]
+        if include_events
+        else [],
+        "last_event_seq": entry.last_event_seq,
+        "last_compaction_seq": entry.last_compaction_seq,
+        "last_compaction_summary": entry.last_compaction_summary,
+        "auto_compaction_cooldown_turns": entry.auto_compaction_cooldown_turns,
+        "intention": entry.intention,
+        "intention_updated_at": entry.intention_updated_at,
+        "initialized": entry.initialized,
+        "prefix_entries": [
+            {
+                "role": item.role,
+                "source": item.source,
+                "content": item.content,
+                "seq": item.seq,
+            }
+            for item in entry.prefix_entries
+        ],
+        "context_snapshot_seq": entry.context_snapshot_seq,
+        "context_snapshot_source": entry.context_snapshot_source,
+        "memory_policy_fingerprint": entry.memory_policy_fingerprint,
+        "memory_policy_mode": entry.memory_policy_mode,
+        "prefix_repair_needed": entry.prefix_repair_needed,
+        "last_repair_attempt_at": entry.last_repair_attempt_at,
+        "last_prompt_tokens": entry.last_prompt_tokens,
+        "max_context_tokens": entry.max_context_tokens,
+        "max_input_tokens": entry.max_input_tokens,
+        "available_prompt_tokens": entry.available_prompt_tokens,
+        "context_model": entry.context_model,
+        "context_provider_id": entry.context_provider_id,
+        "reserve_output_tokens": entry.reserve_output_tokens,
+        "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
+        "last_llm_usage": entry.last_llm_usage,
+        "last_generation_performance": entry.last_generation_performance,
+        "context_metadata": entry.context_metadata,
+        "runtime_metadata_revision": entry.runtime_metadata_revision,
+        "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
+        "model_override": entry.model_override,
+        "model_override_provider_id": entry.model_override_provider_id,
+        "reasoning_effort_override": entry.reasoning_effort_override,
+        "fast_mode_override": entry.fast_mode_override,
+        "loaded_skill_ids": sorted(entry.loaded_skill_ids),
+        "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
+        "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
+        "activated_skill_ids": sorted(entry.activated_skill_ids),
+        "activated_skill_tool_ids_by_skill": {
+            skill_id: sorted(tool_ids)
+            for skill_id, tool_ids in sorted(entry.activated_skill_tool_ids_by_skill.items())
         },
-        separators=(",", ":"),
-    )
+        "activated_skill_tool_ids": sorted(entry.activated_skill_tool_ids),
+        "discovered_tool_handles": [
+            _serialize_discovered_tool_handle(item)
+            for item in sorted(
+                entry.discovered_tool_handles.values(), key=lambda item: item.tool_id
+            )
+        ],
+        "project_contexts": [
+            {
+                "project_root": item.project_root,
+                "status": item.status,
+                "source_path": item.source_path,
+                "content": item.content,
+                "content_hash": item.content_hash,
+                "working_directory": item.working_directory,
+                "seq": item.seq,
+            }
+            for item in sorted(
+                entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
+            )
+        ],
+        "project_metadata_contexts": [
+            {
+                "project_id": item.project_id,
+                "project_name": item.project_name,
+                "project_root": item.project_root,
+                "source_id": item.source_id,
+                "content": item.content,
+                "content_hash": item.content_hash,
+                "working_directory": item.working_directory,
+                "seq": item.seq,
+            }
+            for item in sorted(
+                entry.project_metadata_contexts.values(),
+                key=lambda item: (item.seq, item.project_id),
+            )
+        ],
+        "memory_aliases": entry.memory_aliases.snapshot(),
+    }
 
 
 def _redis_generation(intaris_session_id: str) -> str:
@@ -356,20 +363,24 @@ def _redis_generation(intaris_session_id: str) -> str:
 
 
 def _serialize_cached_event(event: CachedEvent) -> bytes:
-    return json.dumps(
-        {
-            "seq": event.seq,
-            "type": event.type,
-            "data": event.data,
-            "source": event.source,
-            "ts": event.ts,
-        },
-        separators=(",", ":"),
-    ).encode()
+    return json.encode(_cached_event_payload(event))
+
+
+def _cached_event_payload(event: CachedEvent) -> dict[str, Any]:
+    return {
+        "seq": event.seq,
+        "type": event.type,
+        "data": event.data,
+        "source": event.source,
+        "ts": event.ts,
+    }
 
 
 def _deserialize_cached_event(raw: bytes) -> CachedEvent:
-    event = json.loads(raw.decode("utf-8"))
+    return _cached_event_from_payload(json.loads(raw))
+
+
+def _cached_event_from_payload(event: dict[str, Any]) -> CachedEvent:
     return CachedEvent(
         seq=int(event["seq"]),
         type=str(event["type"]),
@@ -381,7 +392,10 @@ def _deserialize_cached_event(raw: bytes) -> CachedEvent:
 
 def _deserialize_entry(raw: str) -> CachedSessionState:
     """Deserialize a JSON string into a CachedSessionState (L1 entry)."""
-    data = json.loads(raw)
+    return _entry_from_payload(json.loads(raw))
+
+
+def _entry_from_payload(data: dict[str, Any]) -> CachedSessionState:
     entry = CachedSessionState(
         session_id=data["session_id"],
         intaris_session_id=data["intaris_session_id"],
@@ -610,6 +624,15 @@ def _discovered_tool_handle_from_raw(raw: dict[str, Any]) -> DiscoveredToolHandl
 _MAX_EVENT_PAGES = 50
 
 
+def _is_retry_admission_notice(event: CachedEvent) -> bool:
+    return (
+        event.type == "system_message"
+        and event.data.get("event") == "system_notice"
+        and event.data.get("kind") == "model_recovery"
+        and event.data.get("scope") == "turn"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalContextSnapshot:
     """Detached canonical state owned by one assembly or compaction."""
@@ -628,7 +651,7 @@ class CanonicalContextSnapshot:
                 raise CanonicalHistoryUnavailable("Profile continuation has no turn identity")
             return
         events = [event for event in self.events if event.data.get("turn_id") == turn_id]
-        if user_event and not any(event.type == "user_message" for event in events):
+        if user_event and not self._has_admitted_user_instruction(turn_id):
             raise CanonicalHistoryUnavailable("Current user instruction is missing from history")
         if profile_switch:
             switches = [
@@ -647,6 +670,43 @@ class CanonicalContextSnapshot:
                 for event_type in ("tool_call", "tool_result")
             ):
                 raise CanonicalHistoryUnavailable("Profile switch tool exchange is incomplete")
+
+    def _has_admitted_user_instruction(self, turn_id: str) -> bool:
+        """Resolve retry admission using only this detached canonical history.
+
+        Retries have distinct execution IDs and intentionally do not duplicate
+        the user's message. Their scheduler-owned durable notice is the link to
+        the original admission. No mutable cache or caller-supplied lineage is
+        trusted here; missing, ambiguous, or non-causal links fail closed.
+        """
+        visited: set[str] = set()
+        before_seq: int | None = None
+        while turn_id not in visited:
+            visited.add(turn_id)
+            events = [
+                event
+                for event in self.events
+                if event.data.get("turn_id") == turn_id
+                and (before_seq is None or event.seq < before_seq)
+            ]
+            if any(event.type == "user_message" for event in events):
+                return True
+            notices = [event for event in events if _is_retry_admission_notice(event)]
+            sources: set[str] = set()
+            for notice in notices:
+                source = notice.data.get("retry_source_turn_id")
+                if not isinstance(source, str) or not source:
+                    return False
+                if source != turn_id:
+                    sources.add(source)
+            if len(sources) != 1:
+                return False
+            source = sources.pop()
+            source_notices = [
+                notice for notice in notices if notice.data.get("retry_source_turn_id") == source
+            ]
+            turn_id, before_seq = source, min(notice.seq for notice in source_notices)
+        return False
 
 
 class SessionCache:
@@ -939,8 +999,8 @@ class SessionCache:
                 else:
                     REDIS_MISSES.inc()
                 return None
-            metadata = json.loads(raw.decode("utf-8"))
-            if not isinstance(metadata, dict) or metadata.get("schema_version") != 3:
+            metadata = json.loads(raw)
+            if not isinstance(metadata, dict) or metadata.get("schema_version") != 4:
                 raise ValueError("invalid Redis session cache metadata")
             generation = str(metadata.get("generation") or "")
             last_seq = int(metadata.get("last_event_seq", 0) or 0)
@@ -958,33 +1018,24 @@ class SessionCache:
                 chunk_raw = await self._redis_service.get(event_head)
                 if chunk_raw is None:
                     raise ValueError("incomplete Redis session cache event generation")
-                chunk = json.loads(chunk_raw.decode("utf-8"))
+                chunk = json.loads(chunk_raw)
                 if not isinstance(chunk, dict) or not isinstance(chunk.get("events"), list):
                     raise ValueError("invalid Redis session cache event chunk")
                 chunks.append(
                     [
-                        _deserialize_cached_event(
-                            json.dumps(raw_event, separators=(",", ":")).encode()
-                        )
+                        _cached_event_from_payload(raw_event)
                         for raw_event in chunk["events"]
                         if isinstance(raw_event, dict)
                     ]
                 )
                 event_head = str(chunk.get("previous") or "")
+                del chunk, chunk_raw
             for chunk_events in reversed(chunks):
                 events.extend(chunk_events)
-            metadata["events"] = [
-                {
-                    "seq": event.seq,
-                    "type": event.type,
-                    "data": event.data,
-                    "source": event.source,
-                    "ts": event.ts,
-                }
-                for event in events
-            ]
             REDIS_HITS.inc()
-            entry = _deserialize_entry(json.dumps(metadata))
+            entry = _entry_from_payload(metadata)
+            entry.events = events
+            entry.event_seqs = {event.seq for event in events}
             entry.redis_generation = generation
             entry.redis_projection_revision = entry.projection_revision
             entry.redis_chain_depth = len(seen_heads)
@@ -1033,29 +1084,27 @@ class SessionCache:
                 if pending_events or checkpoint:
                     chunk_payload = {
                         "previous": event_head,
-                        "events": [
-                            json.loads(_serialize_cached_event(event).decode("utf-8"))
-                            for event in pending_events
-                        ],
+                        "events": [_cached_event_payload(event) for event in pending_events],
                     }
-                    chunk_digest = hashlib.sha256(
-                        json.dumps(chunk_payload, separators=(",", ":")).encode()
-                    ).hexdigest()[:24]
+                    # Encode once before awaiting Redis: the wire snapshot stays detached
+                    # from mutable L1 events without retaining a decoded payload copy.
+                    chunk_payload_bytes = json.encode(chunk_payload)
+                    chunk_digest = hashlib.sha256(chunk_payload_bytes).hexdigest()[:24]
                     event_head = (
                         f"{_REDIS_KEY_PREFIX}{entry.session_id}:{generation}:chunk:{chunk_digest}"
                     )
-                    chunk_payload_bytes = json.dumps(chunk_payload, separators=(",", ":")).encode()
+                    del chunk_payload
                 else:
                     chunk_payload_bytes = None
-                metadata = json.loads(_serialize_entry(entry, include_events=False))
+                metadata = _entry_payload(entry, include_events=False)
                 metadata.update(
                     {
-                        "schema_version": 3,
+                        "schema_version": 4,
                         "generation": generation,
                         "event_head": event_head,
                     }
                 )
-                metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode()
+                metadata_bytes = json.encode(metadata)
                 if chunk_payload_bytes is not None:
                     chunk_written = await self._redis_service.set(
                         event_head,
@@ -1168,7 +1217,7 @@ class SessionCache:
                     "return 1"
                 ),
                 keys=(payload_key,),
-                args=(revision, json.dumps(payload).encode("utf-8"), self._redis_ttl),
+                args=(revision, json.encode(payload), self._redis_ttl),
             )
             return revision if written == 1 else None
         except Exception:
@@ -1193,10 +1242,37 @@ class SessionCache:
     async def refresh(self, session: SessionModel) -> CachedSessionState:
         """Load or incrementally refresh a cache entry from Intaris."""
 
+        entry, _ = await self._refresh(session)
+        return entry
+
+    async def acquire_context_snapshot(self, session: SessionModel) -> CanonicalContextSnapshot:
+        """Capture under the canonical lock, reloading invalidated history once.
+
+        Callers still refresh at their normal boundary. This closes the gap
+        between that refresh and snapshot use without another warm-cache read.
+        Capture precedes Redis I/O, so later invalidation cannot erase the
+        detached generation. Read failures and cancellation propagate.
+        """
+        _, snapshot = await self._refresh(session, capture_context=True)
+        assert snapshot is not None
+        return snapshot
+
+    async def _refresh(
+        self, session: SessionModel, *, capture_context: bool = False
+    ) -> tuple[CachedSessionState, CanonicalContextSnapshot | None]:
+        existing_entry = self.get_entry(session.session_id)
         entry = await self._ensure_entry(session)
         redis_events_to_write: list[CachedEvent] | None = None
         cache_changed = False
+        snapshot = None
         async with entry.lock:
+            if (
+                capture_context
+                and entry is existing_entry
+                and entry.initialized
+                and not entry.canonical_stale
+            ):
+                return entry, self._context_snapshot(entry)
             if not entry.initialized or entry.canonical_stale:
                 await self._cold_load(entry, session)
                 cache_changed = True
@@ -1277,9 +1353,11 @@ class SessionCache:
                 )
             entry.canonical_stale = False
             entry.touched_at = monotonic()
+            if capture_context:
+                snapshot = self._context_snapshot(entry)
         if cache_changed:
             await self._redis_set(entry, events=redis_events_to_write)
-        return entry
+        return entry, snapshot
 
     async def append_recorded_events(
         self,
@@ -2307,6 +2385,10 @@ class SessionCache:
         entry = self.get_entry(session_id)
         if entry is None or not entry.initialized or entry.canonical_stale:
             raise CanonicalHistoryUnavailable("Canonical context is stale; retry the turn")
+        return self._context_snapshot(entry)
+
+    @staticmethod
+    def _context_snapshot(entry: CachedSessionState) -> CanonicalContextSnapshot:
         require_completed_history_copy(
             [event.data for event in entry.events if event.type == "lifecycle"]
         )
@@ -2829,6 +2911,14 @@ class SessionCache:
                     item for item in entry.prefix_entries if item.seq not in superseded_event_seqs
                 ]
             self._apply_loaded_skill_event(entry, event, loaded_skill_id)
+        if _is_retry_admission_notice(event):
+            # Notices are not immutable prompt-prefix entries. Retain their
+            # durable lineage for admission checks on warm append and replay.
+            if event.seq > entry.last_compaction_seq:
+                entry.events.append(event)
+            entry.last_event_seq = max(entry.last_event_seq, event.seq)
+            entry.events_since_compaction_memo.clear()
+            return
         if event.type in PREFIX_EVENT_TYPES:
             project_metadata = project_metadata_from_event_data(event.data, seq=event.seq)
             if project_metadata is not None:

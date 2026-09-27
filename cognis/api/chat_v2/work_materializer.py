@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import copy
 import hashlib
-import json
 import posixpath
 import random
 import uuid
@@ -22,6 +21,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.background_event_reads import BackgroundEventReadAdmission
 from cognis.api.chat_v2.event_store import (
     RawSessionEvent,
@@ -43,6 +43,7 @@ from cognis.api.chat_v2.work_file_projector import (
     scrub_expired_current_file_content,
 )
 from cognis.api.chat_v2.work_projection import is_work_evidence_item, work_item_category
+from cognis.core.diff_stats import count_diff_lines
 from cognis.logging import get_logger
 from cognis.models.tool import ToolDefinition
 from cognis.providers.guardrails.events import EventAppendNotification, EventStoreAuthority
@@ -265,13 +266,7 @@ def _decode_persisted_work_item(payload: Mapping[str, Any]) -> TimelineItem:
 
 
 def _diff_counts(diff: FileDiffRef) -> tuple[int, int]:
-    additions = 0
-    deletions = 0
-    for line in diff.diff.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            additions += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            deletions += 1
+    additions, deletions = count_diff_lines(diff.diff)
     return (
         diff.additions if diff.additions is not None else additions,
         diff.deletions if diff.deletions is not None else deletions,

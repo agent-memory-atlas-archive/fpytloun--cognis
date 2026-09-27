@@ -10,6 +10,8 @@ from cognis.providers.llm.fast_mode import ANTHROPIC_FAST_BETA, enrich_fast_mode
 @pytest.mark.parametrize(
     "model,supported",
     [
+        ("claude-opus-5-5", True),
+        ("anthropic/claude-opus-5-5", True),
         ("claude-opus-5", True),
         ("anthropic/claude-opus-5", True),
         ("claude-opus-4-8", True),

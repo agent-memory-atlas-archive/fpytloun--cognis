@@ -1743,7 +1743,6 @@ test.describe('Control Center', () => {
 
     await expect(taskComposer).toHaveValue('Independent task draft');
     await taskWindow.getByLabel('Minimize').click();
-    await agentDockItem.click();
     await expect(agentDockItem).toHaveAttribute('aria-current', 'true');
     await agentWindow.getByLabel('Minimize').click();
     await taskDockItem.click();

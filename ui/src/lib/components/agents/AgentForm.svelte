@@ -892,6 +892,47 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               </span>
             </label>
           </div>
+          <div class="mt-4 grid gap-4 md:grid-cols-2">
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Minimum evaluation outcome</span>
+              <select bind:value={form.minimumOutcome} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+                <option value="">None (standard evaluation)</option>
+                <option value="deny">Deny all evaluated calls</option>
+                <option value="escalate">Require human approval</option>
+                <option value="approve">No additional restriction</option>
+              </select>
+              <span class="block text-xs text-slate-400">Selects the stricter outcome after evaluation. Explicit Cognis access denials still apply.</span>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Maximum evaluation outcome</span>
+              <select bind:value={form.maximumOutcome} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+                <option value="">None (standard evaluation)</option>
+                <option value="deny">Do not upgrade denials</option>
+                <option value="escalate">Escalate evaluated denials</option>
+                <option value="approve">Allow evaluated denials (yolo)</option>
+              </select>
+              <span class="block text-xs text-slate-400">Selects the more permissive outcome; a minimum restriction takes precedence.</span>
+            </label>
+          </div>
+          {#if form.guardrailsBackend === 'intaris' && form.maximumOutcome === 'approve'}
+            <div role="alert" class="mt-4 rounded-xl border border-red-500/70 bg-red-950/50 px-4 py-3 text-sm text-red-100">
+              <strong>DANGEROUS — Yolo mode:</strong> Intaris still evaluates and audits every evaluated call, but critical and denied calls may execute. This does not override explicit tool permissions or session lifecycle blocks.
+            </div>
+          {/if}
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span>Escalation timeout (seconds)</span>
+            <input
+              type="number"
+              min="1"
+              max="86400"
+              step="1"
+              bind:value={form.escalationTimeoutSeconds}
+              disabled={readonly || isSystemAsset}
+              placeholder="Inherit global default (300 seconds)"
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+            />
+            <span class="block text-xs text-slate-400">Pending tool approvals are denied after this wait. Tasks can override it; empty inherits the global setting.</span>
+          </label>
           {#if selectedMemoryMode}
             <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3">
               <p class="text-xs text-slate-300"><strong>Recommended for:</strong> {selectedMemoryMode.recommended_for}</p>

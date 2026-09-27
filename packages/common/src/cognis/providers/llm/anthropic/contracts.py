@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from types import MappingProxyType
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from cognis import json_codec as json
 from cognis.models.config import ModelInfo
 
 CONTRACT_VERSION = 1
@@ -24,7 +24,7 @@ MAX_ENVELOPE_BLOCKS = 256
 # `cognis.providers.llm.anthropic_subscription.CLAUDE_CODE_VERSION`;
 # `tests/unit/providers/llm/anthropic/test_integration.py` enforces that both
 # produce the same user agent.
-CLAUDE_CODE_VERSION = "2.1.270"
+CLAUDE_CODE_VERSION = "2.1.281"
 
 
 class AnthropicProtocol(StrEnum):

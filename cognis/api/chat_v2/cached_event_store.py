@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import json
 import secrets
 import zlib
 from collections import OrderedDict
@@ -17,6 +16,7 @@ from typing import Any, Literal, TypeVar, cast
 
 from pydantic import ValidationError
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.cache_metrics import (
     EVENT_CACHE_METRICS,
     CacheOperation,

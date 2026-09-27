@@ -22,6 +22,16 @@ const detail = {
 afterEach(cleanup);
 
 describe('SessionDetailsContent', () => {
+  it('shows an amber warning only when yolo is active', async () => {
+    const view = render(SessionDetailsContent, { detail, yoloMode: true });
+    const warning = screen.getByTestId('session-details-yolo-warning');
+    expect(warning).toHaveAttribute('role', 'alert');
+    expect(warning).toHaveClass('border-amber-500/70');
+    expect(warning).toHaveTextContent('Yolo mode active');
+    await view.rerender({ detail, yoloMode: false });
+    expect(screen.queryByTestId('session-details-yolo-warning')).not.toBeInTheDocument();
+  });
+
   it('keeps the narrative collapsed until the user expands it', async () => {
     render(SessionDetailsContent, { detail });
 

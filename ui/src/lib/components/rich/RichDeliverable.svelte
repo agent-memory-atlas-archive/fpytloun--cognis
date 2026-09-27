@@ -6,6 +6,7 @@
   import { addToast } from '$lib/stores/toasts';
   import {
     blockTitle,
+    blockText,
     normalizeRichDeliverable,
     privateDeliverableMediaUrl,
     resolveRichMedia,
@@ -86,7 +87,9 @@
   $: dashboardSectionOwnsIdentity = presentation === 'dashboard'
     && normalized.blocks[0]?.type === 'section_header'
     && Boolean(blockTitle(normalized.blocks[0]));
-  $: payloadOwnsIdentity = heroOwnsIdentity || dashboardSectionOwnsIdentity;
+  $: markdownOwnsIdentity = normalized.blocks[0]?.type === 'markdown'
+    && /^#\s+\S/.test(blockText(normalized.blocks[0]).trimStart());
+  $: payloadOwnsIdentity = heroOwnsIdentity || dashboardSectionOwnsIdentity || markdownOwnsIdentity;
   $: documentBlocks = decoratedBlocks.map((block, index) => index === 0
     && ((block.type === 'hero' && heroOwnsIdentity) || (block.type === 'section_header' && dashboardSectionOwnsIdentity))
     ? { ...block, __document_h1: true, ...(heroOwnsIdentity ? { __publication_anchor: `${instanceNamespace}-overview` } : {}) }
@@ -113,6 +116,8 @@
   let overlayId: string | null = null;
   let unregisterOverlay: (() => void) | null = null;
   let mermaidRenderQueued = false;
+  let mermaidRenderRunning = false;
+  let mermaidRenderPending = false;
   let inlineTocWide = false;
   let rootResizeObserver: ResizeObserver | null = null;
   let collapseIdentity = '';
@@ -323,7 +328,8 @@
         },
       });
       for (const [index, node] of nodes.entries()) {
-        const source = node.textContent ?? '';
+        // Decode persisted arrow brackets without interpreting authored HTML.
+        const source = (node.textContent ?? '').replaceAll('&gt;', '>').replaceAll('&lt;', '<');
         try {
           const renderId = (node as HTMLElement).dataset.mermaidId || `${instanceNamespace}-mermaid-${index}`;
           const result = await mermaid.render(renderId, source);
@@ -343,11 +349,24 @@
   }
 
   function scheduleMermaidRender() {
+    if (mermaidRenderRunning) {
+      mermaidRenderPending = true;
+      return;
+    }
     if (mermaidRenderQueued) return;
     mermaidRenderQueued = true;
     queueMicrotask(async () => {
       mermaidRenderQueued = false;
-      await renderMermaidFallbacks();
+      mermaidRenderRunning = true;
+      try {
+        await renderMermaidFallbacks();
+      } finally {
+        mermaidRenderRunning = false;
+        if (mermaidRenderPending) {
+          mermaidRenderPending = false;
+          scheduleMermaidRender();
+        }
+      }
     });
   }
 
@@ -477,7 +496,7 @@
   data-viewer-theme={surface === 'standalone' ? resolvedViewerTheme : undefined}
 >
   {#if surface === 'standalone'}
-    <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
+    <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
       {#if showToc && (!inlineTocWide || !tocOpen)}<button class="viewer-extra-control" type="button" aria-label="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>{/if}
       {#if shareLinkCallback}<button class="viewer-extra-control" type="button" title={shareCopied ? 'Copied into clipboard' : 'Copy share link'} aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><span data-testid={shareCopied ? 'rich-share-copied-icon' : 'rich-share-icon'}><ViewerIcon name={shareCopied ? 'check' : 'share'} /></span></button>{/if}
     </RichViewerChrome>
@@ -596,7 +615,7 @@
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="rich-full-panel" bind:this={modalPanel} tabindex="0" use:bindPanelInteractions>
-         <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
+         <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
            {#if shareLinkCallback}<button class="viewer-extra-control" type="button" aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><ViewerIcon name="share" /></button>{/if}
            {#if showToc && !tocOpen}
              <button class="viewer-extra-control" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>

@@ -2164,6 +2164,16 @@ async def test_local_runtime_settlement_removes_only_transient_recovery_notices(
         volatile_items=notices,
         active_session_id="sess-1",
     )
+    resolved = notices[0].model_copy(update={"notice_resolved": True})
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1", volatile_items=[resolved], active_session_id="sess-1"
+    )
+    assert next(item for item in runtime_frames[-1] if item.id == resolved.id).notice_resolved
+    # Late replay of the original wait must not resurrect it in reconnect snapshots.
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1", volatile_items=notices, active_session_id="sess-1"
+    )
+    assert next(item for item in runtime_frames[-1] if item.id == resolved.id).notice_resolved
     await manager.send_chat_v2_runtime_to_conversation(
         "conv-1",
         volatile_items=notices,

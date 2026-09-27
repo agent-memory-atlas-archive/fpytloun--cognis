@@ -301,7 +301,7 @@ async def handle_executor_websocket(
     resume_state = _fast_resume_runtime_state(params)
     if resume_state is not None:
         async with session_factory() as session:
-            current = await get_executor_row(session, executor_id)
+            current = await get_executor_row(session, executor_id, defer_observed_tools=True)
         desired_version = int(getattr(current, "desired_config_version", 0) or 0)
         applied_version = int(getattr(current, "applied_config_version", 0) or 0)
         reported_version = int(params.get("config_version") or 0)
@@ -342,7 +342,7 @@ async def handle_executor_websocket(
         )
         configure_ok = False
         async with session_factory() as session:
-            current = await get_executor_row(session, executor_id)
+            current = await get_executor_row(session, executor_id, defer_observed_tools=True)
             if current is not None and current.runtime_state == "reconfiguring":
                 await ownership.update_runtime_state(
                     session,
@@ -352,7 +352,7 @@ async def handle_executor_websocket(
                 await session.commit()
 
     async with session_factory() as session:
-        row = await get_executor_row(session, executor_id)
+        row = await get_executor_row(session, executor_id, defer_observed_tools=True)
     runtime_state = getattr(row, "runtime_state", "offline") if row is not None else "offline"
     _logger.info(
         "executor_ws: executor %s post-configure state: %s (configure_ok=%s)",
@@ -440,7 +440,7 @@ async def handle_executor_websocket(
         ws_provider.unregister_connection(executor_id, conn)
         if is_current:
             async with session_factory() as session:
-                current = await get_executor_row(session, executor_id)
+                current = await get_executor_row(session, executor_id, defer_observed_tools=True)
                 next_state = "offline"
                 if (
                     current is not None
@@ -689,7 +689,7 @@ async def _validate_executor_authentication(
         )
 
     async with session_factory() as session:
-        row = await get_executor_row(session, executor_id)
+        row = await get_executor_row(session, executor_id, defer_observed_tools=True)
     if row is None:
         raise _ExecutorValidationError(-32004, "Executor not found", 4404, "Executor not found")
     if (

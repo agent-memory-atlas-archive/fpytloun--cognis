@@ -6,7 +6,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import json
 import math
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -16,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.local_models import (
     OllamaRuntimeOperationStatus,
@@ -658,6 +658,11 @@ class ForwardedExecutorConnection:
         self._pending[call_id] = pending
         try:
             await self._ensure_open()
+        except asyncio.CancelledError:
+            # No call frame has been submitted. Release admission even when a
+            # caller times out while waiting for the shared connection lock.
+            self._pop_pending(call_id)
+            raise
         except Exception as exc:
             self._pop_pending(call_id)
             if isinstance(exc, ForwardedDeliveryError):

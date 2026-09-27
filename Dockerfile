@@ -9,6 +9,13 @@ COPY docs/ ../docs/
 RUN npm run build && npm run build:standalone
 
 
+FROM node:22-slim AS mermaid-build
+WORKDIR /opt/mermaid
+COPY mermaid-runtime/package.json mermaid-runtime/package-lock.json ./
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+RUN npm ci --omit=dev --no-audit --no-fund
+
+
 FROM python:3.12-slim AS common-wheel
 WORKDIR /src/packages/common
 
@@ -42,8 +49,14 @@ RUN apt-get update \
         libffi8 \
         libgdk-pixbuf-2.0-0 \
         libpango-1.0-0 \
+        chromium \
         shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mermaid-build /opt/mermaid /opt/mermaid
+COPY --from=mermaid-build /usr/local/bin/node /usr/local/bin/node
+ENV COGNIS_MERMAID_CLI=/opt/mermaid/node_modules/.bin/mmdc \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}" \

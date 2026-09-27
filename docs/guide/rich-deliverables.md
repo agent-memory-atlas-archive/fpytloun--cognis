@@ -32,6 +32,20 @@ payload JSON.
 - **PDF export** uses Cognis server-side rendering and caching. It is distinct
   from executor-side `document_generate`.
 
+PDFs adapt the publication design to A4 portrait: bundled Archivo and
+JetBrains Mono fonts, semantic status badges, a compact contents list with
+page links, and three-column summary metrics. Short structured tables (up to
+four rows) stay with their headings when they fit on a page; longer tables
+repeat column headers across pages. Fonts are packaged locally, not fetched
+from external services. PDF bookmarks and page numbers remain available.
+PDF diagrams use the packaged, offline Chromium/Mermaid CLI runtime to
+render up to three authored Mermaid diagrams to images per export. The source
+remains legible when a diagram is invalid, exceeds the bounded render budget,
+or a non-Docker installation has no CLI configured.
+Native installations must provide `COGNIS_MERMAID_CLI` and
+`PUPPETEER_EXECUTABLE_PATH` for PDF diagram support; web rendering uses
+the bundled browser Mermaid module instead.
+
 The standalone renderer scopes media access to the shared deliverable and
 applies its own security policy. It is not a static HTML artifact and should
 not be described as hosting.

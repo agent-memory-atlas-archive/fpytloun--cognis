@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.executor_resources import (
     RESOURCE_SNAPSHOT_MAX_BYTES,
     ExecutorResourceSnapshot,

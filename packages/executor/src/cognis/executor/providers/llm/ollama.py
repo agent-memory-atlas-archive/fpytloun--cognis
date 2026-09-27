@@ -8,10 +8,11 @@ same model metadata regardless of where Ollama is reachable.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import httpx
+
+from cognis import json_codec as json
 
 
 def is_ollama_remote(preset: str, base_url: str) -> bool:

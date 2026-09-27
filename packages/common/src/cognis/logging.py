@@ -13,12 +13,13 @@ latencies, status codes, error categories, decision outcomes.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, cast
+
+from cognis import json_codec as json
 
 # Correlation context variables — set per-request/turn
 correlation_conversation_id: ContextVar[str | None] = ContextVar(

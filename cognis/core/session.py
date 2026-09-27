@@ -282,6 +282,8 @@ def _intaris_session_policy(
     executor_tmpdir: str | None = None,
     interaction_mode: str | None = None,
     session_policy: dict[str, Any] | None = None,
+    agent: AgentDefinition | None = None,
+    conversation_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``policy`` payload for ``guardrails.create_session``.
 
@@ -328,6 +330,14 @@ def _intaris_session_policy(
                 "allow_human_escalation": False,
             }
     policy.update(merge_session_policies(session_policy))
+    maximum = agent.capabilities.maximum_outcome if agent is not None else None
+    if (
+        isinstance(conversation_data, dict)
+        and conversation_data.get("maximum_outcome_override") == "approve"
+    ):
+        maximum = "approve"
+    if maximum is not None:
+        policy["maximum_outcome"] = maximum
     return policy
 
 
@@ -395,6 +405,83 @@ class SessionManager:
         if self.session_lock is not None:
             self.session_lock.evict(session_id)
 
+    async def set_conversation_yolo(
+        self, conversation: ConversationModel, session: SessionModel, *, enabled: bool
+    ) -> None:
+        """Synchronize the active Intaris policy before persisting a conversation override."""
+        async with self.session_factory() as db_session:
+            agent = await self._require_agent(db_session, session.agent_id)
+            row = await queries.get_conversation(db_session, conversation.conversation_id)
+            if row is None or row.active_session_id != session.session_id:
+                raise RuntimeError("Active conversation session changed")
+            previous_data = dict(row.context_data or {})
+            project_paths = await _project_source_paths(db_session, row.project_id)
+        if not agent.capabilities.guardrails_enabled:
+            raise ValueError("Yolo requires the Intaris guardrails backend")
+        intaris_id = session.intaris_session_id or session.session_id
+        remote = await self.providers.guardrails.get_session(
+            intaris_id,
+            user_email=session.user_email,
+            agent_id=session.agent_id,
+            agent_owner_email=agent.owner_email,
+        )
+        previous_policy = dict(remote.policy or {})
+        updated_data = dict(previous_data)
+        if enabled:
+            updated_data["maximum_outcome_override"] = "approve"
+        else:
+            updated_data.pop("maximum_outcome_override", None)
+
+        def policy_for(data: dict[str, Any]) -> dict[str, Any]:
+            policy = dict(previous_policy)
+            policy.pop("maximum_outcome", None)
+            maximum = _intaris_session_policy(
+                _resolve_runtime_workdir(),
+                project_paths=project_paths,
+                agent=agent,
+                conversation_data=data,
+            ).get("maximum_outcome")
+            if maximum is not None:
+                policy["maximum_outcome"] = maximum
+            return policy
+
+        update = self.providers.guardrails.update_session_policy
+        await update(
+            intaris_id,
+            agent_id=session.agent_id,
+            user_id=session.user_email,
+            agent_owner_email=agent.owner_email,
+            details=remote.details,
+            policy=policy_for(updated_data),
+        )
+        try:
+            async with self.session_factory() as db_session:
+                row = await queries.get_conversation_for_update(
+                    db_session, conversation.conversation_id
+                )
+                if row is None or row.active_session_id != session.session_id:
+                    raise RuntimeError("Active conversation session changed")
+                current_data = dict(row.context_data or {})
+                if enabled:
+                    current_data["maximum_outcome_override"] = "approve"
+                else:
+                    current_data.pop("maximum_outcome_override", None)
+                await queries.update_conversation_context_data(
+                    db_session, conversation.conversation_id, context_data=current_data
+                )
+                await db_session.commit()
+        except Exception:
+            await update(
+                intaris_id,
+                agent_id=session.agent_id,
+                user_id=session.user_email,
+                agent_owner_email=agent.owner_email,
+                details=remote.details,
+                policy=previous_policy,
+            )
+            raise
+        conversation.context.platform_data = current_data
+
     async def refresh_intaris_session_policy(
         self,
         session: SessionModel,
@@ -405,9 +492,9 @@ class SessionManager:
         """Refresh Intaris policy from runtime paths and any explicit inherited clauses."""
 
         workdir = _resolve_runtime_workdir()
-        if not workdir:
-            return
         async with self.session_factory() as db_session:
+            agent = await self._require_agent(db_session, session.agent_id)
+            conversation = await queries.get_conversation(db_session, session.conversation_id)
             project_id = await self._lookup_conversation_project_id(
                 db_session, session.conversation_id
             )
@@ -422,6 +509,8 @@ class SessionManager:
             additional_allowed_paths=additional_allowed_paths,
             interaction_mode=runtime_access.interaction_mode if runtime_access else None,
             session_policy=session_policy,
+            agent=agent,
+            conversation_data=conversation.context_data if conversation is not None else None,
         )
         if (
             not new_policy.get("allow_paths")
@@ -446,6 +535,8 @@ class SessionManager:
                     extra={"extra_data": {"session_id": session.session_id}},
                     exc_info=True,
                 )
+                if new_policy.get("maximum_outcome") is not None:
+                    raise
 
     async def create_conversation(
         self,
@@ -622,6 +713,7 @@ class SessionManager:
                 )
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
+                conversation = await queries.get_conversation(db_session, conversation_id)
                 workdir = _resolve_runtime_workdir()
                 runtime_access = current_runtime_access_context.get()
                 with scoped_runtime_context(
@@ -641,6 +733,10 @@ class SessionManager:
                             session_policy=(
                                 runtime_access.session_policy if runtime_access else None
                             ),
+                            agent=agent,
+                            conversation_data=conversation.context_data
+                            if conversation is not None
+                            else None,
                         ),
                     )
                 await queries.set_session_intaris_session_id(
@@ -689,6 +785,7 @@ class SessionManager:
                 )
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
+                conversation = await queries.get_conversation(db_session, conversation_id)
                 workdir = _resolve_runtime_workdir()
                 runtime_access = current_runtime_access_context.get()
                 session_policy = runtime_access.session_policy if runtime_access else None
@@ -711,6 +808,10 @@ class SessionManager:
                             workdir,
                             project_paths=project_paths,
                             session_policy=session_policy,
+                            agent=agent,
+                            conversation_data=conversation.context_data
+                            if conversation is not None
+                            else None,
                         ),
                     )
                 await queries.set_session_intaris_session_id(
@@ -838,6 +939,8 @@ class SessionManager:
                             workdir,
                             project_paths=project_paths,
                             session_policy=session_policy,
+                            agent=agent,
+                            conversation_data=conversation.context_data,
                         ),
                     )
                 await queries.set_session_intaris_session_id(
@@ -1165,6 +1268,9 @@ class SessionManager:
         # Intaris creation precedes row locks; activation reconciles runtime state again.
         async with self.session_factory() as db_session:
             agent = await self._require_agent(db_session, current_session.agent_id)
+            conversation = await queries.get_conversation(
+                db_session, current_session.conversation_id
+            )
             project_id = await self._lookup_conversation_project_id(
                 db_session, current_session.conversation_id
             )
@@ -1182,7 +1288,14 @@ class SessionManager:
                 agent_id=current_session.agent_id,
                 user_id=current_session.user_email,
                 details=_intaris_session_details(workdir, source="cognis:undo"),
-                policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                policy=_intaris_session_policy(
+                    workdir,
+                    project_paths=project_paths,
+                    agent=agent,
+                    conversation_data=conversation.context_data
+                    if conversation is not None
+                    else None,
+                ),
             )
         async with self.session_factory() as db_session:
             try:
@@ -1298,6 +1411,9 @@ class SessionManager:
         async with self.session_factory() as db_session:
             try:
                 child_agent = await self._require_agent(db_session, agent_id)
+                conversation = await queries.get_conversation(
+                    db_session, parent_session.conversation_id
+                )
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=parent_session.conversation_id,
@@ -1343,7 +1459,14 @@ class SessionManager:
                         parent_session_id=parent_session.intaris_session_id
                         or parent_session.session_id,
                         details=child_details,
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                        policy=_intaris_session_policy(
+                            workdir,
+                            project_paths=project_paths,
+                            agent=child_agent,
+                            conversation_data=conversation.context_data
+                            if conversation is not None
+                            else None,
+                        ),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -1667,6 +1790,8 @@ class SessionManager:
                         raise SessionRotationConflictError(
                             "Conversation active session changed during root rotation"
                         )
+                else:
+                    conversation = await queries.get_conversation(db_session, conversation_id)
                 source_session = await queries.get_session_for_update(
                     db_session,
                     current_session.session_id,
@@ -1746,9 +1871,8 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
-                agent_owner_email = (
-                    await self._require_agent(db_session, current_session.agent_id)
-                ).owner_email
+                agent = await self._require_agent(db_session, current_session.agent_id)
+                agent_owner_email = agent.owner_email
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
@@ -1761,7 +1885,14 @@ class SessionManager:
                         user_id=current_session.user_email,
                         parent_session_id=current_session.parent_session_id,
                         details=_intaris_session_details(workdir),
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                        policy=_intaris_session_policy(
+                            workdir,
+                            project_paths=project_paths,
+                            agent=agent,
+                            conversation_data=conversation.context_data
+                            if conversation is not None
+                            else None,
+                        ),
                     )
 
                 await queries.set_session_intaris_session_id(

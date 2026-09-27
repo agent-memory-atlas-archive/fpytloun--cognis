@@ -8,11 +8,11 @@ disk by the :class:`~cognis.core.tool_output_store.ToolOutputStore`.
 from __future__ import annotations
 
 import contextlib
-import json
 from typing import Any
 
 from prometheus_client import Counter
 
+from cognis import json_codec as json
 from cognis.core.agent_registry import AgentRegistry
 from cognis.core.historical_tool_output import resolve_historical_tool_event, tool_event_storage_id
 from cognis.core.tool_output_store import ToolOutputStore

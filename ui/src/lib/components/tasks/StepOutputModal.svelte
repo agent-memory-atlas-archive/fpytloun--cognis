@@ -267,6 +267,26 @@
         </section>
       {/if}
 
+      {#if stepRun.runtime_info?.deterministic_step || stepRun.output?.metadata?.deterministic_step}
+        <section class="rounded-3xl border border-slate-800 bg-slate-950/70 p-4 sm:p-5">
+          <h3 class="text-sm font-medium text-slate-200">Deterministic execution</h3>
+          {#each [
+            ['Tool', stepRun.runtime_info?.tool_name],
+            ['Arguments', stepRun.runtime_info?.render],
+            ['Condition expression', stepRun.runtime_info?.condition_expression],
+            ['Condition evaluation', stepRun.runtime_info?.condition],
+            ['Selected branch', stepRun.runtime_info?.selected_branch],
+            ['Selected target', stepRun.runtime_info?.selected_target],
+            ['Outputs', stepRun.output?.outputs],
+          ] as [label, value]}
+            {#if value !== undefined && value !== null}
+              <h4 class="mt-4 text-xs text-slate-400">{label}</h4>
+              <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-200">{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre>
+            {/if}
+          {/each}
+        </section>
+      {/if}
+
       {#if deliverables.length > 0}
         <section class="rounded-3xl border border-sky-500/20 bg-sky-500/5 p-4 sm:p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">

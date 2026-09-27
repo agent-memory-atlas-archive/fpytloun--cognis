@@ -38,6 +38,7 @@ tool_result — emit a tool result (for the previous tool_call)
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from pathlib import Path
@@ -214,7 +215,6 @@ def render_chat_completion_stream(
     Returns a list of ``data: {...}`` strings (without the trailing newlines).
     The caller is responsible for streaming them with appropriate delays.
     """
-    import json
     import time
 
     chunks: list[str] = []

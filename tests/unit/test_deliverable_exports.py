@@ -3476,7 +3476,13 @@ def test_pdf_parser_uses_local_alias_only_for_exact_bundled_font(monkeypatch) ->
         f"<style>a{{src:url(cognis-asset:emoji-font)}}b{{src:url({other_url})}}</style>"
     )
     assert font_url in document
-    assert captured["fetcher"] is deliverables._blocked_url_fetcher
+    assert isinstance(captured["fetcher"], deliverables._RestrictedResourceFetcher)
+    assert (
+        captured["fetcher"]("cognis-asset:emoji-font").read()
+        == (deliverables._blocked_url_fetcher(font_url)["string"])
+    )
+    with pytest.raises(ValueError, match="external resource loading is disabled"):
+        captured["fetcher"]("https://example.com/untrusted.png")
     assert deliverables._blocked_url_fetcher("cognis-asset:emoji-font") == (
         deliverables._blocked_url_fetcher(font_url)
     )

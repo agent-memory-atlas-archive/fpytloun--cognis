@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
+
+from cognis import json_codec as json
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 import cognis.api.routes.settings as settings_routes
 from cognis.api.app import create_app
 from cognis.api.routes.settings import _validate_llm_provider_payload
-from cognis.store.queries import create_user, upsert_user_ui_state
+from cognis.store.queries import (
+    AUTO_RECAP_ENABLED_STATE_KEY,
+    create_user,
+    get_user_ui_state,
+    upsert_user_ui_state,
+)
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -45,6 +50,12 @@ async def _store_user_preferences_state(app: object, value: dict[str, object]) -
             value,
         )
         await session.commit()
+
+
+async def _auto_recap_enabled_at(app: object) -> object:
+    async with app.state.session_factory() as session:  # type: ignore[attr-defined]
+        row = await get_user_ui_state(session, "user@example.com", AUTO_RECAP_ENABLED_STATE_KEY)
+        return row.updated_at if row else None
 
 
 def test_validate_llm_provider_payload_accepts_chatgpt_direct_codex() -> None:
@@ -134,7 +145,9 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
             "group_tool_calls": True,
             "keep_assistant_messages_separate": False,
             "show_internal_tool_calls": False,
+            "auto_recap": False,
         }
+        assert default_response.json()["notifications"] == {"include_content": True}
 
         payload = {
             "display": {
@@ -150,7 +163,9 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
                 "group_tool_calls": True,
                 "keep_assistant_messages_separate": True,
                 "show_internal_tool_calls": True,
+                "auto_recap": True,
             },
+            "notifications": {"include_content": False},
         }
         update_response = client.put("/api/v1/user-preferences", headers=headers, json=payload)
         assert update_response.status_code == 200
@@ -159,6 +174,13 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
         persisted_response = client.get("/api/v1/user-preferences", headers=headers)
         assert persisted_response.status_code == 200
         assert persisted_response.json() == payload
+        enabled_at = asyncio.run(_auto_recap_enabled_at(client.app))
+        assert enabled_at is not None
+        payload["display"]["theme"] = "light"
+        assert (
+            client.put("/api/v1/user-preferences", headers=headers, json=payload).status_code == 200
+        )
+        assert asyncio.run(_auto_recap_enabled_at(client.app)) == enabled_at
 
 
 def test_user_preferences_reject_invalid_language(monkeypatch: object, tmp_path: Path) -> None:

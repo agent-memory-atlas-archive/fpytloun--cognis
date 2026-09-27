@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import re
 from collections.abc import Callable
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
-import json
 import socket
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -15,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 import httpcore
 import httpx
 
+from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.artifacts.preview import supports_artifact_view
 from cognis.audio.transcription import transcribe_audio_bytes

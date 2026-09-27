@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import unicodedata
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from typing import Any, Literal
 from prometheus_client import Counter, Gauge, Histogram
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
+from cognis import json_codec as json
 from cognis.models.session import SessionEvent
 
 TRUSTED_EVIDENCE_PROTOCOL: Literal["mnemory.trusted-evidence.v1"] = "mnemory.trusted-evidence.v1"

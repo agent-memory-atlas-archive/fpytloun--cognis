@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import json
 import os
 import shutil
 from collections import deque
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)

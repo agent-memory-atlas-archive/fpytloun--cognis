@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.0] - 2026-09-27
+
+### Added
+
+- Added persistent conversation recaps with recent-work summaries and richer artifact and file-diff statistics.
+- Added configurable agent outcome bounds and conversation YOLO mode, with stored-policy verification and visible guardrail warnings.
+- Added GPT-6 Sol and Luna and Claude Opus 5.5 model support, plus a credential-free model-support preflight for repository maintainers.
+- Added agent and task escalation timeout overrides and richer, routed PWA notifications.
+
+### Changed
+
+- Improved context budgeting with calibrated projection, deferred compaction, and durable lifecycle cards.
+- Improved deliverable diagrams, tables, typography, and print layouts; reduced cache and runtime memory pressure.
+
+### Fixed
+
+- Fixed turn recovery, retry lineage, managed-session ownership, and deterministic workflow keys across sessions.
+- Fixed Anthropic orphan results, executor bridge cancellation, and transient Chat recovery notices.
+- Fixed documentation navigation, recap projection typing, and evidence-admission validation at the release gates.
+- Fixed mobile rich-text overflow and Mermaid layout with reduced motion enabled.
+
 ## [0.16.0] - 2026-09-20
 
 ### Added

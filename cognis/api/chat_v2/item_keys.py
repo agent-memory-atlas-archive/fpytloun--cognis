@@ -22,6 +22,7 @@ KIND_RANK: dict[str, int] = {
     "file_diff": 8,
     "system_message": 9,
     "compaction": 10,
+    "recap": 10,
     "notice": 10,
     "error": 11,
     "unknown": 12,

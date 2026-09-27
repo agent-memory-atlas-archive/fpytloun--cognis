@@ -17,7 +17,21 @@ async function waitForBlockReady(page: import('@playwright/test').Page, blockTyp
   await expect(block).toBeVisible();
 
   if (blockType === 'chart') await expect(block.locator('.rich-chart-canvas.chart-ready')).toBeVisible();
-  if (blockType === 'mermaid') await expect(block.locator('svg')).toBeVisible();
+  if (blockType === 'mermaid') {
+    await expect(block.locator('svg')).toBeVisible();
+    const labelGeometry = await block.locator('foreignObject[width]').evaluateAll((labels) =>
+      labels.map((label) => ({
+        expected: Number(label.getAttribute('width')),
+        actual: Number.parseFloat(getComputedStyle(label).width),
+        transition: getComputedStyle(label).transitionDuration,
+      }))
+    );
+    expect(labelGeometry.length).toBeGreaterThan(0);
+    for (const label of labelGeometry) {
+      expect(label.transition).toBe('0s');
+      expect(label.actual).toBeCloseTo(label.expected, 1);
+    }
+  }
   const images = block.locator('img');
   for (let index = 0; index < await images.count(); index += 1) {
     await expect(images.nth(index)).toHaveJSProperty('complete', true);

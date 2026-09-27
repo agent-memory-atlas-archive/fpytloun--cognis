@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import platform
 import re
@@ -16,6 +15,7 @@ from typing import Any
 import httpx
 import psutil
 
+from cognis import json_codec as json
 from cognis.models.executor_resources import (
     AcceleratorResourceSnapshot,
     CPUResourceSnapshot,

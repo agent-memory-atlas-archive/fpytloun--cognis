@@ -66,16 +66,19 @@ describe('ManagedConversationControls', () => {
     expect(onTakeControl).toHaveBeenCalledOnce();
   });
 
-  it('disables mutation controls after the managed conversation closes', () => {
+  it('keeps context recovery available after the managed conversation closes', async () => {
+    const onTakeControl = vi.fn();
     render(ManagedConversationControls, {
       conversation: conversation('completed', 'closed'),
       onStop: vi.fn(),
       onSend: vi.fn(),
-      onTakeControl: vi.fn(),
+      onTakeControl,
     });
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Send instruction' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Take control' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Take control' })).toBeEnabled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Take control' }));
+    expect(onTakeControl).toHaveBeenCalledOnce();
   });
 
   it('links to the immediate controller without invoking control actions', async () => {

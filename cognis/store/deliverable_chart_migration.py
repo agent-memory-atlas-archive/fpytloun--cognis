@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import json
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -14,6 +13,7 @@ from typing import Any, Literal, Protocol
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.deliverable import RICH_DELIVERABLE_MAX_BYTES
 from cognis.rendering.rich_visuals import (

@@ -254,6 +254,14 @@ import X from 'lucide-svelte/icons/x';
     startAuthBootstrap();
 
      window.addEventListener('resize', syncMobileHeaderOffset);
+    const handleServiceWorkerMessage = (event: MessageEvent): void => {
+      const data = event.data as { type?: unknown; url?: unknown } | null;
+      if (data?.type !== 'OPEN_NOTIFICATION_TARGET' || typeof data.url !== 'string') return;
+      const target = new URL(data.url, window.location.origin);
+      if (target.origin !== window.location.origin) return;
+      void goto(`${target.pathname}${target.search}${target.hash}`);
+    };
+    navigator.serviceWorker?.addEventListener('message', handleServiceWorkerMessage);
 
     // Pages that hide the global mobile header (chat detail) use this
     // signal to open the main nav drawer from their own hamburger button.
@@ -279,6 +287,7 @@ import X from 'lucide-svelte/icons/x';
     return () => {
       resetOverlayState();
        window.removeEventListener('resize', syncMobileHeaderOffset);
+      navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage);
       setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
       unsubscribeWork();

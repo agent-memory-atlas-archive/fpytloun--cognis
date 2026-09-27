@@ -7,13 +7,13 @@ an independent LLM call. Uses a cheap model via routing policy.
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,

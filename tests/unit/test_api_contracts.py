@@ -15,6 +15,7 @@ import types
 import pytest
 from pydantic import ValidationError
 
+from cognis.api.chat_v2.schemas import RecapArtifact
 from cognis.api.models import (
     AgentGrantResponse,
     AgentResponse,
@@ -53,6 +54,13 @@ from cognis.models.search import (
     SearchSessionMatch,
 )
 from cognis.models.task import TaskDelivery
+
+
+def test_recap_artifact_size_contract_matches_numeric_ui_field() -> None:
+    artifact = RecapArtifact(id="art-1", title="image.png", mime_type="image/png", size_bytes=73269)
+    assert artifact.model_dump()["size_bytes"] == 73269
+    with pytest.raises(ValidationError):
+        RecapArtifact(id="art-1", title="image.png", mime_type="image/png", size_bytes="73269")
 
 
 def test_task_requests_normalize_empty_optional_ids() -> None:

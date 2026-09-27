@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import re
 import shutil
 import time
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)

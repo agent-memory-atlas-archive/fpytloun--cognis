@@ -1490,6 +1490,41 @@ async def test_forwarded_uncertain_submission_does_not_claim_physical_acceptance
 
 
 @pytest.mark.asyncio
+async def test_forwarded_cancelled_connect_does_not_exhaust_call_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.providers.executor.forwarding import BRIDGE_MAX_PENDING_CALLS
+
+    connecting = asyncio.Event()
+
+    async def blocked_connect(*_args: Any, **_kwargs: Any) -> None:
+        connecting.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", blocked_connect)
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    try:
+        for _ in range(BRIDGE_MAX_PENDING_CALLS + 1):
+            connecting.clear()
+            task = asyncio.create_task(connection.list_tools())
+            await asyncio.wait_for(connecting.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert connection._pending == {}
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_forwarded_cancellation_while_awaiting_acceptance_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -26,6 +26,97 @@ from cognis.models.session import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evict", [False, True])
+async def test_context_acquisition_recovers_invalidation_after_refresh(
+    evict: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guardrails = _Guardrails()
+    cache = SessionCache(guardrails)
+    session = _session()
+    await cache.refresh(session)
+    expected = cache.get_context_snapshot(session.session_id)
+    if evict:
+        await cache.evict_local(session.session_id)
+    else:
+        await cache.invalidate_canonical(session.session_id)
+
+    async def invalidate_during_redis_write(*args: object, **kwargs: object) -> None:
+        await cache.invalidate_canonical(session.session_id)
+
+    # Invalidation can run even before refresh returns: Redis is awaited
+    # outside the canonical lock. Acquisition must already own its snapshot.
+    monkeypatch.setattr(cache, "_redis_set", invalidate_during_redis_write)
+    snapshot = await cache.acquire_context_snapshot(session)
+    assert snapshot.events == expected.events
+    assert snapshot.prefix_entries == expected.prefix_entries
+    assert snapshot.last_event_seq == expected.last_event_seq
+    assert snapshot.last_compaction_summary == expected.last_compaction_summary
+    assert cache.get_entry(session.session_id).canonical_stale
+    assert guardrails.calls == [0, 0]
+
+
+@pytest.mark.asyncio
+async def test_context_acquisition_revalidates_redis_hydration_after_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guardrails = _Guardrails()
+    cache = SessionCache(guardrails)
+    session = _session()
+    entry = await cache.refresh(session)
+    expected = cache.get_context_snapshot(session.session_id)
+    # Simulate an older Redis generation returned when L1 was evicted.
+    next_seq = entry.last_event_seq + 1
+    monkeypatch.setattr(
+        guardrails,
+        "read_events",
+        AsyncMock(
+            return_value=EventReadResult(
+                events=[
+                    {"seq": next_seq, "type": "user_message", "data": {"content": "new admission"}}
+                ],
+                last_seq=next_seq,
+                has_more=False,
+            )
+        ),
+    )
+    await cache.evict_local(session.session_id)
+    monkeypatch.setattr(cache, "_redis_get", AsyncMock(return_value=entry))
+    snapshot = await cache.acquire_context_snapshot(session)
+    assert snapshot.events[: len(expected.events)] == expected.events
+    assert snapshot.last_event_seq == next_seq
+    assert snapshot.events[-1].data["content"] == "new admission"
+    guardrails.read_events.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_context_acquisition_warm_path_does_not_read_intaris() -> None:
+    guardrails = _Guardrails()
+    cache = SessionCache(guardrails)
+    session = _session()
+    await cache.refresh(session)
+    expected = cache.get_context_snapshot(session.session_id)
+    assert await cache.acquire_context_snapshot(session) == expected
+    assert guardrails.calls == [0]
+
+
+@pytest.mark.asyncio
+async def test_context_acquisition_failed_reload_remains_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guardrails = _Guardrails()
+    cache = SessionCache(guardrails)
+    session = _session()
+    await cache.refresh(session)
+    await cache.invalidate_canonical(session.session_id)
+    monkeypatch.setattr(
+        guardrails, "read_events", AsyncMock(side_effect=RuntimeError("Intaris unavailable"))
+    )
+    with pytest.raises(RuntimeError, match="Intaris unavailable"):
+        await cache.acquire_context_snapshot(session)
+    assert cache.get_entry(session.session_id).canonical_stale
+
+
+@pytest.mark.asyncio
 async def test_session_cache_closes_only_owned_redis_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,7 +303,14 @@ async def test_incremental_redis_generation_hydrates_complete_cached_event_chain
     )
 
     reader = SessionCache(_Guardrails(), redis_service=service)
-    hydrated = await reader._ensure_entry(session)  # noqa: SLF001
+    # Hydration must decode each wire value only once, without re-encoding the
+    # full transcript (which previously multiplied peak memory).
+    with monkeypatch.context() as hydration_patch:
+        hydration_patch.setattr(
+            "cognis.core.session_cache.json.dumps",
+            Mock(side_effect=AssertionError("hydration must not serialize history")),
+        )
+        hydrated = await reader._ensure_entry(session)  # noqa: SLF001
 
     assert [event.seq for event in hydrated.events] == [4, 13]
     assert hydrated.last_event_seq == 13

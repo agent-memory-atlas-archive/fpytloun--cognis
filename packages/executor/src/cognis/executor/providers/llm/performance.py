@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.config import GenerationPerformanceSnapshot
 
 _PERFORMANCE_KEYS = {

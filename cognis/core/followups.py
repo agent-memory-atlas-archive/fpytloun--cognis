@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
-import json
 from enum import StrEnum
 from time import monotonic
 from typing import Any, Literal
@@ -13,6 +12,7 @@ from typing import Any, Literal
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, Field, model_validator
 
+from cognis import json_codec as json
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,

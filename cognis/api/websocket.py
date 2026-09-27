@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import json
 import os
 import uuid
 from collections import defaultdict
@@ -29,6 +28,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge
 from sqlalchemy import select
 
+from cognis import json_codec as json
 from cognis.api.authentication import (
     AccessTokenAuthenticationError,
     authenticate_access_token,
@@ -2218,6 +2218,13 @@ class WebSocketConnectionManager:
                 }
             if has_active_turn or volatile_items:
                 for item in volatile_items:
+                    existing = cumulative.get(item.id)
+                    if (
+                        existing is not None
+                        and existing.kind == "message"
+                        and existing.notice_resolved
+                    ):
+                        continue
                     cumulative[item.id] = item
                 effective_items = list(cumulative.values())
                 self._relay_runtime_items[conversation_id] = (context.turn_id, cumulative)
@@ -3067,6 +3074,7 @@ class WebSocketConnectionManager:
                             retry_reason=event.data.get("retry_reason"),
                             retry_source_turn_id=event.data.get("retry_source_turn_id"),
                             attempt=event.data.get("attempt"),
+                            metadata=event.data,
                         )
                     ],
                     active_session_id=session_id if isinstance(session_id, str) else None,
@@ -3552,9 +3560,11 @@ class WebSocketConnectionManager:
                 if task is not None:
                     return str(task.created_by)
             if isinstance(executor_id, str):
-                executor = await session.get(ExecutorRow, executor_id)
-                if executor is not None and executor.owner_email:
-                    return str(executor.owner_email)
+                owner_email = await session.scalar(
+                    select(ExecutorRow.owner_email).where(ExecutorRow.executor_id == executor_id)
+                )
+                if owner_email:
+                    return str(owner_email)
             if isinstance(notification_id, str):
                 notification = await session.get(NotificationRow, notification_id)
                 if notification is not None:
@@ -5292,6 +5302,11 @@ async def _render_command_result(
                 **result.data,
             },
         )
+    elif result.type == "recap":
+        await manager.send_to_conversation(
+            conversation_id,
+            {"type": "recap_available", "conversation_id": conversation_id},
+        )
     elif result.type == "error":
         await manager.send_to_conversation(
             conversation_id,
@@ -5412,7 +5427,10 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
     if event.type == EventType.WORKFLOW_COMPOSED:
         return _workflow_composed_payload(conversation_id, event.data)
     if event.type == EventType.SYSTEM_NOTICE:
-        if is_transient_compaction_start_notice(event.data):
+        if (
+            is_transient_compaction_start_notice(event.data)
+            or event.data.get("notice_resolved") is True
+        ):
             return None
         payload = {
             "type": "system_message",

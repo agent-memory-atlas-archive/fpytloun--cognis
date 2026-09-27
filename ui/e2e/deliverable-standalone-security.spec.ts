@@ -408,6 +408,22 @@ test('renders authorized accordion item media once inside the standalone disclos
   await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth))
     .toBeGreaterThan(0);
   await expect(image).toHaveCount(1);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  const overflow = await page.evaluate(() => ({
+    width: document.documentElement.scrollWidth,
+    offenders: Array.from(document.querySelectorAll<HTMLElement>('body *'))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.right > document.documentElement.clientWidth + 1;
+      })
+      .map((element) => ({
+        tag: element.tagName,
+        className: typeof element.className === 'string' ? element.className : '',
+        left: Math.round(element.getBoundingClientRect().left),
+        right: Math.round(element.getBoundingClientRect().right),
+        width: Math.round(element.getBoundingClientRect().width),
+      }))
+      .slice(0, 12),
+  }));
+  expect(overflow.width, JSON.stringify(overflow.offenders)).toBeLessThanOrEqual(390);
   expect(observedRequests.filter((requestPath) => requestPath === authorizedMediaPath)).toHaveLength(1);
 });

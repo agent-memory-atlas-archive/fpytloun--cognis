@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from cognis import json_codec as json
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,

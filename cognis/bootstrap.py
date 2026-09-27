@@ -198,6 +198,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_execution_paths)
         await conn.run_sync(_ensure_task_completion_delivery_columns)
         await conn.run_sync(_ensure_task_interaction_override_columns)
+        await conn.run_sync(_ensure_task_escalation_timeout_column)
         await conn.run_sync(_ensure_task_creator_agent_column)
         await conn.run_sync(_ensure_task_session_policy_column)
         await conn.run_sync(_ensure_task_control_conversation_column)
@@ -2960,6 +2961,19 @@ def _ensure_task_interaction_override_columns(sync_conn: object) -> None:
 
     if "interaction_mode_override" not in columns:
         execute(text("ALTER TABLE tasks ADD COLUMN interaction_mode_override VARCHAR"))
+
+
+def _ensure_task_escalation_timeout_column(sync_conn: object) -> None:
+    """Support optional task-level escalation deadlines on existing databases."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("tasks")}
+    except Exception:
+        return
+    if "escalation_timeout_seconds" not in columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE tasks ADD COLUMN escalation_timeout_seconds INTEGER")
+        )
 
 
 def _ensure_step_run_execution_paths(sync_conn: object) -> None:

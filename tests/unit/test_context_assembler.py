@@ -161,6 +161,152 @@ async def test_assembly_never_silently_loses_invalidated_history(
         assert result.degraded is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+@pytest.mark.parametrize("source_present", [False, True])
+async def test_retry_assembly_requires_durable_original_admission(
+    skip_memory: bool,
+    source_present: bool,
+) -> None:
+    cache = _SessionCache()
+    cache.history_events = [
+        {
+            "seq": 1,
+            "type": "user_message",
+            "data": {"turn_id": "original", "content": "Never deploy"},
+        },
+        {
+            "seq": 2,
+            "type": "system_message",
+            "data": {
+                "event": "system_notice",
+                "kind": "model_recovery",
+                "scope": "turn",
+                "turn_id": "retry",
+                "retry_source_turn_id": "original",
+            },
+        },
+    ]
+    if not source_present:
+        cache.history_events.pop(0)
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    kwargs = dict(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Never deploy",
+        skip_memory=skip_memory,
+        required_turn_id="retry",
+        require_user_event=True,
+    )
+    if source_present:
+        result = await assembler.assemble(**kwargs)
+        assert any("Never deploy" in str(message.get("content")) for message in result.messages)
+        assert not result.degraded
+    else:
+        with pytest.raises(CanonicalHistoryUnavailable, match="Current user instruction"):
+            await assembler.assemble(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+async def test_real_cache_assembly_recovers_invalidation_during_provider_await(
+    skip_memory: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cognis.core.session_cache import SessionCache
+    from cognis.models.session import EventAppendResult, EventReadResult
+
+    class Guardrails(_Guardrails):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = [
+                {
+                    "seq": 1,
+                    "type": "user_message",
+                    "data": {"content": "Preserve the admitted instruction", "turn_id": "current"},
+                }
+            ]
+
+        async def read_events(self, *, after_seq: int = 0, **kwargs: object) -> EventReadResult:
+            return EventReadResult(
+                events=[event for event in self.events if event["seq"] > after_seq],
+                last_seq=len(self.events),
+                has_more=False,
+            )
+
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            first_seq = len(self.events) + 1
+            for event in kwargs["events"]:
+                self.events.append(
+                    {"seq": len(self.events) + 1, "type": event.type, "data": event.data}
+                )
+            return EventAppendResult(
+                ok=True,
+                count=len(self.events) - first_seq + 1,
+                first_seq=first_seq,
+                last_seq=len(self.events),
+            )
+
+    guardrails = Guardrails()
+    cache = SessionCache(guardrails)
+    session = _session()
+    memory = _Memory()
+    llm = _LLM()
+    refreshed = asyncio.Event()
+    original_refresh = cache.refresh
+    original_recall = memory.recall
+    original_model_info = llm.get_model_info
+
+    async def refresh(session: SessionModel) -> object:
+        entry = await original_refresh(session)
+        refreshed.set()
+        return entry
+
+    async def recall(**kwargs: object) -> object:
+        await refreshed.wait()
+        await cache.invalidate_canonical(session.session_id)
+        return await original_recall(**kwargs)
+
+    async def model_info(model_id: str) -> ModelInfo:
+        await cache.invalidate_canonical(session.session_id)
+        return await original_model_info(model_id)
+
+    monkeypatch.setattr(cache, "refresh", refresh)
+    if skip_memory:
+        monkeypatch.setattr(llm, "get_model_info", model_info)
+    else:
+        monkeypatch.setattr(memory, "recall", recall)
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=guardrails,
+        llm=llm,
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    result = await assembler.assemble(
+        session=session,
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Preserve the admitted instruction",
+        skip_memory=skip_memory,
+        required_turn_id="current",
+        require_user_event=True,
+    )
+    assert any(
+        "Preserve the admitted instruction" in str(message.get("content"))
+        for message in result.messages
+    )
+    assert not result.degraded
+
+
 class _SessionCache:
     def __init__(
         self,
@@ -201,6 +347,9 @@ class _SessionCache:
     def get_entry(self, session_id: str) -> object | None:
         del session_id
         return self.entry
+
+    async def acquire_context_snapshot(self, session: SessionModel) -> CanonicalContextSnapshot:
+        return self.get_context_snapshot(session.session_id)
 
     def get_context_snapshot(self, session_id: str) -> CanonicalContextSnapshot:
         from copy import deepcopy
@@ -462,6 +611,185 @@ class _LLM:
     def count_messages_tokens(self, messages: list[dict[str, object]], model: str) -> int:
         del model
         return sum(max(1, len(str(message.get("content", ""))) // 4) for message in messages)
+
+
+@pytest.mark.parametrize("recoverable", [True, False])
+@pytest.mark.parametrize("threshold", [0.85, 0.9])
+def test_projection_uses_steady_not_legacy_compaction_threshold(
+    recoverable: bool, threshold: float
+) -> None:
+    from cognis.core.message_markers import RECOVERY_CALL_ID
+
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=threshold,
+    )
+    messages = [{"role": "user", "content": "Keep this instruction"}]
+    for index in range(40):
+        call_id = f"call-{index}"
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": "data " * 4300,
+                    **({RECOVERY_CALL_ID: call_id} if recoverable else {}),
+                },
+            ]
+        )
+    messages.append({"role": "user", "content": "Continue"})
+    raw = _LLM().count_messages_tokens(messages, "test-model")
+    assert 250240 * 0.85 < raw < 250240 * 0.88
+    projected, _, _, _, _, tokens = assembler._finalize_assembled_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_context_tokens=400000,
+        available_prompt_tokens=250240,
+        max_prompt_tokens=237728,
+        tool_schema_tokens=0,
+    )
+    assert tokens == raw
+    assert projected[0]["content"] == "Keep this instruction"
+
+
+@pytest.mark.parametrize("ratio", [1.0, 2.361])
+def test_cross_turn_projection_uses_calibrated_savings(ratio: float) -> None:
+    import math
+
+    from cognis.core.message_markers import RECOVERY_CALL_ID
+
+    llm = _LLM()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    messages = [{"role": "user", "content": "Preserve this instruction"}]
+    for i in range(40):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call-{i}",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{i}",
+                    RECOVERY_CALL_ID: f"call-{i}",
+                    "content": "data " * 4800,
+                },
+            ]
+        )
+    messages.append({"role": "user", "content": "Now continue the next task"})
+    raw = llm.count_messages_tokens(messages, "test-model") + 10000
+    assert raw < 320000
+    projected, _ = assembler._project_cross_turn_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_context_tokens=1000000,
+        available_prompt_tokens=839232,
+        max_prompt_tokens=797270,
+        tool_schema_tokens=10000,
+        calibration_ratio=ratio,
+    )
+    remaining = llm.count_messages_tokens(projected, "test-model") + 10000
+    assert math.ceil(remaining * ratio) <= 320000
+    assert projected[0]["content"] == "Preserve this instruction"
+    if ratio == 1.0:
+        assert projected == messages
+    else:
+        assert remaining < raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+async def test_assembly_passes_compatible_calibration_to_worker(skip_memory: bool) -> None:
+    import math
+    from unittest.mock import Mock
+
+    cache = _SessionCache()
+    cache.apply_prompt_token_calibration = Mock(return_value=(3, {"applied_ratio": 2.361}))
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    assembler._finalize_assembled_messages = Mock(wraps=assembler._finalize_assembled_messages)
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Keep the original instruction",
+        skip_memory=skip_memory,
+    )
+    assert assembler._finalize_assembled_messages.call_args.kwargs["calibration_ratio"] == 2.361
+    assert cache.apply_prompt_token_calibration.call_args.kwargs == {
+        "raw_prompt_tokens": 1,
+        "provider_id": None,
+        "model": "test-model",
+        "estimator_identity": "unknown:v1",
+    }
+    assert result.prompt_tokens >= math.ceil(
+        _LLM().count_messages_tokens(result.messages, "test-model") * 2.361
+    )
+
+
+@pytest.mark.parametrize("mismatch", [None, "provider_id", "model", "estimator_identity"])
+def test_projection_calibration_is_scoped_to_runtime_identity(mismatch: str | None) -> None:
+    from cognis.core.session_cache import CachedSessionState, SessionCache
+
+    cache = SessionCache(None)
+    entry = CachedSessionState(session_id="session", intaris_session_id="history")
+    calibration = {
+        "provider_id": "provider",
+        "model": "test-model",
+        "estimator_identity": "unknown:v1",
+        "applied_ratio": 2.361,
+    }
+    if mismatch:
+        calibration[mismatch] = "different"
+    entry.context_metadata["prompt_token_calibration"] = calibration
+    cache._entries["session"] = entry
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    assert assembler._projection_calibration_ratio("session", "test-model", "provider") == (
+        2.361 if mismatch is None else 1.0
+    )
+    assert assembler._projection_calibration_ratio("other-session", "test-model", "provider") == 1.0
 
 
 class _ScopedLLM(_LLM):

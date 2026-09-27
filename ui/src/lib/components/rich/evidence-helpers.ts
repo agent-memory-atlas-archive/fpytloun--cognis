@@ -125,7 +125,7 @@ export function evidenceItems(value: unknown): Record<string, unknown>[] {
 }
 
 export function claimItems(block: RichBlock): Record<string, unknown>[] {
-  return objectList(block.claims ?? block.items ?? block.data);
+  return objectList(block.claims ?? block.items ?? block.cards ?? block.data);
 }
 
 export function matrixRows(block: RichBlock): Record<string, unknown>[] {

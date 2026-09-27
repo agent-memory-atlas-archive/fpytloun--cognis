@@ -17,6 +17,14 @@ async function forceLightTheme(page: import('@playwright/test').Page) {
   });
 }
 
+async function selectScenario(page: import('@playwright/test').Page, name: string | RegExp) {
+  const select = page.getByLabel('Scenario');
+  const option = select.locator('option').filter({ hasText: name }).first();
+  const value = await option.getAttribute('value');
+  if (!value) throw new Error(`Scenario not found: ${name}`);
+  await select.selectOption(value);
+}
+
 const scenarios = [
   'research-answer',
   'incident-report',
@@ -129,7 +137,7 @@ test.describe('rich deliverable visual fixture', () => {
       await page.setViewportSize({ width, height: width === 1440 ? 1200 : 1000 });
       await page.goto('/rich-deliverable-fixture');
       if (width === 390) await forceLightTheme(page);
-      await page.getByRole('tab', { name: 'Ranní Pulse v2', exact: true }).click();
+      await selectScenario(page, 'Ranní Pulse v2');
 
       const fixture = page.getByTestId('rich-deliverable-fixture');
       const pulse = page.getByTestId('rich-deliverable');
@@ -207,12 +215,12 @@ test.describe('rich deliverable visual fixture', () => {
     await expect(page.getByText(/Unsupported block:/)).toHaveCount(0);
 
     for (const scenario of scenarios.slice(1)) {
-      await page.getByRole('tab', { name: new RegExp(scenario.replace(/-/g, '.*'), 'i') }).click();
+      await page.getByLabel('Scenario').selectOption(scenario);
       await expect(fixture).toHaveAttribute('data-scenario', scenario);
       await expect(page.getByText(/Unsupported block:/)).toHaveCount(0);
     }
 
-    await page.getByRole('tab', { name: /implementation.*plan/i }).click();
+    await selectScenario(page, /implementation.*plan/i);
     await expect(page.locator('[data-rich-block-type="steps"]')).toBeVisible();
     await expect(page.locator('[data-rich-block-type="mermaid"]')).toBeVisible();
     await expect(page.locator('[data-rich-block-type="code"]')).toBeVisible();
@@ -249,7 +257,7 @@ test.describe('rich deliverable visual fixture', () => {
     // reach this element rather than resolving to an unrelated ambient
     // color that happened to look plausible in one theme.
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /freeform.*notes/i }).click();
+    await selectScenario(page, /freeform.*notes/i);
     await forceLightTheme(page);
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-scenario', 'freeform-notes');
 
@@ -281,7 +289,7 @@ test.describe('rich deliverable visual fixture', () => {
     // to an unrelated ambient color. Tokens must be defined on both
     // `.rich-deliverable` and `.rich-full`.
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: 'Weekly metrics dashboard', exact: true }).click();
+    await selectScenario(page, 'Weekly metrics dashboard');
     await page.getByRole('button', { name: 'Open full view' }).click();
     await forceLightTheme(page);
     const dialog = page.getByTestId('rich-deliverable-full-view');
@@ -299,7 +307,7 @@ test.describe('rich deliverable visual fixture', () => {
 
   test('gives every registered block type dedicated visual treatment (design-system polish pass)', async ({ page }) => {
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: 'Every block type reference', exact: true }).click();
+    await selectScenario(page, 'Every block type reference');
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-scenario', 'every-block-reference');
     await expect(page.getByText(/Unsupported block:/)).toHaveCount(0);
     const rich = page.getByTestId('rich-deliverable');
@@ -339,7 +347,7 @@ test.describe('rich deliverable visual fixture', () => {
       await expect(page.getByText(/Unsupported block:/)).toHaveCount(0);
       await expectNoHorizontalClipping(page);
 
-      await page.getByRole('tab', { name: /implementation.*plan/i }).click();
+      await selectScenario(page, /implementation.*plan/i);
       await expect(page.locator('[data-rich-block-type="code"]')).toBeVisible();
       await expectNoHorizontalClipping(page);
 
@@ -417,7 +425,7 @@ test.describe('rich deliverable visual fixture', () => {
     await page.goto('/rich-deliverable-fixture');
     await expectNoHorizontalClipping(page);
 
-    await page.getByRole('tab', { name: /weekly.*metrics.*dashboard/i }).click();
+    await selectScenario(page, /weekly.*metrics.*dashboard/i);
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-scenario', 'metrics-dashboard');
 
     const markdownOnly = page.getByRole('button', { name: 'Markdown-only' });
@@ -443,7 +451,7 @@ test.describe('rich deliverable visual fixture', () => {
     expect(headerButtonStyles.borderTopWidth).toBe('0px');
     expect(headerButtonStyles.borderRadius).not.toBe('999px');
 
-    await page.getByRole('tab', { name: /implementation.*plan/i }).click();
+    await selectScenario(page, /implementation.*plan/i);
     await expect(page.locator('[data-rich-block-type="mermaid"]')).toBeVisible();
     await expect(page.locator('.rich-mermaid svg')).toBeVisible();
 
@@ -463,7 +471,7 @@ test.describe('rich deliverable visual fixture', () => {
 
   test('renders canonical chart, mermaid, and divider children once', async ({ page }) => {
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /implementation.*plan/i }).click();
+    await selectScenario(page, /implementation.*plan/i);
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute(
       'data-scenario',
       'implementation-plan',
@@ -489,7 +497,7 @@ test.describe('rich deliverable visual fixture', () => {
       await page.setViewportSize({ width, height: 1000 });
       await page.goto('/rich-deliverable-fixture');
       if (width !== 1440) await forceLightTheme(page);
-      await page.getByRole('tab', { name: 'Generic visual system reference', exact: true }).click();
+      await selectScenario(page, 'Generic visual system reference');
 
       const document = page.getByTestId('rich-deliverable');
       await expect(document).toHaveAttribute('data-presentation', 'default');
@@ -515,7 +523,7 @@ test.describe('rich deliverable visual fixture', () => {
   test('supports publication TOC, citations, previews, captions, and keyboard navigation', async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 1280, height: 1000 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /publication-grade technical report/i }).click();
+    await selectScenario(page, /publication-grade technical report/i);
     await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-scenario', 'publication-report');
     const report = page.getByTestId('rich-deliverable');
     const namespace = await report.getAttribute('data-rich-instance');
@@ -572,7 +580,7 @@ test.describe('rich deliverable visual fixture', () => {
   test('uses one accessible TOC drawer beside actions on narrow mobile', async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 390, height: 760 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /publication-grade technical report/i }).click();
+    await selectScenario(page, /publication-grade technical report/i);
     const report = page.getByTestId('rich-deliverable');
     // The drawer is portaled to document.body (to escape .rich-deliverable's
     // isolated stacking context), so it is no longer a DOM descendant of
@@ -610,7 +618,7 @@ test.describe('rich deliverable visual fixture', () => {
   test('full-view TOC preserves SvelteKit history across route navigation and Back', async ({ page }) => {
     await page.setViewportSize({ width: 1600, height: 1000 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /publication-grade technical report/i }).click();
+    await selectScenario(page, /publication-grade technical report/i);
     await page.getByRole('button', { name: 'Open full view' }).click();
     const dialog = page.getByRole('dialog');
     const stateBefore = await page.evaluate(() => history.state);
@@ -637,7 +645,7 @@ test.describe('rich deliverable visual fixture', () => {
   test('keeps full-view IDs unique and navigates current and legacy fragments in the visible copy', async ({ page }) => {
     await page.setViewportSize({ width: 1600, height: 900 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /publication-grade technical report/i }).click();
+    await selectScenario(page, /publication-grade technical report/i);
     await page.getByRole('button', { name: 'Open full view' }).click();
 
     const fullView = page.getByTestId('rich-deliverable-full-view');
@@ -667,7 +675,7 @@ test.describe('rich deliverable visual fixture', () => {
   test('keeps adversarial generated namespaces unique and titled Markdown semantic', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: /id collision report/i }).click();
+    await selectScenario(page, /id collision report/i);
     const namespace = await page.getByTestId('rich-deliverable').getAttribute('data-rich-instance');
     const mermaidSvg = page.locator('.rich-mermaid svg');
     await expect(mermaidSvg).toHaveCount(1);
@@ -758,7 +766,7 @@ test.describe('multiple rich deliverables', () => {
     test(`renders the capacity dashboard scenario cleanly at ${width}px`, async ({ page }, testInfo) => {
       await page.setViewportSize({ width, height: width === 1440 ? 1200 : 1000 });
       await page.goto('/rich-deliverable-fixture');
-      await page.getByRole('tab', { name: 'Capacity dashboard', exact: true }).click();
+      await selectScenario(page, 'Capacity dashboard');
 
       const fixture = page.getByTestId('rich-deliverable-fixture');
       const rich = page.getByTestId('rich-deliverable');
@@ -884,7 +892,7 @@ test.describe('multiple rich deliverables', () => {
   test('stretches generic card peers on desktop and restores content-driven mobile anchors', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto('/rich-deliverable-fixture');
-    await page.getByRole('tab', { name: 'Every block type reference', exact: true }).click();
+    await selectScenario(page, 'Every block type reference');
     const cardGrid = page.locator('[data-rich-block-type="card_grid"]').first();
     const cardGeometry = await cardGrid.locator('[data-rich-block-type="card"]').evaluateAll((elements) =>
       elements.map((element) => element.getBoundingClientRect().height)

@@ -15,6 +15,7 @@ from cognis.api.chat_v2.item_keys import (
     runtime_timeline_sort_key,
     thinking_item_id,
 )
+from cognis.api.chat_v2.notice_metadata import notice_metadata
 from cognis.api.chat_v2.schemas import (
     BoundaryReceipt,
     ChatRealtimeFrame,
@@ -147,9 +148,17 @@ def compaction_runtime_item(
     return CompactionTimelineItem(
         id=f"compaction:{source_session_id}",
         kind="compaction",
-        sort_key=pre_turn_runtime_timeline_sort_key(
-            kind_rank=KIND_RANK["compaction"],
-            local=0,
+        sort_key=(
+            runtime_timeline_sort_key(
+                phase=_int(event_data.get("assistant_phase_index")),
+                kind_rank=KIND_RANK["compaction"],
+                local=0,
+            )
+            if event_data.get("phase") in {"mid_turn", "pre_model"}
+            else pre_turn_runtime_timeline_sort_key(
+                kind_rank=KIND_RANK["compaction"],
+                local=0,
+            )
         ),
         source_refs=[
             SourceRef(
@@ -335,6 +344,7 @@ def system_message_runtime_item(
     retry_reason: str | None = None,
     retry_source_turn_id: str | None = None,
     attempt: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> MessageTimelineItem:
     """Build a live system notice with the canonical projector identity."""
 
@@ -376,6 +386,7 @@ def system_message_runtime_item(
         retry_reason=retry_reason,
         retry_source_turn_id=retry_source_turn_id,
         attempt=attempt,
+        **notice_metadata(metadata or {}),
         partial=False,
     )
 

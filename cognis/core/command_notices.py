@@ -10,7 +10,7 @@ from cognis.models.session import SessionEvent
 
 logger = get_logger(__name__)
 
-PERSISTED_COMMAND_NOTICE_COMMANDS = frozenset({"/profile", "/model", "/thinking", "/fast"})
+PERSISTED_COMMAND_NOTICE_COMMANDS = frozenset({"/profile", "/model", "/thinking", "/fast", "/yolo"})
 
 
 async def persist_command_system_notice(

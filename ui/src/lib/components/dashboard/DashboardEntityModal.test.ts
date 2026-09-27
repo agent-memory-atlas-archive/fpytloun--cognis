@@ -32,6 +32,9 @@ vi.mock('$lib/stores/auth', async () => {
 vi.mock('./ConversationModalWorkspace.svelte', async () => (
   import('./ConversationModalWorkspace.test-fixture.svelte')
 ));
+vi.mock('$lib/components/chat-v2/ScopedChatV2Timeline.svelte', async () => (
+  import('./DelegateTimeline.test-fixture.svelte')
+));
 vi.mock('$lib/api/client', () => ({
   api: {
     tasks: {
@@ -342,6 +345,11 @@ describe('DashboardEntityModal', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Logs' }));
     expect(await screen.findByTestId('session-logs-panel')).toBeVisible();
+    expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow');
+    await fireEvent.click(screen.getByRole('button', { name: 'View delegate session' }));
+    expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'session:session-delegate');
+    await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow');
     await fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByTestId('session-logs-panel')).not.toBeInTheDocument());
     expect(screen.getByTestId('dashboard-task-modal-panel-steps')).toBeInTheDocument();

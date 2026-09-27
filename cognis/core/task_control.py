@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.api.task_projection import build_task_progress_projection
 from cognis.store.queries import (
     get_task,

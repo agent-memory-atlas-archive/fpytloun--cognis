@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import base64
-import json
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.ownership import SYSTEM_USER_EMAIL
 
 CHATGPT_OAUTH_AUTH_FILE = "auth.json"

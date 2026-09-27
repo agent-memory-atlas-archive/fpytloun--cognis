@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
+from cognis import json_codec as json
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
 from cognis.models.tool import ToolCapability
 

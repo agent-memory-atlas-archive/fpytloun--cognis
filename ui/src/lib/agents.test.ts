@@ -12,6 +12,37 @@ import {
 } from '$lib/agents';
 
 describe('agent payload mapping', () => {
+  it('round-trips agent outcome bounds without disabling Intaris', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1', name: 'Agent', agent_type: 'primary',
+      capabilities: {
+        guardrails_backend: 'intaris',
+        minimum_outcome: 'escalate',
+        maximum_outcome: 'approve'
+      }
+    } as never);
+    expect(form.minimumOutcome).toBe('escalate');
+    expect(form.maximumOutcome).toBe('approve');
+    expect(formStateToPayload(form).capabilities).toMatchObject({
+      minimum_outcome: 'escalate',
+      maximum_outcome: 'approve'
+    });
+    form.guardrailsBackend = 'none';
+    expect(formStateToPayload(form).capabilities).not.toHaveProperty('maximum_outcome');
+    expect(formStateToPayload(form).capabilities).not.toHaveProperty('minimum_outcome');
+  });
+
+  it('round-trips the agent escalation wait and clears it to inherit', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1', name: 'Agent', agent_type: 'primary',
+      capabilities: { escalation_timeout_seconds: 45 }
+    } as never);
+    expect(form.escalationTimeoutSeconds).toBe('45');
+    expect(formStateToPayload(form).capabilities).toMatchObject({ escalation_timeout_seconds: 45 });
+    form.escalationTimeoutSeconds = '';
+    expect(formStateToPayload(form).capabilities).not.toHaveProperty('escalation_timeout_seconds');
+  });
+
   it.each(['default', 'none', 'low', ''])('round-trips thinking state %s through JSON', (effort) => {
     const form = agentToFormState({
       agent_id: 'agent-1', name: 'Agent', agent_type: 'primary',

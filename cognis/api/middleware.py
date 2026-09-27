@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
-import json
 import mmap
 import re
 import tempfile
@@ -25,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from cognis import json_codec as json
 from cognis.api.authentication import (
     AccessTokenAuthenticationError,
     AuthenticatedUser,

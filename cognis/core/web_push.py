@@ -1,33 +1,30 @@
-"""Web Push delivery for installed PWAs.
-
-The payloads intentionally avoid assistant/user message content. Push is a
-wake-up signal that opens the relevant Cognis conversation; full content stays
-behind the authenticated app session.
-"""
+"""Web Push delivery for installed PWAs."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import ipaddress
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from markdown_it import MarkdownIt
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.config import CognisConfig
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.store.models import Agent, Conversation, PushSubscriptionRow
-from cognis.store.queries import get_agent, get_conversation
+from cognis.store.queries import get_agent, get_conversation, get_user_ui_state_value
 
 logger = get_logger(__name__)
 
@@ -43,6 +40,28 @@ _ALLOWED_PUSH_ENDPOINT_SUFFIXES = (
     ".notify.windows.com",
 )
 _MAX_PUSH_LABEL_LENGTH = 80
+_MAX_PUSH_BODY_LENGTH = 500
+_MAX_PUSH_PAYLOAD_BYTES = 3_800
+_MAX_MARKDOWN_SOURCE_LENGTH = 8_000
+_USER_PREFERENCES_STATE_KEY = "ui.preferences"
+_MARKDOWN_PARSER = MarkdownIt("commonmark").enable("strikethrough")
+
+
+class _HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "img":
+            alt = dict(attrs).get("alt")
+            if alt:
+                self.parts.append(alt)
+        elif tag == "br":
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +195,117 @@ def _conversation_notification_body(action: str, conversation: Conversation) -> 
     if action == "New reply":
         return "New reply in this chat."
     return f"{action}."
+
+
+def _push_body(value: Any) -> str:
+    """Return readable, bounded notification text from an event value."""
+
+    if not isinstance(value, str):
+        return ""
+    body = _markdown_to_plain_text(value)
+    if len(body) <= _MAX_PUSH_BODY_LENGTH:
+        return body
+    return f"{body[: _MAX_PUSH_BODY_LENGTH - 3].rstrip()}..."
+
+
+def _markdown_to_plain_text(value: str) -> str:
+    """Remove Markdown presentation syntax from system notification text."""
+
+    parts: list[str] = []
+    in_list_item = False
+    list_item_has_text = False
+    for token in _MARKDOWN_PARSER.parse(value[:_MAX_MARKDOWN_SOURCE_LENGTH]):
+        if token.type == "list_item_open":
+            in_list_item = True
+            list_item_has_text = False
+            continue
+        if token.type == "list_item_close":
+            in_list_item = False
+            parts.append(" ")
+            continue
+        if token.type in {"fence", "code_block"}:
+            parts.extend((token.content, " "))
+            continue
+        if token.type in {"html_block", "html_inline"}:
+            extractor = _HtmlTextExtractor()
+            extractor.feed(token.content)
+            extractor.close()
+            parts.extend((*(extractor.parts), " "))
+            continue
+        if token.type != "inline":
+            if token.type.endswith("_close"):
+                parts.append(" ")
+            continue
+        for child in token.children or ():
+            if child.type in {"text", "code_inline"}:
+                text = child.content
+                if (
+                    in_list_item
+                    and not list_item_has_text
+                    and text.startswith(("[ ] ", "[x] ", "[X] "))
+                ):
+                    text = text[4:]
+                if text.strip():
+                    list_item_has_text = True
+                parts.append(text)
+            elif child.type == "image":
+                parts.append(child.content)
+            elif child.type in {"softbreak", "hardbreak"}:
+                parts.append(" ")
+            elif child.type == "html_inline":
+                extractor = _HtmlTextExtractor()
+                extractor.feed(child.content)
+                extractor.close()
+                parts.extend(extractor.parts)
+        parts.append(" ")
+    return " ".join("".join(parts).split())
+
+
+def _notification_context_body(notification_type: str, payload: dict[str, Any]) -> str:
+    if notification_type == "escalation":
+        tool_name = _push_body(payload.get("tool_name"))
+        reasoning = _push_body(payload.get("reasoning"))
+        arguments = payload.get("arguments_display")
+        details = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else ""
+        return _push_body(" — ".join(part for part in (tool_name, reasoning, details) if part))
+    if notification_type == "step_question":
+        questions = payload.get("questions")
+        if isinstance(questions, list) and questions and isinstance(questions[0], dict):
+            return _push_body(questions[0].get("question"))
+    return _push_body(
+        payload.get("question")
+        or payload.get("message")
+        or payload.get("summary")
+        or payload.get("description")
+        or payload.get("label")
+        or payload.get("step_name")
+        or payload.get("title")
+    )
+
+
+def _serialize_push_payload(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) <= _MAX_PUSH_PAYLOAD_BYTES:
+        return serialized
+    body = str(payload.get("body") or "")
+    low = 0
+    high = len(body)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        candidate = dict(payload)
+        candidate["body"] = f"{body[:midpoint].rstrip()}..." if midpoint < len(body) else body
+        encoded = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= _MAX_PUSH_PAYLOAD_BYTES:
+            low = midpoint
+        else:
+            high = midpoint - 1
+    bounded = dict(payload)
+    bounded["body"] = f"{body[:low].rstrip()}..." if low < len(body) else body
+    serialized = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > _MAX_PUSH_PAYLOAD_BYTES:
+        bounded["body"] = "Cognis needs your attention."
+        serialized = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
+    return serialized
 
 
 def _runtime_config_from_key(
@@ -330,7 +460,7 @@ def load_web_push_config(config: CognisConfig) -> WebPushRuntimeConfig:
 
 
 class WebPushService:
-    """Stores browser subscriptions and sends privacy-safe Web Push payloads."""
+    """Stores browser subscriptions and sends Web Push payloads."""
 
     def __init__(
         self,
@@ -461,6 +591,9 @@ class WebPushService:
         icon: str | None = None,
         conversation_id: str | None = None,
         occurred_at: str | None = None,
+        fallback_body: str | None = None,
+        notification_id: str | None = None,
+        actions: list[dict[str, str]] | None = None,
     ) -> dict[str, int]:
         """Send a push payload to all enabled browser subscriptions for a user."""
 
@@ -476,6 +609,9 @@ class WebPushService:
                 )
             )
             rows = list(result.scalars().all())
+            preferences = await get_user_ui_state_value(
+                session, user_email, _USER_PREFERENCES_STATE_KEY
+            )
 
         if not rows:
             logger.debug(
@@ -488,9 +624,19 @@ class WebPushService:
             extra={"kind": kind, "subscription_count": len(rows)},
         )
 
-        payload_data = {
-            "title": title,
-            "body": body,
+        notification_preferences = (
+            preferences.get("notifications") if isinstance(preferences, dict) else None
+        )
+        include_content = not (
+            isinstance(notification_preferences, dict)
+            and notification_preferences.get("include_content") is False
+        )
+        selected_body = (
+            body if include_content else (fallback_body or "Cognis needs your attention.")
+        )
+        payload_data: dict[str, Any] = {
+            "title": _markdown_to_plain_text(title) or "Cognis",
+            "body": _push_body(selected_body),
             "url": url,
             "tag": tag,
             "kind": kind,
@@ -501,7 +647,11 @@ class WebPushService:
             payload_data["conversation_id"] = conversation_id
         if occurred_at:
             payload_data["occurred_at"] = occurred_at
-        payload = json.dumps(payload_data, separators=(",", ":"))
+        if notification_id:
+            payload_data["notification_id"] = notification_id
+        if actions:
+            payload_data["actions"] = actions
+        payload = _serialize_push_payload(payload_data)
         statuses = await asyncio.gather(
             *(self._send_one(row, payload) for row in rows), return_exceptions=True
         )
@@ -533,7 +683,7 @@ class WebPushService:
         except Exception:
             logger.exception("web_push: background delivery failed")
 
-    async def _event_payload(self, event: Event) -> dict[str, str] | None:
+    async def _event_payload(self, event: Event) -> dict[str, Any] | None:
         if event.type == EventType.TURN_COMPLETED:
             if event.data.get("managed_continuation_pending") or event.data.get("partial"):
                 return None
@@ -555,7 +705,9 @@ class WebPushService:
             return {
                 "user_email": user_email,
                 "title": title,
-                "body": _conversation_notification_body("New reply", conversation),
+                "body": _push_body(event.data.get("final_content"))
+                or _conversation_notification_body("New reply", conversation),
+                "fallback_body": _conversation_notification_body("New reply", conversation),
                 "url": url,
                 "tag": tag,
                 "kind": "message",
@@ -568,6 +720,14 @@ class WebPushService:
             }
 
         if event.type == EventType.TURN_ERROR:
+            # Keep cancellation lifecycle events, but do not alert for an
+            # acknowledgement of the user's own action.
+            if event.data.get("error_code") in {
+                "cancelled",
+                "queued_turn_cancelled",
+                "turn_cancelled",
+            }:
+                return None
             conversation_id = event.data.get("conversation_id")
             if not isinstance(conversation_id, str) or event.data.get("channel_deliverable"):
                 return None
@@ -578,16 +738,13 @@ class WebPushService:
                 return None
             title = _agent_notification_title(agent)
             icon = await self._agent_notification_icon(agent)
-            status = (
-                "Reply stopped"
-                if event.data.get("error_code")
-                in {"cancelled", "queued_turn_cancelled", "turn_cancelled"}
-                else "Reply failed"
-            )
+            status = "Reply failed"
             return {
                 "user_email": conversation.user_email,
                 "title": title,
-                "body": _conversation_notification_body(status, conversation),
+                "body": _push_body(event.data.get("error"))
+                or _conversation_notification_body(status, conversation),
+                "fallback_body": _conversation_notification_body(status, conversation),
                 "url": f"/chat/{conversation_id}",
                 "tag": conversation_id,
                 "kind": "message",
@@ -620,7 +777,13 @@ class WebPushService:
             return {
                 "user_email": user_email,
                 "title": title,
-                "body": _conversation_notification_body(status.rstrip("."), conversation),
+                "body": _push_body(
+                    event.data.get("result_content")
+                    or event.data.get("result_summary")
+                    or event.data.get("reason")
+                )
+                or _conversation_notification_body(status.rstrip("."), conversation),
+                "fallback_body": _conversation_notification_body(status.rstrip("."), conversation),
                 "url": url,
                 "tag": f"task:{event.data.get('task_id') or conversation_id}",
                 "kind": "task",
@@ -670,21 +833,44 @@ class WebPushService:
             title = _agent_notification_title(agent)
             icon = await self._agent_notification_icon(agent)
             notification_type = str(event.data.get("notification_type") or "notification")
-            body = {
+            fallback_body = {
                 "escalation": "Tool approval required.",
                 "gate": "Workflow review required.",
                 "step_question": "The assistant needs your input.",
                 "credential_request": "Credential input required.",
                 "auth_challenge": "Authentication challenge requires attention.",
             }.get(notification_type, "Cognis needs your attention.")
+            event_payload = event.data.get("payload")
+            context_body = (
+                _notification_context_body(notification_type, event_payload)
+                if isinstance(event_payload, dict)
+                else ""
+            )
+            notification_id = str(event.data.get("notification_id") or "")
+            if notification_id:
+                url = f"{url}?notification={notification_id}"
+            actions = (
+                [
+                    {"action": "approve", "title": "Approve"},
+                    {"action": "deny", "title": "Deny"},
+                ]
+                if notification_type == "escalation"
+                else [{"action": "review", "title": "Review"}]
+            )
             return {
                 "user_email": user_email,
                 "title": title,
-                "body": _conversation_notification_body(body.rstrip("."), conversation),
+                "body": context_body
+                or _conversation_notification_body(fallback_body.rstrip("."), conversation),
+                "fallback_body": _conversation_notification_body(
+                    fallback_body.rstrip("."), conversation
+                ),
                 "url": url,
                 "tag": f"notification:{event.data.get('notification_id') or conversation_id}",
                 "kind": notification_type,
                 "conversation_id": conversation_id,
+                "notification_id": notification_id,
+                "actions": actions,
                 **({"icon": icon} if icon else {}),
             }
         return None

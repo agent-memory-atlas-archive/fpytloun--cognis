@@ -26,6 +26,7 @@ from cognis.store.models import (
     LocalModelDeployment,
     LocalModelOperation,
     LocalModelTargetStatus,
+    executor_observed_tools_deferred,
 )
 
 
@@ -210,6 +211,7 @@ async def list_active_executor_rows(session: AsyncSession) -> list[ExecutorRow]:
         select(ExecutorRow)
         .where(ExecutorRow.status == "active")
         .order_by(ExecutorRow.executor_id.asc())
+        .options(executor_observed_tools_deferred())
     )
     return list(result.scalars().all())
 

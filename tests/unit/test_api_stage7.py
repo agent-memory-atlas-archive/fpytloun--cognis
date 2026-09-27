@@ -151,6 +151,67 @@ def test_viewer_cannot_create_task(monkeypatch: object, tmp_path: Path) -> None:
         assert response.status_code == 403
 
 
+def test_task_timeout_crud_round_trip_and_clear(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
+        headers = _auth_headers(client.app, email="user@example.com")
+        created = client.post(
+            "/api/v1/tasks",
+            headers=headers,
+            json={
+                "agent_id": "agent-1",
+                "title": "Timeout task",
+                "status": "draft",
+                "escalation_timeout_seconds": 42,
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+        task = created.json()
+        assert task["escalation_timeout_seconds"] == 42
+        task_id = task["task_id"]
+        fetched = client.get(f"/api/v1/tasks/{task_id}", headers=headers)
+        assert fetched.json()["escalation_timeout_seconds"] == 42
+        updated = client.patch(
+            f"/api/v1/tasks/{task_id}",
+            headers=headers,
+            json={"escalation_timeout_seconds": 12},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["escalation_timeout_seconds"] == 12
+        cleared = client.patch(
+            f"/api/v1/tasks/{task_id}",
+            headers=headers,
+            json={"escalation_timeout_seconds": None},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["escalation_timeout_seconds"] is None
+        invalid = client.patch(
+            f"/api/v1/tasks/{task_id}",
+            headers=headers,
+            json={"escalation_timeout_seconds": 0},
+        )
+        assert invalid.status_code == 422
+
+
 def test_managed_conversation_queue_mutations_are_read_only(
     monkeypatch: object,
     tmp_path: Path,
@@ -663,9 +724,11 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
         assert "cancelled_at" not in control_metadata
 
 
+@pytest.mark.parametrize("initial_conversation_state", ["open", "closed"])
 def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
     monkeypatch: object,
     tmp_path: Path,
+    initial_conversation_state: str,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
 
@@ -719,7 +782,7 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
                     target.conversation_id,
                     target_session.session_id,
                 )
-                await create_managed_conversation_link(
+                link = await create_managed_conversation_link(
                     session,
                     user_email="owner@example.com",
                     controller_agent_id="controller-agent",
@@ -730,6 +793,13 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
                     target_session_id=target_session.session_id,
                     title="Managed target",
                 )
+                if initial_conversation_state == "closed":
+                    await update_managed_conversation_link(
+                        session,
+                        link.link_id,
+                        conversation_state="closed",
+                        closed=True,
+                    )
                 await session.commit()
                 return target.conversation_id
 
@@ -809,6 +879,15 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
         assert control_metadata["closed_reason"] == "taken_over_by_user"
         assert follow_up_context_type == "web"
 
+        repeated_response = client.post(
+            f"/api/v1/conversations/{conversation_id}/managed/take-control",
+            headers=headers,
+            json={},
+        )
+        assert repeated_response.status_code == 200
+        assert repeated_response.json()["result"]["conversation_id"] == follow_up_conversation_id
+        assert client.app.state.session_manager.fork_into_new_conversation.await_count == 1
+
 
 def test_session_intaris_detail_prefers_intaris_summary(
     monkeypatch: object,
@@ -887,6 +966,7 @@ def test_session_intaris_detail_prefers_intaris_summary(
                     title="Intaris title",
                     intention="Intaris intention",
                     status="active",
+                    policy={"maximum_outcome": "approve"},
                     created_at="2026-01-01T00:00:00Z",
                     updated_at="2026-01-01T00:01:00Z",
                 )
@@ -933,6 +1013,7 @@ def test_session_intaris_detail_prefers_intaris_summary(
         assert response.status_code == 200
         body = response.json()
         assert body["intaris_session_id"] == "intaris-session-1"
+        assert body["maximum_outcome"] == "approve"
         assert body["intention"] == "Intaris intention"
         assert body["summary"] == "Latest Intaris summary"
         assert body["last_generation"]["model"] == "qwen3:8b"

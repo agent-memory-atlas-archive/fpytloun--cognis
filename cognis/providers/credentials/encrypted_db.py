@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import os
 import struct
 import time
@@ -17,6 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth

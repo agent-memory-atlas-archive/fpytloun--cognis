@@ -11,7 +11,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import json
 import platform
 import random
 import zlib
@@ -20,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.channels.formatting import split_message
 from cognis.channels.markdown_rendering import markdown_to_discord_markdown
 from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError

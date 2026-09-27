@@ -8,7 +8,6 @@ same metadata, media, and body extraction logic.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field, replace
@@ -18,6 +17,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from bs4 import BeautifulSoup
 from markdownify import markdownify
 
+from cognis import json_codec as json
 from cognis.tools.executor.web.semantic_quality import (
     SemanticQuality,
     assess_semantic_quality,

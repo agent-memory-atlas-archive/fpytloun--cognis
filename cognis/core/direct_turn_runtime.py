@@ -38,6 +38,10 @@ class StaleDirectTurnOwner(RuntimeError):
 class LocalDirectTurnBusy(RuntimeError):
     """Local cancellation cleanup still owns the conversation execution slot."""
 
+    def __init__(self, request_id: str, *, reason: str = "active_turn") -> None:
+        super().__init__(request_id)
+        self.reason = reason
+
 
 class UnboundToolDispatch(RuntimeError):
     """A tool reached its executor send without a durable dispatch descriptor.
@@ -446,7 +450,7 @@ class DurableDirectTurnRuntime:
             await self._execute_claimed_turn(row, payload, fence)
         except StaleDirectTurnOwner:
             return
-        except LocalDirectTurnBusy:
+        except LocalDirectTurnBusy as exc:
             current = await self.store.get(row.request_id)
             current_outcome = (
                 current.outcome if current is not None and isinstance(current.outcome, dict) else {}
@@ -457,8 +461,22 @@ class DurableDirectTurnRuntime:
                 outcome={
                     **current_outcome,
                     "phase": "local_turn_busy",
+                    "local_busy_reason": exc.reason,
                 },
             )
+            attempt = current.attempt_count if current is not None else row.attempt_count
+            if attempt > 0 and attempt & (attempt - 1) == 0:
+                logger.warning(
+                    "direct-turn deferred by local execution owner",
+                    extra={
+                        "extra_data": {
+                            "request_id": row.request_id,
+                            "conversation_id": row.conversation_id,
+                            "reason": exc.reason,
+                            "attempt_count": attempt,
+                        }
+                    },
+                )
             self._retry_after[row.request_id] = (
                 asyncio.get_running_loop().time() + DIRECT_TURN_ACTIVE_POLL_SECONDS
             )

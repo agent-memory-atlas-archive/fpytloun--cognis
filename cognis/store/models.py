@@ -1933,6 +1933,7 @@ class Task(Base):
         Boolean, nullable=False, default=False, server_default=false()
     )
     interaction_mode_override: Mapped[str | None] = mapped_column(String, nullable=True)
+    escalation_timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     session_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     control_conversation_id: Mapped[str | None] = mapped_column(
         String,

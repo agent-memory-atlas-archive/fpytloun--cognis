@@ -7,10 +7,11 @@ module only adapts the provider payload shape at the LLM boundary.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+
+from cognis import json_codec as json
 
 SYSTEM_NOTICE_INSTRUCTION = (
     "Messages wrapped in <system-notice> are internal Cognis controller notices, "

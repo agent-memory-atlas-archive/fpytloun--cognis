@@ -72,6 +72,28 @@ function hydratedRichDeliverable(richPayload: Deliverable['rich_payload']): Deli
 }
 
 describe('StepOutputModal', () => {
+  it('renders deterministic condition evaluation and structured outputs', () => {
+    const stepRun = {
+      ...runWithoutDeliverables(),
+      runtime_info: {
+        deterministic_step: true,
+        condition_expression: '{{ false }}',
+        condition: { rendered: false },
+        selected_branch: 'else',
+        selected_target: 'finish',
+      },
+      output: { outputs: { count: 0 } },
+    } as StepRun;
+    const view = render(StepOutputModal, {
+      stepRun, agentName: 'Riker', visibleStatus: 'approved', onclose: vi.fn(),
+    });
+    expect(screen.getByText('{{ false }}')).toBeVisible();
+    expect(screen.getByText(/"rendered": false/)).toBeVisible();
+    expect(screen.getByText(/"count": 0/)).toBeVisible();
+    expect(screen.getByText('else')).toBeVisible();
+    view.unmount();
+  });
+
   it('renders an output whose partial projection omits deliverables', async () => {
     const escapedToParent = vi.fn();
     window.addEventListener('keydown', escapedToParent);

@@ -74,9 +74,17 @@ class ExecutorConnectionOwnership:
         """Atomically validate the executor row and advance its connection fence."""
 
         async with self._session_factory() as session:
-            row = await session.scalar(
-                select(ExecutorRow).where(ExecutorRow.executor_id == executor_id).with_for_update()
-            )
+            row = (
+                await session.execute(
+                    select(
+                        ExecutorRow.executor_type,
+                        ExecutorRow.status,
+                        ExecutorRow.token_version,
+                    )
+                    .where(ExecutorRow.executor_id == executor_id)
+                    .with_for_update()
+                )
+            ).one_or_none()
             if (
                 row is None
                 or row.executor_type != "websocket"
@@ -238,9 +246,6 @@ class ExecutorConnectionOwnership:
             )
             .values(**filtered_values)
             .returning(ExecutorRow)
+            .options(executor_observed_tools_deferred())
         )
-        if "observed_tools" not in filtered_values:
-            # Heartbeat-driven updates never touch the multi-megabyte tool
-            # catalog; keep it out of RETURNING so asyncpg does not decode it.
-            statement = statement.options(executor_observed_tools_deferred())
         return (await session.execute(statement)).scalar_one_or_none()

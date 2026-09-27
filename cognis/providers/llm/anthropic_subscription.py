@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import secrets
 import time
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.ownership import SYSTEM_USER_EMAIL
 
 ANTHROPIC_SUBSCRIPTION_SECRET_PREFIX = "llm_oauth_anthropic"
@@ -47,7 +47,7 @@ CLAUDE_CODE_IDENTITY_BRIDGE = "The operative agent identity follows."
 # Anthropic rejects a request outright when the reported client version is
 # older than the model requires. `test_integration.py` asserts both modules
 # produce the same user agent, so a partial bump fails the suite.
-CLAUDE_CODE_VERSION = "2.1.270"
+CLAUDE_CODE_VERSION = "2.1.281"
 CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 CCH_SALT = "59cf53e54c78"
@@ -305,6 +305,18 @@ def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
             "max_output_tokens": 128_000,
             "input_cost_per_mtok": 5.0,
             "output_cost_per_mtok": 25.0,
+        },
+        {
+            **common,
+            "model_id": "claude-opus-5-5",
+            "name": "Claude Opus 5.5",
+            "display_name": "Claude Opus 5.5",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 4.0,
+            "output_cost_per_mtok": 20.0,
         },
         {
             **common,

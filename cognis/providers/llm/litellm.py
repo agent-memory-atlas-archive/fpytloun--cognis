@@ -7,7 +7,6 @@ import contextlib
 import hashlib
 import importlib.metadata
 import io
-import json
 import os
 import re
 import tempfile
@@ -31,6 +30,7 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.core.observability import record_attributed_llm_request
 from cognis.core.tool_exposure import LLMApiMode, ToolDiscoveryMode, ToolExposureContract
@@ -843,6 +843,7 @@ async def _observe_llm_stream_request(
     first_raw_chunk_after: float | None = None
     chunk_count = 0
     provider_event_counts: CollectionsCounter[str] = CollectionsCounter()
+    output_item_type_counts: CollectionsCounter[str] = CollectionsCounter()
     recent_provider_event_types: deque[str] = deque(maxlen=20)
     response_completed_seen = False
     response_failed_seen = False
@@ -857,6 +858,16 @@ async def _observe_llm_stream_request(
         nonlocal response_completed_seen, response_failed_seen, meaningful_chunk_count
         nonlocal reasoning_chunk_count
         chunk_count += 1
+        output_item = chunk.get("responses_output_item")
+        if isinstance(output_item, dict):
+            item_type = output_item.get("type")
+            safe_type = (
+                item_type
+                if isinstance(item_type, str)
+                and item_type in {"reasoning", "message", "function_call"}
+                else "other"
+            )
+            output_item_type_counts[safe_type] += 1
         provider_event_type = chunk.get("provider_event_type")
         if isinstance(provider_event_type, str) and provider_event_type:
             provider_event_counts[provider_event_type] += 1
@@ -956,6 +967,8 @@ async def _observe_llm_stream_request(
                 location=location,
             ).observe(cache_hit_ratio)
         diagnostics = dict(request_diagnostics or {})
+        if output_item_type_counts:
+            diagnostics["output_item_type_counts"] = dict(sorted(output_item_type_counts.items()))
         if provider_event_counts:
             diagnostics["provider_event_counts"] = dict(sorted(provider_event_counts.items()))
             diagnostics["recent_provider_event_types"] = list(recent_provider_event_types)
@@ -2159,6 +2172,10 @@ def _looks_like_openai_apply_patch_model(model_name: str) -> bool:
             "openai/gpt-5.5",
             "gpt-6-astra",
             "openai/gpt-6-astra",
+            "gpt-6-sol",
+            "openai/gpt-6-sol",
+            "gpt-6-luna",
+            "openai/gpt-6-luna",
         )
     )
 
@@ -4082,6 +4099,10 @@ class LiteLLMProvider:
                 merged["reasoning_efforts"] = (
                     codex_info.get("reasoning_efforts") or existing_efforts
                 )
+        elif preset == "openai" and model_id in {"gpt-6-sol", "gpt-6-luna"}:
+            openai_catalog_info = codex_catalog_model_info(model_id)
+            if openai_catalog_info is not None:
+                merged.update(openai_catalog_info)
 
         if (
             preset == "ollama"

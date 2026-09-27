@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
+from cognis import json_codec as json
 from cognis.api.authentication import AuthenticatedUser
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.ownership import normalize_executor_scope

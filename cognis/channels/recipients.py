@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.channels.addressing import ADDRESS_KINDS
 from cognis.channels.route_admission import active_managed_binding_id, lock_channel_route
 from cognis.channels.target_refs import ChannelTargetRefCodec

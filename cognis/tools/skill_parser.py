@@ -251,7 +251,7 @@ def compute_content_hash(
     steps: list[dict[str, Any]] | None = None,
 ) -> str:
     """Compute SHA-256 hash of canonical skill content."""
-    import json
+    from cognis import json_codec as json
 
     canonical = json.dumps(
         {

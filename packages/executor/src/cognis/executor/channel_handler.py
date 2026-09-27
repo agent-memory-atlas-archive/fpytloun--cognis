@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.channels.adapters.signal_cli_install import (
     ensure_signal_cli,
     resolve_signal_cli_runtime_config,

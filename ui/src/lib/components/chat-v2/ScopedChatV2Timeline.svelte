@@ -38,6 +38,7 @@
     compact = false,
     userScrolledUp = $bindable(false),
     onViewSession,
+    onOpenWork,
     emptyLabel = 'No events recorded yet.',
     onTodosChange,
     onOngoingWorkChange,
@@ -60,6 +61,7 @@
     compact?: boolean;
     userScrolledUp?: boolean;
     onViewSession?: (sessionId: string) => void | Promise<void>;
+    onOpenWork?: (category: import('$lib/chat-v2/types').WorkCategory, sessionId: string, path?: string, sourceItemId?: string) => void;
     emptyLabel?: string;
     onTodosChange?: (todos: TodoSnapshotItem[]) => void;
     onOngoingWorkChange?: (work: BackgroundWorkItem[]) => void;
@@ -751,7 +753,7 @@
     {:else if items.length === 0 && !(scope.kind === 'task_step' && stepRun)}
       <div class="py-6 text-sm text-slate-400">{emptyLabel}</div>
     {:else}
-      <ChatV2TimelineList {items} {agent} {compact} preferences={effectivePreferences} {cycleStates} {onViewSession} {scope} />
+      <ChatV2TimelineList {items} {agent} {compact} preferences={effectivePreferences} {cycleStates} {onViewSession} {onOpenWork} {scope} />
     {/if}
     {#if scope.kind === 'task_step' && stepRun}
       <TaskStepOutcomeEpilogue {stepRun} />

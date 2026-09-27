@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import html
-import json
 import math
 import re
 from collections.abc import Callable
@@ -16,6 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, field_validator
 
+from cognis import json_codec as json
 from cognis.rendering.rich_visuals import RICH_ICON_SYMBOLS, normalize_chart
 
 

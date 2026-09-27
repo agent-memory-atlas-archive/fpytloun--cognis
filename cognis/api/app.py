@@ -1079,6 +1079,17 @@ def create_app(
 
         # CommandDispatcher — transport-agnostic slash command handling.
         from cognis.core.commands import CommandDispatcher
+        from cognis.core.recap import RecapService
+
+        recap_service = RecapService(
+            session_factory=session_factory,
+            providers=providers,
+            scheduler=turn_scheduler,
+            session_cache=session_cache,
+            event_bus=event_bus,
+            lease_store=maintenance_leases,
+        )
+        app.state.recap_service = recap_service
 
         command_dispatcher = CommandDispatcher(
             session_factory=session_factory,
@@ -1089,6 +1100,7 @@ def create_app(
             pause_waiter=pause_waiter,
             notification_service=notification_service,
             turn_scheduler=turn_scheduler,
+            recap_service=recap_service,
         )
 
         from cognis.store.queries import get_setting_value
@@ -1697,8 +1709,10 @@ def create_app(
         app.state.shutdown_coordinator = shutdown_coordinator
         await observability_service.start()
         app.state.observability_service = observability_service
+        recap_service.start()
         yield
 
+        await recap_service.stop()
         await shutdown_coordinator.drain()
         await turn_scheduler.stop_direct_turn_runtime()
         event_bus.unsubscribe(
@@ -1760,7 +1774,20 @@ def create_app(
         await engine.dispose()
         controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.16.0", lifespan=lifespan)
+    @asynccontextmanager
+    async def monitored_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        from cognis.core.memory_diagnostics import MemoryDiagnostics
+
+        diagnostics = MemoryDiagnostics()
+        diagnostics.start()
+        try:
+            async with lifespan(app):
+                diagnostics.mark_application_started()
+                yield
+        finally:
+            await diagnostics.stop()
+
+    app = FastAPI(title="Cognis", version="0.17.0", lifespan=monitored_lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths

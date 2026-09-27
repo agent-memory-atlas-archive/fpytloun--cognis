@@ -12,6 +12,7 @@ from zipfile import ZipFile
 
 COMMON_ALLOWED_PREFIXES = (
     "cognis/__init__.py",
+    "cognis/json_codec.py",
     "cognis/json_stream.py",
     "cognis/logging.py",
     "cognis/mcp_runtime.py",
@@ -184,12 +185,12 @@ def assert_split(common: Path, controller: Path, executor: Path) -> None:
     common_metadata = metadata(common)
     controller_metadata = metadata(controller)
     executor_metadata = metadata(executor)
-    if "Version: 0.16.0" not in common_metadata:
-        raise AssertionError("common metadata does not report version 0.16.0")
-    if "Version: 0.16.0" not in controller_metadata:
-        raise AssertionError("controller metadata does not report version 0.16.0")
-    if "Version: 0.16.0" not in executor_metadata:
-        raise AssertionError("executor metadata does not report version 0.16.0")
+    if "Version: 0.17.0" not in common_metadata:
+        raise AssertionError("common metadata does not report version 0.17.0")
+    if "Version: 0.17.0" not in controller_metadata:
+        raise AssertionError("controller metadata does not report version 0.17.0")
+    if "Version: 0.17.0" not in executor_metadata:
+        raise AssertionError("executor metadata does not report version 0.17.0")
     if _requires(controller_metadata) != [
         item for item in _requires(controller_metadata) if item != "cognis-executor"
     ]:

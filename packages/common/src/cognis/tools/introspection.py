@@ -72,11 +72,27 @@ def describe_available_tool(
             ),
             None,
         )
+        correction: dict[str, Any] = {}
+        if selected is None and len(tool.descriptor.operations) == 1:
+            selected = tool.descriptor.operations[0]
+            correction = {
+                "requested_operation": operation,
+                "resolved_operation": selected.operation,
+                "message": (
+                    "This tool has only one operation; its authoritative schema is returned. "
+                    "Omit operation when describing single-operation tools."
+                ),
+            }
         if selected is None:
             return {
                 "valid": False,
                 "error": "operation_not_available",
                 "requested_operation": operation,
+                "message": (
+                    "The tool is available, but this operation name is not. "
+                    "Use an exact name from available_operations or omit operation "
+                    "to inspect the full descriptor."
+                ),
                 **identity,
                 "available_operations": sorted(
                     candidate.operation for candidate in tool.descriptor.operations
@@ -96,6 +112,7 @@ def describe_available_tool(
             "valid": True,
             **identity,
             "descriptor": descriptor,
+            **correction,
         }
     return {
         "valid": True,

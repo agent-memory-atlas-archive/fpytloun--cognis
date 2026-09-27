@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 import shutil
 from collections import OrderedDict
@@ -15,6 +14,7 @@ from weakref import WeakValueDictionary
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.core.local_models import parse_local_model_reference, sanitize_local_model_error
 from cognis.models.local_models import (
     LOCAL_MODEL_BYTE_COUNT_MAX,

@@ -6,12 +6,12 @@ import base64
 import binascii
 import hashlib
 import hmac
-import json
 from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import Field
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.schemas import StrictModel
 
 CursorErrorCode = Literal[

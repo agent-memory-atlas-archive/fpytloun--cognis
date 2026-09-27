@@ -61,7 +61,10 @@ async def _session_factory(tmp_path: object):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_id", ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"])
+@pytest.mark.parametrize(
+    "model_id",
+    ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"],
+)
 async def test_known_claude_metadata_survives_stale_litellm(tmp_path, monkeypatch, model_id):
     engine, factory = await _session_factory(tmp_path)
     provider = LiteLLMProvider(factory, _MemorySecrets())
@@ -790,6 +793,7 @@ async def test_anthropic_subscription_discover_models_uses_remote_models(
         captured["access_token"] = auth.access_token
         return [
             {"model_id": "claude-fable-5", "name": "Claude Fable 5 Remote"},
+            {"model_id": "claude-opus-5-5", "name": "Claude Opus 5.5 Remote"},
             {"model_id": "claude-model-only-from-api", "name": "Remote-only model"},
         ]
 
@@ -807,6 +811,10 @@ async def test_anthropic_subscription_discover_models_uses_remote_models(
     assert "claude-model-only-from-api" in by_id
     assert by_id["claude-fable-5"]["name"] == "Claude Fable 5 Remote"
     assert by_id["claude-fable-5"]["supports_prompt_caching"] is True
+    assert by_id["claude-opus-5-5"]["name"] == "Claude Opus 5.5 Remote"
+    assert by_id["claude-opus-5-5"]["context_window"] == 1_000_000
+    assert by_id["claude-opus-5-5"]["max_input_tokens"] == 872_000
+    assert by_id["claude-opus-5-5"]["max_output_tokens"] == 128_000
     # Discovery is a registry baseline, not a copy of configured model overrides.
     assert "claude-sonnet-4-5" not in by_id
     async with session_factory() as db:
@@ -814,6 +822,8 @@ async def test_anthropic_subscription_discover_models_uses_remote_models(
         assert saved.config["models"] == [{"model_id": "claude-sonnet-4-5"}]
     assert by_id["claude-opus-5"]["supports_fast_mode"] is True
     assert by_id["claude-opus-5"]["fast_mode_parameter"] == "speed"
+    assert by_id["claude-opus-5-5"]["supports_fast_mode"] is True
+    assert by_id["claude-opus-5-5"]["fast_mode_parameter"] == "speed"
     await engine.dispose()
 
 
@@ -3392,8 +3402,10 @@ async def test_litellm_provider_does_not_infer_native_apply_patch_for_compatible
 
 
 @pytest.mark.asyncio
-async def test_litellm_provider_infers_native_apply_patch_for_gpt55_direct_openai(
+@pytest.mark.parametrize("model_id", ["gpt-5.5", "gpt-6-sol", "gpt-6-luna"])
+async def test_litellm_provider_infers_native_apply_patch_for_direct_openai(
     tmp_path: object,
+    model_id: str,
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -3403,17 +3415,29 @@ async def test_litellm_provider_infers_native_apply_patch_for_gpt55_direct_opena
                 display_name="OpenAI",
                 location="controller",
                 backend="litellm",
-                config={"preset": "openai", "default_model": "gpt-5.5"},
+                config={"preset": "openai", "default_model": model_id},
                 status="active",
             )
         )
         await session.commit()
 
     provider = LiteLLMProvider(session_factory)
-    model_info = await provider.get_model_info("gpt-5.5", provider_id="openai")
+    model_info = await provider.get_model_info(model_id, provider_id="openai")
 
     assert model_info.supports_responses_api is True
     assert model_info.supports_openai_apply_patch is True
+    if model_id.startswith("gpt-6-"):
+        assert model_info.context_window == 400_000
+        assert model_info.max_input_tokens == 272_000
+        assert model_info.max_context_window == 1_000_000
+        assert model_info.max_output_tokens == 128_000
+        assert model_info.supports_vision is True
+        assert model_info.supports_pdf_input is True
+        assert model_info.supports_reasoning is True
+        assert model_info.supports_verbosity is True
+        assert model_info.default_verbosity == "low"
+        assert model_info.supports_tool_search is True
+        assert model_info.openai_apply_patch_tool_type == "freeform"
     await engine.dispose()
 
 

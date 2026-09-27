@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from datetime import UTC, datetime
 from typing import Any
 
 from cognis import __version__
+from cognis import json_codec as json
 
 
 def server_time_iso() -> str:

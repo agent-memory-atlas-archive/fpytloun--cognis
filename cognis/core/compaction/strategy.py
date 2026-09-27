@@ -545,7 +545,7 @@ class CompactionStrategy:
             entry = await self.session_cache.refresh(session)
         return await self._generate_summary_from_entry(
             session,
-            entry=self.session_cache.get_context_snapshot(session.session_id),
+            entry=await self.session_cache.acquire_context_snapshot(session),
             trigger=trigger,
             model_context=model_context,
             long_lived_chat=long_lived_chat,
@@ -736,7 +736,7 @@ class CompactionStrategy:
             return CompactionResult(compacted=False, method="llm_failed")
 
         await self.session_cache.refresh(session)
-        entry = self.session_cache.get_context_snapshot(session.session_id)
+        entry = await self.session_cache.acquire_context_snapshot(session)
 
         max_input_tokens = await self._resolve_max_input_tokens(
             model_context,

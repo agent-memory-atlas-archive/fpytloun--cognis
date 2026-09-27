@@ -47,6 +47,7 @@ import X from 'lucide-svelte/icons/x';
   import ManagedConversationControls from '$lib/components/ManagedConversationControls.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
   import SessionDetailsContent from '$lib/components/session/SessionDetailsContent.svelte';
+  import { conversationYoloEnabled, sessionYoloEnabled } from '$lib/yolo-mode';
   import WorkView from '$lib/components/work/WorkView.svelte';
   import type { WorkInitialFocus } from '$lib/work/workFocus';
   import TimelineOngoingWorkDrawer from '$lib/components/timeline/TimelineOngoingWorkDrawer.svelte';
@@ -1540,6 +1541,10 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
     }
+    if (response.result_type === 'recap') {
+      scheduleChatV2CanonicalRecovery(response.conversation_id, { immediate: true });
+      return;
+    }
     if (
       response.result_type === 'session_compacted'
       || response.result_type === 'session_reset'
@@ -1585,6 +1590,31 @@ import X from 'lucide-svelte/icons/x';
         active_executor_id: data.executor_id,
         active_executor_source: 'user'
       });
+    }
+    if (
+      currentConversation
+      && response.conversation_id === currentConversation.conversation_id
+      && Object.hasOwn(data, 'maximum_outcome_override')
+      && (data.maximum_outcome_override === 'approve' || data.maximum_outcome_override === null)
+    ) {
+      const platformData = { ...(currentConversation.context?.platform_data ?? {}) };
+      if (data.maximum_outcome_override === 'approve') {
+        platformData.maximum_outcome_override = 'approve';
+      } else {
+        delete platformData.maximum_outcome_override;
+      }
+      const context = { ...currentConversation.context, platform_data: platformData };
+      currentConversation = { ...currentConversation, context };
+      patchConversationInList(currentConversation.conversation_id, { context });
+      if (sessionInfo && currentConversation.active_session_id === sessionInfo.intaris_session_id) {
+        sessionInfo = {
+          ...sessionInfo,
+          maximum_outcome: data.maximum_outcome_override === 'approve'
+            ? 'approve'
+            : conversationAgent(currentConversation)?.capabilities?.maximum_outcome ?? null
+        };
+        setSessionInfo(currentConversation.conversation_id, currentConversation.active_session_id, sessionInfo);
+      }
     }
     appendChatV2LocalSystemMessage(
       response.text,
@@ -6361,6 +6391,7 @@ import X from 'lucide-svelte/icons/x';
         intention: detail.intention,
         summary: detail.summary,
         status: detail.status,
+        maximum_outcome: detail.maximum_outcome ?? null,
         total_calls: detail.total_calls,
         approved_count: detail.approved_count,
         denied_count: detail.denied_count,
@@ -8432,6 +8463,10 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
+    if (event.type === 'recap_available') {
+      scheduleChatV2CanonicalRecovery(event.conversation_id, { immediate: true });
+      return;
+    }
     const eventPreviousSessionId = event.type === 'session_compacted' ? event.previous_session_id : null;
     // A new conversation was created on another device/tab. Newer servers send
     // the hydrated sidebar row so this can stay local; fall back to a full
@@ -10572,6 +10607,14 @@ import X from 'lucide-svelte/icons/x';
                   {/if}
                 </div>
               {/if}
+              {#if conversationYoloEnabled(currentConversation, currentConversation ? conversationAgent(currentConversation) ?? null : null)}
+                <span
+                  class="shrink-0 rounded-full border border-amber-500/70 bg-amber-950/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-200"
+                  role="status"
+                  title="Dangerous: Intaris still evaluates and audits calls, but policy may allow evaluated denials."
+                  data-testid="chat-header-yolo-badge"
+                >Yolo mode</span>
+              {/if}
             </div>
 
             <!-- Sub-header info row -->
@@ -10823,7 +10866,7 @@ import X from 'lucide-svelte/icons/x';
                    diagnosticsFreshness={focusedDiagnostics.freshness}
                   onOpenWork={(category, sessionId, focus) => openInspectorWork(category, sessionId, focus)}
                   onRefresh={() => loadVisibleActivityOverview(true)}
-                   onViewSession={handleViewSession}
+                 onViewSession={handleViewSession}
                  />
               {:else if overviewReadPresentation.error}
                 <div class="space-y-2">
@@ -10897,9 +10940,15 @@ import X from 'lucide-svelte/icons/x';
             {@const panelContextUsage = (contextUsage ?? loadedSessionInfo.context_usage)!}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
             {#if true}
-             <SessionDetailsContent
+              <SessionDetailsContent
                 detail={sessionInfo}
                 sessionId={focusedSessionId ?? currentConversation.active_session_id ?? sessionInfo.intaris_session_id}
+                yoloMode={sessionYoloEnabled(
+                  currentConversation,
+                  conversationAgent(currentConversation) ?? null,
+                  focusedSessionId,
+                  sessionInfo.maximum_outcome
+                )}
                 contextUsage={panelContextUsage}
                 performance={activeLastGeneration()}
                 onOpenIntaris={openIntarisSession}
@@ -11395,9 +11444,10 @@ import X from 'lucide-svelte/icons/x';
                 agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
                 searchQuery={chatSearchQuery}
                 searchMatchedIds={chatSearchOpen ? chatSearchMatchedMessageIds : emptySearchMatchedIds}
-                searchSelectedId={selectedChatSearchTargetId}
-                preferences={$userPreferences}
-                onViewSession={handleViewSession}
+                 searchSelectedId={selectedChatSearchTargetId}
+                 preferences={$userPreferences}
+                 onViewSession={handleViewSession}
+                  onOpenWork={(category, sessionId, path, sourceItemId) => openInspectorWork(category, sessionId, path && sourceItemId ? { workItemId: sourceItemId, files: [{ path }] } : undefined)}
               />
             {/if}
 

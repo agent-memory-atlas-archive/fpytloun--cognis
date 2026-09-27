@@ -16,7 +16,6 @@ import copy
 import hashlib
 import html
 import inspect
-import json
 import logging
 import math
 import os
@@ -33,6 +32,7 @@ from urllib.parse import unquote, urlparse
 from prometheus_client import Counter, Histogram
 from pydantic import ValidationError
 
+from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.agent_profiles import (
@@ -2058,6 +2058,14 @@ def _llm_stream_chunk_has_provider_liveness(chunk: dict[str, Any]) -> bool:
 def _llm_stream_chunk_has_reasoning_liveness(chunk: dict[str, Any]) -> bool:
     """Return whether a chunk indicates model-side reasoning/progress."""
 
+    item = chunk.get("responses_output_item")
+    if (
+        chunk.get("provider_event_type") == "response.output_item.done"
+        and isinstance(item, dict)
+        and item.get("type") == "reasoning"
+    ):
+        # Encrypted reasoning can complete without any public summary deltas.
+        return True
     if chunk.get("provider_event_type") in {
         "response.reasoning_text.delta",
         "response.reasoning_text.done",
@@ -2782,18 +2790,10 @@ def _should_run_post_turn_auto_compaction(ctx: StepContext, context_result: Any)
 
     if not ctx.policy.enable_auto_compaction:
         return False
-    if not getattr(context_result, "recommend_compaction", False):
-        return False
-
     latest_projection_exceeded = getattr(ctx, "last_projection_exceeded_selected_budget", None)
-    if latest_projection_exceeded is False:
-        return False
-    if latest_projection_exceeded is True:
-        return True
-
-    # If no exact projection snapshot was recorded, preserve the previous
-    # conservative behavior and compact based on the assembly recommendation.
-    return True
+    # No projection means no evidence that reduction was exhausted. The next
+    # pre-model gate checks pressure before permitting a provider request.
+    return latest_projection_exceeded is True
 
 
 def _has_compactable_pre_turn_history(
@@ -3080,6 +3080,7 @@ def _task_row_to_model(task_row: Any) -> Any:
                 ),
             },
             "interaction_mode_override": getattr(task_row, "interaction_mode_override", None),
+            "escalation_timeout_seconds": getattr(task_row, "escalation_timeout_seconds", None),
             "workflow_id": getattr(task_row, "workflow_id", None),
             "project_id": getattr(task_row, "project_id", None),
             "attempt_number": getattr(task_row, "attempt_number", 1),
@@ -4338,6 +4339,11 @@ def _resolve_call_tool_envelope(
     """Resolve a call_tool envelope to its canonical target without changing call identity."""
 
     if tc.name != CALL_TOOL_TOOL.name:
+        return None
+    if (
+        validate_tool_arguments(tc.name, tc.arguments, schema=tool_input_schema(CALL_TOOL_TOOL))
+        is not None
+    ):
         return None
     target_identifier = tc.arguments.get("tool")
     target_arguments = tc.arguments.get("arguments")
@@ -5639,6 +5645,13 @@ class PauseWaiter:
         self._resolutions.pop(pause_id, None)
         self._pending.pop(pause_id, None)
 
+    def discard_unwatched(self, pause_id: str) -> bool:
+        """Discard a stale pause only when no local coroutine is waiting on it."""
+        if pause_id in self._events:
+            return False
+        self.clear(pause_id)
+        return True
+
     def pending_count(self) -> int:
         """Return number of active waits."""
         return len([pause for pause in self._pending.values() if not pause.resolved])
@@ -5926,6 +5939,8 @@ class CompactionRunContext:
     hard_pressure_exceeded: bool = False
     used_timeout_fallback: bool = False
     phase: str = "turn"
+    turn_id: str | None = None
+    assistant_phase: int = 0
     status: str = "started"
     provider_id: str | None = None
     model_id: str | None = None
@@ -5966,6 +5981,19 @@ class CompactionRunContext:
             hard_pressure_exceeded=snapshot.exceeded,
         )
 
+    def apply_projection_boundary(self, projection: ProjectedMessages) -> None:
+        """Record the binding hard limit without changing enforcement policy."""
+        limits = [self.available_prompt_tokens, self.loop_pressure_threshold_prompt_tokens]
+        if projection.policy is not None:
+            limits.append(projection.policy.hard_prompt_tokens)
+        self.compaction_threshold_prompt_tokens = min(value for value in limits if value > 0)
+        self.hard_pressure_exceeded = self.prompt_tokens > self.compaction_threshold_prompt_tokens
+        self.phase = "mid_turn"
+        self.reason = (
+            f"Projected context {self.prompt_tokens:,} tokens exceeds the "
+            f"{self.compaction_threshold_prompt_tokens:,} hard limit."
+        )
+
     def event_data(self) -> dict[str, Any]:
         return {
             "compaction_id": self.compaction_id,
@@ -5983,6 +6011,8 @@ class CompactionRunContext:
             "hard_pressure_exceeded": self.hard_pressure_exceeded,
             "used_timeout_fallback": self.used_timeout_fallback,
             "phase": self.phase,
+            "turn_id": self.turn_id,
+            "assistant_phase_index": self.assistant_phase,
             "status": self.status,
             "provider_id": self.provider_id,
             "model_id": self.model_id,
@@ -6485,9 +6515,10 @@ class AgentLoop:
                 }
             },
         )
-        await self.session_lock.acquire(ctx.session.session_id)
-        timeout_seconds = self._resolve_step_timeout_seconds(ctx)
+        locked_session_id = ctx.session.session_id
+        await self.session_lock.acquire(locked_session_id)
         try:
+            timeout_seconds = self._resolve_step_timeout_seconds(ctx)
             if ctx.memory_policy is None:
                 resolved_profile = resolve_conversation_agent_profile(
                     ctx.agent, ctx.session, ctx.conversation
@@ -6637,7 +6668,11 @@ class AgentLoop:
             )
         finally:
             try:
-                await asyncio.shield(self._recover_pending_managed_join_handoffs(ctx))
+                from cognis.core.cancellation import join_owned_task
+
+                await join_owned_task(
+                    asyncio.create_task(self._recover_pending_managed_join_handoffs(ctx))
+                )
             except Exception:
                 logger.warning(
                     "agent: failed to recover pending managed join handoffs",
@@ -6649,7 +6684,8 @@ class AgentLoop:
                     },
                     exc_info=True,
                 )
-            self.session_lock.release(ctx.session.session_id)
+            finally:
+                self.session_lock.release(locked_session_id)
             duration = (datetime.now(UTC) - start_time).total_seconds()
             STEP_DURATION.labels(phase="total").observe(duration)
 
@@ -8762,164 +8798,15 @@ class AgentLoop:
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
         cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
 
-        auto_compaction_cooldown_remaining = self._auto_compaction_cooldown_remaining_for_turn(ctx)
-        if auto_compaction_cooldown_remaining > 0 and _should_run_pre_turn_auto_compaction(
-            ctx, context_result
-        ):
-            logger.info(
-                "agent: pre-turn compaction skipped during recursion cooldown",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        "turn_id": ctx.turn_id,
-                        "cooldown_turns_remaining": auto_compaction_cooldown_remaining,
-                    }
-                },
-            )
-        elif _should_run_pre_turn_auto_compaction(ctx, context_result):
-            compaction_run = CompactionRunContext.from_context_result(
-                context_result,
-                trigger="pre_turn_auto",
-                reason="context_compaction_threshold",
-            )
-            if not _has_compactable_pre_turn_history(
-                ctx,
-                self.session_cache,
-            ):
-                compaction_run.status = "skipped"
-                compaction_run.fallback_reason = "no_compactable_history"
-                logger.info(
-                    "agent: pre-turn compaction skipped; relying on projection",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "turn_id": ctx.turn_id,
-                            **self._step_log_metadata(ctx),
-                            **compaction_run.event_data(),
-                        }
-                    },
-                )
-                projection_notice = (
-                    (
-                        "Context window is critically full, but there is no older "
-                        "conversation history to compact. Continuing with prompt projection."
-                    )
-                    if compaction_run.hard_pressure_exceeded
-                    else (
-                        "Automatic compaction was recommended, but there is no older "
-                        "conversation history to compact. Continuing with prompt projection."
-                    )
-                )
-                await self._emit_compaction_notice(
-                    ctx,
-                    projection_notice,
-                    on_token=on_token,
-                    persist=True,
-                    metadata=compaction_run.event_data(),
-                )
-            else:
-                notice = _context_pressure_compaction_notice(context_result)
-                await self._emit_compaction_notice(
-                    ctx,
-                    notice,
-                    on_token=on_token,
-                    persist=True,
-                    metadata=compaction_run.event_data(),
-                )
-                compaction_result = await self._auto_compact(
-                    ctx,
-                    run=compaction_run,
-                    on_token=on_token,
-                    skip_few_events_check=True,
-                )
-                if compaction_result is not None:
-                    if compaction_result.compacted:
-                        new_session = await self._rotate_after_compaction(
-                            ctx,
-                            compaction_result,
-                            trigger="pre_turn_auto",
-                            run=compaction_run,
-                        )
-                        if new_session is not None:
-                            ctx.session = new_session
-                            ctx.is_retry = True
-                            ctx.prior_context = None
-                            ctx.compaction_recursion_depth += 1
-                            return await self._execute_step(
-                                ctx,
-                                on_token=on_token,
-                                on_thinking=on_thinking,
-                                on_tool_call=on_tool_call,
-                                on_tool_result=on_tool_result,
-                            )
-                    else:
-                        compaction_run.status = "skipped"
-                        compaction_run.fallback_reason = (
-                            f"compaction_{compaction_result.method or 'noop'}"
-                        )
-                        logger.info(
-                            "agent: pre-turn compaction produced no compacted session; relying on projection",
-                            extra={
-                                "extra_data": {
-                                    "session_id": ctx.session.session_id,
-                                    "turn_id": ctx.turn_id,
-                                    **self._step_log_metadata(ctx),
-                                    "compaction_method": compaction_result.method,
-                                    **compaction_run.event_data(),
-                                }
-                            },
-                        )
-                        await self._emit_compaction_notice(
-                            ctx,
-                            (
-                                "Automatic compaction found no older history to compact. "
-                                "Continuing with prompt projection."
-                            ),
-                            on_token=on_token,
-                            persist=True,
-                            metadata=compaction_run.event_data(),
-                        )
-                elif compaction_run.hard_pressure_exceeded:
-                    step_output = StepOutput(
-                        summary=(
-                            "Stopped before the model call because automatic compaction failed "
-                            "while the session was over the hard context-pressure threshold."
-                        ),
-                        content="",
-                        outcome={
-                            "status": "failed",
-                            "reason": "Context pressure exceeded and automatic compaction failed.",
-                        },
-                        metadata={"context_pressure": compaction_run.event_data()},
-                    )
-                    await self._emit_compaction_notice(
-                        ctx,
-                        (
-                            "Context window is critically full and automatic compaction failed. "
-                            "Stopping this turn before another model call; please retry after "
-                            "manual compaction if needed."
-                        ),
-                        on_token=on_token,
-                        persist=True,
-                        metadata=compaction_run.event_data(),
-                    )
-                    return step_output
-                elif compaction_result is not None:
-                    await self._emit_compaction_notice(
-                        ctx,
-                        (
-                            "Automatic compaction was requested, but there was not enough "
-                            "older context to compact. Continuing the current turn."
-                        ),
-                        on_token=on_token,
-                        persist=True,
-                        metadata=compaction_run.event_data(),
-                    )
+        # Full model-facing projection must run before automatic compaction.
+        # The pre-model pressure gate below owns this decision, including retries.
+        self._auto_compaction_cooldown_remaining_for_turn(ctx)
 
         # Main agentic loop
         step_reprompt_count = 0
         empty_direct_response_reprompt_count = 0
         mid_stream_retries = 0
+        pending_retry_notice_id: str | None = None
         visible_chunk_seen = False
         openai_tool_search_retries = 0
         fast_mode_fallback_retries = 0
@@ -8992,7 +8879,6 @@ class AgentLoop:
         queued_orchestration_guidance_signature: str | None = None
         non_primary_reminder_signature: str | None = None
         background_shell_reminder_signature: str | None = None
-        context_pressure_thresholds_emitted: set[int] = set()
         anthropic_native_chain: dict[str, Any] | None = None
         anthropic_native_chain_fingerprint: str | None = None
         anthropic_native_continuation_required = False
@@ -9008,23 +8894,9 @@ class AgentLoop:
         # projection knows which groups were already preserved.
         if ctx.projection_state is None and context_result is not None:
             try:
-                from cognis.core.context_budget import resolve_context_budget as _rcb
-
-                _seed_budget = _rcb(
-                    max_context_tokens=getattr(context_result, "max_context_tokens", 0),
-                    max_input_tokens=getattr(context_result, "max_input_tokens", 0),
-                    agent_max_tokens=(
-                        ctx.agent.llm_config.max_tokens if ctx.agent.llm_config else None
-                    ),
-                    model_max_output_tokens=getattr(ctx.current_model_info, "max_output_tokens", 0),
-                    prompt_serialization_margin_ratio=prompt_serialization_margin_ratio_for_model(
-                        ctx.current_model_info,
-                        ctx.current_model,
-                    ),
-                )
                 _seed_policy = ProjectionPolicy.from_budget(
                     max_context_tokens=getattr(context_result, "max_context_tokens", 0),
-                    available_prompt_tokens=_seed_budget.available_prompt_tokens,
+                    available_prompt_tokens=getattr(context_result, "available_prompt_tokens", 0),
                     phase="within_turn",
                     pressure_mode=PressureMode.normal,
                 )
@@ -9787,27 +9659,6 @@ class AgentLoop:
                     visible_tool_ids=exposure.visible_tool_ids,
                 )
             pre_call_snapshot = projected_model.snapshot
-            if pre_call_snapshot is not None and pre_call_snapshot.available_prompt_tokens > 0:
-                context_used_percent = round(
-                    (pre_call_snapshot.prompt_tokens / pre_call_snapshot.available_prompt_tokens)
-                    * 100
-                )
-                for threshold in (70, 85):
-                    if (
-                        context_used_percent >= threshold
-                        and threshold not in context_pressure_thresholds_emitted
-                    ):
-                        pressure_message = {
-                            "role": "system",
-                            "content": (
-                                f"Context is {context_used_percent}% used; prioritize consolidating "
-                                "findings, updating todos, and writing deliverables over further broad exploration."
-                            ),
-                            "_context_pressure_reminder": True,
-                        }
-                        messages.append(pressure_message)
-                        model_messages.append(pressure_message)
-                        context_pressure_thresholds_emitted.add(threshold)
             await self._store_context_usage_snapshot(
                 ctx,
                 snapshot=pre_call_snapshot,
@@ -9831,11 +9682,12 @@ class AgentLoop:
                     trigger="pre_model_pressure",
                     reason="projected_context_pressure",
                 )
+                pressure_run.apply_projection_boundary(projected_model)
                 notice = (
                     "Context window is critically full after projection; stopping before "
                     f"another model call. Usage is {pre_call_snapshot.prompt_tokens:,}/"
                     f"{pre_call_snapshot.available_prompt_tokens:,} prompt-budget tokens "
-                    f"(threshold {pre_call_snapshot.threshold_prompt_tokens:,})."
+                    f"(hard limit {pressure_run.compaction_threshold_prompt_tokens:,})."
                 )
                 logger.warning(
                     "Context pressure ceiling reached before model call",
@@ -9855,13 +9707,14 @@ class AgentLoop:
                         }
                     },
                 )
-                await self._emit_compaction_notice(
-                    ctx,
-                    notice,
-                    on_token=on_token,
-                    persist=False,
-                    metadata=pressure_run.event_data(),
-                )
+                if not ctx.policy.enable_auto_compaction:
+                    await self._emit_compaction_notice(
+                        ctx,
+                        notice,
+                        on_token=on_token,
+                        persist=True,
+                        metadata=pressure_run.event_data(),
+                    )
                 if ctx.policy.enable_auto_compaction:
                     pressure_run.phase = "pre_model"
                     await self._flush_events_incremental(
@@ -9909,6 +9762,14 @@ class AgentLoop:
                                 on_tool_call=on_tool_call,
                                 on_tool_result=on_tool_result,
                             )
+                if ctx.policy.enable_auto_compaction:
+                    await self._emit_compaction_notice(
+                        ctx,
+                        f"Context recovery could not resume this turn. {pressure_run.reason}",
+                        on_token=on_token,
+                        persist=True,
+                        metadata={**pressure_run.event_data(), "kind": "compaction_failure"},
+                    )
                 queue_terminal_attachment_event()
                 await self._flush_events_incremental(
                     ctx,
@@ -10087,6 +9948,15 @@ class AgentLoop:
                     stats=stream_idle_stats,
                     cancel_event=ctx.cancel_event,
                 ):
+                    if (
+                        pending_retry_notice_id
+                        and not chunk.get("mid_stream_failure")
+                        and _llm_stream_chunk_has_activity(chunk)
+                    ):
+                        await self._resolve_recovery_notice(
+                            ctx, pending_retry_notice_id, kind="model_recovery", scope="retry"
+                        )
+                        pending_retry_notice_id = None
                     if not stream_activity_seen and _llm_stream_chunk_has_activity(chunk):
                         stream_activity_seen = True
                         logger.debug(
@@ -10322,6 +10192,11 @@ class AgentLoop:
                 break
 
             finally:
+                if pending_retry_notice_id:
+                    await self._resolve_recovery_notice(
+                        ctx, pending_retry_notice_id, kind="model_recovery", scope="retry"
+                    )
+                    pending_retry_notice_id = None
                 if not generation_completed:
                     closer = getattr(stream, "aclose", None)
                     if callable(closer):
@@ -10542,6 +10417,7 @@ class AgentLoop:
                     retry_at = _retry_at_iso(delay)
                     if _should_emit_mid_stream_retry_notice(mid_stream_error_details):
                         try:
+                            pending_retry_notice_id = f"model-retry:{uuid.uuid4().hex}"
                             await self._emit_recovery_notice(
                                 ctx,
                                 _mid_stream_retry_notice(
@@ -10558,6 +10434,7 @@ class AgentLoop:
                                 metadata={
                                     "kind": "model_recovery",
                                     "scope": "retry",
+                                    "notice_id": pending_retry_notice_id,
                                     "provider_id": current_provider_id,
                                     "model": current_model,
                                     "reason_class": reason_class,
@@ -15624,11 +15501,12 @@ class AgentLoop:
                     trigger="tool_loop_pressure",
                     reason="tool_call_context_pressure",
                 )
+                pressure_run.apply_projection_boundary(post_tool_projection)
                 notice = (
                     "Context window is critically full; stopping this turn before more "
                     f"tool calls. Usage is {post_tool_snapshot.prompt_tokens:,}/"
                     f"{post_tool_snapshot.available_prompt_tokens:,} prompt-budget tokens "
-                    f"(threshold {post_tool_snapshot.threshold_prompt_tokens:,})."
+                    f"(hard limit {pressure_run.compaction_threshold_prompt_tokens:,})."
                 )
                 logger.warning(
                     "Context pressure ceiling reached during tool loop",
@@ -15662,24 +15540,14 @@ class AgentLoop:
                         },
                     )
                 )
-                events_to_record.append(
-                    SessionEvent(
-                        type="lifecycle",
-                        data=_system_notice_data(
-                            notice,
-                            kind="tool_call_context_pressure",
-                            turn_id=ctx.turn_id,
-                            metadata=pressure_run.event_data(),
-                        ),
+                if not ctx.policy.enable_auto_compaction:
+                    await self._emit_compaction_notice(
+                        ctx,
+                        notice,
+                        on_token=on_token,
+                        persist=True,
+                        metadata=pressure_run.event_data(),
                     )
-                )
-                await self._emit_compaction_notice(
-                    ctx,
-                    notice,
-                    on_token=on_token,
-                    persist=False,
-                    metadata=pressure_run.event_data(),
-                )
                 await self._flush_events_incremental(
                     ctx,
                     events_to_record,
@@ -15727,6 +15595,14 @@ class AgentLoop:
                                 on_tool_call=on_tool_call,
                                 on_tool_result=on_tool_result,
                             )
+                if ctx.policy.enable_auto_compaction:
+                    await self._emit_compaction_notice(
+                        ctx,
+                        f"Context recovery could not resume this turn. {pressure_run.reason}",
+                        on_token=on_token,
+                        persist=True,
+                        metadata={**pressure_run.event_data(), "kind": "compaction_failure"},
+                    )
                 step_output = StepOutput(
                     summary=(
                         "Stopped because the step exceeded the context-pressure ceiling. "
@@ -15891,6 +15767,23 @@ class AgentLoop:
         if not eval_meta or eval_meta.get("decision") != "escalate":
             return result
 
+        if ctx.interaction_mode == "none":
+            # A task without an approval channel must never turn an Intaris
+            # escalation into a silent approval (or wait for a human).
+            return ToolResult(
+                output="Tool denied: escalation is disabled for this unattended task.",
+                is_error=True,
+                metadata={
+                    **(result.metadata or {}),
+                    "evaluation": {
+                        **eval_meta,
+                        "decision": "deny",
+                        "escalation_suppressed": True,
+                    },
+                    "tool_status": "failed",
+                },
+            )
+
         intaris_call_id = eval_meta.get("call_id")
         if not intaris_call_id:
             # No call_id from Intaris — cannot track, treat as denied
@@ -15898,11 +15791,24 @@ class AgentLoop:
 
         conversation_id = ctx.conversation.conversation_id
 
-        # Read escalation timeout from settings
+        # Resolve the deadline once at escalation creation. A pending approval
+        # keeps its original deadline even if task or agent settings change.
         async with self.session_manager.session_factory() as db:
-            timeout_raw: int = await get_setting_value(  # type: ignore[assignment]
-                db, "session.escalation_timeout_seconds", 300
+            task_timeout = None
+            if ctx.task_id is not None:
+                from cognis.store.queries import get_task
+
+                task_row = await get_task(db, ctx.task_id)
+                task_timeout = task_row.escalation_timeout_seconds if task_row is not None else None
+            timeout_raw = (
+                task_timeout
+                if task_timeout is not None
+                else ctx.agent.capabilities.escalation_timeout_seconds
             )
+            if timeout_raw is None:
+                timeout_raw = cast(
+                    int, await get_setting_value(db, "session.escalation_timeout_seconds", 300)
+                )
         timeout_f = float(timeout_raw)
 
         # Create the escalation via the notification service.  For
@@ -20644,6 +20550,7 @@ class AgentLoop:
                     source_session_id=ctx.session.session_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     interaction_mode_override=tc.arguments.get("interaction_mode_override"),
+                    escalation_timeout_seconds=tc.arguments.get("escalation_timeout_seconds"),
                     session_policy=SessionPolicy.model_validate(
                         tc.arguments.get("session_policy") or {}
                     ),
@@ -20814,6 +20721,9 @@ class AgentLoop:
                         "expected_output": task_row.expected_output,
                         "status": task_row.status,
                         "priority": task_row.priority,
+                        "escalation_timeout_seconds": getattr(
+                            task_row, "escalation_timeout_seconds", None
+                        ),
                         "agent_id": task_row.agent_id,
                         "created_by_agent_id": getattr(task_row, "created_by_agent_id", None),
                         "workflow_id": task_row.workflow_id,
@@ -21226,6 +21136,11 @@ class AgentLoop:
                         SessionPolicy.model_validate(tc.arguments["session_policy"]).model_dump()
                         if "session_policy" in tc.arguments
                         else None
+                    ),
+                    escalation_timeout_seconds=tc.arguments.get("escalation_timeout_seconds"),
+                    clear_escalation_timeout_seconds=(
+                        "escalation_timeout_seconds" in tc.arguments
+                        and tc.arguments["escalation_timeout_seconds"] is None
                     ),
                 )
                 await db.commit()
@@ -22883,58 +22798,67 @@ class AgentLoop:
     ) -> None:
         del on_token  # Recovery state is a system notice, never assistant content.
         notified = False
+        notice_id = f"intaris-recovery:{uuid.uuid4().hex}"
         loop = asyncio.get_running_loop()
         bounded_wait_seconds = max(1.0, min(max_wait_seconds, _INTARIS_MAX_RECOVERY_WAIT_SECONDS))
         deadline = loop.time() + bounded_wait_seconds
-        while True:
-            self._raise_if_cancelled(ctx)
-            if loop.time() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for Intaris recovery during {operation} after "
-                    f"{int(bounded_wait_seconds)}s"
-                )
-            try:
-                health = await self.providers.guardrails.health()
-            except Exception:
-                health = None
-            if health is not None and health.status == "healthy":
-                return
-            if not notified:
-                logger.warning(
-                    "agent: pausing for Intaris recovery",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "operation": operation,
-                        }
-                    },
-                )
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.SYSTEM_NOTICE,
-                        data={
-                            "conversation_id": ctx.conversation.conversation_id,
-                            "session_id": ctx.session.session_id,
-                            "turn_id": ctx.turn_id,
-                            "message": (
-                                "Paused while Intaris recovers. "
-                                f"Retrying for up to {int(bounded_wait_seconds)} seconds."
-                            ),
-                            "notice_id": f"intaris-recovery:{ctx.turn_id}:{operation}",
-                            "kind": "intaris_recovery",
-                            "scope": "transient_retry",
+        try:
+            while True:
+                self._raise_if_cancelled(ctx)
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for Intaris recovery during {operation} after "
+                        f"{int(bounded_wait_seconds)}s"
+                    )
+                try:
+                    health = await self.providers.guardrails.health()
+                except Exception:
+                    health = None
+                if health is not None and health.status == "healthy":
+                    return
+                if not notified:
+                    logger.warning(
+                        "agent: pausing for Intaris recovery",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "operation": operation,
+                            }
                         },
                     )
+                    notified = True
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.SYSTEM_NOTICE,
+                            data={
+                                "conversation_id": ctx.conversation.conversation_id,
+                                "session_id": ctx.session.session_id,
+                                "turn_id": ctx.turn_id,
+                                "message": (
+                                    "Paused while Intaris recovers. "
+                                    f"Retrying for up to {int(bounded_wait_seconds)} seconds."
+                                ),
+                                "notice_id": notice_id,
+                                "kind": "intaris_recovery",
+                                "scope": "transient_retry",
+                            },
+                        )
+                    )
+                if ctx.cancel_event is None:
+                    await asyncio.sleep(_INTARIS_RETRY_POLL_SECONDS)
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        ctx.cancel_event.wait(), timeout=_INTARIS_RETRY_POLL_SECONDS
+                    )
+                except TimeoutError:
+                    continue
+                self._raise_if_cancelled(ctx)
+        finally:
+            if notified:
+                await self._resolve_recovery_notice(
+                    ctx, notice_id, kind="intaris_recovery", scope="transient_retry"
                 )
-                notified = True
-            if ctx.cancel_event is None:
-                await asyncio.sleep(_INTARIS_RETRY_POLL_SECONDS)
-                continue
-            try:
-                await asyncio.wait_for(ctx.cancel_event.wait(), timeout=_INTARIS_RETRY_POLL_SECONDS)
-            except TimeoutError:
-                continue
-            self._raise_if_cancelled(ctx)
 
     async def _record_events_strict(
         self,
@@ -26462,6 +26386,14 @@ class AgentLoop:
             )
 
         turn_state = ctx.projection_state
+        # Assembly seeding can precede model resolution. Refresh sizing without
+        # resetting preservation state, including on the cached-projection path.
+        turn_state.policy = ProjectionPolicy.from_budget(
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
+            phase="within_turn",
+            pressure_mode=turn_state.pressure_mode,
+        )
 
         # ── Build a lightweight pressure snapshot ─────────────────────────────
         # Use the cached token estimates on messages (set by previous projection
@@ -26594,6 +26526,7 @@ class AgentLoop:
                     ),
                 )
                 if not self._projection_exceeded_selected_budget(skipped_projection):
+                    turn_state.policy = policy
                     self._record_projection_prefix_stability(turn_state, skipped_projection)
                     turn_state.last_result = result
                     turn_state.last_message_count = len(messages)
@@ -27449,6 +27382,26 @@ class AgentLoop:
             record_reason="system_notice",
         )
 
+    async def _resolve_recovery_notice(
+        self, ctx: StepContext, notice_id: str, *, kind: str, scope: str
+    ) -> None:
+        """Retire one runtime-only wait without erasing durable recovery history."""
+        # Operation-owned IDs are never reused. Keep the resolved item as a
+        # runtime tombstone so cumulative snapshots and partial merges agree.
+        try:
+            await self._emit_recovery_notice(
+                ctx,
+                "Recovery wait ended.",
+                metadata={
+                    "notice_id": notice_id,
+                    "kind": kind,
+                    "scope": scope,
+                    "notice_resolved": True,
+                },
+            )
+        except Exception:
+            logger.warning("agent: failed to resolve recovery notice", exc_info=True)
+
     async def _emit_recovery_notice(
         self,
         ctx: StepContext,
@@ -28197,6 +28150,8 @@ class AgentLoop:
         )
         guard_token = compaction_publication_guard.set(guard)
         keep_lease = False
+        if run is None:
+            run = CompactionRunContext(trigger=trigger, reason=trigger)
         try:
             result = await self._auto_compact_owned(
                 ctx,
@@ -28210,6 +28165,32 @@ class AgentLoop:
             )
             keep_lease = result is not None and result.compacted
             return result
+        except asyncio.CancelledError:
+            if run.status == "running":
+                try:
+                    await self._assert_compaction_ownership(ctx)
+                    run.status = "failed"
+                    run.fallback_reason = "cancelled"
+                    await self.persist_compaction_terminal(ctx.session, run.event_data())
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.SESSION_COMPACTION_FINISHED,
+                            data={
+                                "conversation_id": ctx.conversation.conversation_id,
+                                "session_id": ctx.session.session_id,
+                                **run.event_data(),
+                            },
+                        )
+                    )
+                except (StaleDirectTurnOwner, CompactionOwnershipLost):
+                    pass
+                except Exception:
+                    logger.warning(
+                        "agent: failed to persist cancelled compaction",
+                        extra={"extra_data": {"session_id": ctx.session.session_id}},
+                        exc_info=True,
+                    )
+            raise
         finally:
             compaction_publication_guard.reset(guard_token)
             if not keep_lease:
@@ -28289,7 +28270,9 @@ class AgentLoop:
                     "status": status,
                     "fallback_reason": fallback_reason,
                 }
-            if status in {"failed", "skipped"}:
+            if status == "running":
+                await self.persist_compaction_lifecycle(ctx.session, event_data)
+            elif status in {"failed", "skipped"}:
                 await self.persist_compaction_terminal(ctx.session, event_data)
             await self.event_bus.publish(
                 Event(
@@ -28302,6 +28285,12 @@ class AgentLoop:
                 )
             )
 
+        # Keep one occurrence identity even for callers without an explicit run.
+        if run is None:
+            run = CompactionRunContext(trigger=trigger, reason=trigger)
+        run.turn_id = ctx.turn_id
+        phase_callback = getattr(ctx, "get_current_assistant_phase", None)
+        run.assistant_phase = phase_callback() if callable(phase_callback) else 0
         await publish_compaction_status(EventType.SESSION_COMPACTION_STARTED, "running")
 
         with AUTO_COMPACTION_DURATION.time():
@@ -28309,6 +28298,8 @@ class AgentLoop:
                 model_context = await self._resolve_compaction_model_context(ctx)
                 if run is not None:
                     model_context.compaction_id = run.compaction_id
+            except (StaleDirectTurnOwner, CompactionOwnershipLost, StepInterrupted):
+                raise
             except Exception:
                 logger.warning(
                     "agent: auto-compaction model context resolution failed",
@@ -28385,6 +28376,8 @@ class AgentLoop:
                             model_context=model_context,
                         ),
                     )
+                except (StaleDirectTurnOwner, CompactionOwnershipLost, StepInterrupted):
+                    raise
                 except Exception:
                     logger.warning(
                         "agent: mechanical fallback compaction failed after timeout",
@@ -28397,6 +28390,8 @@ class AgentLoop:
                         fallback_reason="timeout_fallback_failed",
                     )
                     return None
+            except (StaleDirectTurnOwner, CompactionOwnershipLost, StepInterrupted):
+                raise
             except Exception:
                 # compact() already attempted its internal retry and fallback.
                 # Surface the failure cleanly without a second fallback attempt.
@@ -28412,6 +28407,10 @@ class AgentLoop:
                 )
                 return None
 
+        if compaction_result.compacted and compaction_result.turns_compacted <= 0:
+            compaction_result = compaction_result.model_copy(
+                update={"compacted": False, "method": "no_compactable_history"}
+            )
         if not compaction_result.compacted:
             await publish_compaction_status(
                 EventType.SESSION_COMPACTION_FINISHED,
@@ -28443,11 +28442,24 @@ class AgentLoop:
         status = str(event_data.get("status") or "")
         if status not in {"failed", "skipped"}:
             raise ValueError(f"Unsupported terminal compaction status: {status}")
+        await self.persist_compaction_lifecycle(session, event_data)
+
+    async def persist_compaction_lifecycle(
+        self, session: SessionModel, event_data: Mapping[str, Any]
+    ) -> None:
+        """Persist a compaction occurrence transition before live publication."""
+        status = str(event_data.get("status") or "")
+        if status not in {"running", "failed", "skipped"}:
+            raise ValueError(f"Unsupported compaction status: {status}")
         compaction_id = str(event_data.get("compaction_id") or "")
         if not compaction_id:
             raise ValueError("Terminal compaction events require compaction_id")
         payload = {
-            "event": "session_compaction_finished",
+            "event": (
+                "session_compaction_started"
+                if status == "running"
+                else "session_compaction_finished"
+            ),
             "session_id": session.session_id,
             **dict(event_data),
         }
@@ -28455,6 +28467,9 @@ class AgentLoop:
             [SessionEvent(type="lifecycle", data=payload)],
             None,
         )
+        publication_guard = compaction_publication_guard.get()
+        if publication_guard is not None:
+            await publication_guard.check()
         append_result = await self.providers.guardrails.record_events(
             session_id=session.intaris_session_id or session.session_id,
             events=events,
@@ -31113,6 +31128,7 @@ class AgentLoop:
                     session,
                     owner_email=user_email,
                     include_shared=True,
+                    defer_observed_tools=True,
                 )
                 skills = await list_skills(session, owner_email=user_email)
             agent_values = [
@@ -31213,6 +31229,7 @@ class AgentLoop:
             SWITCH_EXECUTOR_TOOL.name: SWITCH_EXECUTOR_TOOL,
             SEARCH_TOOLS_TOOL.name: SEARCH_TOOLS_TOOL,
             DESCRIBE_TOOL_TOOL.name: DESCRIBE_TOOL_TOOL,
+            CALL_TOOL_TOOL.name: CALL_TOOL_TOOL,
             VALIDATE_TOOL_CALL_TOOL.name: VALIDATE_TOOL_CALL_TOOL,
         }
         for tool_def in orchestration_tools(OrchestrationMode.FULL):
@@ -31346,7 +31363,15 @@ class AgentLoop:
         """Validate ``raw_arguments`` against the controller tool schema."""
 
         schema = self._get_controller_tool_parameters(tool_name, ctx=ctx)
-        return validate_tool_arguments(tool_name, raw_arguments, schema=schema)
+        error = validate_tool_arguments(tool_name, raw_arguments, schema=schema)
+        if error is not None and tool_name == CALL_TOOL_TOOL.name:
+            error.message += (
+                " call_tool requires an envelope with 'tool' set to the exact tool_id "
+                "returned by search_tools and 'arguments' containing the target's JSON object. "
+                "Do not place target parameters at the top level. "
+                "Use describe_tool with that tool_id if the target schema is unknown."
+            )
+        return error
 
     async def _emit_tool_argument_error(
         self,

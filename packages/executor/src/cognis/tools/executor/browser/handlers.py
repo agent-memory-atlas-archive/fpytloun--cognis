@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import mimetypes
 import re
 import tempfile
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from cognis import json_codec as json
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.browser import humanizer
 from cognis.tools.executor.browser.manager import (

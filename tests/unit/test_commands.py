@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from types import SimpleNamespace
 from typing import Any, cast
@@ -88,6 +89,14 @@ class _TurnScheduler:
         self.checkpoints: dict[str, dict[str, str | None]] = {}
         self._agent_loop: object | None = None
         self.runtime: tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None = None
+        self.admission_locks: dict[str, asyncio.Lock] = {}
+        self.active_conversations: set[str] = set()
+
+    def turn_admission_lock(self, conversation_id: str) -> asyncio.Lock:
+        return self.admission_locks.setdefault(conversation_id, asyncio.Lock())
+
+    def has_active_turn(self, conversation_id: str) -> bool:
+        return conversation_id in self.active_conversations
 
     async def cancel_turn(self, conversation_id: str) -> bool:
         self.calls.append(conversation_id)
@@ -545,6 +554,7 @@ def test_system_slash_command_boundary_matrix() -> None:
         "/model",
         "/thinking",
         "/fast",
+        "/yolo",
         "/profile",
         "/skill",
         "/executor",
@@ -567,6 +577,85 @@ def test_system_slash_command_boundary_matrix() -> None:
         assert is_system_slash_command_message(command), command
         assert is_system_slash_command_message(f"{command} extra"), command
         assert not is_system_slash_command_message(f"{command}extra"), command
+
+
+@pytest.mark.asyncio
+async def test_yolo_changes_only_current_conversation_and_rejects_busy_turn() -> None:
+    scheduler = _TurnScheduler(cancelled=False)
+    manager = SimpleNamespace(set_conversation_yolo=AsyncMock())
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=_SessionCache(),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+    conversation = _conversation()
+    session = _session()
+    agent = _agent()
+
+    for command, enabled in (("/yolo", True), ("/yolo off", False)):
+        result = await dispatcher.dispatch(
+            command,
+            conversation=conversation,
+            session=session,
+            agent=agent,
+            user_email="user@example.com",
+        )
+        assert result is not None and result.type == "system_message"
+        assert result.data["maximum_outcome_override"] == ("approve" if enabled else None)
+        manager.set_conversation_yolo.assert_awaited_with(conversation, session, enabled=enabled)
+
+    # Chat v2 owns this non-reentrant admission lock while dispatching commands.
+    async with scheduler.turn_admission_lock(conversation.conversation_id):
+        result = await asyncio.wait_for(
+            dispatcher.dispatch(
+                "/yolo",
+                conversation=conversation,
+                session=session,
+                agent=agent,
+                user_email="user@example.com",
+                admission_lock_held=True,
+            ),
+            timeout=1,
+        )
+    assert result is not None and result.type == "system_message"
+
+    scheduler.active_conversations.add(conversation.conversation_id)
+    result = await dispatcher.dispatch(
+        "/yolo",
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        user_email="user@example.com",
+    )
+    assert result is not None and result.data["code"] == "turn_active"
+    assert manager.set_conversation_yolo.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_yolo_reports_sync_failure_without_confirming_mode() -> None:
+    manager = SimpleNamespace(set_conversation_yolo=AsyncMock(side_effect=RuntimeError("offline")))
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=_SessionCache(),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        "/yolo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None and result.data["code"] == "outcome_policy_sync_failed"
 
 
 @pytest.mark.asyncio
@@ -1195,7 +1284,10 @@ async def test_manual_zero_turn_compaction_does_not_rotate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_manual_compact_publishes_first_class_runtime_lifecycle() -> None:
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_manual_compact_publishes_first_class_runtime_lifecycle(cancelled: bool) -> None:
+    import asyncio
+
     strategy = _CompactionStrategy()
     strategy.compact = AsyncMock(
         return_value=SimpleNamespace(
@@ -1206,12 +1298,16 @@ async def test_manual_compact_publishes_first_class_runtime_lifecycle() -> None:
             preserved_tail_events=[],
         )
     )
+    if cancelled:
+        strategy.compact.side_effect = asyncio.CancelledError()
     old_session = _session()
     new_session = old_session.model_copy(update={"session_id": "session-new"})
     session_cache = _SessionCache()
     session_cache.refresh = AsyncMock()
     agent_loop = _LockingAgentLoop()
     agent_loop.event_bus = SimpleNamespace(publish=AsyncMock())
+    agent_loop.persist_compaction_lifecycle = AsyncMock()
+    agent_loop.persist_compaction_terminal = AsyncMock()
     scheduler = _TurnScheduler(cancelled=False)
     scheduler._agent_loop = agent_loop
     rotate_session = AsyncMock(return_value=new_session)
@@ -1232,6 +1328,21 @@ async def test_manual_compact_publishes_first_class_runtime_lifecycle() -> None:
         turn_scheduler=scheduler,
     )
 
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await dispatcher.dispatch(
+                "/compact",
+                conversation=_conversation(),
+                session=old_session,
+                agent=_agent(),
+                user_email="user@example.com",
+            )
+        agent_loop.persist_compaction_lifecycle.assert_awaited_once()
+        agent_loop.persist_compaction_terminal.assert_awaited_once()
+        assert agent_loop.persist_compaction_terminal.await_args.args[1]["reason"] == "cancelled"
+        rotate_session.assert_not_awaited()
+        return
+
     result = await dispatcher.dispatch(
         "/compact",
         conversation=_conversation(),
@@ -1242,6 +1353,7 @@ async def test_manual_compact_publishes_first_class_runtime_lifecycle() -> None:
 
     assert result is not None
     assert result.type == "session_compacted"
+    agent_loop.persist_compaction_lifecycle.assert_awaited_once()
     published = [call.args[0] for call in agent_loop.event_bus.publish.await_args_list]
     assert [event.type.value for event in published] == [
         "session_compaction_started",
@@ -1314,6 +1426,7 @@ async def test_manual_compact_holds_session_lock_and_reloads_runtime() -> None:
 
     def _assert_locked() -> None:
         assert agent_loop.locked
+        assert scheduler.turn_admission_lock(_conversation().conversation_id).locked()
 
     strategy.lock_probe = _assert_locked
 
@@ -1342,6 +1455,104 @@ async def test_manual_compact_holds_session_lock_and_reloads_runtime() -> None:
     assert (
         cast(SessionModel, strategy.calls[0]["session"]).session_id == reloaded_session.session_id
     )
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_blocks_concurrent_turn_admission_until_command_finishes() -> None:
+    strategy = _CompactionStrategy()
+    scheduler = _TurnScheduler(cancelled=False)
+    scheduler.runtime = (_conversation(), _session(), _agent(), False)
+    compaction_started = asyncio.Event()
+    finish_compaction = asyncio.Event()
+    admission_acquired = asyncio.Event()
+
+    async def _compact(session: SessionModel, **kwargs: object) -> object:
+        del session, kwargs
+        compaction_started.set()
+        await finish_compaction.wait()
+        return SimpleNamespace(
+            compacted=False,
+            method="skipped",
+            reason="nothing_to_compact",
+        )
+
+    strategy.compact = AsyncMock(side_effect=_compact)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    compact_task = asyncio.create_task(
+        dispatcher.dispatch(
+            "/compact",
+            conversation=_conversation(),
+            session=_session(),
+            agent=_agent(),
+            user_email="user@example.com",
+        )
+    )
+    await compaction_started.wait()
+
+    async def _admit_turn() -> None:
+        async with scheduler.turn_admission_lock(_conversation().conversation_id):
+            admission_acquired.set()
+
+    admission_task = asyncio.create_task(_admit_turn())
+    await asyncio.sleep(0)
+    assert not admission_acquired.is_set()
+
+    finish_compaction.set()
+    result = await compact_task
+    await admission_task
+
+    assert result is not None
+    assert admission_acquired.is_set()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_rechecks_busy_state_after_waiting_for_admission() -> None:
+    strategy = _CompactionStrategy()
+    scheduler = _TurnScheduler(cancelled=False)
+    conversation = _conversation()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    admission_lock = scheduler.turn_admission_lock(conversation.conversation_id)
+    await admission_lock.acquire()
+    compact_task = asyncio.create_task(
+        dispatcher.dispatch(
+            "/compact",
+            conversation=conversation,
+            session=_session(),
+            agent=_agent(),
+            user_email="user@example.com",
+            has_busy_turn=False,
+        )
+    )
+    await asyncio.sleep(0)
+    scheduler.active_conversations.add(conversation.conversation_id)
+    admission_lock.release()
+
+    result = await compact_task
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "turn_active"
+    assert strategy.calls == []
 
 
 @pytest.mark.asyncio

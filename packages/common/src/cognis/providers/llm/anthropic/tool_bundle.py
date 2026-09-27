@@ -7,7 +7,6 @@ remain the execution and validation authority.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -15,6 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
+from cognis import json_codec as json
 from cognis.providers.llm.anthropic.contracts import (
     AnthropicToolBinding,
     CompiledAnthropicToolBundle,

@@ -72,7 +72,9 @@ DESCRIBE_TOOL_TOOL = ToolDefinition(
         "mutation kind, omitted/null/array/concurrency semantics, dynamic options, examples, side "
         "effects, and schema version/hash. Accepts callable names and stable tool IDs returned by "
         "search_tools. For a multi-operation tool, pass the exact operation name from search_tools "
-        "to avoid loading the full schema union. It never reveals tools outside the caller's "
+        "to avoid loading the full schema union. Omit operation for single-operation tools "
+        "(including browser tools); do not infer an operation from a tool name. "
+        "It never reveals tools outside the caller's "
         "effective authorization scope."
     ),
     parameters={
@@ -133,7 +135,10 @@ CALL_TOOL_TOOL = ToolDefinition(
     name="call_tool",
     description=(
         "Call one currently authorized tool from the live session inventory without exposing its "
-        "schema. Use a stable tool ID returned by search_tools when available. The target receives "
+        "schema. Always supply the envelope: 'tool' is the exact tool_id returned by search_tools, "
+        "and 'arguments' is a JSON object containing all target parameters. Never place target "
+        "parameters at the top level. Use describe_tool first if the target schema is unknown. "
+        "The target receives "
         "the same validation, policy, approval, and execution behavior as a direct tool call."
     ),
     parameters={

@@ -249,14 +249,16 @@ def test_tool_output_maintenance_does_not_block_startup(
     started = threading.Event()
     release = threading.Event()
 
-    async def _slow_cleanup(_: Any) -> int:
+    async def _slow_maintenance(_: Any) -> Any:
         started.set()
         await asyncio.to_thread(release.wait)
-        return 0
+        return SimpleNamespace(
+            expired_deleted=0, size_cap_deleted=0, cleanup_failed=False, size_cap_failed=False
+        )
 
     monkeypatch.setattr(
-        "cognis.core.tool_output_store.ToolOutputStore.cleanup_expired",
-        _slow_cleanup,
+        "cognis.core.tool_output_store.ToolOutputStore.maintain",
+        _slow_maintenance,
     )
 
     with TestClient(create_app()) as client:

@@ -415,8 +415,10 @@ async def test_deferred_observed_tools_stay_out_of_hot_reads_and_writes(tmp_path
     observed_column = re.compile(r"\bobserved_tools\b")
 
     authority = ExecutorConnectionOwnership(factory, "controller-a:boot-a")
+    statements.clear()
     owner = await authority.takeover_validated("executor-1", token_version=0)
     assert owner is not None
+    assert statements and not any(observed_column.search(s) for s in statements), statements
 
     # Heartbeat-style path: deferred read + owned RETURNING update, no catalog decode.
     statements.clear()
@@ -442,7 +444,7 @@ async def test_deferred_observed_tools_stay_out_of_hot_reads_and_writes(tmp_path
         assert rows[0].observed_tools == catalog
         assert rows[0].runtime_metadata == {"call_snapshot": {"seq": 1}}
 
-    # Writing the catalog still round-trips through the owned update.
+    # Writing the catalog does not decode it again through RETURNING.
     statements.clear()
     async with factory() as session:
         updated = await authority.update_runtime_state(
@@ -451,7 +453,17 @@ async def test_deferred_observed_tools_stay_out_of_hot_reads_and_writes(tmp_path
             observed_tools=catalog[:1],
         )
         assert updated is not None
+        with pytest.raises(InvalidRequestError):
+            _ = updated.observed_tools
         await session.commit()
+    returning_clauses = [
+        statement.upper().split("RETURNING", 1)[1]
+        for statement in statements
+        if statement.lstrip().upper().startswith("UPDATE") and "RETURNING" in statement.upper()
+    ]
+    assert returning_clauses and not any(
+        observed_column.search(clause.lower()) for clause in returning_clauses
+    ), statements
     async with factory() as session:
         row = await get_executor_row(session, "executor-1")
         assert row is not None and row.observed_tools == catalog[:1]

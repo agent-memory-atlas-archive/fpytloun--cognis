@@ -6,7 +6,6 @@ are in the bootstrap module.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import uuid
@@ -16,6 +15,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from sqlalchemy.engine import make_url
+
+from cognis import json_codec as json
 
 
 def _expand_path(path: str) -> Path:

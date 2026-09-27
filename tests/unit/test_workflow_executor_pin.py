@@ -626,9 +626,12 @@ async def test_expired_additional_pin_falls_back_to_primary(
             _session_factory=_runtime_session_factory,
             executor=SimpleNamespace(
                 websocket=SimpleNamespace(
+                    get_ready_connection=lambda executor_id: (
+                        SimpleNamespace(connected=True) if executor_id == "exec-primary" else None
+                    ),
                     get_connection=lambda executor_id: (
                         SimpleNamespace(connected=True) if executor_id == "exec-primary" else None
-                    )
+                    ),
                 )
             ),
         ),

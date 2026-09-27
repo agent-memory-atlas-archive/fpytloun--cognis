@@ -338,7 +338,7 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
         providers = await list_llm_providers(session)
         from cognis.store.queries import list_executors
 
-        all_executors = await list_executors(session)
+        all_executors = await list_executors(session, defer_observed_tools=True)
         executor_has_tools = any(
             (executor.enabled_tools and len(executor.enabled_tools) > 0)
             or (executor.enabled_tool_groups and len(executor.enabled_tool_groups) > 0)

@@ -2195,6 +2195,57 @@ async def get_conversation_channel_route(
     )
 
 
+AUTO_RECAP_ENABLED_STATE_KEY = "chat.auto_recap_enabled"
+
+
+async def list_recent_web_recap_candidates(
+    session: AsyncSession,
+    *,
+    since: datetime,
+    until: datetime,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[tuple[str, datetime, datetime | None]]:
+    """Find recently settled web chats with auto-recap enabled.
+
+    The auto-recap toggle timestamp guards against backfilling chats that
+    were already idle when enabled. Content/marker checks remain in Intaris.
+    """
+    recap_enablement = aliased(UserUiState)
+    rows = await session.execute(
+        select(
+            Conversation.conversation_id,
+            Conversation.last_message_at,
+            recap_enablement.updated_at,
+        )
+        .join(
+            UserUiState,
+            (Conversation.user_email == UserUiState.user_email)
+            & (UserUiState.key == "ui.preferences"),
+        )
+        .outerjoin(
+            recap_enablement,
+            (Conversation.user_email == recap_enablement.user_email)
+            & (recap_enablement.key == AUTO_RECAP_ENABLED_STATE_KEY),
+        )
+        .where(
+            Conversation.status == "active",
+            Conversation.context_type == "web",
+            Conversation.active_session_id.is_not(None),
+            Conversation.last_message_at >= since,
+            Conversation.last_message_at <= until,
+            UserUiState.value["chat"]["auto_recap"].as_boolean().is_(True),
+        )
+        .order_by(Conversation.last_message_at.desc(), Conversation.conversation_id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return [
+        (conversation_id, activity_at, enabled_at)
+        for conversation_id, activity_at, enabled_at in rows
+    ]
+
+
 async def list_conversations(
     session: AsyncSession,
     user_email: str,
@@ -6248,6 +6299,7 @@ async def create_task(
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
     interaction_mode_override: str | None = None,
+    escalation_timeout_seconds: int | None = None,
     session_policy: dict[str, Any] | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
@@ -6283,6 +6335,7 @@ async def create_task(
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
         interaction_mode_override=interaction_mode_override,
+        escalation_timeout_seconds=escalation_timeout_seconds,
         session_policy=session_policy,
         workflow_id=workflow_id,
         project_id=project_id,
@@ -6875,6 +6928,8 @@ async def update_task_fields(
     workflow_id: str | None = None,
     project_id: str | None = None,
     session_policy: dict[str, Any] | None = None,
+    escalation_timeout_seconds: int | None = None,
+    clear_escalation_timeout_seconds: bool = False,
     clear_workflow_id: bool = False,
     clear_project_id: bool = False,
 ) -> bool:
@@ -6902,6 +6957,10 @@ async def update_task_fields(
         values["project_id"] = None
     if session_policy is not None:
         values["session_policy"] = session_policy
+    if escalation_timeout_seconds is not None:
+        values["escalation_timeout_seconds"] = escalation_timeout_seconds
+    elif clear_escalation_timeout_seconds:
+        values["escalation_timeout_seconds"] = None
     if not values:
         return False
     stmt = (
@@ -8927,6 +8986,7 @@ async def list_active_websocket_executors(
             ExecutorRow.status == "active",
         )
         .order_by(ExecutorRow.executor_id)
+        .options(executor_observed_tools_deferred())
     )
     if for_update:
         stmt = stmt.with_for_update()
@@ -8942,7 +9002,11 @@ async def list_websocket_executors_for_mcp_server(
 ) -> list[ExecutorRow]:
     """List websocket executors whose config references an MCP server."""
 
-    rows = await list_executors(session, for_update=for_update)
+    rows = await list_executors(
+        session,
+        for_update=for_update,
+        defer_observed_tools=True,
+    )
     result = []
     for row in rows:
         if row.executor_type != "websocket":
@@ -9820,6 +9884,7 @@ async def mcp_server_referenced_by_executors(
         session,
         owner_email=owner_email,
         include_shared=include_shared,
+        defer_observed_tools=True,
     )
     referencing: list[str] = []
     for ex in executors:

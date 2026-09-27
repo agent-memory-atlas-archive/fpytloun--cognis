@@ -71,7 +71,15 @@ describe('embedded docs registry', () => {
     expect(docsOverview.content).not.toContain('](specs/README.md)');
 
     const usingChat = await getEmbeddedDoc('using-chat');
+    expect(usingChat?.content).toContain('](/docs/context-management)');
     expect(usingChat?.content).not.toContain('](../assets/screenshots/chat-desktop.webp)');
+    expect((await getEmbeddedDoc('context-management'))?.content).toContain('## What the numbers mean');
+
+    const providers = await getEmbeddedDoc('configuring-providers');
+    expect(providers?.content).toContain(
+      '](https://github.com/fpytloun/cognis/blob/main/docs/guide/model-support-preflight.md)'
+    );
+    expect(await getEmbeddedDoc('model-support-preflight')).toBeNull();
   });
 
   it('builds internal onboarding doc links only', async () => {

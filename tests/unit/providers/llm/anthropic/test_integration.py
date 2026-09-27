@@ -697,6 +697,67 @@ def test_frozen_native_chain_without_client_tools_drops_orphan_result() -> None:
     ]
 
 
+def test_request_drops_orphan_result_outside_native_replay_group() -> None:
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        messages=[
+            {"role": "assistant", "content": "Previous response"},
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_orphan",
+                "content": "stale result",
+            },
+            {"role": "user", "content": "continue"},
+        ],
+        request_kwargs={},
+        credential_ref="$credential:test",
+    )
+
+    assert payload["messages"] == [
+        {"role": "assistant", "content": [{"type": "text", "text": "Previous response"}]},
+        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+    ]
+
+
+def test_request_keeps_first_matching_result_and_drops_invalid_results() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    _context, payload, _bundle = build_native_request(
+        provider=_provider(),
+        model="claude-test",
+        model_info=ModelInfo(model_id="claude-test"),
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "toolu_valid", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "toolu_orphan", "content": "stale result"},
+            {"role": "tool", "tool_call_id": "toolu_valid", "content": "ok"},
+            {"role": "tool", "tool_call_id": "toolu_valid", "content": "duplicate"},
+            {"role": "user", "content": "continue"},
+        ],
+        request_kwargs={"tools": tools},
+        credential_ref="$credential:test",
+    )
+
+    assert payload["messages"][1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "toolu_valid", "content": "ok"},
+        {"type": "text", "text": "continue"},
+    ]
+
+
 def test_frozen_native_chain_rejects_provider_thinking_and_bundle_corruption() -> None:
     context, bundle = build_native_chain(
         provider=_provider(),

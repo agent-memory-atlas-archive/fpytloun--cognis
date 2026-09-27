@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 from collections import OrderedDict
 from time import monotonic
 from typing import Any
+
+from cognis import json_codec as json
 
 REPLAY_SAFE_UNARY_METHODS = frozenset(
     {

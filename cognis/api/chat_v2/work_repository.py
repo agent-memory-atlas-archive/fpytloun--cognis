@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +15,7 @@ from prometheus_client import Histogram
 from sqlalchemy import and_, case, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis import json_codec as json
 from cognis.api.chat_v2.schemas import (
     ActivityOverviewDetail,
     ActivityOverviewResponse,

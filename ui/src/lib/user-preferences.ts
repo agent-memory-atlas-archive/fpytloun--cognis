@@ -13,7 +13,11 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     show_thinking_blocks: false,
     group_tool_calls: true,
     keep_assistant_messages_separate: false,
-    show_internal_tool_calls: false
+    show_internal_tool_calls: false,
+    auto_recap: false
+  },
+  notifications: {
+    include_content: true
   }
 };
 
@@ -27,6 +31,7 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
   }
   const display = isRecord(value.display) ? value.display : {};
   const chat = isRecord(value.chat) ? value.chat : {};
+  const notifications = isRecord(value.notifications) ? value.notifications : {};
   const theme = display.theme === 'dark' || display.theme === 'light' || display.theme === 'system'
     ? display.theme
     : DEFAULT_USER_PREFERENCES.display.theme;
@@ -62,7 +67,15 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
         : DEFAULT_USER_PREFERENCES.chat.keep_assistant_messages_separate,
       show_internal_tool_calls: typeof chat.show_internal_tool_calls === 'boolean'
         ? chat.show_internal_tool_calls
-        : DEFAULT_USER_PREFERENCES.chat.show_internal_tool_calls
+        : DEFAULT_USER_PREFERENCES.chat.show_internal_tool_calls,
+      auto_recap: typeof chat.auto_recap === 'boolean'
+        ? chat.auto_recap
+        : DEFAULT_USER_PREFERENCES.chat.auto_recap
+    },
+    notifications: {
+      include_content: typeof notifications.include_content === 'boolean'
+        ? notifications.include_content
+        : DEFAULT_USER_PREFERENCES.notifications.include_content
     }
   };
 }

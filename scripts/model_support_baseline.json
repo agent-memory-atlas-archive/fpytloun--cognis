@@ -1,0 +1,345 @@
+{
+  "schema_version": 2,
+  "claude": {
+    "claude-fable-5-1": {
+      "pricing": "$10 / input MTok, $50 / output MTok",
+      "thinking": "Adaptive (always on)",
+      "default_effort": "`high`",
+      "context_window": "1M tokens",
+      "max_output": "128K tokens"
+    },
+    "claude-opus-5-5": {
+      "pricing": "$4 / input MTok, $20 / output MTok",
+      "thinking": "Adaptive (always on)",
+      "default_effort": "`medium`",
+      "context_window": "1M tokens",
+      "max_output": "128K tokens"
+    },
+    "claude-sonnet-5": {
+      "pricing": "$2 / input MTok, $10 / output MTok",
+      "thinking": "Adaptive",
+      "default_effort": "`high`",
+      "context_window": "1M tokens",
+      "max_output": "128K tokens"
+    },
+    "claude-haiku-4-5-20251001": {
+      "pricing": "$1 / input MTok, $5 / output MTok",
+      "thinking": "Extended",
+      "default_effort": "Not supported",
+      "context_window": "200K tokens",
+      "max_output": "64K tokens"
+    }
+  },
+  "openai": [
+    "gpt-3.5-turbo",
+    "gpt-4",
+    "gpt-4-turbo",
+    "gpt-4-turbo-preview",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4.5-preview",
+    "gpt-4o",
+    "gpt-4o-audio-preview",
+    "gpt-4o-mini",
+    "gpt-4o-mini-audio-preview",
+    "gpt-4o-mini-realtime-preview",
+    "gpt-4o-mini-search-preview",
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-mini-tts",
+    "gpt-4o-realtime-preview",
+    "gpt-4o-search-preview",
+    "gpt-4o-transcribe",
+    "gpt-4o-transcribe-diarize",
+    "gpt-5",
+    "gpt-5-chat-latest",
+    "gpt-5-codex",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5-pro",
+    "gpt-5.1",
+    "gpt-5.1-chat-latest",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2",
+    "gpt-5.2-chat-latest",
+    "gpt-5.2-codex",
+    "gpt-5.2-pro",
+    "gpt-5.3-chat-latest",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4-pro",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.6-cyber",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol"
+  ],
+  "openai_details": {
+    "gpt-5.6-cyber": {
+      "context_window": 400000,
+      "max_input_tokens": 272000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$12.5",
+        "cached_input": "$1.25",
+        "output": "$75"
+      },
+      "reasoning_efforts": [],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-5.6-luna": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$0.2",
+        "cached_input": "$0.02",
+        "output": "$1.2"
+      },
+      "reasoning_efforts": [],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-5.6-sol": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$4",
+        "cached_input": "$0.4",
+        "output": "$20"
+      },
+      "reasoning_efforts": [],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-5.6-terra": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$2",
+        "cached_input": "$0.2",
+        "output": "$12"
+      },
+      "reasoning_efforts": [],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-6-astra": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$10",
+        "cached_input": "$1",
+        "output": "$50"
+      },
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-6-luna": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$0.1",
+        "cached_input": "$0.01",
+        "output": "$0.5"
+      },
+      "reasoning_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-6-sol": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$2",
+        "cached_input": "$0.2",
+        "output": "$10"
+      },
+      "reasoning_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    }
+  }
+}

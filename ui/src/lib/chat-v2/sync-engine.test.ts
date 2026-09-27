@@ -2762,6 +2762,16 @@ describe('Chat v2 sync engine', () => {
       })
     );
 
+    const lateStart = applySyncResponse(reconciled.state, syncResponse({
+      ops: [{ op: 'upsert_item', item: {
+        ...canonical, status: 'running',
+        sort_key: '0000:000000000000001:000000:10:000000000'
+      } as TimelineItem }],
+      runtime: runtime(4, { has_active_turn: false, volatile_items: [] })
+    }));
+    expect(visibleTimelineItems(lateStart.state).find((item) => item.id === compaction.id)?.status)
+      .toBe('compacted');
+
     expect(reconciled.state.localItems.some((item) => item.id === compaction.id)).toBe(false);
     expect(visibleTimelineItems(reconciled.state).filter((item) => item.id === compaction.id)).toEqual([
       expect.objectContaining({ kind: 'compaction', status: 'compacted', stable: true })

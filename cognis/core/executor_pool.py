@@ -280,7 +280,7 @@ async def resolve_executor_pool(
     primary and additional buckets. Primary membership wins on overlap.
     """
 
-    from cognis.store.queries import get_executor_row, list_executors
+    from cognis.store.queries import list_executors
 
     execution = agent_execution or {}
     primary_explicit = execution.get("executor_id")
@@ -295,15 +295,11 @@ async def resolve_executor_pool(
         all_rows: list[Any] = await list_executors(
             session, owner_email=executor_owner_email, include_shared=True
         )
+        rows_by_id = {row.executor_id: row for row in all_rows}
 
         # Primary explicit id
         if isinstance(primary_explicit, str) and primary_explicit.strip():
-            row = await get_executor_row(
-                session,
-                str(primary_explicit),
-                owner_email=executor_owner_email,
-                include_shared=True,
-            )
+            row = rows_by_id.get(str(primary_explicit))
             if row is None:
                 # Synthetic placeholder so context/UI can show "configured but missing"
                 primary_targets.append(
@@ -362,12 +358,7 @@ async def resolve_executor_pool(
                 if entry_id in seen_ids:
                     # Already covered by primary or earlier additional
                     continue
-                row = await get_executor_row(
-                    session,
-                    entry_id,
-                    owner_email=executor_owner_email,
-                    include_shared=True,
-                )
+                row = rows_by_id.get(entry_id)
                 if row is None:
                     additional_targets.append(
                         ResolvedExecutorTarget(

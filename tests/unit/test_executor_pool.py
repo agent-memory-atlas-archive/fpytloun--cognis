@@ -253,6 +253,31 @@ async def test_pool_additional_explicit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_reuses_visible_catalog_rows_without_reloading() -> None:
+    rows = [
+        FakeExecutorRow(executor_id="exec-primary", observed_tools=[{"name": "bash"}]),
+        FakeExecutorRow(executor_id="exec-extra", observed_tools=[{"name": "read"}]),
+    ]
+    async with _patched_queries(rows):
+        with patch(
+            "cognis.store.queries.get_executor_row",
+            side_effect=AssertionError("must reuse the authorized list result"),
+        ):
+            pool = await resolve_executor_pool(
+                session_factory=_FakeSessionFactory(rows),
+                agent_execution={
+                    "executor_id": "exec-primary",
+                    "additional_executors": [{"executor_id": "exec-extra"}],
+                },
+                user_email="user@example.com",
+                executor_owner_email="user@example.com",
+                policy=ExecutorPolicy(),
+            )
+    assert pool.primary[0].observed_tool_names == {"bash"}
+    assert pool.additional[0].observed_tool_names == {"read"}
+
+
+@pytest.mark.asyncio
 async def test_pool_additional_collision_with_primary_dedupes_to_primary() -> None:
     rows = [FakeExecutorRow(executor_id="exec-x")]
     async with _patched_queries(rows):

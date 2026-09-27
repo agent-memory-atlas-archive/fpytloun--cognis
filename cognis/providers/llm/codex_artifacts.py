@@ -7,6 +7,7 @@ import base64
 import copy
 import hashlib
 import io
+import threading
 import warnings
 from collections import OrderedDict
 from datetime import UTC, datetime
@@ -23,6 +24,9 @@ MAX_CODEX_IMAGE_DIMENSION = 2048
 MAX_CODEX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_CODEX_ENCODED_IMAGE_BYTES = 28 * 1024 * 1024
 DEFAULT_CODEX_IMAGE_CACHE_BYTES = 64 * 1024 * 1024
+MAX_CODEX_IMAGE_PIXELS = 16 * 1024 * 1024
+# The native worker owns this slot, including after its asyncio waiter is cancelled.
+_decode_slot = threading.Lock()
 # Still-image formats direct Codex accepts on the wire. Anything else that
 # Pillow can decode is converted to _CONVERSION_FORMAT instead of rejected.
 _SUPPORTED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
@@ -72,21 +76,23 @@ class CodexImageNormalizationCache:
                 self._entries.move_to_end(cache_key)
                 return cached
 
-        data_url = await asyncio.to_thread(_normalize_data_url, content, artifact_id=artifact_id)
-        if self._max_bytes <= 0 or len(data_url) > self._max_bytes:
-            return data_url
-
+        # Serialize misses so concurrent requests recheck the cache after the
+        # first normalization. Authorization remains the caller's responsibility.
         async with self._lock:
             cached = self._entries.get(cache_key)
             if cached is not None:
                 self._entries.move_to_end(cache_key)
                 return cached
-            self._entries[cache_key] = data_url
-            self._size_bytes += len(data_url)
-            while self._size_bytes > self._max_bytes:
-                _evicted_key, evicted_data_url = self._entries.popitem(last=False)
-                self._size_bytes -= len(evicted_data_url)
-        return data_url
+            data_url = await asyncio.to_thread(
+                _normalize_data_url, content, artifact_id=artifact_id
+            )
+            if self._max_bytes > 0 and len(data_url) <= self._max_bytes:
+                self._entries[cache_key] = data_url
+                self._size_bytes += len(data_url)
+                while self._size_bytes > self._max_bytes:
+                    _, removed = self._entries.popitem(last=False)
+                    self._size_bytes -= len(removed)
+            return data_url
 
     def clear(self) -> None:
         """Remove retained normalized image content."""
@@ -291,6 +297,8 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(content)) as image:
+                if image.width * image.height > MAX_CODEX_IMAGE_PIXELS:
+                    raise CodexArtifactError(f"Image exceeds decode pixel budget: {artifact_id}")
                 image.verify()
             with Image.open(io.BytesIO(content)) as image:
                 source_format = str(image.format or "")
@@ -298,6 +306,9 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
                     bool(getattr(image, "is_animated", False))
                     or int(getattr(image, "n_frames", 1)) != 1
                 )
+                original_size = image.size
+                if source_format == "JPEG":
+                    image.draft("RGB", (MAX_CODEX_IMAGE_DIMENSION, MAX_CODEX_IMAGE_DIMENSION))
                 image.load()
                 # Direct Codex accepts a narrow set of still formats. Convert
                 # anything else, including the first frame of an animation,
@@ -305,7 +316,7 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
                 needs_conversion = animated or source_format not in _SUPPORTED_FORMATS
                 target_format = _CONVERSION_FORMAT if needs_conversion else source_format
                 oversized = max(image.size) > MAX_CODEX_IMAGE_DIMENSION
-                if not needs_conversion and not oversized:
+                if not needs_conversion and not oversized and image.size == original_size:
                     return content, _FORMAT_MIME_TYPES[target_format]
                 normalized_image: Image.Image = image
                 if oversized:
@@ -333,5 +344,6 @@ def _image_content_hash(content: bytes) -> str:
 
 
 def _normalize_data_url(content: bytes, *, artifact_id: str) -> str:
-    encoded, mime_type = _normalize_image(content, artifact_id=artifact_id)
-    return f"data:{mime_type};base64,{base64.b64encode(encoded).decode('ascii')}"
+    with _decode_slot:
+        encoded, mime_type = _normalize_image(content, artifact_id=artifact_id)
+        return f"data:{mime_type};base64,{base64.b64encode(encoded).decode('ascii')}"

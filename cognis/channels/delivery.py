@@ -11,7 +11,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -21,6 +20,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.channels.formatting import split_message
 from cognis.channels.protocol import (
     CHANNEL_DELIVERY_ERRORS,

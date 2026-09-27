@@ -651,6 +651,7 @@ def test_agent_management_settings_get_schema_and_update(
                 "action": "settings_update",
                 "agent_id": "managed-agent",
                 "settings": {
+                    "escalation_timeout_seconds": 45,
                     "available_workflow_ids": ["software-development"],
                     "default_workflow_id": "software-development",
                     "workflow_selection_mode": "use_default",
@@ -690,6 +691,7 @@ def test_agent_management_settings_get_schema_and_update(
             "system": {"enabled": False},
         }
         assert settings["enabled_skills"] == []
+        assert settings["escalation_timeout_seconds"] == 45
         assert settings["tools_state"]["config_state"] == "default_inherited"
         assert reread["settings"] == updated["settings"]
 

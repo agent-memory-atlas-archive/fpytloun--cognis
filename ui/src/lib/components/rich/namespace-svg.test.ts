@@ -50,4 +50,15 @@ describe('namespaceMermaidSvg', () => {
     expect(first).not.toContain('second-');
     expect(second).not.toContain('first-');
   });
+
+  it('normalizes Mermaid HTML line breaks before namespacing a flowchart', () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" id="flow"><defs><marker id="arrow"><path/></marker></defs><foreignObject><div xmlns="http://www.w3.org/1999/xhtml"><p>HEAD request<br>per file</p></div></foreignObject><path marker-end="url(#arrow)"/></svg>';
+    const output = namespaceMermaidSvg(svg, 'report-flow');
+    const document = new DOMParser().parseFromString(output, 'image/svg+xml');
+    expect(document.querySelector('parsererror')).toBeNull();
+    expect(document.querySelector('foreignObject p')?.textContent).toBe('HEAD requestper file');
+    expect(document.querySelector('foreignObject br')).not.toBeNull();
+    expect(output).toContain('marker-end="url(#report-flow-arrow)"');
+    expect(() => namespaceMermaidSvg('<svg><path></svg>', 'report-flow')).toThrow('Invalid Mermaid SVG');
+  });
 });

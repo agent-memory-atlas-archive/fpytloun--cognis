@@ -101,6 +101,8 @@ type WebPushPayload = {
   conversation_id?: string;
   occurred_at?: string;
   icon?: unknown;
+  notification_id?: string;
+  actions?: Array<{ action: string; title: string }>;
 };
 
 type ActiveConversationMessage = {
@@ -267,10 +269,6 @@ function notificationIcon(value: unknown): string {
   }
 }
 
-function isIosWebKit(): boolean {
-  return /iPad|iPhone|iPod/.test(navigator.userAgent || '');
-}
-
 function sameOriginTarget(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   try {
@@ -418,7 +416,9 @@ sw.addEventListener('push', (event) => {
       const target = new URL(payload.url || '/chat', sw.location.origin);
       if (await wasPushObserved(payload.conversation_id, payload.occurred_at)) return;
       if (await hasForegroundClientFor(target, payload.conversation_id)) return;
-      await sw.registration.showNotification(payload.title || 'Cognis', {
+      const notificationOptions: NotificationOptions & {
+        actions?: Array<{ action: string; title: string }>;
+      } = {
         body: payload.body || 'Cognis needs your attention.',
         icon: notificationIcon(payload.icon),
         badge: '/pwa/icon-192.png',
@@ -426,9 +426,12 @@ sw.addEventListener('push', (event) => {
         data: {
           url: `${target.pathname}${target.search}${target.hash}`,
           conversation_id: payload.conversation_id,
-          kind: payload.kind || 'notification'
+          kind: payload.kind || 'notification',
+          notification_id: payload.notification_id
         },
-      });
+        actions: payload.actions,
+      };
+      await sw.registration.showNotification(payload.title || 'Cognis', notificationOptions);
     })()
   );
 });
@@ -437,13 +440,38 @@ sw.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(
     (async () => {
+      const notificationData = event.notification.data as {
+        notification_id?: unknown;
+      } | undefined;
+      if (
+        (event.action === 'approve' || event.action === 'deny')
+        && typeof notificationData?.notification_id === 'string'
+      ) {
+        const response = await fetch(
+          `/api/v1/attention-actions/${encodeURIComponent(notificationData.notification_id)}/resolve`,
+          {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              expected_revision: 1,
+              submission_id: `notification-${event.action}-${notificationData.notification_id}`,
+              action: event.action
+            })
+          }
+        ).catch(() => null);
+        if (response?.ok) return;
+      }
       const target = notificationTarget(event.notification);
+      const actionTarget = new URL(target);
+      if (event.action) actionTarget.searchParams.set('notificationAction', event.action);
+      const resolvedTarget = actionTarget.href;
       const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
 
       for (const client of clients) {
         const windowClient = client as WindowClient;
         try {
-          if (new URL(windowClient.url).href !== target) continue;
+          if (new URL(windowClient.url).href !== resolvedTarget) continue;
           await windowClient.focus();
           return;
         } catch {
@@ -451,16 +479,12 @@ sw.addEventListener('notificationclick', (event) => {
         }
       }
 
-      if (isIosWebKit()) {
-        await sw.clients.openWindow(target);
-        return;
-      }
-
       for (const client of clients) {
         const windowClient = client as WindowClient;
         try {
           if (new URL(windowClient.url).origin !== sw.location.origin) continue;
-          const navigated = await windowClient.navigate(target);
+          windowClient.postMessage({ type: 'OPEN_NOTIFICATION_TARGET', url: resolvedTarget });
+          const navigated = await windowClient.navigate(resolvedTarget);
           await (navigated ?? windowClient).focus();
           return;
         } catch {
@@ -468,7 +492,7 @@ sw.addEventListener('notificationclick', (event) => {
         }
       }
 
-      await sw.clients.openWindow(target);
+      await sw.clients.openWindow(resolvedTarget);
     })()
   );
 });

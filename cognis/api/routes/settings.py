@@ -77,6 +77,7 @@ from cognis.store.models import (
     WorkflowRow,
 )
 from cognis.store.queries import (
+    AUTO_RECAP_ENABLED_STATE_KEY,
     create_llm_provider,
     delete_llm_provider,
     delete_model_routing,
@@ -405,6 +406,15 @@ async def user_preferences_update(
     forbid_mutation_for_viewer(request)
     preferences = UserPreferencesResponse.model_validate(payload.model_dump(mode="json"))
     async with request.app.state.session_factory() as session:
+        previous = await get_user_ui_state_value(session, user.email, USER_PREFERENCES_STATE_KEY)
+        was_enabled = UserPreferencesResponse.model_validate(previous or {}).chat.auto_recap
+        if was_enabled != preferences.chat.auto_recap:
+            await upsert_user_ui_state(
+                session,
+                user.email,
+                AUTO_RECAP_ENABLED_STATE_KEY,
+                {"enabled": preferences.chat.auto_recap},
+            )
         row = await upsert_user_ui_state(
             session,
             user.email,

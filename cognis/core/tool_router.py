@@ -6,7 +6,6 @@ import ast
 import asyncio
 import base64
 import hashlib
-import json
 import re
 import uuid
 from collections.abc import Callable, Coroutine
@@ -21,6 +20,7 @@ from urllib.parse import urlparse
 from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.core.chat_modes import is_plan_mutating_tool_call
@@ -512,6 +512,9 @@ class ToolRouter:
         if registered_tool is None:
             return PermissionDecision(decision="deny", reasoning="Unknown tool", source="registry")
         evaluation_context = await self._evaluation_context(tool_call, registered_tool.definition)
+        minimum_outcome = agent.capabilities.minimum_outcome
+        if minimum_outcome is not None:
+            evaluation_context["minimum_outcome"] = minimum_outcome
         if evaluation_context.get("read_only_required") is True and is_plan_mutating_tool_call(
             registered_tool.definition, tool_call.arguments
         ):
@@ -541,7 +544,8 @@ class ToolRouter:
                 return PermissionDecision(
                     decision="deny", reasoning="Tool denied by agent policy", source="agent"
                 )
-            evaluation_context["minimum_outcome"] = "escalate"
+            if minimum_outcome != "deny":
+                evaluation_context["minimum_outcome"] = "escalate"
             evaluation_context["approval_call_id"] = (tool_call.runtime_metadata or {}).get(
                 "approval_call_id"
             )

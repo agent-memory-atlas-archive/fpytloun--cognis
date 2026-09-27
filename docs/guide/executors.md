@@ -20,14 +20,13 @@ This separation lets Cognis:
 The normal installation includes all built-in executor components:
 
 ```bash
-pip install "cognis-executor[full]==0.16.0"
+pip install "cognis-executor[full]==0.17.0"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 
 Homebrew is the recommended macOS installation. See the
-[macOS executor distribution guide](macos-executor.md). The public tap exists;
-the formula becomes available with the first release containing immutable
-macOS executor assets.
+[macOS executor distribution guide](macos-executor.md). The public tap
+installs the executor from immutable macOS release assets.
 
 The bare package is intentionally minimal. It includes filesystem, shell,
 search, project-context, WebSocket, MCP transport, channel adapters, and LSP

@@ -36,7 +36,9 @@ function rewriteReference(value: string, ids: ReadonlyMap<string, string>): stri
  * duplicates are collapsed because one reference cannot select them separately.
  */
 export function namespaceMermaidSvg(svg: string, namespace: string): string {
-  const document = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  // Mermaid emits HTML <br> inside foreignObject labels; XML parsing requires
+  // the void element to be closed before we can safely namespace SVG IDs.
+  const document = new DOMParser().parseFromString(svg.replace(/<br\s*\/?>/gi, '<br/>'), 'image/svg+xml');
   if (document.querySelector('parsererror')) throw new Error('Invalid Mermaid SVG');
 
   const idElements = Array.from(document.querySelectorAll('[id]'));

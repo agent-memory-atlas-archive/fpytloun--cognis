@@ -1,6 +1,7 @@
 <script lang="ts">
   import ActivitySegmentBlock from '$lib/components/chat-v2/ActivitySegmentBlock.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
+  import RecapCard from '$lib/components/chat-v2/RecapCard.svelte';
   import ThinkingGroupBlock from '$lib/components/chat-v2/ThinkingGroupBlock.svelte';
   import ToolCallGroupBlock from '$lib/components/chat-v2/ToolCallGroupBlock.svelte';
   import { prepareTimelineRows } from '$lib/chat-v2/tool-groups';
@@ -8,7 +9,7 @@
   import { selectRenderableTimeline } from '$lib/chat-v2/selectors';
   import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
   import type { ToolCallTimelineItem as RenderToolCallTimelineItem } from '$lib/timeline-render-model';
-  import type { TimelineItem as ChatV2TimelineItem, TimelineScope, TurnCycleState } from '$lib/chat-v2/types';
+  import type { TimelineItem as ChatV2TimelineItem, TimelineScope, TurnCycleState, WorkCategory } from '$lib/chat-v2/types';
   import type { Agent, UserPreferences } from '$lib/types/api';
 
   let {
@@ -21,6 +22,7 @@
     searchSelectedId = null,
     preferences = DEFAULT_USER_PREFERENCES,
     onViewSession,
+    onOpenWork,
     scope
   } = $props<{
     items: ChatV2TimelineItem[];
@@ -32,6 +34,7 @@
     searchSelectedId?: string | null;
     preferences?: UserPreferences;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    onOpenWork?: ((category: WorkCategory, sessionId: string, path?: string, sourceItemId?: string) => void) | undefined;
     scope?: TimelineScope | undefined;
   }>();
 
@@ -66,7 +69,10 @@
     {#if row.kind === 'item'}
       {@const item = row.item}
       {@const searchMatched = searchMatchedIds.has(item.id)}
-      <ChatV2TimelineItemRenderer
+      {#if item.kind === 'recap'}
+        <RecapCard {item} {onOpenWork} />
+      {:else}
+        <ChatV2TimelineItemRenderer
         {item}
         {agent}
         {compact}
@@ -76,7 +82,8 @@
         {getToolCall}
         {onViewSession}
         {scope}
-      />
+        />
+      {/if}
     {:else if row.kind === 'activity_segment'}
       <ActivitySegmentBlock
         {row}

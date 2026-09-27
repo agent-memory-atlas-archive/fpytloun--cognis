@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.core.mcp_management import (
     MCPManagementDependencies,
     MCPManagementError,

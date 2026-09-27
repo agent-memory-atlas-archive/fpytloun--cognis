@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import mimetypes
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.officecli.install import OFFICECLI_RUNTIME_METADATA_KEY
 from cognis.tools.executor.officecli.runner import run_officecli

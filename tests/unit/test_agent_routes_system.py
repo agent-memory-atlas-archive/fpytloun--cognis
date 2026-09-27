@@ -199,6 +199,9 @@ def test_duplicate_preserves_unavailable_backend_fail_closed_configuration(
             "memory_backend": "future-memory",
             "memory_backend_options": {"future_option": True},
             "guardrails_backend": "intaris",
+            "minimum_outcome": None,
+            "maximum_outcome": None,
+            "escalation_timeout_seconds": None,
         }
         assert body["agent_profiles"]["specialist"]["memory_backend_options"] == {
             "profile_option": "kept"

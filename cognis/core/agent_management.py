@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ from typing import Any, cast
 
 from sqlalchemy import select, update
 
+from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.serializers import agent_to_response
 from cognis.core.agent_profiles import (
@@ -1518,6 +1518,7 @@ def _agent_settings_payload(
         "llm_config": llm_config,
         "execution": execution,
         "capabilities": capabilities,
+        "escalation_timeout_seconds": capabilities.get("escalation_timeout_seconds"),
         "memory": {
             "backend": capabilities.get("memory_backend", "mnemory"),
             "options": capabilities.get("memory_backend_options", {}),
@@ -1629,7 +1630,10 @@ async def _settings_updates(
         executor_ids = {
             executor.executor_id
             for executor in await list_executors(
-                session, owner_email=actor_email, include_shared=True
+                session,
+                owner_email=actor_email,
+                include_shared=True,
+                defer_observed_tools=True,
             )
         }
         providers = await list_llm_providers(session)
@@ -1649,6 +1653,16 @@ async def _settings_updates(
     memory_fields = {"memory_backend", "memory_backend_options"}
     if memory_fields.intersection(settings):
         capabilities = _validated_memory_capabilities(capabilities, settings)
+        updates["capabilities"] = capabilities
+    if "escalation_timeout_seconds" in settings:
+        candidate = {
+            **capabilities,
+            "escalation_timeout_seconds": settings["escalation_timeout_seconds"],
+        }
+        try:
+            capabilities = AgentCapabilities.model_validate(candidate).model_dump(mode="json")
+        except ValueError as exc:
+            raise AgentManagementError(str(exc)) from exc
         updates["capabilities"] = capabilities
 
     ordered_settings = sorted(
@@ -1695,7 +1709,7 @@ async def _settings_updates(
                 provider_models,
             )
             updates["llm_config"] = llm_config
-        elif field in {"memory_backend", "memory_backend_options"}:
+        elif field in {"memory_backend", "memory_backend_options", "escalation_timeout_seconds"}:
             # Validated atomically above so backend/options transitions do not
             # depend on input field order.
             continue
@@ -1740,6 +1754,7 @@ def _settings_field_names() -> set[str]:
         "voice",
         "memory_backend",
         "memory_backend_options",
+        "escalation_timeout_seconds",
         "delegation",
     }
 

@@ -42,7 +42,7 @@ class _Provider:
     def __init__(self, present: bool | dict[str, bool]) -> None:
         self.present = present
 
-    def get_connection(self, executor_id: str) -> _Connection | None:
+    def get_ready_connection(self, executor_id: str) -> _Connection | None:
         present = (
             self.present.get(executor_id, False) if isinstance(self.present, dict) else self.present
         )

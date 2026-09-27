@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from collections.abc import Mapping
@@ -11,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.core.tool_deferral import deferred_builtin_family_names
 from cognis.models.config import ModelInfo
 from cognis.models.tool import (

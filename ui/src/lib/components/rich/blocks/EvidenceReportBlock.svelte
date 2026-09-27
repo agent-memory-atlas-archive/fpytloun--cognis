@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { renderInlineMarkdown, renderInlineMarkdownNoLinks } from '$lib/markdown';
+  import { renderInlineMarkdown, renderInlineMarkdownNoLinks, renderMarkdown } from '$lib/markdown';
   import { blockText, blockTitle, blockType, type RichBlock } from '$lib/rich-deliverable';
-  import { objectList, stringList, valueText } from '../block-helpers';
+  import { stringList, valueText } from '../block-helpers';
   import { claimItems, confidenceLabel, confidencePercent, evidenceItems, normalizeSources, resolveSourceRefs, sourceMeta } from '../evidence-helpers';
   import { citationNumber, orderedSources } from '../publication';
   import { getPublicationContext } from '../publication-context';
@@ -35,10 +35,18 @@
           <strong>{@html renderInlineMarkdown(String(claim.title ?? claim.claim ?? ''))}</strong>
         </header>
         {#if claimBody}<p>{@html renderInlineMarkdown(String(claimBody))}</p>{/if}
-        <div class="rich-confidence" aria-label={`Confidence ${confidenceLabel(claim.confidence ?? claim.score)}`}>
-          <span>{confidenceLabel(claim.confidence ?? claim.score)}</span>
-          <div><i style={`width: ${percent}%`}></i></div>
-        </div>
+        {#if typeof claim.evidence === 'string' && claim.evidence}
+          <div class="rich-claim-evidence"><strong>Evidence</strong>{@html renderMarkdown(claim.evidence)}</div>
+        {/if}
+        {#if typeof claim.verdict === 'string' && claim.verdict}
+          <p class="rich-claim-verdict"><strong>Verdict:</strong> {@html renderInlineMarkdown(claim.verdict)}</p>
+        {/if}
+        {#if claim.confidence !== undefined || claim.score !== undefined}
+          <div class="rich-confidence" aria-label={`Confidence ${confidenceLabel(claim.confidence ?? claim.score)}`}>
+            <span>{confidenceLabel(claim.confidence ?? claim.score)}</span>
+            <div><i style={`width: ${percent}%`}></i></div>
+          </div>
+        {/if}
 
         {#if snippets.length > 0}
           <details>

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from cognis import json_codec as json
 from cognis.models.deliverable import pulse_quality_metadata
 
 _DAILY_BRIEF_TITLE_RE = re.compile(r"^\s*daily[\s_-]+brief\s*$", re.IGNORECASE)

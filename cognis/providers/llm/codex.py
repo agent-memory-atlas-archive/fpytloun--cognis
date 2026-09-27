@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,13 +9,14 @@ from typing import Any
 
 import httpx
 
+from cognis import json_codec as json
 from cognis.models.config import normalize_reasoning_level
 
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_USAGE_DASHBOARD_URL = "https://chatgpt.com/codex/settings/usage"
-CODEX_CLIENT_VERSION = "0.153.4"
+CODEX_CLIENT_VERSION = "0.155.0"
 CODEX_MODEL_CACHE_TTL_SECONDS = 300.0
 
 _CODEX_CATALOG: dict[str, dict[str, Any]] | None = None
@@ -37,6 +37,8 @@ _CODEX_NATIVE_PDF_MODELS = {
     # currently advertises text/image modalities only, while the Responses
     # transport accepts PDFs for these models.
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.5",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -103,7 +105,7 @@ def codex_unknown_model_info(model_id: str) -> dict[str, Any]:
     """Conservative Codex metadata for user-specified models absent from the catalog."""
 
     supports_openai_apply_patch = "codex" in model_id.lower()
-    return {
+    info = {
         "model_id": model_id,
         "display_name": model_id,
         "context_window": 400_000,
@@ -113,6 +115,8 @@ def codex_unknown_model_info(model_id: str) -> dict[str, Any]:
         "supports_tools": True,
         "supports_streaming": True,
         "supports_vision": True,
+        "supports_pdf_input": model_id in _CODEX_NATIVE_PDF_MODELS,
+        "supports_file_input": False,
         "supports_reasoning": True,
         "reasoning_efforts": ["low", "medium", "high"],
         "supports_prompt_caching": True,
@@ -127,6 +131,8 @@ def codex_unknown_model_info(model_id: str) -> dict[str, Any]:
         "source": "codex_unknown",
         "confidence": "fallback",
     }
+    info.update(_CODEX_MODEL_INFO_OVERRIDES.get(model_id, {}))
+    return info
 
 
 def bundled_codex_model_entries(

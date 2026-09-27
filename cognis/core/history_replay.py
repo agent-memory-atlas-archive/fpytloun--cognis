@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import html
-import json
 from collections.abc import Iterator
 from typing import Any
+
+from cognis import json_codec as json
 
 
 def recorded_tool_output(data: dict[str, Any]) -> str | None:

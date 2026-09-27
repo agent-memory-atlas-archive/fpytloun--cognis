@@ -48,11 +48,17 @@ export interface UserChatPreferences {
   group_tool_calls: boolean;
   keep_assistant_messages_separate: boolean;
   show_internal_tool_calls: boolean;
+  auto_recap: boolean;
+}
+
+export interface UserNotificationPreferences {
+  include_content: boolean;
 }
 
 export interface UserPreferences {
   display: UserDisplayPreferences;
   chat: UserChatPreferences;
+  notifications: UserNotificationPreferences;
 }
 
 export interface TokenResponse {
@@ -779,6 +785,8 @@ export interface IntarisSessionDetail {
   intention: string | null;
   summary: string | null;
   status: string;
+  maximum_outcome?: 'deny' | 'escalate' | 'approve' | null;
+  escalation_timeout_seconds?: number | null;
   total_calls: number;
   approved_count: number;
   denied_count: number;
@@ -822,6 +830,9 @@ export interface AgentCapabilities {
   memory_backend_options?: Record<string, unknown>;
   /** Guardrails backend: "intaris" (default) | "none" */
   guardrails_backend: string;
+  minimum_outcome?: 'deny' | 'escalate' | 'approve' | null;
+  maximum_outcome?: 'deny' | 'escalate' | 'approve' | null;
+  escalation_timeout_seconds?: number | null;
 }
 
 export interface MemoryModeDescriptor {
@@ -2385,6 +2396,7 @@ export interface Task {
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
+  escalation_timeout_seconds: number | null;
   session_policy: SessionPolicy | null;
   workflow_id: string | null;
   project_id: string | null;
@@ -3926,6 +3938,11 @@ export interface WebSocketSessionCompactedEvent {
   fallback_reason?: string | null;
 }
 
+export interface WebSocketRecapAvailableEvent {
+  type: 'recap_available';
+  conversation_id: string;
+}
+
 export interface WebSocketSessionCompactionStartedEvent {
   type: 'session_compaction_started';
   conversation_id: string;
@@ -4067,6 +4084,7 @@ export type CognisWebSocketEvent =
   | WebSocketSessionCompactionStartedEvent
   | WebSocketSessionCompactionFinishedEvent
   | WebSocketSessionCompactedEvent
+  | WebSocketRecapAvailableEvent
   | WebSocketSessionResetEvent
   | WebSocketHistoryRebasedEvent
   | WebSocketConversationCreatedEvent

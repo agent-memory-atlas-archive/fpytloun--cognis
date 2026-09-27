@@ -22,12 +22,12 @@ Design principles
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
+from cognis import json_codec as json
 from cognis.core.message_markers import (
     ANCHOR_NAMES,
     PROJECTED_COMPACTED,
@@ -290,7 +290,7 @@ def clear_large_tool_call_arguments(
                 **tool_call,
                 "function": {
                     **function,
-                    "arguments": json.dumps(preview),
+                    "arguments": json.dumps(preview, separators=(", ", ": ")),
                 },
             }
         )
