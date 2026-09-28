@@ -5,6 +5,8 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 const config = {
   preprocess: vitePreprocess(),
   kit: {
+    // The PWA store owns module-worker registration and update handling.
+    serviceWorker: { register: false },
     adapter: adapter({
       pages: 'build',
       assets: 'build',
