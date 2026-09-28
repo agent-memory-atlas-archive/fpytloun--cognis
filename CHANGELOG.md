@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - Made automatic continuation replay stable across server-generated message timestamps while retaining conflicts for changed explicit metadata, content, and metadata origin.
 - Preserved exact replay of existing pending and completed admissions without rewriting persisted hashes or inferring the origin of legacy metadata. Legacy timestamp differences remain conflicts.
+- Replaced full-history window ranking in recent Work activity with batched index-ordered pages, preserving distinct top-ten results and artifact visibility checks.
 
 ### Upgrade notes
 

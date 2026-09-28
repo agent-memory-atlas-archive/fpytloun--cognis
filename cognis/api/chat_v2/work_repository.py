@@ -2460,95 +2460,63 @@ async def _recent_activity(
         ),
         else_=WorkRecordRow.source_item_id,
     )
-    artifact_category = WorkRecordRow.category == "artifacts"
-    candidates = (
-        select(
-            *common_columns,
-            case(
-                (artifact_category, ArtifactRecordRow.filename),
-                else_=literal(None, type_=ArtifactRecordRow.filename.type),
-            ).label("artifact_filename"),
-            case(
-                (artifact_category, ArtifactRecordRow.mime_type),
-                else_=literal(None, type_=ArtifactRecordRow.mime_type.type),
-            ).label("artifact_mime_type"),
-            case(
-                (artifact_category, ArtifactRecordRow.size_bytes),
-                else_=literal(None, type_=ArtifactRecordRow.size_bytes.type),
-            ).label("artifact_size_bytes"),
-            func.row_number()
-            .over(
-                partition_by=(WorkRecordRow.category, identity),
-                order_by=ordering,
+    selected: dict[str, list[Any]] = {category: [] for category in categories}
+    seen: dict[str, set[str]] = {category: set() for category in categories}
+    pending = set(categories)
+    while pending:
+        pages = []
+        for category in categories:
+            if category not in pending:
+                continue
+            page = select(*common_columns).where(
+                WorkRecordRow.owner_email == owner_email,
+                WorkRecordRow.session_id.in_(session_ids or [""]),
+                WorkRecordRow.materializer_version == WORK_MATERIALIZER_VERSION,
+                WorkRecordRow.is_evidence.is_(True),
+                WorkRecordRow.category >= literal(category),
+                WorkRecordRow.category <= literal(category),
             )
-            .label("identity_ordinal"),
-        )
-        .outerjoin(
-            ArtifactRecordRow,
-            and_(
-                artifact_category,
-                ArtifactRecordRow.artifact_id == WorkRecordRow.entity_id,
-                ArtifactRecordRow.owner_email == owner_email,
-            ),
-        )
-        .where(
-            WorkRecordRow.owner_email == owner_email,
-            WorkRecordRow.session_id.in_(session_ids or [""]),
-            WorkRecordRow.materializer_version == WORK_MATERIALIZER_VERSION,
-            WorkRecordRow.is_evidence.is_(True),
-            WorkRecordRow.category.in_(categories),
-            or_(
-                ~artifact_category,
-                and_(
-                    ArtifactRecordRow.artifact_id.is_not(None),
-                    ArtifactRecordRow.deleted_at.is_(None),
-                ),
-            ),
-        )
-        .subquery("recent_activity_candidates")
-    )
-    candidate_ordering = (
-        candidates.c.occurred_at.desc(),
-        candidates.c.session_id.desc(),
-        candidates.c.source_seq.desc(),
-        candidates.c.item_ordinal.desc(),
-        candidates.c.work_record_id.desc(),
-    )
-    ranked = (
-        select(
-            *(column for column in candidates.c if column.key != "identity_ordinal"),
-            func.row_number()
-            .over(
-                partition_by=candidates.c.category,
-                order_by=candidate_ordering,
-            )
-            .label("category_ordinal"),
-        )
-        .where(candidates.c.identity_ordinal == 1)
-        .subquery("recent_activity_ranked")
-    )
-    category_order = case(
-        {category: ordinal for ordinal, category in enumerate(categories)},
-        value=ranked.c.category,
-    )
-    rows = list(
-        (
-            await db.execute(
-                select(*(column for column in ranked.c if column.key != "category_ordinal"))
-                .where(ranked.c.category_ordinal <= 10)
-                .order_by(
-                    category_order,
-                    *(
-                        ranked.c.occurred_at.desc(),
-                        ranked.c.session_id.desc(),
-                        ranked.c.source_seq.desc(),
-                        ranked.c.item_ordinal.desc(),
-                        ranked.c.work_record_id.desc(),
+            if category == "artifacts":
+                page = page.join(
+                    ArtifactRecordRow,
+                    and_(
+                        ArtifactRecordRow.artifact_id == WorkRecordRow.entity_id,
+                        ArtifactRecordRow.owner_email == owner_email,
+                        ArtifactRecordRow.deleted_at.is_(None),
+                    ),
+                ).add_columns(
+                    ArtifactRecordRow.filename.label("artifact_filename"),
+                    ArtifactRecordRow.mime_type.label("artifact_mime_type"),
+                    ArtifactRecordRow.size_bytes.label("artifact_size_bytes"),
+                )
+            else:
+                page = page.add_columns(
+                    literal(None, type_=ArtifactRecordRow.filename.type).label("artifact_filename"),
+                    literal(None, type_=ArtifactRecordRow.mime_type.type).label(
+                        "artifact_mime_type"
+                    ),
+                    literal(None, type_=ArtifactRecordRow.size_bytes.type).label(
+                        "artifact_size_bytes"
                     ),
                 )
-            )
-        ).all()
-    )
+            # At most ten identities are excluded. This lets the ordered index
+            # advance past duplicate histories without ranking the entire scope.
+            if seen[category]:
+                page = page.where(identity.not_in(seen[category]))
+            page = page.order_by(WorkRecordRow.category.desc(), *ordering).limit(32)
+            pages.append(select(page.subquery()))
+        batched = union_all(*pages).subquery("recent_activity_ranked")
+        page_rows = (await db.execute(select(batched))).all()
+        for category in tuple(pending):
+            members = [row for row in page_rows if row.category == category]
+            for row in members:
+                key = str(row.entity_id or row.source_item_id)
+                if key not in seen[category] and len(selected[category]) < 10:
+                    seen[category].add(key)
+                    selected[category].append(row)
+            if len(selected[category]) == 10 or len(members) < 32:
+                pending.remove(category)
+    rows = [row for category in categories for row in selected[category]]
     selected_ids = [str(row.work_record_id) for row in rows]
     records_by_id = {
         record.work_record_id: record

@@ -5882,6 +5882,61 @@ async def test_repository_pages_only_evidence_records(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["commands", "deliverables"])
+@pytest.mark.parametrize("fallback_identity", [False, True])
+async def test_recent_distinct_identity_crosses_batched_page(
+    tmp_path: Path, category: str, fallback_identity: bool
+) -> None:
+    from cognis.api.chat_v2.work_repository import _recent_activity
+
+    engine, factory = await _database(tmp_path, owners=("alice",))
+    try:
+        async with factory() as db:
+            for index in range(80):
+                identity = "shared" if index >= 40 else f"identity-{index}"
+                db.add(
+                    WorkRecordRow(
+                        work_record_id=f"page-record-{index}",
+                        owner_email="alice@example.com",
+                        session_id="session-alice",
+                        materializer_version=WORK_MATERIALIZER_VERSION,
+                        source_store="intaris",
+                        source_session_id="source-session-alice",
+                        source_seq=index,
+                        source_item_id=identity if fallback_identity else f"tool:{index}",
+                        item_ordinal=0,
+                        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+                        record_type="tool_pair",
+                        category=category,
+                        entity_id="" if fallback_identity else identity,
+                        is_evidence=True,
+                        call_id=f"page-call-{index}",
+                        timeline_item={
+                            "kind": "tool_call",
+                            "id": f"tool:{index}",
+                            "sort_key": str(index),
+                            "call_id": f"page-call-{index}",
+                            "tool_name": "bash",
+                            "status": "complete",
+                        },
+                    )
+                )
+            await db.commit()
+            recent, records, _ = await _recent_activity(
+                db,
+                owner_email="alice@example.com",
+                session_ids=["session-alice"],
+                statement=None,
+            )
+            assert len(recent[category]) == 10
+            assert [row.work_record_id for row in records] == [
+                f"page-record-{index}" for index in [79, *range(39, 30, -1)]
+            ]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_set_based_category_summary_matches_exact_filtered_semantics(
     tmp_path: Path,
 ) -> None:

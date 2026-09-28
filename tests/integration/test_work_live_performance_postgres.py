@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import time
@@ -391,6 +392,10 @@ def _samples(
     ) -> None:
         statements.append(statement)
         started_queries[id(_context)] = time.perf_counter()
+        if "recent_activity_ranked" in statement:
+            # Do not filter out window queries: the plan gate must detect them.
+            for category in ("commands", "artifacts"):
+                recent_queries.setdefault(category, (statement, parameters))
         if (
             "work_records.category >=" in statement
             and "work_records.occurred_at DESC" in statement
@@ -485,6 +490,52 @@ async def _query_plan(engine: AsyncEngine, statement: str, parameters: Any) -> s
             parameters,
         )
         return "\n".join(str(row[0]) for row in rows)
+
+
+async def _recent_plan(engine: AsyncEngine, statement: str, parameters: Any) -> dict[str, Any]:
+    async with engine.connect() as connection:
+        result = await connection.exec_driver_sql(
+            f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {statement}", parameters
+        )
+        value = result.scalar_one()
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value[0]
+
+
+def _assert_recent_plan(plan: dict[str, Any]) -> None:
+    def nodes(node: dict[str, Any]):
+        yield node
+        for child in node.get("Plans", []):
+            yield from nodes(child)
+
+    all_nodes = list(nodes(plan["Plan"]))
+    assert not any(node["Node Type"] == "WindowAgg" for node in all_nodes), plan
+    records = [node for node in all_nodes if node.get("Relation Name") == "work_records"]
+    assert records, plan
+    assert all(node["Node Type"] in {"Index Scan", "Index Only Scan"} for node in records), plan
+    assert any(
+        node.get("Index Name") == "ix_work_records_owner_category_order" for node in records
+    ), plan
+    assert (
+        sum(
+            (node["Actual Rows"] + node.get("Rows Removed by Filter", 0)) * node["Actual Loops"]
+            for node in records
+        )
+        <= 4096
+    ), plan
+    for node in all_nodes:
+        if node["Node Type"] == "Sort":
+            assert node["Actual Rows"] <= 32, plan
+            assert node.get("Sort Space Type") == "Memory", plan
+            assert node.get("Sort Space Used", 0) <= 64, plan
+    append = next(node for node in all_nodes if node["Node Type"] == "Append")
+    command_branch = next(
+        branch
+        for branch in append["Plans"]
+        if any("'commands'" in node.get("Index Cond", "") for node in nodes(branch))
+    )
+    assert not any(node["Node Type"] == "Sort" for node in nodes(command_branch)), plan
 
 
 async def _append_fresh_command(
@@ -797,7 +848,7 @@ def test_public_work_postgres_production_shape(
         assert "Execution Time:" in overview_plan
         recent_plans = {
             category: client.portal.call(
-                _query_plan,
+                _recent_plan,
                 client.app.state.engine,
                 query[0],
                 query[1],
@@ -806,11 +857,8 @@ def test_public_work_postgres_production_shape(
             if category in {"commands", "artifacts"}
         }
         assert set(recent_plans) == {"commands", "artifacts"}
-        assert "ix_work_records_owner_category_order" in recent_plans["commands"]
-        assert "WindowAgg" not in recent_plans["commands"]
-        assert "Sort" not in recent_plans["commands"]
-        assert "WindowAgg" not in recent_plans["artifacts"]
-        assert "external" not in recent_plans["artifacts"].lower()
+        for recent_plan in recent_plans.values():
+            _assert_recent_plan(recent_plan)
         summary_plan = client.portal.call(
             _statement_plan,
             client.app.state.engine,
