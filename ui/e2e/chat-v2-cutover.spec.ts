@@ -121,6 +121,12 @@ test('keeps the settled mobile chat header and composer above the keyboard', asy
 
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.keyboard))
     .toBe('open');
+  // Keyboard state is synchronous; local avoidance geometry updates in rAF.
+  await expect.poll(() => composer.evaluate(node => {
+    const bottom = (window.visualViewport?.offsetTop ?? 0)
+      + (window.visualViewport?.height ?? window.innerHeight);
+    return node.getBoundingClientRect().bottom <= bottom + 1;
+  })).toBe(true);
   const geometry = await page.evaluate(() => {
     const chatNode = document.querySelector<HTMLElement>('[data-testid="chat-main"]');
     const headerNode = document.querySelector<HTMLElement>('[data-testid="chat-header"]');

@@ -380,15 +380,21 @@
 
   function restoreScrollAnchor(
     previousHeight: number,
-    previousTop: number
+    previousTop: number,
+    rowKey: string | null,
+    rowOffset: number,
   ): void {
     if (!viewport) return;
     restoringScrollAnchor = true;
     try {
-      // Preserve the distance from the current content, independent of browser
-      // scroll anchoring and variable-height prepended rows.
+      const row = Array.from(viewport.querySelectorAll<HTMLElement>('[data-timeline-row-key]'))
+        .find(node => node.dataset.timelineRowKey === rowKey);
+      const top = row
+        ? viewport.scrollTop + row.getBoundingClientRect().top
+          - viewport.getBoundingClientRect().top - rowOffset
+        : previousTop + viewport.scrollHeight - previousHeight;
       timelineViewport?.setProgrammaticScrollTop(
-        previousTop + viewport.scrollHeight - previousHeight,
+        top,
       );
     } finally {
       // Scroll events dispatch synchronously in browsers. Defer the reset so a
@@ -425,8 +431,6 @@
     }
     seenBackfillCursors.add(before);
     if (automatic) autoFillPagesRemaining -= 1;
-    const previousHeight = currentViewport?.scrollHeight ?? 0;
-    const previousTop = currentViewport?.scrollTop ?? 0;
     loadingOlder = true;
     olderError = '';
     const controller = new AbortController();
@@ -442,6 +446,15 @@
         || requestVersion !== requestGeneration
         || currentStore !== store
       ) return;
+      // Capture the current reading position, not the position when the request
+      // began: the user may have scrolled while the response was in flight.
+      const previousHeight = currentViewport?.scrollHeight ?? 0;
+      const previousTop = currentViewport?.scrollTop ?? 0;
+      const viewportTop = currentViewport?.getBoundingClientRect().top ?? 0;
+      const anchor = Array.from(currentViewport?.querySelectorAll<HTMLElement>('[data-timeline-row-key]') ?? [])
+        .find(row => row.getBoundingClientRect().bottom > viewportTop);
+      const rowKey = anchor?.dataset.timelineRowKey ?? null;
+      const rowOffset = anchor ? anchor.getBoundingClientRect().top - viewportTop : 0;
       if (!currentStore.applyBackfill(response)) {
         autoFillAllowed = false;
         return;
@@ -460,7 +473,7 @@
         || currentStore !== store
         || currentViewport !== viewport
       ) return;
-      restoreScrollAnchor(previousHeight, previousTop);
+      restoreScrollAnchor(previousHeight, previousTop, rowKey, rowOffset);
     } catch (caught) {
       if (
         scopeVersion !== scopeGeneration

@@ -294,12 +294,19 @@ test.describe('ScopedChatV2Timeline', () => {
     const timeline = page.getByTestId('scoped-timeline-shell');
     const viewport = timeline.getByTestId('scoped-timeline-viewport');
     await expect(timeline.getByText(/Load older/i)).toHaveCount(0);
+    await expect(timeline.getByRole('heading', { name: 'Parent conversation event 20' })).toBeVisible();
+    await expect.poll(() => viewport.evaluate(node =>
+      node.scrollHeight - node.scrollTop - node.clientHeight)).toBeLessThanOrEqual(2);
+    await viewport.hover();
+    await viewport.evaluate(node => { node.scrollTop = 100; });
+    await page.mouse.wheel(0, -500);
+    // Anchor preservation is verified with a held response in the dedicated
+    // row-anchor tests; height deltas are not a row position invariant.
+    await expect(timeline.getByText('Parent conversation event 4', { exact: true })).toBeVisible();
     const settledAnchor = await viewport.evaluate((node) => {
       const element = node as HTMLElement;
-      element.scrollTop = 0;
       return element.scrollHeight - element.scrollTop;
     });
-    await viewport.evaluate((node) => node.dispatchEvent(new Event('scroll')));
     await expect(timeline.locator('[data-has-older="true"]')).toBeVisible();
     await expect(timeline.getByText('Parent conversation event 4', { exact: true })).toBeVisible();
     await page.waitForTimeout(50);
