@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.17.1] - Unreleased
+
+### Fixed
+
+- Made automatic continuation replay stable across server-generated message timestamps while retaining conflicts for changed explicit metadata, content, and metadata origin.
+- Preserved exact replay of existing pending and completed admissions without rewriting persisted hashes or inferring the origin of legacy metadata. Legacy timestamp differences remain conflicts.
+
+### Upgrade notes
+
+- Coordinate the upgrade of all controller admission writers, including automatic continuations and recovery workers. Quiesce ingress and finish active admission/handoff transactions before stopping old writers; resume only after the complete fleet is upgraded.
+- Mixed-version admission writers and rolling downgrade after new admissions are not supported. Keep existing rows and idempotency keys; reconcile uncertain requests rather than deleting records or issuing fresh keys.
+- Existing requests without their original timestamp cannot use the exact legacy replay path. Draining pending work alone does not remove this limitation.
+- This patch supersedes the tagged v0.17.0 candidate. Do not replace its tags or attach patch-version binaries to that tag.
+
 ## [0.17.0] - 2026-09-28
 
 ### Added

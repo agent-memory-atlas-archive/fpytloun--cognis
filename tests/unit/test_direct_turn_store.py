@@ -39,15 +39,28 @@ ADMISSION_KEY = b"trusted-evidence-direct-turn-test-key"
 
 
 @pytest.mark.asyncio
-async def test_scheduler_successor_uses_real_admission_at_capacity(tmp_path):
+@pytest.mark.parametrize("elapsed_seconds", [0, 1])
+async def test_scheduler_successor_uses_real_admission_at_capacity(
+    tmp_path, monkeypatch, elapsed_seconds
+):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
+    from cognis.core import message_envelope
     from cognis.core.agent_loop import PauseWaiter
     from cognis.core.events import EventBus
     from cognis.core.followups import MID_STREAM_FAILURE_CONTINUATION_REASON
     from cognis.core.turn_scheduler import TurnScheduler
     from cognis.models.session import SessionStatus
+
+    clock = [datetime(2026, 1, 1, tzinfo=UTC)]
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0]
+
+    monkeypatch.setattr(message_envelope, "datetime", ControlledDatetime)
 
     harness = await _harness(tmp_path)
     try:
@@ -108,6 +121,7 @@ async def test_scheduler_successor_uses_real_admission_at_capacity(tmp_path):
         assert parent.status == "completed"
         pending = await harness.store.list_conversation_pending("conv-a")
         assert [row.turn_id for row in pending] == [result.successor_turn_id]
+        clock[0] += timedelta(seconds=elapsed_seconds)
         replay = await scheduler._schedule_automatic_continuation(
             conversation_id="conv-a",
             session_id="session",
@@ -119,6 +133,9 @@ async def test_scheduler_successor_uses_real_admission_at_capacity(tmp_path):
         )
         assert replay.successor_turn_id == result.successor_turn_id
         assert len(await harness.store.list_conversation_pending("conv-a")) == 1
+        assert pending[0].payload["metadata"]["user_message_metadata"]["ts"] == (
+            "2026-01-01T00:00:00Z"
+        )
     finally:
         await harness.engine.dispose()
 
@@ -395,6 +412,54 @@ async def test_active_reads_reuse_caller_session_without_factory_checkout(tmp_pa
                 )
                 == {}
             )
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generated", [False, True])
+@pytest.mark.parametrize("changed_field", [None, "ts", "sender", "content", "origin"])
+async def test_metadata_origin_controls_admission_identity(tmp_path, generated, changed_field):
+    harness = await _harness(tmp_path)
+    try:
+        metadata = {"ts": "2026-01-01T00:00:00Z", "sender": "Alice"}
+        payload = {
+            "schema_version": 1,
+            "content": "request",
+            "attachments": [],
+            "metadata": {"user_message_metadata": metadata},
+        }
+        args = {
+            "conversation_id": "conv-a",
+            "session_id": None,
+            "agent_id": "agent-1",
+            "user_id": "user@example.com",
+            "idempotency_scope": "web:conv-a:user@example.com",
+            "idempotency_key": "metadata-replay",
+            "generated_user_message_metadata": generated,
+        }
+        first = await harness.store.admit(**args, payload=payload)
+        changed_metadata = dict(metadata)
+        changed_payload = {**payload, "metadata": {"user_message_metadata": changed_metadata}}
+        if changed_field == "ts":
+            changed_metadata["ts"] = "2026-01-01T00:00:01Z"
+        elif changed_field == "sender":
+            changed_metadata["sender"] = "Bob"
+        elif changed_field == "content":
+            changed_payload["content"] = "different request"
+        elif changed_field == "origin":
+            args["generated_user_message_metadata"] = not generated
+        if changed_field is None or (generated and changed_field == "ts"):
+            replay = await harness.store.admit(**args, payload=changed_payload)
+            assert not replay.created
+            assert replay.request.request_id == first.request.request_id
+            assert replay.request.payload == first.request.payload
+            assert replay.request.payload_hash == first.request.payload_hash
+        else:
+            with pytest.raises(DirectTurnConflictError):
+                await harness.store.admit(**args, payload=changed_payload)
+        assert len(await harness.store.list_conversation_pending("conv-a")) == 1
+        assert metadata["ts"] == "2026-01-01T00:00:00Z"
     finally:
         await harness.engine.dispose()
 

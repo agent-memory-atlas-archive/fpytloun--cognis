@@ -455,7 +455,9 @@ def _validated_payload(payload: dict[str, Any], payload_version: int) -> dict[st
     return normalized
 
 
-def _admission_descriptor_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _admission_descriptor_payload(
+    payload: dict[str, Any], *, generated_user_message_metadata: bool = False
+) -> dict[str, Any]:
     """Remove server-owned policy data from the client idempotency descriptor."""
     descriptor_payload = dict(payload)
     metadata = payload.get("metadata")
@@ -463,6 +465,12 @@ def _admission_descriptor_payload(payload: dict[str, Any]) -> dict[str, Any]:
         descriptor_payload["metadata"] = {
             key: value for key, value in metadata.items() if key != TRUSTED_EVIDENCE_ADMISSION_KEY
         }
+        if generated_user_message_metadata:
+            envelope = metadata.get("user_message_metadata")
+            if isinstance(envelope, dict):
+                descriptor_payload["metadata"]["user_message_metadata"] = {
+                    key: value for key, value in envelope.items() if key != "ts"
+                }
     return descriptor_payload
 
 
@@ -483,6 +491,7 @@ class DirectTurnStore:
         idempotency_key: str,
         payload: dict[str, Any],
         payload_version: int = 1,
+        generated_user_message_metadata: bool = False,
         request_id: str | None = None,
         turn_id: str | None = None,
         admission_guard: DirectTurnAdmissionGuard | None = None,
@@ -499,9 +508,22 @@ class DirectTurnStore:
             "agent_id": agent_id,
             "user_id": user_id,
             "payload_version": payload_version,
-            "payload": _admission_descriptor_payload(payload),
+            "payload": _admission_descriptor_payload(
+                payload, generated_user_message_metadata=generated_user_message_metadata
+            ),
         }
+        # Both new branches are namespaced away from the unversioned legacy
+        # descriptor. Provenance comes from the caller, never from the payload.
+        descriptor["generated_user_message_metadata"] = generated_user_message_metadata
         admission_hash = _canonical_hash(descriptor)
+        legacy_descriptor = {
+            key: value
+            for key, value in descriptor.items()
+            if key != "generated_user_message_metadata"
+        }
+        # Exact old semantics: retain even a server-generated timestamp.
+        legacy_descriptor["payload"] = _admission_descriptor_payload(payload)
+        legacy_admission_hash = _canonical_hash(legacy_descriptor)
         payload_hash = _canonical_hash(payload)
 
         values = {
@@ -527,6 +549,7 @@ class DirectTurnStore:
                     idempotency_scope=idempotency_scope,
                     idempotency_key=idempotency_key,
                     admission_hash=admission_hash,
+                    legacy_admission_hash=legacy_admission_hash,
                     admission_guard=admission_guard,
                     transaction_participant=transaction_participant,
                 )
@@ -543,6 +566,7 @@ class DirectTurnStore:
         idempotency_scope: str,
         idempotency_key: str,
         admission_hash: str,
+        legacy_admission_hash: str,
         admission_guard: DirectTurnAdmissionGuard | None,
         transaction_participant: (
             Callable[[AsyncSession, DirectTurnRequestRow, bool], Awaitable[None]] | None
@@ -584,7 +608,7 @@ class DirectTurnStore:
                 if row is None:
                     await session.rollback()
                     raise DirectTurnConflictError("request_id or turn_id already exists")
-                if row.admission_hash != admission_hash:
+                if row.admission_hash not in (admission_hash, legacy_admission_hash):
                     await session.rollback()
                     raise DirectTurnConflictError(
                         "idempotency key was reused with a different request"

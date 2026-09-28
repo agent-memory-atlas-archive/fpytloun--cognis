@@ -1787,7 +1787,7 @@ def create_app(
         finally:
             await diagnostics.stop()
 
-    app = FastAPI(title="Cognis", version="0.17.0", lifespan=monitored_lifespan)
+    app = FastAPI(title="Cognis", version="0.17.1", lifespan=monitored_lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths

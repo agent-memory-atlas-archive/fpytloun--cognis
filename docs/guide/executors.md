@@ -20,7 +20,7 @@ This separation lets Cognis:
 The normal installation includes all built-in executor components:
 
 ```bash
-pip install "cognis-executor[full]==0.17.0"
+pip install "cognis-executor[full]==0.17.1"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 

@@ -2976,7 +2976,8 @@ class TurnScheduler:
         contextual_messages = [
             {**item, "intention_eligible": False} for item in (contextual_messages or [])
         ]
-        if user_message_metadata is None:
+        generated_user_message_metadata = user_message_metadata is None
+        if generated_user_message_metadata:
             user_message_metadata = message_metadata()
         admission_origin = admission_origin or classify_origin(
             user_message_metadata,
@@ -3491,6 +3492,7 @@ class TurnScheduler:
                         )
                     try:
                         admission = await self._direct_turn_store.admit(
+                            generated_user_message_metadata=generated_user_message_metadata,
                             conversation_id=conversation_id,
                             session_id=getattr(session, "session_id", None),
                             agent_id=agent.agent_id,

@@ -291,7 +291,7 @@ cognis-executor
 Install a normal remote executor with the complete component set:
 
 ```bash
-pip install "cognis-executor[full]==0.17.0"
+pip install "cognis-executor[full]==0.17.1"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 

@@ -43,6 +43,48 @@ Those layers must depend only on this contract, not on runtime-specific logic.
 
 ## Runtime Boundary
 
+### Durable admission metadata identity
+
+The turn scheduler owns whether message metadata was supplied by the caller or
+generated for this admission attempt. It passes that distinction directly to
+the store; payload fields cannot assert it. The admission descriptor excludes
+only the timestamp in scheduler-generated message metadata and includes its
+generated or explicit origin as a top-level descriptor field. Neither new branch
+uses the unversioned legacy descriptor namespace. Explicit timestamps and all other request fields retain
+strict idempotency conflict checking. The immutable persisted payload keeps the
+first admission's timestamp; replay returns that original row.
+
+This is request-admission state, not runtime execution state. The existing
+store transaction continues to own deduplication and atomic predecessor/successor
+handoff. The scheduler retains its pre-admission capacity checks. No new external
+side effect, lock, schema column or cancellation owner is introduced.
+
+On replay the store accepts either the current descriptor hash or the exact
+legacy descriptor hash computed from the incoming request, with its timestamp
+still included. It never derives provenance from an old payload and never rewrites
+the persisted admission or payload hashes. Pending and completed legacy rows have
+the same policy: exact old replay works; a timestamp-only difference still
+conflicts even if the current caller generated it. Legacy descriptors did not
+distinguish origin, so either caller origin can replay the exact old request.
+New descriptors distinguish both origins and cannot pass the legacy fallback.
+Hash matching does not expire keys or change the original request's lifecycle.
+
+**Coordinated upgrade required:** there is no mixed-version rollout protocol.
+Quiesce admission ingress and automatic continuation producers, allow active
+admission/handoff transactions to finish, stop all old controller writers, and
+upgrade the complete controller fleet before reopening ingress. Do not leave
+old workers/recovery writers connected while new admissions are accepted.
+Retain pending/completed rows and keys. Exact legacy replay is supported, but
+clients without the original timestamp still need reconciliation rather than a
+new key. Draining pending work alone does not solve that limitation.
+
+An old controller cannot recognize newly written descriptor hashes. Rollback
+after accepting new admissions is therefore not a rolling downgrade: keep
+ingress quiescent and decide a separately verified recovery procedure. Do not
+bypass hash checks, delete rows, mutate old hashes, or issue a fresh key for an
+uncertain operation. This patch does not authorize deployment or database
+migration; publication and the coordinated deployment window require approval.
+
 ### Cognis-owned responsibilities
 
 - conversation identity and routing
