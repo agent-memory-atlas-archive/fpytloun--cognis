@@ -666,6 +666,57 @@ ApplyCallback = Callable[[ChatV2RuntimeRelayEnvelope], Awaitable[None]]
 SubscriberCallback = Callable[[str], bool]
 
 
+class RuntimeAuthoritySource:
+    """Transport-independent, process-scoped ordering of claimed generations."""
+
+    def __init__(self, epoch: str, max_entries: int = DEFAULT_STATE_MAX_ENTRIES) -> None:
+        self.epoch = epoch
+        self.max_entries = max_entries
+        self.revisions: OrderedDict[tuple[str, ...], int] = OrderedDict()
+
+    def next_revision(self, context: RelayGenerationContext) -> int:
+        key = (
+            context.conversation_id,
+            context.session_id,
+            context.turn_id,
+            context.direct_request_id,
+            context.owner_controller_id,
+            context.owner_incarnation_id,
+            str(context.fencing_token),
+            self.epoch,
+        )
+        current = self.revisions.pop(key, 0)
+        if current >= MAX_REDIS_SAFE_INTEGER:
+            self.revisions[key] = current
+            raise ValueError("source_revision exceeds Redis-safe integer range")
+        revision = current + 1
+        self.revisions[key] = revision
+        while len(self.revisions) > self.max_entries:
+            self.revisions.popitem(last=False)
+        return revision
+
+    def authority(
+        self,
+        context: RelayGenerationContext,
+        *,
+        has_active_turn: bool,
+        lifecycle: RuntimeLifecycle | None = None,
+    ) -> RuntimeAuthority:
+        return RuntimeAuthority(
+            direct_request_id=context.direct_request_id,
+            turn_id=context.turn_id,
+            fencing_token=context.fencing_token,
+            lifecycle=lifecycle or (context.lifecycle if has_active_turn else "terminal"),
+            source_epoch=self.epoch,
+            source_revision=self.next_revision(context),
+        )
+
+    def invalidate(self, conversation_id: str) -> None:
+        for key in list(self.revisions):
+            if key[0] == conversation_id:
+                self.revisions.pop(key, None)
+
+
 class ChatV2RuntimeRedisRelay:
     """Bounded, non-authoritative relay; Redis failures never block observers."""
 
@@ -706,7 +757,7 @@ class ChatV2RuntimeRedisRelay:
         self._seen: OrderedDict[str, tuple[float, int, RelayKind, str, tuple[str, ...]]] = (
             OrderedDict()
         )
-        self._revisions: OrderedDict[tuple[str, ...], int] = OrderedDict()
+        self.authority_source = RuntimeAuthoritySource(self.origin.runtime_epoch, state_max_entries)
         self._publisher_task: asyncio.Task[None] | None = None
         self._receiver_task: asyncio.Task[None] | None = None
         self._receiver_deliveries: set[asyncio.Task[None]] = set()
@@ -726,25 +777,7 @@ class ChatV2RuntimeRedisRelay:
         return f"{RELAY_CHANNEL}:latest:{digest}"
 
     def next_revision(self, context: RelayGenerationContext) -> int:
-        key = (
-            context.conversation_id,
-            context.session_id,
-            context.turn_id,
-            context.direct_request_id,
-            context.owner_controller_id,
-            context.owner_incarnation_id,
-            str(context.fencing_token),
-            self.origin.runtime_epoch,
-        )
-        current = self._revisions.pop(key, 0)
-        if current >= MAX_REDIS_SAFE_INTEGER:
-            self._revisions[key] = current
-            raise ValueError("source_revision exceeds Redis-safe integer range")
-        revision = current + 1
-        self._revisions[key] = revision
-        while len(self._revisions) > self._state_max_entries:
-            self._revisions.popitem(last=False)
-        return revision
+        return self.authority_source.next_revision(context)
 
     def make_envelope(
         self,
@@ -766,7 +799,11 @@ class ChatV2RuntimeRedisRelay:
             relay_context_usage["__boundary_receipts"] = [
                 item.model_dump(mode="json") for item in boundary_receipts
             ]
-        source_revision = self.next_revision(context)
+        authority = self.authority_source.authority(
+            context, has_active_turn=has_active_turn, lifecycle=lifecycle
+        )
+        assert authority.source_revision is not None
+        source_revision = authority.source_revision
         return ChatV2RuntimeRelayEnvelope(
             kind=kind,
             event_id=event_id or secrets.token_urlsafe(18),
@@ -782,14 +819,7 @@ class ChatV2RuntimeRedisRelay:
             ),
             fencing_token=context.fencing_token,
             source_revision=source_revision,
-            authority=RuntimeAuthority(
-                direct_request_id=context.direct_request_id,
-                turn_id=context.turn_id,
-                fencing_token=context.fencing_token,
-                lifecycle=(lifecycle or (context.lifecycle if has_active_turn else "terminal")),
-                source_epoch=self.origin.runtime_epoch,
-                source_revision=source_revision,
-            ),
+            authority=authority,
             has_active_turn=has_active_turn,
             active_turn=active_turn,
             volatile_items=volatile_items or [],
@@ -1208,9 +1238,7 @@ class ChatV2RuntimeRedisRelay:
         for event_id, (_, _, __, stored_conversation_id, ___) in list(self._seen.items()):
             if stored_conversation_id == conversation_id:
                 self._seen.pop(event_id, None)
-        for key in list(self._revisions):
-            if key[0] == conversation_id:
-                self._revisions.pop(key, None)
+        self.authority_source.invalidate(conversation_id)
 
     def _seen_decision(self, envelope: ChatV2RuntimeRelayEnvelope) -> str | None:
         self._expire_seen()

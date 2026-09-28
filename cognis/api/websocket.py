@@ -52,6 +52,7 @@ from cognis.api.chat_v2.realtime import (
 from cognis.api.chat_v2.schemas import (
     BoundaryReceipt,
     RuntimeAuthority,
+    RuntimeLifecycle,
     TimelineItem,
     TimelineScope,
 )
@@ -74,6 +75,7 @@ from cognis.core.chat_v2_runtime_relay import (
     AdmissionDecision,
     ChatV2RuntimeRelayEnvelope,
     RelayKind,
+    RuntimeAuthoritySource,
 )
 from cognis.core.command_notices import persist_command_system_notice
 from cognis.core.conversation_state import (
@@ -1507,6 +1509,7 @@ class WebSocketConnectionManager:
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
         self._relay_runtime_items: dict[str, tuple[str, dict[str, TimelineItem]]] = {}
+        self._local_runtime_authority = RuntimeAuthoritySource(uuid.uuid4().hex)
 
         # Register as global EventBus subscriber for UI fanout
         event_bus = getattr(app.state, "event_bus", None)
@@ -2160,7 +2163,7 @@ class WebSocketConnectionManager:
         active_session_id: str | None = None,
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
-        lifecycle: str | None = None,
+        lifecycle: RuntimeLifecycle | None = None,
         retire_assistant_streams: bool = False,
         active_turn: dict[str, Any] | None = None,
         runtime_authority: RuntimeAuthority | None = None,
@@ -2281,6 +2284,10 @@ class WebSocketConnectionManager:
                 ),
                 boundary_receipts=boundary_receipts,
             )
+        if context is not None and relay is None:
+            runtime_authority = self._local_runtime_authority.authority(
+                context, has_active_turn=has_active_turn, lifecycle=lifecycle
+            )
         await self._fanout_chat_v2_runtime(
             conversation_id,
             volatile_items=effective_items,
@@ -2292,7 +2299,9 @@ class WebSocketConnectionManager:
             boundary_receipts=boundary_receipts,
             authority=(envelope.authority if envelope is not None else runtime_authority),
             volatile_items_complete=(
-                envelope.volatile_items_complete if envelope is not None else not has_active_turn
+                envelope.volatile_items_complete
+                if envelope is not None
+                else context is not None or not has_active_turn
             ),
         )
         if context is None or relay is None:

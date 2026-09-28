@@ -82,13 +82,15 @@
     if (closeInProgress || !open) return;
     closeInProgress = true;
     open = false;
+    onClose?.();
     await tick();
-    const target = restoreFocus;
+    const scope = documentRoot?.();
+    const target = scope?.querySelector<HTMLElement>('[aria-label="Open table of contents"]')
+      ?? (scope ? (scope.contains(restoreFocus) ? restoreFocus : null) : restoreFocus);
     restoreFocus = null;
     if (options.restoreTrigger !== false && target?.isConnected) {
       target.focus({ preventScroll: true });
     }
-    onClose?.();
     closeInProgress = false;
   }
 

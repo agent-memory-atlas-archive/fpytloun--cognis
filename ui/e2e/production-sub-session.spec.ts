@@ -209,6 +209,8 @@ test('opened child session loads older history on top-edge scroll', async ({ pag
   });
   const scoped = overlay.getByRole('region', { name: 'Timeline' });
   await expect(scoped).toBeVisible();
+  // The region exists while its initial snapshot is still loading.
+  await expect(scoped.getByRole('heading', { name: 'Long active answer' })).toBeVisible();
   await scoped.evaluate((node) => {
     const element = node as HTMLElement;
     element.scrollTop = 1;

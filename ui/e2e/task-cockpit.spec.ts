@@ -307,6 +307,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await page.goto('/chat/conv-task-chat?view=work', { waitUntil: 'domcontentloaded' });
     const infoAction = page.getByTestId('chat-header-info');
     await expect(infoAction).toHaveAttribute('aria-controls', 'conversation-info-drawer');
+    await expect(page.getByRole('button', { name: 'Release safety review', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Expand conversation filters' }).click();
     await expect(page.getByRole('button', { name: 'Task', exact: true })).toBeVisible();
     await page.getByRole('button', { name: 'Collapse conversation filters' }).click();

@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - Fixed Anthropic orphan results, executor bridge cancellation, and transient Chat recovery notices.
 - Fixed documentation navigation, recap projection typing, and evidence-admission validation at the release gates.
 - Fixed mobile rich-text overflow and Mermaid layout with reduced motion enabled.
+- Preserved authoritative streaming updates without Redis and restored table-of-contents focus across responsive layout changes.
 
 ## [0.16.0] - 2026-09-20
 

@@ -50,6 +50,27 @@ afterEach(() => {
 });
 
 describe('RichToc', () => {
+  it('focuses the current scoped opener recreated by the close callback', async () => {
+    stubMobile();
+    const scope = document.createElement('section');
+    const original = document.createElement('button');
+    original.setAttribute('aria-label', 'Open table of contents');
+    scope.appendChild(original);
+    document.body.appendChild(scope);
+    original.focus();
+    const current = original.cloneNode() as HTMLButtonElement;
+    render(RichToc, {
+      items, open: true, onNavigate: vi.fn(), documentRoot: () => scope,
+      onClose: () => scope.replaceChildren(current),
+    });
+    const dialog = await screen.findByRole('dialog', { name: 'Table of contents' });
+    await waitFor(() => expect(
+      within(dialog).getByRole('button', { name: 'Close table of contents' }),
+    ).toHaveFocus());
+    await fireEvent.keyDown(dialog, { key: 'Escape' });
+    await waitFor(() => expect(current).toHaveFocus());
+    expect(original.isConnected).toBe(false);
+  });
   it('renders a compact semantic hierarchy without level badges or cards', () => {
     stubMobile(false);
     const { container } = render(RichToc, {

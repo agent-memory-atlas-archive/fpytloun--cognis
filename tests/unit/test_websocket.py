@@ -221,6 +221,54 @@ def test_unread_payload_normalizes_naive_and_aware_datetimes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_local_runtime_preserves_claim_authority_without_redis() -> None:
+    context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                turn_scheduler=SimpleNamespace(relay_generation_context=lambda _: context)
+            )
+        )
+    )
+    manager._fanout_chat_v2_runtime = AsyncMock()
+    for active, lifecycle in [(True, None), (True, None), (False, "recoverable")]:
+        await manager.send_chat_v2_runtime_to_conversation(
+            context.conversation_id,
+            volatile_items=[],
+            has_active_turn=active,
+            active_session_id=context.session_id,
+            lifecycle=lifecycle,
+        )
+    calls = manager._fanout_chat_v2_runtime.await_args_list
+    authorities = [call.kwargs["authority"] for call in calls]
+    assert [authority.source_revision for authority in authorities] == [1, 2, 3]
+    assert len({authority.source_epoch for authority in authorities}) == 1
+    assert [authority.lifecycle for authority in authorities] == ["active", "active", "recoverable"]
+    assert all(authority.fencing_token == 7 for authority in authorities)
+    assert all(authority.turn_id == context.turn_id for authority in authorities)
+    assert all(call.kwargs["volatile_items_complete"] for call in calls)
+    await manager.send_chat_v2_runtime_to_conversation(
+        context.conversation_id,
+        volatile_items=[],
+        runtime_authority=RuntimeAuthority(
+            direct_request_id=context.direct_request_id,
+            turn_id=context.turn_id,
+            fencing_token=6,
+            lifecycle="active",
+        ),
+    )
+    assert manager._fanout_chat_v2_runtime.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_runtime_relay_validation_rechecks_postgres_owner_after_takeover() -> None:
     old_context = RelayGenerationContext(
         direct_request_id="request-1",
@@ -2055,8 +2103,14 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
             state=SimpleNamespace(
                 chat_v2_runtime_relay=None,
                 turn_scheduler=SimpleNamespace(
-                    relay_generation_context=lambda _conversation_id: SimpleNamespace(
-                        turn_id="turn-1"
+                    relay_generation_context=lambda conversation_id: RelayGenerationContext(
+                        turn_id="turn-1",
+                        direct_request_id="request-1",
+                        session_id="sess-1",
+                        conversation_id=conversation_id,
+                        owner_controller_id="controller-a",
+                        owner_incarnation_id="boot-a",
+                        fencing_token=1,
                     )
                 ),
             )
@@ -2139,8 +2193,14 @@ async def test_local_runtime_settlement_removes_only_transient_recovery_notices(
             state=SimpleNamespace(
                 chat_v2_runtime_relay=None,
                 turn_scheduler=SimpleNamespace(
-                    relay_generation_context=lambda _conversation_id: SimpleNamespace(
-                        turn_id="turn-1"
+                    relay_generation_context=lambda conversation_id: RelayGenerationContext(
+                        turn_id="turn-1",
+                        direct_request_id="request-1",
+                        session_id="sess-1",
+                        conversation_id=conversation_id,
+                        owner_controller_id="controller-a",
+                        owner_incarnation_id="boot-a",
+                        fencing_token=1,
                     )
                 ),
             )

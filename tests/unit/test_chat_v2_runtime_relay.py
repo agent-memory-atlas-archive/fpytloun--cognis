@@ -445,8 +445,8 @@ def test_origin_epoch_is_stable_and_revision_is_per_exact_context() -> None:
     assert relay.next_revision(_context()) == 2
     assert relay.next_revision(_context(turn="turn-2")) == 1
     assert relay.origin.runtime_epoch == epoch
-    key = next(iter(relay._revisions))  # noqa: SLF001
-    relay._revisions[key] = MAX_REDIS_SAFE_INTEGER  # noqa: SLF001
+    key = next(iter(relay.authority_source.revisions))
+    relay.authority_source.revisions[key] = MAX_REDIS_SAFE_INTEGER
     with pytest.raises(ValueError, match="source_revision"):
         relay.next_revision(_context())
 

@@ -740,14 +740,23 @@ export async function installTaskCockpitFixture(
       const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
       return json(taskActivityOverview(stepRunId));
     }
-    if (path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/snapshot$/)) {
-      const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
+    if (path === '/api/v1/llm-providers/stage39-provider/usage') {
+      return json({
+        provider_id: 'stage39-provider', ok: false, source: 'unsupported',
+        usage_url: null, fetched_at: NOW, plan_type: null,
+        primary: null, secondary: null, credits: null, rate_limit_reached_type: null,
+        allowed: null, limit_reached: null, additional_rate_limits: [],
+      });
+    }
+    const isFetchSessionSnapshot = path === '/api/v1/chat/v2/sessions/sess-fetch/snapshot';
+    if (isFetchSessionSnapshot || path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/snapshot$/)) {
+      const stepRunId = isFetchSessionSnapshot ? HEAVY_STEP_RUN_ID : (path.split('/')[6] ?? HEAVY_STEP_RUN_ID);
       return json({
         schema_version: 2,
         projection_version: 'stage39-task-step-logs',
         scope: {
-          key: `task_step:${stepRunId}`,
-          kind: 'task_step',
+          key: isFetchSessionSnapshot ? 'session:sess-fetch' : `task_step:${stepRunId}`,
+          kind: isFetchSessionSnapshot ? 'session' : 'task_step',
           conversation_id: 'conv-fetch',
           session_id: 'sess-fetch',
           task_id: TASK_ID,
@@ -1204,7 +1213,13 @@ export async function installTaskCockpitFixture(
     if (path === '/api/v1/conversations/sidebar') {
       const isTaskFilter = url.searchParams.get('status') === 'task';
       return json({
-        agents: [],
+        agents: [{
+          agent_id: 'agent-stage39',
+          name: 'stage39',
+          display_name: 'Stage 39 Agent',
+          avatar_url: null,
+          avatar_image_id: null,
+        }],
         agent_direct_chats: [],
         conversations: {
           items: isTaskFilter ? [taskChatConversation, taskChatConversationB] : [],
