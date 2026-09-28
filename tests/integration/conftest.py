@@ -36,6 +36,95 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _reserve_ports(count: int) -> list[socket.socket]:
+    """Reserve distinct ports until each subprocess is ready to bind."""
+    reservations = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            reservations.append(sock)
+        return reservations
+    except BaseException:
+        for sock in reservations:
+            sock.close()
+        raise
+
+
+def _listener_in_process_group(port: int, pgid: int) -> bool:
+    """Linux fixture identity check; never accept an unrelated HTTP listener."""
+    if not Path("/proc/net/tcp").exists():
+        result = subprocess.run(
+            ["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for pid in result.stdout.split():
+            try:
+                if os.getpgid(int(pid)) == pgid:
+                    return True
+            except ProcessLookupError:
+                continue
+        return False
+    inodes = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        for line in table.read_text().splitlines()[1:]:
+            fields = line.split()
+            if int(fields[1].split(":")[1], 16) == port and fields[3] == "0A":
+                inodes.add(f"socket:[{fields[9]}]")
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if os.getpgid(int(proc.name)) != pgid:
+                continue
+            for fd in (proc / "fd").iterdir():
+                if os.readlink(fd) in inodes:
+                    return True
+        except (ProcessLookupError, FileNotFoundError, PermissionError):
+            continue
+    return False
+
+
+def _wait_cognis_ready(
+    proc: subprocess.Popen[bytes], port: int, root: Path, admin_email: str
+) -> None:
+    """Require the expected child, ready response and exact bootstrapped DB."""
+    import sqlite3
+
+    deadline = time.monotonic() + 120
+    status = None
+    with httpx.Client(trust_env=False, timeout=5) as client:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                response = client.get(f"http://127.0.0.1:{port}/api/readyz")
+                status = response.status_code
+                if not _listener_in_process_group(port, proc.pid):
+                    raise RuntimeError(
+                        f"Wrong fixture listener: pid={proc.pid} port={port} root={root} HTTP={status}"
+                    )
+                if status == 200 and response.json() == {"status": "ready"}:
+                    with sqlite3.connect(f"file:{root / 'cognis.db'}?mode=ro", uri=True) as db:
+                        assert (
+                            db.execute(
+                                "SELECT count(*) FROM users WHERE email = ? AND password_hash IS NOT NULL",
+                                (admin_email,),
+                            ).fetchone()[0]
+                            == 1
+                        )
+                    return
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                pass
+            time.sleep(0.1)
+    raise RuntimeError(
+        f"Cognis bootstrap failed: pid={proc.pid} exit={proc.poll()} "
+        f"port={port} root={root} HTTP={status}"
+    )
+
+
 def _wait_healthy(url: str, *, timeout: float = 120.0, interval: float = 1.0) -> None:
     """Poll a /health endpoint until it responds (any HTTP status).
 
