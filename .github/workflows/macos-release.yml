@@ -101,7 +101,7 @@ jobs:
       - name: Build and validate before credentials are available
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s apps/apple/tests
+          env -u COGNIS_PACKAGE_FLAVOR python3 -m unittest discover -s apps/apple/tests
           brew install cairo
           DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix cairo)/lib"
           export DYLD_FALLBACK_LIBRARY_PATH

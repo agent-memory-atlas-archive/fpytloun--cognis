@@ -147,3 +147,21 @@ class WorkflowTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
+
+    def test_packaging_checks_isolate_the_release_flavor(self):
+        import shlex
+        import subprocess
+
+        workflow = (ROOT / ".github/workflows/macos-release.yml").read_text()
+        command = next(
+            line.strip() for line in workflow.splitlines() if "-m unittest discover" in line
+        )
+        result = subprocess.run(
+            [*shlex.split(command), "-k", "acceptance_bundle_uses_only_isolated_m2_origin"],
+            cwd=ROOT,
+            env={**os.environ, "COGNIS_PACKAGE_FLAVOR": "standard"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Ran 1 test", result.stderr)
