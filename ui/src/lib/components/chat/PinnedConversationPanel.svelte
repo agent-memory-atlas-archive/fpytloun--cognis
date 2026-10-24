@@ -7,7 +7,7 @@
   import Plus from 'lucide-svelte/icons/plus';
   import Search from 'lucide-svelte/icons/search';
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
-  import CompactConversationChat from '$lib/components/chat-v2/CompactConversationChat.svelte';
+  import ChatWorkspace from '$lib/components/chat-v2/ChatWorkspace.svelte';
   import PinnedConversationPicker from './PinnedConversationPicker.svelte';
   import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import type { PinnedPanel } from './pinned-panel.svelte';
@@ -79,7 +79,8 @@
     {:else if panel.error}<div class="m-auto p-4 text-sm text-danger" role="alert">{panel.error}<button class="ml-2 text-accent hover:text-accent-hover" onclick={() => { if (panel.selected) void panel.select(panel.selected); }}>Retry</button></div>
     {:else if panel.selectedId && panel.conversation}
       {#key panel.selectedId}
-        <CompactConversationChat conversationId={panel.selectedId} agent={panel.group?.agent ?? null} embedded
+        <ChatWorkspace conversationId={panel.selectedId} agent={panel.group?.agent ?? null} inspectorOpen={false}
+          sessionId={panel.conversation.active_session_id ?? ''} agents={panel.group?.agent ? [panel.group.agent] : []}
           conversation={panel.conversation} readOnly={Boolean(panel.conversation.is_readonly_for_caller)}
           onInitialLoaded={panel.loaded} onSent={() => { if (panel.selectedId) void panel.refresh(panel.selectedId); }} onCommandResponse={panel.command} />
       {/key}

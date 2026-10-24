@@ -29,9 +29,9 @@
 
 <span class={`inline-flex items-center gap-2 ${inline ? '' : 'rounded-full border border-separator bg-surface/80 px-3 py-1.5'} ${className}`}>
   <span class="inline-flex items-center gap-1.5" aria-hidden="true">
-    <span class={`${dotClass()} animate-bounce [animation-delay:0ms]`}></span>
-    <span class={`${dotClass()} animate-bounce [animation-delay:150ms]`}></span>
-    <span class={`${dotClass()} animate-bounce [animation-delay:300ms]`}></span>
+    <span class={`${dotClass()} animate-bounce motion-reduce:animate-none [animation-delay:0ms]`}></span>
+    <span class={`${dotClass()} animate-bounce motion-reduce:animate-none [animation-delay:150ms]`}></span>
+    <span class={`${dotClass()} animate-bounce motion-reduce:animate-none [animation-delay:300ms]`}></span>
   </span>
   {#if label}
     <span class="text-xs font-medium text-secondary">{label}</span>

@@ -87,6 +87,7 @@ from cognis.core.context_projection import (
     compacted_tool_group_anchors,
     project_messages,
     projected_prefix_fingerprint,
+    projection_source_fingerprint,
     should_reproject,
     tool_transcript_prefix_fingerprint,
 )
@@ -11284,12 +11285,11 @@ class AgentLoop:
                 provider_retry_after_seconds = _mid_stream_provider_retry_after_seconds(
                     mid_stream_error_details
                 )
-                if (
-                    hasattr(self.providers.llm, "inference_recovery")
-                    and not transcript_mutated_for_retry
-                ):
-                    # Transport recovery already spent its bounded allowance.
-                    # Only actual transcript repair may restart the agent cycle.
+                if (mid_stream_error_details or {}).get(
+                    "recovery_exhausted"
+                ) is True and not transcript_mutated_for_retry:
+                    # Admission can fail before transport recovery starts.
+                    # Only an explicit result proves that the allowance was spent.
                     llm_stream_max_retries_for_error = 0
                 retry_after_exceeds_inline_cap = (
                     provider_retry_after_seconds is not None
@@ -11452,7 +11452,7 @@ class AgentLoop:
                     _should_continue_after_exhausted_mid_stream_failure(mid_stream_error_details)
                     and not retry_after_exceeds_inline_cap
                     and (
-                        not hasattr(self.providers.llm, "inference_recovery")
+                        (mid_stream_error_details or {}).get("recovery_exhausted") is not True
                         or committed_output_seen
                     )
                 )
@@ -27718,6 +27718,9 @@ class AgentLoop:
                 ctx.projection_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(
                     messages
                 )
+                ctx.projection_state.last_source_fingerprint = projection_source_fingerprint(
+                    messages
+                )
             return ProjectedMessages(
                 messages=[_strip_internal_message_fields(message) for message in messages],
                 snapshot=stable_snapshot,
@@ -27846,7 +27849,6 @@ class AgentLoop:
             oversized_appended=pressure_snap.oversized_result_appended,
             prefix_fingerprint_unchanged=prefix_fingerprint_unchanged,
         )
-        PROJECTION_CYCLES_TOTAL.labels(decision=str(decision)).inc()
         projection_reason = (
             "initial_projection"
             if turn_state.last_result is None
@@ -27879,11 +27881,30 @@ class AgentLoop:
                 )
             )
 
-        if decision is ReprojectDecision.skip and turn_state.last_result is not None:
+        # A soft sizing goal alone must not rewrite an accepted prefix. Reuse
+        # still requires an unchanged source prefix and the exact safety gate
+        # below; transitions, oversized results and critical pressure keep their
+        # existing full-projection path.
+        source_prefix_unchanged = (
+            turn_state.last_source_fingerprint is not None
+            and len(messages) >= turn_state.last_message_count
+            and turn_state.last_source_fingerprint
+            == projection_source_fingerprint(messages[: turn_state.last_message_count])
+        )
+        reuse_for_soft_target = (
+            decision is ReprojectDecision.reproject
+            and projection_reason == "steady_target"
+            and new_mode != PressureMode.critical
+            and turn_state.last_prefix_fingerprint is not None
+            and source_prefix_unchanged
+        )
+        if (
+            decision is ReprojectDecision.skip or reuse_for_soft_target
+        ) and turn_state.last_result is not None:
             # Fast path: append new tail messages verbatim (stripped of internal markers).
             last_count = turn_state.last_message_count
             current_prefix_fingerprint = tool_transcript_prefix_fingerprint(messages[:last_count])
-            if (
+            if len(messages) >= last_count and (
                 turn_state.last_prefix_fingerprint is None
                 or turn_state.last_prefix_fingerprint == current_prefix_fingerprint
             ):
@@ -27919,7 +27940,9 @@ class AgentLoop:
                         result.messages, result.mutable_start_index
                     ),
                 )
-                if not self._projection_exceeded_selected_budget(skipped_projection):
+                if (snapshot is not None or not reuse_for_soft_target) and (
+                    not self._projection_exceeded_selected_budget(skipped_projection)
+                ):
                     turn_state.policy = policy
                     self._record_projection_prefix_stability(turn_state, skipped_projection)
                     turn_state.last_result = result
@@ -27930,62 +27953,62 @@ class AgentLoop:
                     turn_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(
                         messages
                     )
+                    turn_state.last_source_fingerprint = (
+                        projection_source_fingerprint(messages) if source_prefix_unchanged else None
+                    )
                     turn_state.skip_count += 1
                     deciding_trigger_tokens = None
-                    return finish(skipped_projection, reason="cached_rendering")
+                    PROJECTION_CYCLES_TOTAL.labels(decision=str(ReprojectDecision.skip)).inc()
+                    return finish(
+                        skipped_projection,
+                        reason="soft_target_cached_rendering"
+                        if reuse_for_soft_target
+                        else "cached_rendering",
+                    )
 
-                # Exact provider token counting is authoritative. If the cheap
-                # cached estimate allowed the skip path but the exact projected
-                # prompt is now over the selected pressure budget, escalate
-                # immediately and run a full projection pass in critical mode so
-                # already-preserved tool groups may be demoted.
-                prior_exact_mode = turn_state.pressure_mode
-                turn_state.prior_pressure_mode = prior_exact_mode
-                turn_state.pressure_mode = PressureMode.critical
-                turn_state.under_threshold_cycles = 0
-                turn_state.forced_critical_count += 1
-                PROJECTION_FORCED_CRITICAL_TOTAL.labels(reason="exact_pressure_skip_guard").inc()
-                new_mode = PressureMode.critical
-                decision = ReprojectDecision.critical_reproject
-                projection_reason = "exact_budget_exceeded"
-                deciding_trigger_tokens = min(
-                    (skipped_projection.policy or stable_policy).hard_prompt_tokens,
-                    snapshot.available_prompt_tokens
-                    if snapshot
-                    else budget.available_prompt_tokens,
-                    getattr(
-                        snapshot,
-                        "threshold_prompt_tokens",
-                        (skipped_projection.policy or stable_policy).hard_prompt_tokens,
-                    ),
-                )
-                if prior_exact_mode != PressureMode.critical:
-                    PROJECTION_PRESSURE_TRANSITIONS_TOTAL.labels(
-                        from_mode=str(prior_exact_mode), to_mode=str(PressureMode.critical)
+                # A missing count cannot authorize the new shortcut, but is
+                # not evidence of critical pressure: retain the original full
+                # projection decision. A measured overage still escalates.
+                if snapshot is not None:
+                    prior_exact_mode = turn_state.pressure_mode
+                    turn_state.prior_pressure_mode = prior_exact_mode
+                    turn_state.pressure_mode = PressureMode.critical
+                    turn_state.under_threshold_cycles = 0
+                    turn_state.forced_critical_count += 1
+                    PROJECTION_FORCED_CRITICAL_TOTAL.labels(
+                        reason="exact_pressure_skip_guard"
                     ).inc()
-                logger.info(
-                    "context projection exact pressure forced critical reproject",
-                    extra={
-                        "extra_data": {
-                            "session_id": ctx.session.session_id,
-                            "turn_id": ctx.turn_id,
-                            "prior_projection_mode": str(prior_exact_mode),
-                            "prompt_tokens": snapshot.prompt_tokens if snapshot else None,
-                            "available_prompt_tokens": (
-                                snapshot.available_prompt_tokens if snapshot else None
-                            ),
-                            "threshold_prompt_tokens": (
-                                snapshot.threshold_prompt_tokens if snapshot else None
-                            ),
-                            "forced_critical_count": turn_state.forced_critical_count,
-                            "reproject_count": turn_state.reproject_count,
-                            "skip_count": turn_state.skip_count,
-                        }
-                    },
-                )
+                    new_mode = PressureMode.critical
+                    decision = ReprojectDecision.critical_reproject
+                    projection_reason = "exact_budget_exceeded"
+                    deciding_trigger_tokens = min(
+                        (skipped_projection.policy or stable_policy).hard_prompt_tokens,
+                        snapshot.available_prompt_tokens,
+                        snapshot.threshold_prompt_tokens,
+                    )
+                    if prior_exact_mode != PressureMode.critical:
+                        PROJECTION_PRESSURE_TRANSITIONS_TOTAL.labels(
+                            from_mode=str(prior_exact_mode), to_mode=str(PressureMode.critical)
+                        ).inc()
+                    logger.info(
+                        "context projection exact pressure forced critical reproject",
+                        extra={
+                            "extra_data": {
+                                "session_id": ctx.session.session_id,
+                                "turn_id": ctx.turn_id,
+                                "prior_projection_mode": str(prior_exact_mode),
+                                "prompt_tokens": snapshot.prompt_tokens,
+                                "available_prompt_tokens": snapshot.available_prompt_tokens,
+                                "threshold_prompt_tokens": snapshot.threshold_prompt_tokens,
+                                "forced_critical_count": turn_state.forced_critical_count,
+                                "reproject_count": turn_state.reproject_count,
+                                "skip_count": turn_state.skip_count,
+                            }
+                        },
+                    )
             else:
                 logger.info(
-                    "context projection skip invalidated by mutated tool transcript prefix",
+                    "context projection skip invalidated by mutated transcript prefix",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
@@ -27997,6 +28020,7 @@ class AgentLoop:
 
         # ── Full re-projection ────────────────────────────────────────────────
         # Try modes from current pressure upward until we fit in budget.
+        PROJECTION_CYCLES_TOTAL.labels(decision=str(decision)).inc()
         modes_to_try: list[PressureMode]
         if decision is ReprojectDecision.critical_reproject:
             if new_mode == PressureMode.critical and pressure_prompt_estimate < int(
@@ -28064,6 +28088,7 @@ class AgentLoop:
             last_projection.messages
         )
         turn_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(messages)
+        turn_state.last_source_fingerprint = projection_source_fingerprint(messages)
         turn_state.reproject_count += 1
         if last_projection.policy is not None:
             turn_state.policy = last_projection.policy

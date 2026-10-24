@@ -9356,7 +9356,7 @@ async def test_durable_transient_retry_is_hidden_until_attempts_exhausted() -> N
 
     assert pending is False
     assert classified.transient is False
-    assert classified.recoverable is False
+    assert classified.recoverable is True
     assert classified.detail == {
         "durable_retry_exhausted": True,
         "attempts": DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS,

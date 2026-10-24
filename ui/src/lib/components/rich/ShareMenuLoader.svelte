@@ -5,6 +5,7 @@
   export let createLink: (options: ShareLinkOptions) => Promise<string>;
   export let allowModeChoice = false;
   export let defaultMode: 'view' | 'download' = 'view';
+  export let label = '';
   let menu: typeof import('./ShareMenu.svelte')['default'] | null = null;
   let error = '';
   onMount(() => {
@@ -17,9 +18,9 @@
 </script>
 
 {#if menu}
-  <svelte:component this={menu} {createLink} {allowModeChoice} {defaultMode} />
+  <svelte:component this={menu} {createLink} {allowModeChoice} {defaultMode} {label} />
 {:else}
-  <button type="button" aria-label="Share public link" disabled><ViewerIcon name="share" /></button>
+  <button type="button" aria-label="Share public link" disabled><ViewerIcon name="share" />{#if label}<span>{label}</span>{/if}</button>
   {#if error}<span role="status">{error}</span>{/if}
 {/if}
 

@@ -1,6 +1,11 @@
 import type { ChatV2ClientState } from './sync-engine';
 import type { TimelineItem } from './types';
 
+export function clientDiagnosticFilename(conversationId: string | null): string {
+  const id = conversationId?.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+  return id ? `cognis-chat-diagnostic-${id}.json` : 'cognis-chat-diagnostic.json';
+}
+
 function itemMetadata(item: TimelineItem) {
   return {
     id: item.id,

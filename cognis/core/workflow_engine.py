@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import hashlib
 import html
+import math
 import os
 import re
 import uuid
@@ -787,7 +788,7 @@ class WorkflowEngine:
                 else:
                     step_result, step_run_id = step_execution, ""
 
-                if step_result is None:
+                if step_result is None or step_result.error is not None:
                     # Step execution failed (e.g. mid-stream LLM error after
                     # internal retries).  Route through _handle_step_retry so
                     # the attempt counter is checked — the step may still have
@@ -802,17 +803,21 @@ class WorkflowEngine:
                         },
                     )
                     handled = await self._handle_step_retry(
-                        task, step_def, state, workflow, evaluation=None
+                        task, step_def, state, workflow, evaluation=None, failure=step_result
                     )
                     if not handled:
                         state.status = "failed"
                         break
+                    if task.status == TaskStatus.READY:
+                        return task
                     continue
 
                 # Store step output temporarily — will be committed to
                 # state.step_outputs only after evaluation approves (or
                 # if no evaluation is configured).  This prevents rejected
                 # output from being visible to downstream steps.
+                state.loop_iterations.pop(f"recovery:{step_def.name}", None)
+                state.resume_failed_step = False
                 pending_output = step_result.model_dump(mode="json")
 
                 # Evaluate if configured
@@ -2508,7 +2513,11 @@ class WorkflowEngine:
 
         # Determine if this is a retry (re-attempt of a previously-run step)
         attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
-        is_retry = attempt > 1
+        recovering = (
+            state.resume_failed_step
+            or state.loop_iterations.get(f"recovery:{step_def.name}", 0) > 0
+        )
+        is_retry = attempt > 1 or recovering
 
         # Determine step index
         step_index = self._find_step_index(workflow, step_def.name) or 0
@@ -2547,7 +2556,13 @@ class WorkflowEngine:
                 agent,
                 agent_profile_id=step_agent_profile_id,
                 session_policy=session_policy,
-                require_same_conversation=bool(reuse_source_name),
+                require_same_conversation=bool(reuse_source_name) or recovering,
+                allow_unstarted_recovery=(
+                    recovering
+                    and reuse_source_name is None
+                    and effective_input.type in {"null", "last", "summary"}
+                    and step_def.name not in state.step_outputs
+                ),
             )
         else:
             conversation, session = await self._create_step_session(
@@ -3213,9 +3228,8 @@ class WorkflowEngine:
                 extra={"extra_data": {"session_id": session.session_id}},
             )
 
-        # Return None for failed steps so the workflow engine treats them
-        # as failures (retry logic, on_exhausted handling, etc.)
-        return (None if step_failed else output), step_run_id
+        # Preserve structured recovery metadata through the workflow boundary.
+        return output, step_run_id
 
     async def _evaluate_step(
         self,
@@ -3919,6 +3933,7 @@ class WorkflowEngine:
         state: WorkflowState,
         workflow: Workflow,
         evaluation: StepEvaluation | None = None,
+        failure: StepOutput | None = None,
     ) -> bool:
         """Handle step retry — execution failure or evaluation rejection.
 
@@ -3934,6 +3949,22 @@ class WorkflowEngine:
 
         Returns True if retry is possible, False if exhausted.
         """
+        if failure is not None:
+            from cognis.core.session_recovery import step_failure_traits
+
+            state.last_retry_reason = "execution_failed"
+            state.last_evaluation_feedback = failure.error
+            transient, _ = step_failure_traits(failure)
+            if transient:
+                return await self._defer_step_recovery(task, step_def, state, workflow, failure)
+            if isinstance(failure.metadata.get("model_error"), dict):
+                # Do not multiply the inference owner's exhausted retries by
+                # spending workflow quality attempts on the same request.
+                state.last_evaluation_feedback = failure.error
+                return await self._handle_exhausted(
+                    task, step_def, state, workflow, "gate", last_error=failure.error
+                )
+
         completion = self._resolve_completion(step_def, workflow)
         max_attempts = completion.max_attempts if completion else 3
         reason: Literal["execution_failed", "evaluation_rejected"] = (
@@ -4376,6 +4407,60 @@ class WorkflowEngine:
                 },
             )
             state.last_evaluation_feedback = feedback_text
+
+    async def _defer_step_recovery(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        state: WorkflowState,
+        workflow: Workflow,
+        failure: StepOutput,
+    ) -> bool:
+        """Release the worker while preserving the failed step's session and quality budget."""
+        from cognis.core.session_recovery import SESSION_TRANSIENT_MAX_ATTEMPTS
+
+        recovery_key = f"recovery:{step_def.name}"
+        attempts = state.loop_iterations.get(recovery_key, 0) + 1
+        state.loop_iterations[recovery_key] = attempts
+        state.last_retry_reason = "execution_failed"
+        state.last_evaluation_feedback = failure.error
+        if attempts >= SESSION_TRANSIENT_MAX_ATTEMPTS:
+            state.loop_iterations.pop(recovery_key, None)
+            return await self._handle_exhausted(
+                task, step_def, state, workflow, "gate", last_error=failure.error
+            )
+        model_error = failure.metadata.get("model_error", {})
+        retry_after = (
+            model_error.get("retry_after_seconds") if isinstance(model_error, dict) else None
+        )
+        delay = (
+            float(retry_after)
+            if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            and math.isfinite(retry_after)
+            and retry_after > 0
+            else min(60.0, 2.0 ** min(attempts, 6))
+        )
+        scheduled_for = datetime.now(UTC) + timedelta(seconds=delay)
+        task.status = TaskStatus.READY
+        task.scheduled_for = scheduled_for
+        task.result_summary = failure.error or failure.summary
+        state.current_step_status = None
+        # The failed StepRun remains evidence. Resumption reuses its session
+        # and the already recorded tool results rather than replaying tools.
+        async with self._session_factory() as db_session:
+            await assert_task_execution_fence(db_session)
+            changed = await defer_running_task(
+                db_session,
+                task.task_id,
+                scheduled_for=scheduled_for,
+                workflow_state=state.model_dump(mode="json"),
+                result_summary=task.result_summary,
+            )
+            if not changed:
+                raise StaleTaskExecutionOwner(task.task_id)
+            await db_session.commit()
+        return True
 
     async def _handle_exhausted(
         self,
@@ -5653,6 +5738,7 @@ class WorkflowEngine:
         agent_profile_id: str | None = None,
         session_policy: dict[str, Any] | None = None,
         require_same_conversation: bool = False,
+        allow_unstarted_recovery: bool = False,
     ) -> tuple[Any, Any, bool]:
         """Reuse the prior step session on retry, or create a new one.
 
@@ -5728,7 +5814,21 @@ class WorkflowEngine:
                                     f"for {step_def.name!r}"
                                 )
                             return conversation, resumed_session, seeded_from_prior
-            if require_same_conversation:
+            unstarted_recovery = False
+            if require_same_conversation and allow_unstarted_recovery and prior_run is None:
+                async with self._session_factory() as db_session:
+                    await assert_task_execution_fence(db_session)
+                    # Reuse filtering is not evidence that execution never started.
+                    current_attempt_run = await get_latest_step_run_for_task_step(
+                        db_session,
+                        task.task_id,
+                        step_def.name,
+                        attempt_number=task.attempt_number,
+                        current_revision_only=False,
+                        eligible_statuses=None,
+                    )
+                unstarted_recovery = current_attempt_run is None
+            if require_same_conversation and not unstarted_recovery:
                 raise RuntimeError(
                     f"Continued step {step_def.name!r} has no recoverable prior conversation"
                 )
@@ -6070,6 +6170,8 @@ class WorkflowEngine:
     def _build_failure_result_summary(self, state: WorkflowState, workflow: Workflow) -> str:
         """Build the most specific available summary for a failed workflow."""
 
+        if state.last_retry_reason == "execution_failed" and state.last_evaluation_feedback:
+            return state.last_evaluation_feedback
         if workflow.steps:
             current_index = min(max(state.current_step_index, 0), len(workflow.steps) - 1)
             current_step = workflow.steps[current_index]

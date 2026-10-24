@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { chatNavigation, followConversationLink } from '$lib/chat-v2/navigation';
+  const navigation = chatNavigation();
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
   import ExternalLink from 'lucide-svelte/icons/external-link';
@@ -117,7 +119,7 @@
                 {:else if item.kind === 'task' && item.task_id}
                   <a class="flex min-h-10 min-w-0 items-center break-words text-sm font-medium text-accent hover:text-accent-hover" href={`/tasks/${item.task_id}`}>{item.title}</a>
                 {:else if item.kind === 'managed_conversation' && item.target_conversation_id}
-                  <a class="flex min-h-10 min-w-0 items-center break-words text-sm font-medium text-accent hover:text-accent-hover" href={`/chat/${item.target_conversation_id}`}>{item.title}</a>
+                  <a class="flex min-h-10 min-w-0 items-center break-words text-sm font-medium text-accent hover:text-accent-hover" href={`/chat/${item.target_conversation_id}`} onclick={(event) => followConversationLink(event, item.target_conversation_id!, navigation)}>{item.title}</a>
                 {:else if item.session_id && onViewSession}
                   <button type="button" class="min-h-10 w-full min-w-0 break-words text-left text-sm font-medium text-accent hover:text-accent-hover" onclick={() => viewSession(item.session_id)}>{item.title}</button>
                 {:else}

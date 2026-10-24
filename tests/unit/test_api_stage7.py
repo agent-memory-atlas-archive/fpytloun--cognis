@@ -2052,6 +2052,86 @@ def test_task_mutation_rejects_non_owner(monkeypatch: object, tmp_path: Path) ->
         assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    ("actor", "task_status", "expected"),
+    [
+        ("user", "failed", 200),
+        ("user", "running", 409),
+        ("attacker", "failed", 404),
+        ("viewer", "failed", 403),
+    ],
+)
+def test_task_retry_preserves_identity_and_checks_access(
+    monkeypatch: object,
+    tmp_path: Path,
+    actor: str,
+    task_status: str,
+    expected: int,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                for user in ("user", "attacker", "viewer"):
+                    await create_user(
+                        session,
+                        email=f"{user}@example.com",
+                        name=user,
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="viewer" if user == "viewer" else "user",
+                    )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                task = await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    title="Failed task",
+                    status=task_status,
+                )
+                await session.commit()
+                return task.task_id
+
+        task_id = client.portal.call(_seed)
+
+        async def _retry(target: str, *, preserve_step_context: bool = False) -> TaskModel:
+            assert target == task_id
+            assert preserve_step_context
+            if task_status != "failed":
+                raise ValueError("Only failed tasks can be retried")
+            return TaskModel(
+                task_id=task_id,
+                title="Failed task",
+                created_by="user@example.com",
+                agent_id="agent-1",
+                status=TaskStatus.RUNNING,
+            )
+
+        retry = AsyncMock(side_effect=_retry)
+        rerun = AsyncMock()
+        app.state.task_queue.retry_failed_task = retry
+        app.state.task_queue.rerun_task = rerun
+        response = client.post(
+            f"/api/v1/tasks/{task_id}/retry",
+            headers=_auth_headers(
+                app, email=f"{actor}@example.com", role="viewer" if actor == "viewer" else "user"
+            ),
+        )
+        assert response.status_code == expected
+        rerun.assert_not_awaited()
+        if expected == 200:
+            assert response.json() == {"ok": True, "task_id": task_id, "status": "running"}
+            retry.assert_awaited_once_with(task_id, preserve_step_context=True)
+        elif expected in {403, 404}:
+            retry.assert_not_awaited()
+
+
 def test_task_rerun_returns_new_task_target(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app

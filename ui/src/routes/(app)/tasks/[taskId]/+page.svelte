@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RecoveryBanner from '$lib/components/RecoveryBanner.svelte';
 import { DEFAULT_INTARIS_EVALUATION } from '$lib/session-policy';
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
@@ -811,9 +812,10 @@ import Target from 'lucide-svelte/icons/target';
     if (isProjectedStepRun(stepRun)) void loadStepRunDetail(stepRun.step_run_id);
   }
 
-  async function openSessionLogsById(sessionId: string): Promise<void> {
+  async function openSessionLogsById(sessionId: string, node?: import('$lib/chat-v2/types').WorkstreamRef): Promise<void> {
     const currentDrawer = sessionDrawer;
-    const conversationId = currentDrawer?.conversationId;
+    const ownerRun = task?.step_runs.find(run => run.session_id === sessionId);
+    const conversationId = node?.conversation_id ?? ownerRun?.conversation_id ?? currentDrawer?.conversationId;
     if (!conversationId) return;
     if (currentDrawer?.sessionId === sessionId) return;
     let sessionRow: Session | null = null;
@@ -1730,11 +1732,13 @@ import Target from 'lucide-svelte/icons/target';
     }
   }
 
-  async function rerunTask(): Promise<void> {
+  async function rerunTask(recover = false): Promise<void> {
     if (!task || rerunBusy) return;
     rerunBusy = true;
     try {
-      const rerun = await api.tasks.rerun(task.task_id);
+      const rerun = recover === true && task.status === 'failed'
+        ? { ...await api.tasks.retry(task.task_id), created_new: false }
+        : await api.tasks.rerun(task.task_id);
       error = '';
       if (rerun.created_new) {
         addToast('Created a new rerun task.', 'success');
@@ -1846,7 +1850,7 @@ import Target from 'lucide-svelte/icons/target';
           </Button>
 
           {#if isRerunnable}
-            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={rerunBusy} onclick={rerunTask}>
+            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={rerunBusy} onclick={() => void rerunTask()}>
               Re-run task
             </Button>
           {/if}
@@ -2019,7 +2023,14 @@ import Target from 'lucide-svelte/icons/target';
           />
         {/if}
 
-        {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest}
+        {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest && !rerunBusy}
+          {#if isRerunnable}
+            <RecoveryBanner
+              message={task.result_summary || task.applied_completion_reason || 'The task cannot continue automatically. Review the latest step evidence, then retry.'}
+              actionLabel={task.status === 'paused' ? 'Continue task' : 'Retry task'}
+              onRetry={() => void rerunTask(true)}
+            />
+          {:else}
           <Card class="border-danger-border bg-danger-subtle p-4">
             <p class="text-xs font-semibold uppercase tracking-[0.25em] text-danger">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
             {#if task.result_summary || task.applied_completion_reason}
@@ -2028,6 +2039,7 @@ import Target from 'lucide-svelte/icons/target';
               <p class="mt-2 text-sm text-foreground">The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.</p>
             {/if}
           </Card>
+          {/if}
         {/if}
         </div>
 
@@ -2042,7 +2054,7 @@ import Target from 'lucide-svelte/icons/target';
             stepRuns={task.step_runs}
             {agents}
             canonicalDeliverableId={typeof task.result_data?.final_deliverable_id === 'string' ? task.result_data.final_deliverable_id : null}
-            onViewSession={(sessionId) => { void openSessionLogsById(sessionId); }}
+            onViewSession={(sessionId, node) => { void openSessionLogsById(sessionId, node); }}
             onViewWork={(scope, category) => { taskAgentDock.openWork(scope, category); }}
           />
         </div>
@@ -3020,6 +3032,8 @@ import Target from 'lucide-svelte/icons/target';
          stepRunId={sessionDrawer.stepRunId}
          taskId={task?.task_id ?? null}
         stepRun={sessionDrawerStepRun}
+        attempts={task?.step_runs ?? []}
+        {agents}
         stepName={sessionDrawer.stepName}
         agent={sessionDrawer.agent}
         backLabel={sessionDrawerBackStack[sessionDrawerBackStack.length - 1]?.stepName ?? 'Parent session'}

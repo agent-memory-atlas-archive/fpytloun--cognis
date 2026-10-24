@@ -1,4 +1,5 @@
 import type { ContextUsage, GenerationPerformanceSnapshot, IntarisSessionDetail, RuntimeSelection, TokenUsage } from '$lib/types/api';
+import type { Snippet } from 'svelte';
 
 export interface SessionDetailsData {
   session_id?: string;
@@ -37,4 +38,5 @@ export interface SessionDetailsProps {
   onArchive?: (() => void | Promise<void>) | undefined;
   onRestore?: (() => void | Promise<void>) | undefined;
   onDelete?: (() => void | Promise<void>) | undefined;
+  runtimeDetailsFooter?: Snippet;
 }

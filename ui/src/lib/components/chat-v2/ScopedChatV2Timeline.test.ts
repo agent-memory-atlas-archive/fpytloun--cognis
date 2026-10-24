@@ -828,17 +828,17 @@ describe('ScopedChatV2Timeline history backfill', () => {
         .mockReturnValueOnce(stalePage)
         .mockResolvedValueOnce(backfill(scope, [message(10, 'refreshed older row')], null)),
     };
-    render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
     await screen.findByText('message 4');
     const viewport = screen.getByTestId('scoped-timeline-viewport');
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await waitFor(() => expect(api.timeline).toHaveBeenCalledOnce());
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Refresh timeline' }));
+    const refresh = view.component.refresh();
     resolveRefresh?.(snapshot(scope, [11, 12, 13, 14].map((item) => message(item)), 'before-refresh'));
     await screen.findByText('message 14');
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh timeline' })).toBeEnabled());
+    await refresh;
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await screen.findByText('refreshed older row');
@@ -867,14 +867,15 @@ describe('ScopedChatV2Timeline history backfill', () => {
         .mockReturnValueOnce(initialPage)
         .mockResolvedValueOnce(backfill(scope, [message(10, 'post-refresh older row')], null)),
     };
-    render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
     await screen.findByText('message 4');
     const viewport = screen.getByTestId('scoped-timeline-viewport');
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await waitFor(() => expect(api.timeline).toHaveBeenCalledOnce());
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Refresh timeline' }));
+    const refresh = view.component.refresh();
+    await waitFor(() => expect(api.snapshot).toHaveBeenCalledTimes(2));
     expect(screen.queryByText(/Load older/i)).not.toBeInTheDocument();
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await fireEvent.touchStart(viewport, { touches: [{ clientY: 100 }] });
@@ -884,7 +885,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
 
     resolveRefresh?.(snapshot(scope, [11, 12, 13, 14].map((item) => message(item)), 'before-refresh'));
     await screen.findByText('message 14');
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh timeline' })).toBeEnabled());
+    await refresh;
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await screen.findByText('post-refresh older row');
@@ -1047,7 +1048,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
 
     await screen.findByText('Request timed out after 30 seconds.');
-    const retry = screen.getByRole('button', { name: 'Refresh timeline' });
+    const retry = screen.getByRole('button', { name: 'Try again' });
     expect(retry).toBeEnabled();
     await fireEvent.click(retry);
     await screen.findByText('retry row');

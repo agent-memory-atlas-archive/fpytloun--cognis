@@ -53,6 +53,43 @@ function deferred<T>() {
 }
 
 describe('canonical timeline ownership', () => {
+  it('crosses event-only pages in one upward action until visible history arrives', async () => {
+    const client = api();
+    const page = (before_cursor: string | null, items: TimelineBackfillResponse['items'] = []): TimelineBackfillResponse => ({
+      schema_version: 2, projection_version: 'test', scope, conversation_id: scope.conversation_id!,
+      before_cursor, has_more_before: before_cursor !== null, items, server_time: '',
+    });
+    client.timeline.mockResolvedValueOnce(page('before-2'));
+    client.timeline.mockResolvedValueOnce(page('before-3'));
+    client.timeline.mockResolvedValueOnce(page(null, [{
+      id: 'message:older', kind: 'message', role: 'assistant', message_id: 'older',
+      sort_key: '0000:000000000000001:000000:02:000000000',
+      source_refs: [], stable: true, content: 'Earlier step progress', attachments: [], partial: false,
+    }]));
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    await view.controller.olderVisible('before-1');
+    expect(client.timeline).toHaveBeenCalledTimes(3);
+    expect(view.controller.store.visibleItems.map(item => item.id)).toContain('message:older');
+    expect(view.controller.store.snapshot.hasMoreBefore).toBe(false);
+    view.release();
+  });
+
+  it.each([true, false])('bounds sparse history even when the cursor repeats: %s', async (repeats) => {
+    const client = api();
+    let page = 0;
+    client.timeline.mockImplementation(async () => ({
+      schema_version: 2, projection_version: 'test', scope, conversation_id: scope.conversation_id!,
+      before_cursor: repeats ? 'before-1' : `before-${++page + 1}`,
+      has_more_before: true, items: [], server_time: '',
+    }));
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    await view.controller.olderVisible('before-1');
+    expect(client.timeline).toHaveBeenCalledTimes(repeats ? 1 : 8);
+    expect(view.controller.store.snapshot.hasMoreBefore).toBe(true);
+    view.release();
+  });
   it('isolates a provider conflict until all original consumers release', async () => {
     const original = api();
     const replacement = api();

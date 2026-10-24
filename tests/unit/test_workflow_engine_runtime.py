@@ -1032,6 +1032,81 @@ async def test_has_prior_step_session_accepts_idle_sessions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prior_status", [None, "pending", "evaluating", "cancelled", "failed"])
+async def test_unstarted_recovery_requires_unfiltered_current_attempt_absence(
+    monkeypatch: pytest.MonkeyPatch, prior_status: str | None
+) -> None:
+    engine = _build_engine()
+    prior = (
+        None
+        if prior_status is None
+        else SimpleNamespace(
+            status=prior_status, session_id=None, superseded_by_step_run_id="next-run"
+        )
+    )
+    query = AsyncMock(side_effect=[None, prior])
+    fence = AsyncMock()
+    created = (SimpleNamespace(), SimpleNamespace())
+    create = AsyncMock(return_value=created)
+    monkeypatch.setattr(workflow_engine_module, "get_latest_step_run_for_task_step", query)
+    monkeypatch.setattr(workflow_engine_module, "assert_task_execution_fence", fence)
+    monkeypatch.setattr(engine, "_create_step_session", create)
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        attempt_number=2,
+    )
+    step = StepDefinition(name="plan", type="run")
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+    if prior is None:
+        assert await engine._reuse_or_create_step_session(
+            task, step, agent, require_same_conversation=True, allow_unstarted_recovery=True
+        ) == (*created, False)
+        create.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="no recoverable prior conversation"):
+            await engine._reuse_or_create_step_session(
+                task, step, agent, require_same_conversation=True, allow_unstarted_recovery=True
+            )
+        create.assert_not_awaited()
+    fence.assert_awaited_once()
+    assert query.await_args_list[1].kwargs == {
+        "attempt_number": 2,
+        "current_revision_only": False,
+        "eligible_statuses": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_at", ["lookup", "fence"])
+async def test_unstarted_recovery_never_treats_failed_evidence_as_absence(
+    monkeypatch: pytest.MonkeyPatch, failure_at: str
+) -> None:
+    engine = _build_engine()
+    query = AsyncMock(side_effect=[None, RuntimeError("evidence unavailable")])
+    fence = AsyncMock(
+        side_effect=RuntimeError("evidence unavailable") if failure_at == "fence" else None
+    )
+    create = AsyncMock()
+    monkeypatch.setattr(workflow_engine_module, "get_latest_step_run_for_task_step", query)
+    monkeypatch.setattr(workflow_engine_module, "assert_task_execution_fence", fence)
+    monkeypatch.setattr(engine, "_create_step_session", create)
+    with pytest.raises(RuntimeError, match="evidence unavailable"):
+        await engine._reuse_or_create_step_session(
+            TaskModel(
+                task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+            ),
+            StepDefinition(name="plan", type="run"),
+            AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+            require_same_conversation=True,
+            allow_unstarted_recovery=True,
+        )
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reuse_or_create_step_session_resumes_completed_step_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2030,6 +2105,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recovering", [False, True])
 @pytest.mark.parametrize(
     ("require_deliverable", "original_error"),
     [(False, None), (True, None), (True, "Provider stream failed")],
@@ -2038,6 +2114,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
     monkeypatch: pytest.MonkeyPatch,
     require_deliverable: bool,
     original_error: str | None,
+    recovering: bool,
 ) -> None:
     engine = _build_engine()
     task = TaskModel(
@@ -2047,6 +2124,9 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         agent_id="agent-1",
         workflow_state=WorkflowState(),
     )
+    if recovering:
+        task.workflow_state.loop_iterations["recovery:execute"] = 1
+        task.workflow_state.last_retry_reason = "execution_failed"
     step_def = StepDefinition(
         name="execute",
         type="run",
@@ -2097,7 +2177,19 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
 
     async def _latest_step_run(*args: object, **kwargs: object):
         del args, kwargs
+        if recovering:
+            return SimpleNamespace(
+                step_run_id="sr-resumed",
+                session_id="sess-1",
+                intaris_session_id="sess-1",
+                runtime_info={},
+                todos=[],
+            )
         return None
+
+    async def _reuse_step_session(*args: object, **kwargs: object):
+        assert recovering
+        return conversation, session, True
 
     async def _create_step_run(*args: object, **kwargs: object):
         del args, kwargs
@@ -2112,6 +2204,8 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
 
     async def _run_step(ctx: StepContext, **kwargs: object) -> StepOutput:
         del kwargs
+        assert ctx.is_retry is recovering
+        assert ctx.session.session_id == "sess-1"
         observed["orchestration_mode"] = ctx.orchestration_mode.value
         observed["has_boundary_consumer"] = ctx.consume_boundary_batch is not None
         observed["has_cooperative_wait_input"] = ctx.wait_for_boundary_input is not None
@@ -2123,6 +2217,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
 
     monkeypatch.setattr(engine, "_resolve_step_agents", _resolve_step_agents)
     monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
+    monkeypatch.setattr(engine, "_reuse_or_create_step_session", _reuse_step_session)
     monkeypatch.setattr(engine, "_resolve_step_runtime", _resolve_runtime)
     monkeypatch.setattr(engine._agent_loop, "run_step", _run_step, raising=False)
     monkeypatch.setattr(engine._session_manager, "refresh_intaris_session_policy", _refresh)
@@ -2141,7 +2236,8 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
     if require_deliverable and expected_error is None:
         expected_error = "Step 'execute' requires a deliverable, but the step finished without one."
     if expected_error:
-        assert output is None
+        assert output is not None
+        assert output.error == expected_error
     else:
         assert output is not None
         assert output.error is None
@@ -2410,6 +2506,171 @@ async def test_execute_workflow_defers_transient_executor_unavailable_then_succe
     assert second_result.status == TaskStatus.COMPLETED
     assert state.step_outputs["run"]["summary"] == "done"
     assert "attempts:run" not in state.loop_iterations
+
+
+@pytest.mark.asyncio
+async def test_provider_wait_releases_worker_without_spending_quality_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    state = WorkflowState()
+    task = TaskModel(
+        task_id="task-provider-wait",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status=TaskStatus.RUNNING,
+        workflow_state=state,
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test",
+        steps=[
+            StepDefinition(
+                name="run",
+                type="run",
+                prompt="Do work",
+                completion=CompletionConfig(evaluate=False, max_attempts=1),
+            )
+        ],
+    )
+    failure = StepOutput(
+        summary="Rate limited",
+        error="Provider rate limit resets in 600 seconds.",
+        metadata={
+            "model_error": {
+                "reason_class": "rate_limit",
+                "transient": True,
+                "retry_after_seconds": 600,
+                "recoverable": True,
+            }
+        },
+    )
+    execute_step = AsyncMock(return_value=(failure, "sr-provider-wait"))
+    defer = AsyncMock(return_value=True)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(engine, "_execute_run_step", execute_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", AsyncMock())
+    monkeypatch.setattr(engine, "_persist_task_final", AsyncMock())
+    monkeypatch.setattr(engine, "_cleanup_step_sessions", cleanup)
+    monkeypatch.setattr(workflow_engine_module, "defer_running_task", defer)
+    started = datetime.now(UTC)
+
+    first = await engine.execute_workflow(task, workflow)
+
+    assert first.status == TaskStatus.READY
+    assert 599 <= (first.scheduled_for - started).total_seconds() <= 605
+    assert state.loop_iterations["recovery:run"] == 1
+    assert "attempts:run" not in state.loop_iterations
+    assert defer.await_count == execute_step.await_count == 1
+    assert first.result_summary == failure.error
+    cleanup.assert_not_awaited()
+
+    task.status = TaskStatus.RUNNING
+    execute_step.return_value = (StepOutput(summary="done"), "sr-provider-wait")
+    second = await engine.execute_workflow(task, workflow)
+    assert second.status == TaskStatus.COMPLETED
+    assert "recovery:run" not in state.loop_iterations
+    assert "attempts:run" not in state.loop_iterations
+
+
+@pytest.mark.asyncio
+async def test_exhausted_provider_failure_preserves_cause_without_quality_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    exhausted = AsyncMock(return_value=False)
+    monkeypatch.setattr(engine, "_handle_exhausted", exhausted)
+    task = TaskModel(
+        task_id="task-failure", title="Task", created_by="user@example.com", agent_id="agent-1"
+    )
+    step = StepDefinition(name="run", type="run", prompt="")
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step])
+    failure = StepOutput(
+        summary="Provider connection reset",
+        error="Provider connection reset",
+        metadata={
+            "model_error": {"reason_class": "connection", "transient": False, "recoverable": True},
+        },
+    )
+    state = WorkflowState()
+
+    assert not await engine._handle_step_retry(task, step, state, workflow, failure=failure)
+    assert "attempts:run" not in state.loop_iterations
+    assert exhausted.call_args.kwargs["last_error"] == failure.error
+
+
+@pytest.mark.asyncio
+async def test_exhausted_provider_cause_reaches_terminal_task_without_accepted_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    failure = StepOutput(
+        summary="Connection failed",
+        error="Provider connection reset after 3 attempts",
+        metadata={
+            "model_error": {"reason_class": "connection", "recoverable": True, "transient": False}
+        },
+    )
+    task = TaskModel(
+        task_id="task-terminal-cause",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status=TaskStatus.RUNNING,
+        workflow_state=WorkflowState(),
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test",
+        interaction={"mode": "none"},
+        steps=[
+            StepDefinition(
+                name="run",
+                type="run",
+                prompt="Do work",
+                completion=CompletionConfig(evaluate=False),
+            )
+        ],
+    )
+    persist = AsyncMock()
+    monkeypatch.setattr(engine, "_execute_run_step", AsyncMock(return_value=(failure, "sr-fail")))
+    monkeypatch.setattr(engine, "_persist_workflow_state", AsyncMock())
+    monkeypatch.setattr(engine, "_persist_task_final", persist)
+    monkeypatch.setattr(engine, "_cleanup_step_sessions", AsyncMock())
+
+    result = await engine.execute_workflow(task, workflow)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.result_summary == failure.error
+    assert result.workflow_state.step_outputs == {}
+    assert persist.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_deferral_cannot_revive_cancelled_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.core.task_execution import StaleTaskExecutionOwner
+
+    engine = _build_engine()
+    defer = AsyncMock(return_value=False)
+    monkeypatch.setattr(workflow_engine_module, "defer_running_task", defer)
+    task = TaskModel(
+        task_id="cancelled-task",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status=TaskStatus.RUNNING,
+    )
+    step = StepDefinition(name="run", type="run", prompt="")
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step])
+    failure = StepOutput(
+        summary="Rate limited", error="Rate limited", metadata={"model_error": {"transient": True}}
+    )
+    with pytest.raises(StaleTaskExecutionOwner):
+        await engine._defer_step_recovery(task, step, WorkflowState(), workflow, failure)
+    assert defer.await_count == 1
 
 
 @pytest.mark.asyncio

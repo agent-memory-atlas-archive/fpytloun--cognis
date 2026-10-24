@@ -534,8 +534,10 @@ async def test_create_and_get_task(tmp_path: object) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_context", [False, True])
 async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
     tmp_path: object,
+    preserve_context: bool,
 ) -> None:
     engine, factory = await _bootstrap_db(tmp_path)
     try:
@@ -602,18 +604,22 @@ async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
             lambda task, claim: launched.append(claim)
         )
 
-        retried = await queue.retry_failed_task("task-retry-history")
+        retried = await queue.retry_failed_task(
+            "task-retry-history", preserve_step_context=preserve_context
+        )
 
-        assert retried.attempt_number == 2
+        assert retried.attempt_number == (1 if preserve_context else 2)
+        assert retried.workflow_state.resume_failed_step is preserve_context
         assert retried.status == TaskStatus.RUNNING
         assert len(launched) == 1
-        assert launched[0].attempt_number == 2
+        assert launched[0].attempt_number == (1 if preserve_context else 2)
         assert launched[0].task_lease is original_claim.task_lease
         async with factory() as session:
             persisted = await get_task(session, "task-retry-history")
             original_run = await get_step_run(session, "sr-original")
             assert persisted is not None
-            assert persisted.attempt_number == 2
+            assert persisted.attempt_number == (1 if preserve_context else 2)
+            assert persisted.workflow_state["resume_failed_step"] is preserve_context
             assert persisted.completed_at is None
             assert persisted.result_summary is None
             assert persisted.result_data is None
@@ -623,6 +629,221 @@ async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
             assert original_run.attempt_number == 1
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_available", [False, True])
+async def test_recovery_executes_failed_step_with_original_tool_evidence(
+    tmp_path: object,
+    history_available: bool,
+) -> None:
+    from cognis.core.agent_loop import PauseWaiter
+    from cognis.core.canonical_history import CanonicalHistoryUnavailable
+    from cognis.core.runtime import ResolvedStepRuntime
+    from cognis.core.workflow_engine import WorkflowEngine
+    from cognis.models.agent import AgentDefinition
+    from cognis.models.session import EventAppendResult, EventReadResult
+    from cognis.models.workflow import CompletionConfig, StepOutput
+
+    db_engine, factory = await _bootstrap_db(tmp_path)
+    source_events = [
+        {
+            "seq": 1,
+            "type": "tool_call",
+            "data": {"call_id": "create-ticket", "name": "create_ticket"},
+        },
+        {
+            "seq": 2,
+            "type": "tool_result",
+            "data": {
+                "call_id": "create-ticket",
+                "name": "create_ticket",
+                "content": "Ticket already created: TICKET-42",
+            },
+        },
+    ]
+    history: dict[str, list] = {"intaris-source": source_events}
+    cache_events: dict[str, list] = {}
+
+    async def read_events(session_id: str, **kwargs: object) -> EventReadResult:
+        if not history_available:
+            raise RuntimeError("Source event store unavailable")
+        events = history.get(session_id, [])
+        return EventReadResult(
+            events=events,
+            last_seq=len(events),
+            has_more=False,
+            first_available_seq=1 if events else None,
+            history_gap=None,
+        )
+
+    async def record_events(*, session_id: str, events: list, **kwargs: object):
+        target = history.setdefault(session_id, [])
+        first = len(target) + 1
+        target.extend(
+            {"seq": first + i, "type": event.type, "data": event.data}
+            for i, event in enumerate(events)
+        )
+        return EventAppendResult(ok=True, count=len(events), first_seq=first, last_seq=len(target))
+
+    async def seed_events(session: object, events: list, seq: int) -> None:
+        cache_events.setdefault(session.session_id, []).extend(events)
+
+    async def append_events(session: object, events: list, result: object) -> None:
+        cache_events.setdefault(session.session_id, []).extend(events)
+
+    guardrails = SimpleNamespace(
+        read_events=read_events,
+        record_events=record_events,
+    )
+    try:
+        async with factory() as db:
+            conversation = await create_conversation(db, "user@test.com", "agent-1", "task_step")
+            source = await create_session(
+                db,
+                conversation.conversation_id,
+                "user@test.com",
+                "agent-1",
+                status="completed",
+                intaris_session_id="intaris-source",
+            )
+            task = await create_task(
+                db,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Recover",
+                status="failed",
+                workflow_state=WorkflowState(status="failed").model_dump(),
+            )
+            run = await create_step_run(
+                db,
+                task_id=task.task_id,
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                conversation_id=conversation.conversation_id,
+                attempt_number=1,
+            )
+            run.session_id = source.session_id
+            run.intaris_session_id = "intaris-source"
+            run.status = "failed"
+            await db.commit()
+            task_id = task.task_id
+
+        async def create_root(**kwargs: object):
+            async with factory() as db:
+                target = await create_session(
+                    db,
+                    kwargs["conversation_id"],
+                    kwargs["user_email"],
+                    kwargs["agent_id"],
+                    intaris_session_id="intaris-recovered",
+                )
+                await db.commit()
+                return target
+
+        async def run_step(ctx: object, **kwargs: object) -> StepOutput:
+            assert ctx.is_retry
+            assert ctx.session.session_id != source.session_id
+            assert any(
+                event.type == "tool_result"
+                and event.data.get("content") == "Ticket already created: TICKET-42"
+                for event in cache_events[ctx.session.session_id]
+            )
+            return StepOutput(summary="Continued with the existing ticket")
+
+        agent_loop = SimpleNamespace(run_step=AsyncMock(side_effect=run_step))
+        workflow_engine = WorkflowEngine(
+            session_factory=factory,
+            providers=SimpleNamespace(guardrails=guardrails, guardrail=guardrails, llm=None),
+            agent_loop=agent_loop,
+            step_evaluator=SimpleNamespace(),
+            workflow_registry=SimpleNamespace(),
+            session_manager=SimpleNamespace(
+                create_root_session=create_root,
+                refresh_intaris_session_policy=AsyncMock(),
+                mark_failed=AsyncMock(),
+            ),
+            event_bus=EventBus(),
+            pause_waiter=PauseWaiter(),
+        )
+        workflow_engine._session_cache = SimpleNamespace(
+            seed_events=seed_events,
+            append_recorded_events=append_events,
+            get_entry=lambda session_id: (
+                SimpleNamespace(
+                    events=cache_events[session_id],
+                    last_event_seq=len(cache_events[session_id]),
+                    initialized=True,
+                    canonical_stale=False,
+                )
+                if session_id in cache_events
+                else None
+            ),
+        )
+        agent = AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@test.com",
+            name="Agent",
+            model="openai:gpt-4o",
+        )
+        workflow_engine._resolve_step_agents = AsyncMock(return_value=(agent, agent))
+        workflow_engine._step_runtime_factory = AsyncMock(
+            return_value=ResolvedStepRuntime(
+                tool_registry=object(),
+                executor_connection=None,
+                cleanup=AsyncMock(),
+                executor_environment=None,
+                runtime_info={},
+            )
+        )
+        workflow_engine._resolve_step_reasoning_effort = AsyncMock(return_value=None)
+        workflow_engine._apply_step_runtime_overrides = AsyncMock()
+        workflow_engine._persist_current_todos = AsyncMock()
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_registry=WorkflowRegistry(factory),
+            agent_registry=AgentRegistry(factory),
+            workflow_engine=workflow_engine,
+            event_bus=EventBus(),
+        )
+        claim = TaskExecutionClaim(
+            task_id=task_id,
+            agent_id="agent-1",
+            attempt_number=1,
+            task_lease=SimpleNamespace(),
+            agent_capacity_lease=None,
+            global_capacity_lease=None,
+        )
+        queue._execution_store = SimpleNamespace(
+            claim_existing=AsyncMock(return_value=claim),
+            release=AsyncMock(),
+        )
+        queue._launch_claimed_task_run = lambda *_: None
+        recovered = await queue.retry_failed_task(task_id, preserve_step_context=True)
+        step = StepDefinition(
+            name="execute",
+            type="run",
+            prompt="Continue",
+            require_deliverable=False,
+            completion=CompletionConfig(evaluate=False),
+        )
+        workflow = Workflow(workflow_id="wf:recovery", name="Recovery", steps=[step])
+        if history_available:
+            output, _ = await workflow_engine._execute_run_step(
+                recovered, step, recovered.workflow_state, workflow
+            )
+            assert output.summary == "Continued with the existing ticket"
+            agent_loop.run_step.assert_awaited_once()
+        else:
+            with pytest.raises(CanonicalHistoryUnavailable):
+                await workflow_engine._execute_run_step(
+                    recovered, step, recovered.workflow_state, workflow
+                )
+            agent_loop.run_step.assert_not_awaited()
+    finally:
+        await db_engine.dispose()
 
 
 @pytest.mark.asyncio

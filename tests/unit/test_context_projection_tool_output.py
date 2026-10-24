@@ -22,8 +22,9 @@ def test_compacted_tool_result_includes_anchor_hint_with_anchors() -> None:
         }
     )
 
-    assert "list_tool_output_anchors(call_id='call_saved')" in text
-    assert "read_tool_output_anchor" in text
+    assert "read_tool_output(call_id='call_saved')" in text
+    assert "Anchors: overview, details." in text
+    assert text.count("call_saved") == 1
 
 
 def test_rehydrated_tool_result_preserves_anchor_metadata_for_projection() -> None:
@@ -54,7 +55,7 @@ def test_rehydrated_tool_result_preserves_anchor_metadata_for_projection() -> No
 
     assert tool_message["_anchors_available"] is True
     assert tool_message["_anchor_count"] == 2
-    assert "list_tool_output_anchors(call_id='call_saved')" in text
+    assert "Anchors: overview, details." in text
 
 
 def test_lazy_artifact_ref_survives_replay_and_compact_projection() -> None:
@@ -145,5 +146,6 @@ def test_legacy_anchor_count_preserves_list_only_recovery() -> None:
 
     tool_message = next(message for message in messages if message.get("role") == "tool")
     text = build_compacted_tool_result_placeholder(tool_message)
-    assert "list_tool_output_anchors(call_id='call_old')" in text
+    assert "read_tool_output(call_id='call_old')" in text
+    assert "Anchors available." in text
     assert "read_tool_output_anchor" not in text

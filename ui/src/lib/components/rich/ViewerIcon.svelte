@@ -1,7 +1,11 @@
 <script lang="ts">
+  import Share from 'lucide-svelte/icons/share';
   export let name: 'light' | 'dark' | 'system' | 'download' | 'copy' | 'check' | 'contents' | 'collapse' | 'expand' | 'close' | 'share';
 </script>
 
+{#if name === 'share'}
+  <Share size={16} strokeWidth={1.5} aria-hidden="true" data-viewer-icon="share" />
+{:else}
 <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" data-viewer-icon={name}>
   {#if name === 'light'}
     <circle cx="8" cy="8" r="3.1" />
@@ -22,12 +26,11 @@
     <path d="M9.8 4.2 6 8l3.8 3.8M13 4.2v7.6" />
   {:else if name === 'expand'}
     <path d="m6 4 4 4-4 4" />
-  {:else if name === 'share'}
-    <path d="M9 2h5v5M14 2 7 9M6 3H3v10h10v-3" />
   {:else}
     <path d="m4 4 8 8M12 4l-8 8" />
   {/if}
 </svg>
+{/if}
 
 <style>
   svg { width: 16px; height: 16px; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; flex: none; }

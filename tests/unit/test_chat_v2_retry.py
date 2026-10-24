@@ -19,6 +19,71 @@ class _AsyncContext:
         return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_failed_retry_follows_saved_lineage_but_new_message_supersedes_it(
+    monkeypatch: pytest.MonkeyPatch,
+    superseded: bool,
+) -> None:
+    events = [
+        {
+            "seq": 1,
+            "type": "user_message",
+            "data": {
+                "turn_id": "turn-1",
+                "content": "Original request",
+                "client_message_id": "client-1",
+            },
+        },
+        {
+            "seq": 2,
+            "type": "system_message",
+            "data": {
+                "turn_id": "turn-2",
+                "retry_source_turn_id": "turn-1",
+                "kind": "model_recovery",
+                "scope": "turn",
+            },
+        },
+        {
+            "seq": 3,
+            "type": "lifecycle",
+            "data": {
+                "event": "turn_error",
+                "turn_id": "turn-2",
+            },
+        },
+    ]
+    if superseded:
+        events.append(
+            {
+                "seq": 4,
+                "type": "user_message",
+                "data": {
+                    "turn_id": "turn-3",
+                    "content": "New request",
+                },
+            }
+        )
+    monkeypatch.setattr(routes, "_session_read_refs", AsyncMock(return_value=[_ref(events)]))
+    monkeypatch.setattr(routes, "_session_rows", AsyncMock(return_value=[]))
+    source, failed = await routes._retry_source_from_failed_turn(
+        _request(events),
+        SimpleNamespace(conversation_id="conv-1", active_session_id="sess-1"),
+        "turn-2",
+    )
+    if superseded:
+        assert source is None
+        assert not failed
+    else:
+        assert failed
+        assert source == {
+            "content": "Original request",
+            "client_message_id": "client-1",
+            "attachments": [],
+        }
+
+
 def _request(events: list[dict[str, object]]) -> SimpleNamespace:
     guardrails = SimpleNamespace(
         read_events=AsyncMock(

@@ -827,6 +827,18 @@ def test_task_rerun_response_round_trip() -> None:
     assert response.created_new is True
 
 
+def test_task_retry_reuses_action_response_without_new_task_identity() -> None:
+    from cognis.api.models import TaskActionResponse
+
+    response = TaskActionResponse(ok=True, task_id="task-recovery", status="running")
+    assert TaskActionResponse.model_validate(response.model_dump()) == response
+    assert response.model_dump() == {
+        "ok": True,
+        "task_id": "task-recovery",
+        "status": "running",
+    }
+
+
 def test_workflow_response_round_trips_lifecycle_and_lineage() -> None:
     response = WorkflowResponse(
         workflow_id="wf-1",

@@ -3,17 +3,22 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const childSource = readFileSync(resolve('src/lib/components/chat-v2/ChildChatView.svelte'), 'utf8');
+const parentLinkSource = readFileSync(resolve('src/lib/components/chat-v2/ParentChatLink.svelte'), 'utf8');
+const headerSource = readFileSync(resolve('src/lib/components/chat-v2/SessionLogHeader.svelte'), 'utf8');
+const infoButtonSource = readFileSync(resolve('src/lib/components/session/SessionDetailsButton.svelte'), 'utf8');
+const appCss = readFileSync(resolve('src/app.css'), 'utf8');
 const pageSource = readFileSync(resolve('src/routes/(app)/chat/[conversationId]/+page.svelte'), 'utf8');
 const layoutSource = readFileSync(resolve('src/routes/(app)/+layout.svelte'), 'utf8');
 
 describe('ChildChatView shell ownership', () => {
-  it('uses the shared scoped timeline, live follow, and a real Inspector toggle', () => {
+  it('uses the shared scoped timeline, compact header, and info control', () => {
     expect(childSource).toContain('<ScopedChatV2Timeline');
     expect(childSource).toContain('<TimelineOngoingWorkDrawer');
     expect(childSource).toContain('childViewScope(view)');
-    expect(childSource).toContain('Following latest');
-    expect(childSource).toContain('data-testid="child-header-inspector"');
-    expect(childSource).not.toContain('SessionDetailsButton');
+    expect(childSource).not.toContain('Following latest');
+    expect(childSource).toContain('testId="child-header-inspector"');
+    expect(childSource).toContain('<SessionDetailsButton');
+    expect(childSource).toContain('<SessionLogHeader');
     expect(childSource).not.toContain('aria-label="Info"');
     expect(childSource).toContain('onTodosChange={handleTodosChange}');
     expect(childSource).not.toContain('onTodosChange={(next)');
@@ -319,7 +324,7 @@ describe('ChildChatView PWA-safe theme and layout', () => {
   });
 
   it('inherits the route-owned top safe area while protecting horizontal edges', () => {
-    const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
+    const header = headerSource;
     expect(header).not.toContain('env(safe-area-inset-top)');
     expect(header).toContain('env(safe-area-inset-left)');
     expect(header).toContain('env(safe-area-inset-right)');
@@ -330,31 +335,25 @@ describe('ChildChatView PWA-safe theme and layout', () => {
   });
 
   it('gives Back, Inspector, and Close 40-44px touch targets on narrow/coarse screens with compact desktop sizes', () => {
-    const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
-    const backButton = header.slice(header.indexOf('aria-label="Back to parent conversation"') - 200, header.indexOf('aria-label="Back to parent conversation"'));
-    expect(backButton).toContain('h-[44px] w-[44px]');
-    expect(backButton).toContain('sm:h-8 sm:w-8');
-
-    const inspectorButton = header.slice(header.indexOf('data-testid="child-header-inspector"') - 400, header.indexOf('data-testid="child-header-inspector"'));
-    expect(inspectorButton).toContain('h-[44px] w-[44px]');
-    expect(inspectorButton).toContain('sm:h-8 sm:w-8');
-
-    const closeButton = header.slice(header.indexOf('aria-label="Close child conversation"') - 200, header.indexOf('aria-label="Close child conversation"'));
-    expect(closeButton).toContain('h-[44px] w-[44px]');
-    expect(closeButton).toContain('sm:h-8 sm:w-8');
+    const header = childSource.slice(childSource.indexOf('<SessionLogHeader'), childSource.indexOf('</SessionLogHeader>'));
+    expect(header).toContain('<ParentChatLink');
+    expect(parentLinkSource).toContain('touch-target-compact');
+    expect(infoButtonSource).toContain('touch-target-compact');
+    expect(header).toContain('touch-target-compact');
+    expect(appCss).toMatch(/\.touch-target-compact\s*\{[^}]*height: 44px/s);
+    expect(appCss).toMatch(/\.touch-target-compact\s*\{[^}]*height: 2rem/s);
   });
 
-  it('hides the raw session ID text on narrow widths while keeping Copy accessible', () => {
-    const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
+  it('keeps Copy accessible without raw session ID text in the compact header', () => {
+    const header = childSource.slice(childSource.indexOf('<SessionLogHeader'), childSource.indexOf('</SessionLogHeader>'));
     expect(header).toContain('aria-label="Copy canonical session ID"');
-    expect(header).toContain('h-[44px] min-w-[44px]');
-    expect(header).toMatch(/<span class="hidden sm:inline">\{view\.sessionId\.slice\(0, 12\)\}<\/span>/);
+    expect(header).not.toContain('view.sessionId.slice');
   });
 
   it('never overlaps header actions: title stays min-width-constrained and actions stay shrink-0', () => {
-    const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
-    expect(header).toContain('<h2 class="truncate text-sm font-semibold text-foreground">{node.title}</h2>');
+    const header = headerSource;
+    expect(header).toContain('<h2 class="truncate text-sm font-semibold text-foreground">{title}</h2>');
     expect(header).toContain('class="min-w-0 flex-1"');
-    expect(header).toContain('class="flex shrink-0 items-center gap-0.5 sm:gap-1.5"');
+    expect(header).toContain('class="flex shrink-0 items-center gap-1"');
   });
 });

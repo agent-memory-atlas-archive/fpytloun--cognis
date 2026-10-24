@@ -58,8 +58,8 @@ def test_call_id_included_in_marker() -> None:
     assert "list_tool_output_anchors" not in result
     assert "read_tool_output_anchor" not in result
     assert "anchor='result:1'" not in result
-    assert "search_tool_output(call_id='call_abc123', pattern='error|timeout|keyword')" in result
     assert "read_tool_output(call_id='call_abc123')" in result
+    assert result.count("call_abc123") == 1
 
 
 def test_call_id_omitted_when_none() -> None:
@@ -106,10 +106,9 @@ def test_marker_lists_real_anchors_when_provided() -> None:
         anchors=["error:1", "result:1", "summary"],
     )
     assert was_truncated is True
-    # Example anchor in the recall hint should be the first real anchor
-    assert "anchor='error:1'" in result
-    # Real anchor list should be enumerated in the marker
-    assert "Available anchors: error:1, result:1, summary" in result
+    assert "read_tool_output(call_id='call_xyz')" in result
+    assert "Anchors: error:1, result:1, summary" in result
+    assert result.count("call_xyz") == 1
 
 
 def test_marker_caps_inline_anchor_list() -> None:
@@ -120,7 +119,7 @@ def test_marker_caps_inline_anchor_list() -> None:
     assert "section:4" in result
     assert "+5 more" in result
     # Anchors past the cap should not be inlined
-    assert "section:9" not in result.split("Available anchors:")[1]
+    assert "section:9" not in result.split("Anchors:")[1]
 
 
 def test_marker_does_not_invent_anchor_when_no_anchors() -> None:
@@ -128,4 +127,4 @@ def test_marker_does_not_invent_anchor_when_no_anchors() -> None:
     result, _ = middle_truncate(text, 800, call_id="call_xyz", anchors=[])
     assert "read_tool_output_anchor" not in result
     assert "anchor='result:1'" not in result
-    assert "Available anchors:" not in result
+    assert "Anchors:" not in result

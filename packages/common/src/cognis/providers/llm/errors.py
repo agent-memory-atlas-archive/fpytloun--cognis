@@ -70,6 +70,7 @@ class MidStreamErrorPayload(TypedDict, total=False):
     response_id: str | None
     response_status: str | None
     retry_after_seconds: float | None
+    recovery_exhausted: bool
     details: dict[str, Any] | None
     artifact_urls: list[str]
     artifact_ids: list[str]

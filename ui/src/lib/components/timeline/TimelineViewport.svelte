@@ -18,7 +18,7 @@
     emptyLabel = 'No events recorded yet.',
     live = false,
     hasStreamingItems = undefined,
-    liveLabel = 'Reading latest logs',
+    liveLabel = 'Turn running',
     followPausedLabel = 'Scroll to latest',
     viewportElement = $bindable<HTMLDivElement | null>(null),
     contentElement = $bindable<HTMLDivElement | null>(null),
@@ -401,9 +401,9 @@
       </button>
     </nav>
   {:else if !loading && !error && live}
-    <nav class="sticky bottom-2 left-1/2 z-10 flex w-fit -translate-x-1/2 items-center gap-1 rounded-full border border-control-border bg-elevated/95 p-1 shadow-lg backdrop-blur" aria-label="Live tail controls">
-      <LiveDots label={liveLabel} size="sm" />
-    </nav>
+    <div class="flex justify-center py-2" role="status" aria-label={liveLabel} data-testid="timeline-running-indicator">
+      <LiveDots inline tone="slate" size="sm" />
+    </div>
   {/if}
 </div>
 

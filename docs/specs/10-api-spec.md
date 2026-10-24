@@ -671,6 +671,7 @@ DELETE /api/v1/tasks/:id                          → Cancel and remove
 POST   /api/v1/tasks/:id/submit                   → Move draft → queued (start execution)
 POST   /api/v1/tasks/:id/pause                    → Pause running task
 POST   /api/v1/tasks/:id/resume                   → Resume paused task
+POST   /api/v1/tasks/:id/retry                    → Recover failed task in place with saved step history (TaskActionResponse)
 POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
 POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
 POST   /api/v1/tasks/:id/step-response            → Respond to the current `step_request_questions` question set

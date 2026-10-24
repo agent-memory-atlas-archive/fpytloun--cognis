@@ -68,10 +68,15 @@ describe('ChildChatView', () => {
     });
     expect(screen.getByRole('heading', { name: 'Child session' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Info' })).toBeNull();
-    await fireEvent.click(screen.getByRole('button', { name: 'Collapse conversation inspector' }));
+    const info = screen.getByRole('button', { name: 'Toggle session details' });
+    expect(info).toHaveAttribute('aria-expanded', 'true');
+    expect(info.querySelector('svg')).toHaveClass('lucide-info');
+    await fireEvent.click(info);
     expect(onToggleInspector).toHaveBeenCalledOnce();
-    await fireEvent.click(screen.getByRole('button', { name: 'Back to parent conversation' }));
+    await fireEvent.click(screen.getByRole('link', { name: 'Back to parent conversation' }));
     expect(onBack).toHaveBeenCalledOnce();
+    expect(screen.getByRole('link', { name: 'Back to parent conversation' })).toHaveAttribute('href', '/chat/root');
+    expect(screen.getByRole('link', { name: 'Back to parent conversation' })).not.toHaveTextContent('Parent');
     await fireEvent.click(screen.getByRole('button', { name: 'Close child conversation' }));
     expect(onClose).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.getByRole('button', { name: /Ongoing work/ })).toBeTruthy());
@@ -140,8 +145,9 @@ describe('ChildChatView', () => {
     const header = screen.getByTestId('child-header');
     expect(header).toHaveTextContent(label);
     expect(header).not.toHaveTextContent('Closed');
-    expect(header.textContent?.includes('Following latest'))
-      .toBe(['running', 'queued', 'waiting', 'recovering'].includes(executionState));
+    expect(header).not.toHaveTextContent('Following latest');
+    expect(header).not.toHaveTextContent('Live follow paused');
+    expect(header.querySelectorAll('.animate-bounce')).toHaveLength(0);
   });
 
   it('renders terminated as closed without live-follow state', () => {
@@ -184,7 +190,7 @@ describe('ChildChatView', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
     await fireEvent.click(link);
     expect(onViewSession).not.toHaveBeenCalled();
-    expect(screen.getByRole('button', { name: 'Collapse conversation inspector' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Toggle session details' })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('button', { name: 'Close child conversation' })).toBeTruthy();
   });
 

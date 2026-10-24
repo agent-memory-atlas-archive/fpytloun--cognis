@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
-  import RefreshCw from 'lucide-svelte/icons/refresh-cw';
   import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
   import TaskStepOutcomeEpilogue from '$lib/components/tasks/TaskStepOutcomeEpilogue.svelte';
   import TimelineTodoDrawer from '$lib/components/timeline/TimelineTodoDrawer.svelte';
@@ -487,7 +486,9 @@
     backfillController?.abort();
     backfillController = controller;
     try {
-      const admitted = await timeline!.older(before, controller.signal);
+      const admitted = automatic
+        ? await timeline!.older(before, controller.signal)
+        : await timeline!.olderVisible(before, controller.signal);
       if (
         scopeVersion !== scopeGeneration
         || requestVersion !== requestGeneration
@@ -854,20 +855,25 @@
       {#if onMissingStream}<button class="ml-2 underline" type="button" onclick={onMissingStream}>Refresh</button>{/if}
     </div>
   {/if}
-  {#if !compact}
+  {#if !compact && (store.snapshot.syncStatus === 'gapped' || (store.snapshot.cursor && !timeline?.reconciled && timeline?.phase === 'error'))}
     <div class="flex items-center justify-between px-4 py-2 text-xs text-muted" data-testid="scoped-timeline-status-row">
       <span role="status">{store.snapshot.syncStatus === 'gapped'
         ? 'Reconnecting…'
         : store.snapshot.cursor && !timeline?.reconciled && timeline?.phase === 'error'
           ? 'Cached · refresh unavailable'
           : ''}</span>
-      {#if !compact}
-        <Button size="sm" variant="ghost" aria-label="Refresh timeline" onclick={recover} disabled={loading}><RefreshCw class="h-3.5 w-3.5" /></Button>
-      {/if}
+      <Button size="sm" variant="ghost" onclick={recover} disabled={loading}>Retry connection</Button>
     </div>
   {/if}
   {#if loadingOlder}
     <span class="sr-only" role="status" aria-live="polite">Loading earlier timeline history.</span>
+  {/if}
+  {#if hasOlder}
+    <div class="shrink-0 px-4 text-center">
+      <Button size="sm" variant="ghost" onclick={beginUserBackfillPass} disabled={loading || loadingOlder}>
+        {loadingOlder ? 'Loading earlier history…' : 'Load earlier history'}
+      </Button>
+    </div>
   {/if}
   {#if olderError && !net.hideErrors}
     <div class="absolute left-1/2 top-2 z-20 -translate-x-1/2 rounded-lg border border-danger-border bg-elevated/95 px-3 py-2 text-xs text-danger shadow-lg" role="alert">
@@ -888,7 +894,7 @@
     {emptyLabel}
     live={hasEditableComposer ? false : live}
     {hasStreamingItems}
-    liveLabel={activityStatus === 'evaluating' ? 'Evaluator is reviewing…' : 'Following latest logs'}
+    liveLabel={activityStatus === 'evaluating' ? 'Evaluator is reviewing…' : 'Turn running'}
     followPausedLabel="Resume live follow"
     bind:viewportElement={viewport}
     bind:contentElement={content}

@@ -24,6 +24,8 @@
   import DocumentLinkActions from './DocumentLinkActions.svelte';
   import type { ShareLinkOptions } from './share-options';
   import './rich-publication.css';
+  import './rich-conversation.css';
+  import ChatDocumentActions from './ChatDocumentActions.svelte';
   import { loadViewerTheme, observeViewerTheme, resolveViewerTheme, viewerTheme } from './viewer-theme';
   import {
     buildCitationRegistry,
@@ -53,6 +55,8 @@
   export let instanceId = '';
   export let internalUrl = '';
   export let hosted = false;
+  export let conversational = false;
+  export let footer: Snippet | undefined = undefined;
   export let extraActions: Snippet | undefined = undefined;
   export let mediaUrlFor: RichMediaUrlFor = (mediaKey: string) => instanceId
     ? privateDeliverableMediaUrl(instanceId, mediaKey)
@@ -108,6 +112,7 @@
     : block);
   $: publicationContext.set(buildCitationRegistry(normalized.blocks, normalized.sources, instanceNamespace));
   $: showToc = options.showToc;
+  $: chatFlow = conversational && surface === 'embedded' && !exportMode;
   let fullOpen = false;
   let inlineExpanded = !collapsedByDefault;
   let tocOpen = false;
@@ -387,8 +392,12 @@
     scheduleMermaidRender();
     if (typeof ResizeObserver !== 'undefined') {
       rootResizeObserver = new ResizeObserver(([entry]) => {
+        const wasWide = inlineTocWide;
         inlineTocWide = (entry?.contentRect.width ?? 0) >= 960;
-        if (!tocChosen) tocOpen = inlineTocWide;
+        if (chatFlow && wasWide && !inlineTocWide) {
+          tocOpen = false;
+          tocChosen = false;
+        } else if (!tocChosen) tocOpen = inlineTocWide;
       });
       rootResizeObserver.observe(root);
     }
@@ -475,6 +484,7 @@
   class:compact
   class:embedded={surface === 'embedded'}
   class:hosted
+  class:conversational={chatFlow}
   class="rich-deliverable"
   class:theme-palette={Boolean(viewerFamily)}
   data-theme-family={viewerFamily}
@@ -497,7 +507,7 @@
     </RichViewerChrome>
   {/if}
 
-  {#if !hosted}
+  {#if !hosted && !chatFlow}
   <header class="rich-toolbar" class:actions-only={(payloadOwnsIdentity && inlineExpanded) || surface === 'standalone'} data-testid="rich-deliverable-toolbar">
     {#if surface !== 'standalone' && (!payloadOwnsIdentity || !inlineExpanded)}
     <div>
@@ -509,7 +519,10 @@
       {/if}
     </div>
     {/if}
-    {#if surface === 'embedded'}
+    {#if surface === 'embedded'}{@render documentActions()}{/if}
+  </header>
+  {/if}
+  {#snippet documentActions()}
     <nav class="rich-actions" aria-label="Document actions">
       {#if collapsedByDefault}
         <button
@@ -521,11 +534,13 @@
           on:click={toggleInlineDocument}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d={inlineExpanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} /></svg>
+          {#if chatFlow}<span>{inlineExpanded ? 'Collapse' : 'Expand document'}</span>{/if}
         </button>
       {/if}
       {#if showToc && (!inlineTocWide || !tocOpen)}
         <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2m3 0h11M4 12h2m3 0h11M4 18h2m3 0h11" /></svg>
+          {#if chatFlow}<span>Contents</span>{/if}
         </button>
       {/if}
       <!-- "Open full view" and "Open standalone page" are only meaningful
@@ -533,20 +548,18 @@
            itself would just reopen the same page/a fullscreen copy of the
            page you're already looking at. -->
       {#if surface === 'embedded'}
-        <button type="button" aria-label="Open full view" title="Open full view" on:click={openFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg></button>
-        {#if standaloneUrl}<a href={standaloneUrl} target="_blank" rel="noreferrer" aria-label="Open standalone page" title="Open standalone page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 11 13M10 6H5a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5" /></svg></a>{/if}
+        <button type="button" aria-label={chatFlow ? 'Open document' : 'Open full view'} title={chatFlow ? 'Open document' : 'Open full view'} on:click={openFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg>{#if chatFlow}<span>Open document</span>{/if}</button>
+        {#if standaloneUrl && !chatFlow}<a href={standaloneUrl} target="_blank" rel="noreferrer" aria-label="Open standalone page" title="Open standalone page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 11 13M10 6H5a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5" /></svg></a>{/if}
       {/if}
-      {#if pdfUrl || htmlUrl || markdownUrl}<DownloadMenu {pdfUrl} {htmlUrl} {markdownUrl} />{/if}
+      {#if pdfUrl || htmlUrl || markdownUrl}<DownloadMenu {pdfUrl} {htmlUrl} {markdownUrl} label={chatFlow ? 'Download' : ''} />{/if}
        {#if internalUrl}
-          <DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
+          <DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} shareLabel={chatFlow ? 'Share' : ''} />
        {:else if shareLinkCallback}
-        <ShareMenu createLink={shareLinkCallback} />
+        <ShareMenu createLink={shareLinkCallback} label={chatFlow ? 'Share' : ''} />
       {/if}
        {#if !internalUrl}<button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>{/if}
     </nav>
-    {/if}
-  </header>
-  {/if}
+  {/snippet}
   {#if hosted && showToc && (!inlineTocWide || !tocOpen)}
     <div class="rich-hosted-navigation">
       <button class="document-icon-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>
@@ -559,6 +572,7 @@
     id={`${instanceNamespace}-inline-document`}
     class:has-toc={showToc && tocOpen}
     class:inline-toc-sidebar={showToc && inlineTocWide && tocOpen}
+    class:chat-toc-enabled={chatFlow && showToc}
     class="rich-document rich-inline-document"
     data-testid="rich-deliverable-inline-document"
   >
@@ -572,6 +586,7 @@
         layout={inlineTocWide ? 'sidebar' : 'drawer'}
         visible={inlineTocWide ? tocOpen : true}
         dismissibleSidebar={true}
+        side={chatFlow ? 'right' : 'left'}
         theme={resolvedViewerTheme}
         family={viewerFamily}
         documentRoot={() => root}
@@ -580,7 +595,7 @@
 
     <div class="rich-body" data-testid="rich-deliverable-body">
       {#if expiredLink}<p class="preview-notice" role="status"><strong>Shared link expired</strong> — viewing through your authenticated owner access.</p>{/if}
-      {#if surface === 'standalone' && !payloadOwnsIdentity}
+      {#if (surface === 'standalone' || chatFlow) && !payloadOwnsIdentity}
         {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
         <h1 class="document-title">{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
         {#if subtitle}<p class="document-lede">{@html renderInlineMarkdown(subtitle)}</p>{/if}
@@ -594,7 +609,24 @@
         <div class="rich-fallback">{@html renderMarkdown(content)}</div>
       {/if}
     </div>
+    {#if chatFlow && showToc && (!inlineTocWide || !tocOpen)}
+      <div class="chat-toc-rail">
+        <button class="copy-icon-button" type="button" aria-label="Open table of contents" title="Contents"
+          aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="collapse" /></button>
+      </div>
+    {/if}
   </div>
+  {/if}
+
+  {#if chatFlow}
+    {#if !inlineExpanded}<p class="chat-document-summary">{effectiveTitle || 'Deliverable'}</p>{/if}
+    <footer class="chat-document-footer" data-testid="chat-document-footer">
+      {@render footer?.()}
+      <ChatDocumentActions openFullView={openFullView} copyDocument={copyFallback} {copied}
+        {pdfUrl} {htmlUrl} {markdownUrl} {internalUrl} createLink={shareLinkCallback}
+        collapsible={collapsedByDefault} expanded={inlineExpanded} toggleExpanded={toggleInlineDocument}
+        {extraActions} />
+    </footer>
   {/if}
 
   {#if fullOpen}

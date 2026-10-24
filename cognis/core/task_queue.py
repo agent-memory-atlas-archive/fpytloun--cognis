@@ -666,12 +666,15 @@ class TaskQueue:
             self._launch_claimed_task_run(task, claim)
         return task
 
-    async def retry_failed_task(self, task_id: str) -> TaskModel:
+    async def retry_failed_task(
+        self, task_id: str, *, preserve_step_context: bool = True
+    ) -> TaskModel:
         """Reset a failed task's workflow state and re-launch it.
 
         Unlike ``resume_task`` (which only works for paused tasks), this
-        method handles tasks in ``failed`` status by starting a new task
-        attempt and transitioning back to ``running``.
+        method handles tasks in ``failed`` status. Recovery retains the
+        logical attempt and saved step history by default; explicit
+        fresh-attempt callers can disable context preservation.
         """
         async with self._session_factory() as db_session:
             task_row = await get_task(db_session, task_id)
@@ -687,6 +690,7 @@ class TaskQueue:
                 else WorkflowState()
             )
             ws.loop_iterations = {}  # Reset all attempt counters
+            ws.resume_failed_step = preserve_step_context
             ws.status = "running"
             ws.current_step_status = None
             ws.pending_pause_type = None
@@ -701,7 +705,8 @@ class TaskQueue:
                 await self._execution_store.release(claim)
                 raise ValueError("Task not found")
             task_row.workflow_state = ws.model_dump(mode="json")
-            task_row.attempt_number += 1
+            if not preserve_step_context:
+                task_row.attempt_number += 1
             task_row.completed_at = None
             task_row.result_summary = None
             task_row.result_data = None

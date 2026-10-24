@@ -311,7 +311,11 @@ async def test_partial_batch_delivery_and_cold_replay_keep_provider_prefix(
         loop.context_assembler = assembler
         loop._record_events_strict = AsyncMock()
         ctx = SimpleNamespace(
-            session=session, agent=agent, turn_id="turn_partial_batch", execution_fence=None
+            session=session,
+            agent=agent,
+            turn_id="turn_partial_batch",
+            execution_fence=None,
+            pending_events=[],
         )
         await loop._commit_context_delivery(
             ctx, audit_messages=[], projection_decisions=decisions, on_token=None

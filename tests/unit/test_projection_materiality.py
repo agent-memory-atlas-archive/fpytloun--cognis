@@ -149,5 +149,7 @@ def test_existing_compact_decision_for_a_small_result_remains_authoritative() ->
 
     replayed = apply_projection_decisions(messages, decisions)
 
-    assert replayed[1]["content"] == build_compacted_tool_result_placeholder(messages[1])
+    assert replayed[1]["content"] == build_compacted_tool_result_placeholder(
+        messages[1], rendering_policy_version=1
+    )
     assert replayed[1][PROJECTED_COMPACTED] is True

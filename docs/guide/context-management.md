@@ -93,6 +93,16 @@ rendered view. If persistence fails, a cached retry must persist those decisions
 before inference; successful decisions are deduplicated through canonical replay.
 This does not trigger new projection below the normal pressure threshold.
 
+Within a turn, crossing only the soft steady target first checks the accepted
+rendering plus newly appended messages. If the complete source prefix is unchanged
+and that candidate remains below the existing 95% loop-pressure gate and within
+the hard and available budgets, Cognis reuses it rather than rewriting older
+tool results. Current tool-schema overhead and token calibration are included.
+Initial projection, oversized new results, pressure transitions, critical pressure,
+and changed source prefixes retain the full projection path. The 75%/35%
+between-turn policy and session-compaction thresholds do not change.
+This reduces avoidable cache invalidation; it does not guarantee a provider cache hit.
+
 Regular executor calls and controller calls persist the same bounded native replay
 fields. Original argument JSON (including whitespace and Unicode) is retained
 when sanitization does not change its values; redacted arguments are reserialized.
@@ -108,7 +118,9 @@ reuse and non-numeric reasons have no new deciding threshold. Cross-turn logs
 distinguish the effective-input target from the actual savings target. A `normal` pressure mode alone
 does not mean projection was unnecessary: the 75% projection trigger is separate
 from the 92% within-turn pressure escalation band. Cached pending deltas are
-identified as `cached_rendering`, not a new pressure transition.
+identified as `cached_rendering`, not a new pressure transition. Reuse after a
+soft-target decision is identified as `soft_target_cached_rendering`; it has no
+new deciding threshold because the unchanged safety gates accepted the candidate.
 
 Parallel tool batches can contain both compacted and retained results. Only a
 batch whose results are all compacted is treated as a whole-batch demotion;
@@ -120,6 +132,19 @@ A textual tool result is replaced by a placeholder only when the placeholder is 
 most half its size. Short outputs stay verbatim: replacing them would add tokens and
 rewrite an early cache position for no saving. Fallback pruning counts savings net
 of the placeholder.
+
+New recoverable placeholders contain one executable `read_tool_output` call,
+not repeated read/search/anchor instructions. Shared tool guidance explains how
+to search or use anchors; markers retain concrete anchor names, source provenance
+and authorized lazy artifact references. Missing saved handles remain explicitly
+unrecoverable. Truncated previews use the same concise recovery formatter.
+
+New result projections use rendering-policy version 2. Existing version-1
+decisions retain their exact rendering, including after cold-cache recovery.
+The version travels with the projected message and existing bounded projection
+decisions; `SessionCache` reconstructs both versions from Intaris. This adds no
+content storage, external writes, locks, or cancellation/retry owner. Tool
+exchanges, projection/compaction thresholds and idle renewal policy are unchanged.
 
 Tools from one model response are executed and recorded as call/result pairs, but
 the live request sends them as one assistant turn followed by their results. Cold

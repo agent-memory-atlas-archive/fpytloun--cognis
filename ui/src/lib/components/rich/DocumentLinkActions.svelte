@@ -5,10 +5,11 @@
   import type { ShareLinkOptions } from './share-options';
   import './document-actions.css';
   import type { Snippet } from 'svelte';
-  let { internalUrl, createLink, allowModeChoice = true, defaultMode = 'view', extraActions }: {
+  let { internalUrl, createLink, allowModeChoice = true, defaultMode = 'view', extraActions, shareLabel = '' }: {
     internalUrl: string; createLink?: ((options: ShareLinkOptions) => Promise<string>) | null;
     allowModeChoice?: boolean; defaultMode?: 'view' | 'download';
     extraActions?: Snippet;
+    shareLabel?: string;
   } = $props();
   let copied = $state(false);
   let error = $state('');
@@ -22,5 +23,5 @@
 <button class="document-icon-action" type="button" aria-label={copied ? 'Internal link copied' : 'Copy internal link'} title={copied ? 'Internal link copied' : 'Copy internal link'} onclick={copy}>
   {#if copied}<Check size={18} />{:else}<Link size={18} />{/if}
 </button>
-{#if createLink}<ShareMenu {createLink} {allowModeChoice} {defaultMode} />{/if}
+{#if createLink}<ShareMenu {createLink} {allowModeChoice} {defaultMode} label={shareLabel} />{/if}
 {#if error}<span role="status" class="text-xs text-danger">{error}</span>{/if}

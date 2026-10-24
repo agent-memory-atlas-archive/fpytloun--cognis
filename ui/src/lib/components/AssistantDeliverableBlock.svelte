@@ -27,6 +27,7 @@
   export let displayOnly = false;
   export let collapsedByDefault = false;
   export let allowSharing = true;
+  export let conversational = false;
   const sharingPermission = getContext<Readable<boolean>>(DELIVERABLE_SHARING_CONTEXT) ?? readable(true);
 
   // `baseDeliverable` is the revision this card represents; `revisionView` is a
@@ -175,7 +176,7 @@
   }
 </script>
 
-<div class="assistant-deliverable-wrapper" data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
+<div class="assistant-deliverable-wrapper" class:conversational data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
   {#if loading && !deliverable}
     <div class="text-sm text-muted">Loading deliverable…</div>
   {:else if displayOnly && !deliverable}
@@ -195,10 +196,10 @@
       {/if}
     </div>
   {:else if deliverable && richPayload}
-    {#if showLibraryLink && !displayOnly}
+    {#if showLibraryLink && !displayOnly && !conversational}
       <div class="mb-2 flex justify-end"><a class="inline-flex min-h-9 items-center text-xs text-accent hover:text-accent-hover hover:underline" href={`/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}>Open in Library ↗</a></div>
     {/if}
-    <DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
+    {#if !conversational}<DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />{/if}
     {#if revisionError}<p class="mb-2 text-xs text-danger">{revisionError}</p>{/if}
     <!-- Remount when the card becomes superseded so it applies the collapsed default. -->
     {#key `${deliverable.deliverable_id}:${supersededCollapsed}`}
@@ -208,7 +209,7 @@
       content={deliverable.content}
       payload={richPayload}
       instanceId={deliverable.deliverable_id}
-      internalUrl={`/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}
+      internalUrl={conversational && (!showLibraryLink || displayOnly) ? '' : `/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}
       mediaUrlFor={authenticatedMediaUrlFor}
       standaloneUrl={standaloneUrl}
       pdfUrl={pdfUrl}
@@ -216,10 +217,14 @@
       markdownUrl={markdownUrl}
       shareLinkCallback={allowSharing && $sharingPermission ? createShareLink : undefined}
       surface="embedded"
+      {conversational}
       compact
       collapsedByDefault={collapsedByDefault || supersededCollapsed}
     >
-      {#snippet extraActions()}<DocumentFavoriteButton kind="deliverable" id={deliverable.deliverable_id} />{/snippet}
+      {#snippet extraActions()}<DocumentFavoriteButton kind="deliverable" id={deliverable.deliverable_id} showLabel={conversational} />{/snippet}
+      {#snippet footer()}
+        <DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
+      {/snippet}
     </RichDeliverable>
     {/await}
     {/key}
@@ -235,5 +240,10 @@
     /* RichDeliverable owns all its own document chrome now for every
        format; avoid a nested frame here. */
     padding: 0;
+  }
+  /* Match ChatMessage's avatar, gap, bubble padding and one-pixel border. */
+  .assistant-deliverable-wrapper.conversational { box-sizing: border-box; padding-left: calc(3.25rem + 1px); }
+  @media (min-width: 640px) {
+    .assistant-deliverable-wrapper.conversational { padding-left: calc(3.75rem + 1px); }
   }
 </style>

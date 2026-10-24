@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock('$lib/components/chat-v2/ScopedChatV2Timeline.svelte', async () => ({
   default: (await import('$lib/components/LoadingState.svelte')).default,
 }));
+vi.mock('$lib/components/chat-v2/CompactConversationChat.svelte', async () => (
+  import('$lib/components/dashboard/ConversationModalWorkspace.chat-test-fixture.svelte')
+));
 
 vi.mock('$lib/api/client', () => ({
   api: {
@@ -17,6 +20,8 @@ vi.mock('$lib/api/client', () => ({
       resolve: vi.fn(),
     },
     sessions: { intarisDetail: vi.fn() },
+    conversations: { sessions: vi.fn(async () => []) },
+    tasks: { stepRunDetail: vi.fn() },
     llmProviders: { providerUsage: vi.fn() },
   },
 }));
@@ -28,9 +33,15 @@ vi.mock('$lib/chat-v2/api', () => ({
 }));
 
 import SessionLogsDrawer from './SessionLogsDrawer.svelte';
+import type { Notification as AppNotification, StepRun, Agent } from '$lib/types/api';
 
 describe('SessionLogsDrawer', () => {
   beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
     mocks.notifications.mockReset().mockResolvedValue([]);
     mocks.activityOverview.mockReset().mockResolvedValue({
       schema_version: 2,
@@ -67,6 +78,24 @@ describe('SessionLogsDrawer', () => {
     expect(screen.getAllByRole('dialog')).toHaveLength(1);
   });
 
+  it('binds pending approvals to the displayed child instead of keeping root approvals', async () => {
+    const { api } = await import('$lib/api/client');
+    vi.mocked(api.notifications.list).mockImplementation(async (_conversationId, options) => [{
+      notification_id: `approval-${options?.sessionId}`, notification_type: 'escalation', status: 'pending',
+      conversation_id: 'conversation-one', task_id: null, step_name: null, step_run_id: null,
+      session_id: options?.sessionId ?? null, created_at: new Date().toISOString(), resolution: null, resolved_at: null,
+      payload: { tool_name: options?.sessionId === 'session-one' ? 'root-action' : 'child-action', timeout_seconds: 300 },
+    }] satisfies AppNotification[]);
+    render(SessionLogsDrawer, {
+      conversationId: 'conversation-one', sessionId: 'session-one', onclose: vi.fn(),
+    });
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'root-action' })).toBeTruthy());
+    await fireEvent.click(screen.getByRole('button', { name: 'View child session' }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'child-action' })).toBeTruthy());
+    expect(screen.queryByRole('heading', { name: 'root-action' })).toBeNull();
+    expect(api.notifications.list).toHaveBeenLastCalledWith('conversation-one', { sessionId: 'session-child' });
+  });
+
   it('stops a handled top-overlay Escape before parent window handlers', async () => {
     const onclose = vi.fn();
     const escapedToParent = vi.fn();
@@ -82,5 +111,51 @@ describe('SessionLogsDrawer', () => {
     expect(onclose).toHaveBeenCalledOnce();
     expect(escapedToParent).not.toHaveBeenCalled();
     window.removeEventListener('keydown', escapedToParent);
+  });
+
+  it('keeps separate retry attempts reachable and changes the canonical scope', async () => {
+    const original = {
+      step_run_id: 'step-first', task_id: 'task-weekly', step_name: 'execute',
+      session_id: 'session-first', conversation_id: 'conversation-first', attempt: 1, status: 'failed', agent_id: 'agent-first',
+    } as StepRun;
+    const current = {
+      ...original, step_run_id: 'step-second', session_id: 'session-second',
+      conversation_id: 'conversation-second', attempt: 2, status: 'running', agent_id: 'agent-second',
+    } as StepRun;
+    const detail = vi.mocked((await import('$lib/api/client')).api.tasks.stepRunDetail);
+    detail.mockResolvedValue(original);
+    render(SessionLogsDrawer, {
+      conversationId: current.conversation_id!, sessionId: current.session_id!,
+      stepRunId: current.step_run_id, taskId: current.task_id, stepRun: current,
+      attempts: [original, current], onclose: vi.fn(),
+      agents: [{ agent_id: 'agent-first', name: 'First agent' }, { agent_id: 'agent-second', name: 'Second agent' }] as Agent[],
+    });
+    expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('task_step:step-second');
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Step attempt' }), { target: { value: original.step_run_id } });
+    await waitFor(() => expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('task_step:step-first'));
+    expect(detail).toHaveBeenCalledWith(original.step_run_id);
+    expect(screen.getByRole('combobox', { name: 'Step attempt' })).toHaveDisplayValue('Attempt 1 of 2 · failed');
+    expect(screen.getByTestId('compact-chat-agent')).toHaveTextContent('agent-first');
+  });
+
+  it('numbers task restarts oldest to newest even when step attempt resets to one', () => {
+    const attempts = [5, 4, 3, 2, 1].map(number => ({
+      step_run_id: `step-restart-${number}`, task_id: 'task-restarts', step_name: 'execute',
+      session_id: `session-restart-${number}`, conversation_id: `conversation-restart-${number}`,
+      attempt: 1, attempt_number: number, status: 'failed',
+    } as StepRun));
+    const latest = attempts[0];
+    render(SessionLogsDrawer, {
+      conversationId: latest.conversation_id!, sessionId: latest.session_id!,
+      stepRunId: latest.step_run_id, taskId: latest.task_id, stepName: 'execute',
+      stepRun: latest, attempts, onclose: vi.fn(),
+    });
+    const picker = screen.getByRole('combobox', { name: 'Step attempt' });
+    expect(picker).toHaveDisplayValue('Attempt 5 of 5 · failed');
+    expect(picker.closest('header')).toBe(screen.getByTestId('session-logs-header'));
+    expect(screen.getAllByRole('option').map(option => option.textContent))
+      .toEqual([1, 2, 3, 4, 5].map(number => `Attempt ${number} of 5 · failed`));
+    expect(screen.queryByText('Step history')).not.toBeInTheDocument();
+    expect(screen.queryByText('Earlier attempts remain available here.')).not.toBeInTheDocument();
   });
 });

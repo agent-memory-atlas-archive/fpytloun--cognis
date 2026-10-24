@@ -5585,17 +5585,19 @@ async def get_child_session_continuation_chain(
     session_id: str,
     *,
     max_depth: int = 1000,
+    include_root: bool = False,
 ) -> tuple[list[Session], bool]:
-    """Return the complete bounded rotation chain for one child session."""
+    """Return a bounded rotation lane, optionally including workflow roots."""
 
     first = await session.get(Session, session_id)
-    if first is None or first.parent_session_id is None:
+    if first is None or (first.parent_session_id is None and not include_root):
         return ([first] if first is not None else []), False
 
     rows = await list_conversation_sessions(
         session,
         first.conversation_id,
         parent_session_id=first.parent_session_id,
+        root_only=first.parent_session_id is None,
         include_internal=True,
     )
     lane_rows = {

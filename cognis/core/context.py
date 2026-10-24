@@ -45,8 +45,8 @@ from cognis.core.context_projection import (
     ProjectionPolicy,
     ProjectionResult,
     apply_projection_decisions,
-    build_compacted_tool_result_placeholder,
     clear_large_tool_call_arguments,
+    compact_tool_result,
     compacted_tool_group_anchors,
     compaction_shrinks_tool_result,
     project_messages,
@@ -5192,11 +5192,9 @@ def _compact_droppable_tool_groups(
                 continue
             if not compaction_shrinks_tool_result(tool_message):
                 continue
-            replacements[result_index] = {
-                **{k: v for k, v in tool_message.items() if k != TOKEN_ESTIMATE},
-                "content": build_compacted_tool_result_placeholder(tool_message),
-                "_projected_compacted": True,
-            }
+            replacements[result_index] = compact_tool_result(
+                {k: v for k, v in tool_message.items() if k != TOKEN_ESTIMATE}
+            )
         if replacements:
             yield replacements
 

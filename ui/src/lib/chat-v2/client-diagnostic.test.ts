@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { captureClientDiagnostic } from './client-diagnostic';
+import { captureClientDiagnostic, clientDiagnosticFilename } from './client-diagnostic';
 import { emptyChatV2State, type ChatV2ClientState } from './sync-engine';
 import { conversationTimelineScope, type TimelineItem } from './types';
 
@@ -55,6 +55,12 @@ function fixture(): ChatV2ClientState {
 }
 
 describe('metadata-only client diagnostic', () => {
+  it('includes the conversation identifier in a safe JSON filename', () => {
+    expect(clientDiagnosticFilename('diagnostic-conversation')).toBe('cognis-chat-diagnostic-diagnostic-conversation.json');
+    expect(clientDiagnosticFilename('conversation/with\nseparators')).toBe('cognis-chat-diagnostic-conversation_with_separators.json');
+    expect(clientDiagnosticFilename(null)).toBe('cognis-chat-diagnostic.json');
+  });
+
   it('separates canonical, local, runtime and actual visible ordering', () => {
     const state = fixture();
     const visible = [state.timelineItems[0], state.runtime!.volatile_items[0], state.localItems[0]];

@@ -66,6 +66,48 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 describe('AssistantDeliverableBlock', () => {
+  it('renders conversational content once with document actions and revision history after the body', async () => {
+    mocks.getDeliverable.mockResolvedValue(deliverable({ revision: 2, latest_revision: 2 }));
+    const { container } = render(AssistantDeliverableBlock, { item: item(), conversational: true });
+    const root = await screen.findByTestId('rich-deliverable');
+    expect(root).toHaveClass('conversational');
+    expect(screen.getAllByRole('heading', { name: 'Final report' })).toHaveLength(1);
+    expect(screen.queryByTestId('rich-deliverable-toolbar')).toBeNull();
+    const footer = screen.getByTestId('chat-document-footer');
+    expect(within(footer).getByRole('button', { name: 'Open fullscreen' })).toHaveTextContent('');
+    expect(within(footer).getByTestId('deliverable-revision-toggle')).toBeTruthy();
+    expect(within(footer).getByTitle('More document actions').closest('details')).not.toHaveAttribute('open');
+    await fireEvent.click(within(footer).getByTitle('More document actions'));
+    expect(within(footer).getByRole('link', { name: 'Open in Library ↗' })).toBeTruthy();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(within(footer).getByTitle('More document actions')).toHaveFocus();
+    const body = screen.getByTestId('rich-deliverable-inline-document');
+    expect(body.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await fireEvent.click(within(footer).getByTitle('Download document'));
+    expect(within(footer).getByRole('link', { name: 'PDF' })).toBeTruthy();
+    await fireEvent.click(within(footer).getByRole('button', { name: 'Open fullscreen' }));
+    const full = screen.getByTestId('rich-deliverable-full-view');
+    expect(full).not.toHaveClass('conversational');
+    expect(within(full).getByTestId('rich-viewer-chrome')).toBeTruthy();
+    await fireEvent.click(within(full).getByRole('button', { name: 'Close' }));
+    expect(container.querySelector('script')).toBeNull();
+  });
+
+  it('keeps a collapsed conversational document identifiable and expandable', async () => {
+    mocks.getDeliverable.mockResolvedValue(deliverable());
+    render(AssistantDeliverableBlock, { item: item(), conversational: true, collapsedByDefault: true, allowSharing: false });
+    await screen.findByTestId('rich-deliverable');
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
+    expect(screen.getByText('Markdown report')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Share public link' })).toBeNull();
+    await fireEvent.click(screen.getByTitle('More document actions'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
+    expect(screen.getByRole('heading', { name: 'Final report' })).toBeTruthy();
+    await fireEvent.click(screen.getByTitle('More document actions'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Collapse document' }));
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
+  });
+
   it('does not offer public sharing when a parent workspace denies it', async () => {
     mocks.getDeliverable.mockResolvedValue(deliverable());
     render(AssistantDeliverableBlock, {

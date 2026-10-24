@@ -15,8 +15,8 @@ const NODE_PREFIX = '.svelte-kit/generated/client-optimized/nodes/';
 
 // Budgets (brotli bytes). Raise deliberately, with a reason, never silently.
 const BUDGETS = {
-  // Explicitly approved for the theme-restoration release's measured 400.8 KiB graph.
-  chatCriticalJsBrotli: 401 * 1024,
+  // Explicitly approved for the deliverable update's measured 402.0 KiB graph.
+  chatCriticalJsBrotli: 405 * 1024,
   chatCriticalCssBrotli: 32 * 1024,
   largestCriticalChunkBrotli: 96 * 1024,
 };

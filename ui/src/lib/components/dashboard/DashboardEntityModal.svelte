@@ -97,7 +97,6 @@
   let conversationDetail = $state<Conversation | null>(null);
   let outputStepRun = $state<StepRun | null>(null);
   let logsStepRun = $state<StepRun | null>(null);
-  let logSessionStack = $state<string[]>([]);
   let stepViewerLoading = $state(false);
   let stepViewerError = $state<string | null>(null);
   let stepViewerRequest = 0;
@@ -315,7 +314,6 @@
       const hydrated = await hydrateStepRun(run);
       if (request !== stepViewerRequest) return;
       logsStepRun = hydrated;
-      logSessionStack = [];
     } catch (caught) {
       if (request === stepViewerRequest) {
         stepViewerError = asApiError(caught).message || 'Could not load step logs.';
@@ -349,7 +347,6 @@
     refreshError = null;
     outputStepRun = null;
     logsStepRun = null;
-    logSessionStack = [];
     stepViewerRequest += 1;
     stepViewerLoading = false;
     stepViewerError = null;
@@ -586,18 +583,14 @@
 {#if logsStepRun && taskId}
   <SessionLogsDrawer
     conversationId={logsStepRun.conversation_id ?? logsStepRun.session_id ?? ''}
-    sessionId={logSessionStack.at(-1) ?? logsStepRun.session_id ?? ''}
-    stepRunId={logSessionStack.length ? null : logsStepRun.step_run_id}
+    sessionId={logsStepRun.session_id ?? ''}
+    stepRunId={logsStepRun.step_run_id}
     {taskId}
-    stepName={logSessionStack.at(-1) ?? logsStepRun.step_name}
-    agent={logSessionStack.length ? null : agents.find((item: Agent) => item.agent_id === logsStepRun?.agent_id) ?? null}
-    stepRun={logSessionStack.length ? null : logsStepRun}
-    onViewSession={(sessionId) => {
-      if (sessionId !== (logSessionStack.at(-1) ?? logsStepRun?.session_id)) {
-        logSessionStack = [...logSessionStack, sessionId];
-      }
-    }}
-    onBack={logSessionStack.length ? () => { logSessionStack = logSessionStack.slice(0, -1); } : undefined}
-    onclose={() => { logsStepRun = null; logSessionStack = []; }}
+    stepName={logsStepRun.step_name}
+    agent={agents.find((item: Agent) => item.agent_id === logsStepRun?.agent_id) ?? null}
+    stepRun={logsStepRun}
+    attempts={taskDetail?.step_runs ?? []}
+    {agents}
+    onclose={() => { logsStepRun = null; }}
   />
 {/if}

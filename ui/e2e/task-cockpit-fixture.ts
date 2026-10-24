@@ -1,7 +1,7 @@
 import type { Page, Request } from '@playwright/test';
 import type { ActivityOverviewResponse } from '../src/lib/chat-v2/types';
 
-export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed' | 'cancelled';
+export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed';
 
 const NOW = '2026-07-30T12:00:00Z';
 export const TASK_ID = 'task-stage39-cockpit';
@@ -190,7 +190,7 @@ function task(status: CockpitStatus): Record<string, unknown> {
     started_at: draft ? null : NOW,
     completed_at: terminal ? NOW : null,
     updated_at: NOW,
-    result_summary: terminal ? 'Release approved.' : null,
+    result_summary: status === 'failed' ? 'Provider connection reset after 3 attempts.' : terminal ? 'Release approved.' : null,
     result_data: terminal ? { final_deliverable_id: 'dlv-stage39-final' } : null,
     applied_completion_mode: null,
     applied_completion_reason: null,

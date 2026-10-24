@@ -47,6 +47,7 @@ from cognis.core.tool_output_presentation import (
 from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
 )
+from cognis.core.tool_output_recovery import COMPACT_RESULT_RENDERING_POLICY_VERSION
 
 # ── Public constants ──────────────────────────────────────────────────────────
 
@@ -158,7 +159,11 @@ def _prune_minimum_savings_tokens(
 # ── Placeholder builders ──────────────────────────────────────────────────────
 
 
-def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
+def build_compacted_tool_result_placeholder(
+    message: dict[str, Any],
+    *,
+    rendering_policy_version: int = COMPACT_RESULT_RENDERING_POLICY_VERSION,
+) -> str:
     """Build a deterministic placeholder for a compacted tool result."""
 
     tool_name = str(message.get(TOOL_NAME) or "tool")
@@ -203,6 +208,7 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
         if isinstance(message.get("_anchor_count"), int)
         else None,
         anchor_names=anchor_names,
+        legacy=rendering_policy_version == 1,
     )
     presentation = message.get("_tool_output_presentation")
     lazy_refs = presentation.get("lazy_artifact_refs", []) if isinstance(presentation, dict) else []
@@ -217,11 +223,30 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
         if lazy_refs
         else ""
     )
+    if rendering_policy_version == COMPACT_RESULT_RENDERING_POLICY_VERSION:
+        return f"[Tool output omitted from prompt. {recovery_hint}{source_note}{lazy_note}]"
     return (
         "[Tool output omitted from prompt. "
         f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
         f"{recovery_hint}{lazy_note} Only recover if a specific missing detail is needed.]"
     )
+
+
+def compact_tool_result(
+    message: dict[str, Any],
+    *,
+    rendering_policy_version: int = COMPACT_RESULT_RENDERING_POLICY_VERSION,
+) -> dict[str, Any]:
+    """Project one result while retaining its rendering version for durable replay."""
+
+    return {
+        **message,
+        "content": build_compacted_tool_result_placeholder(
+            message, rendering_policy_version=rendering_policy_version
+        ),
+        PROJECTED_COMPACTED: True,
+        "_compact_result_rendering_version": rendering_policy_version,
+    }
 
 
 def compaction_shrinks_tool_result(message: dict[str, Any]) -> bool:
@@ -232,6 +257,9 @@ def compaction_shrinks_tool_result(message: dict[str, Any]) -> bool:
     Small outputs stay verbatim; non-text content keeps the existing behavior.
     """
 
+    # Accepted renderings, including older versions, remain authoritative.
+    if message.get(PROJECTED_COMPACTED):
+        return False
     content = message.get("content")
     if not isinstance(content, str):
         return True
@@ -405,12 +433,18 @@ def projection_decisions_from_diff(
 
     decisions: dict[str, list[dict[str, Any]]] = {}
 
-    def add(call_id: Any, operation: str, parameters: dict[str, int] | None = None) -> None:
+    def add(
+        call_id: Any,
+        operation: str,
+        parameters: dict[str, int] | None = None,
+        *,
+        rendering_policy_version: int = PROJECTION_RENDERING_POLICY_VERSION,
+    ) -> None:
         if not isinstance(call_id, str) or not call_id:
             return
         decision = {
             "operation": operation,
-            "rendering_policy_version": PROJECTION_RENDERING_POLICY_VERSION,
+            "rendering_policy_version": rendering_policy_version,
             "parameters": parameters or {},
         }
         call_decisions = decisions.setdefault(call_id, [])
@@ -432,7 +466,11 @@ def projection_decisions_from_diff(
         if message.get("_delegation_result_replay"):
             add(message.get("_recovery_call_id"), "compact_delegation_result")
         elif message.get("role") == "tool":
-            add(message.get("tool_call_id"), "compact_result")
+            add(
+                message.get("tool_call_id"),
+                "compact_result",
+                rendering_policy_version=message.get("_compact_result_rendering_version", 1),
+            )
         elif message.get(TOOL_ATTACHMENT_CONTEXT):
             add(message.get(TOOL_CALL_ID) or message.get("tool_call_id"), "compact_attachment")
     before_event_seqs = {
@@ -528,11 +566,12 @@ def apply_projection_decisions(
                 if (
                     decision.get("operation") == "compact_result"
                     and decision.get("rendering_policy_version")
-                    == PROJECTION_RENDERING_POLICY_VERSION
+                    in (1, COMPACT_RESULT_RENDERING_POLICY_VERSION)
                     and not updated.get(PROJECTED_COMPACTED)
                 ):
-                    updated["content"] = build_compacted_tool_result_placeholder(message)
-                    updated[PROJECTED_COMPACTED] = True
+                    updated = compact_tool_result(
+                        message, rendering_policy_version=decision["rendering_policy_version"]
+                    )
         elif isinstance(message.get("tool_calls"), list):
             calls = list(message["tool_calls"])
             changed = False
@@ -888,6 +927,7 @@ class ProjectionTurnState:
     last_projected_token_estimate: int = 0
     last_group_anchor: str | None = None  # hash of last tool group call_ids
     last_prefix_fingerprint: str | None = None
+    last_source_fingerprint: str | None = None
 
     # Monotonic preservation: anchors of groups already sent to the model.
     # Under non-critical pressure these are never demoted.
@@ -946,6 +986,7 @@ class ProjectionTurnState:
             last_projected_token_estimate=self.last_projected_token_estimate,
             last_group_anchor=self.last_group_anchor,
             last_prefix_fingerprint=self.last_prefix_fingerprint,
+            last_source_fingerprint=self.last_source_fingerprint,
             committed_preservations=set(self.committed_preservations),
             demoted_anchors=set(self.demoted_anchors),
             reproject_count=self.reproject_count,
@@ -999,6 +1040,7 @@ class ProjectionTurnState:
         self.last_result = result
         self.last_message_count = len(messages)
         self.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(messages)
+        self.last_source_fingerprint = projection_source_fingerprint(messages)
         # Seed committed_preservations from the groups that were preserved in
         # the cross-turn projection (i.e. not compacted).
         groups = _collect_tool_groups(messages)
@@ -1034,6 +1076,17 @@ def _group_anchor(group: _ToolGroup) -> str:
     """Stable hash of a tool group's call_ids — used as a preservation key."""
     key = ",".join(sorted(group.call_ids))
     return hashlib.sha1(key.encode(), usedforsecurity=False).hexdigest()[:16]
+
+
+def projection_source_fingerprint(messages: list[dict[str, Any]]) -> str:
+    """Fingerprint the complete source prefix, excluding mutable token estimates."""
+    return projected_prefix_fingerprint(
+        [
+            {key: value for key, value in message.items() if key != TOKEN_ESTIMATE}
+            for message in messages
+        ],
+        len(messages),
+    )
 
 
 def tool_transcript_prefix_fingerprint(messages: list[dict[str, Any]]) -> str:
@@ -1235,8 +1288,7 @@ def _estimated_group_compaction_savings(
             )
         elif message.get("role") == "tool":
             if compaction_shrinks_tool_result(message):
-                projected_message["content"] = build_compacted_tool_result_placeholder(message)
-                projected_message[PROJECTED_COMPACTED] = True
+                projected_message = compact_tool_result(message)
         elif message.get(TOOL_ATTACHMENT_CONTEXT):
             projected_message["role"] = "system"
             projected_message["content"] = build_compacted_tool_attachment_placeholder(message)
@@ -1704,13 +1756,7 @@ def project_messages(
             and message.get("tool_call_id") in compacted_call_ids
             and compaction_shrinks_tool_result(message)
         ):
-            projected.append(
-                {
-                    **message,
-                    "content": build_compacted_tool_result_placeholder(message),
-                    PROJECTED_COMPACTED: True,
-                }
-            )
+            projected.append(compact_tool_result(message))
             continue
         if message.get(TOOL_ATTACHMENT_CONTEXT) and (
             message.get(TOOL_CALL_ID) in compacted_call_ids
@@ -1876,11 +1922,7 @@ def prune_projected_messages(
     # (newer results spend the protected budget first).
     for index in sorted(pruneable_result_indices):
         message = result[index]
-        result[index] = {
-            **message,
-            "content": build_compacted_tool_result_placeholder(message),
-            PROJECTED_COMPACTED: True,
-        }
+        result[index] = compact_tool_result(message)
     for index in pruneable_call_indices:
         result[index] = clear_large_tool_call_arguments(
             result[index], arg_clear_threshold=arg_clear_threshold

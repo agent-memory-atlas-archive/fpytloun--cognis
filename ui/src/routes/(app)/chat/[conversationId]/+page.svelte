@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { provideChatNavigation } from '$lib/chat-v2/navigation';
+  import { performManagedAction } from '$lib/chat-v2/managed-actions';
   import GitFork from 'lucide-svelte/icons/git-fork';
   import PinConversationButton from '$lib/components/chat/PinConversationButton.svelte';
   import { isWorkspaceReplica, openNativeConversationWindow } from '$lib/native/host';
@@ -366,6 +368,8 @@ import X from 'lucide-svelte/icons/x';
     selectLatestTodoState,
     selectPendingInputToolCall,
   } from '$lib/chat-v2/selectors';
+  import { selectFailedTurnRecovery } from '$lib/chat-v2/recovery';
+  import RecoveryBanner from '$lib/components/RecoveryBanner.svelte';
   import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem as ChatV2TimelineItem } from '$lib/chat-v2/types';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
   import {
@@ -2095,11 +2099,6 @@ import X from 'lucide-svelte/icons/x';
 
   const conversationViewCache = new Map<string, ConversationViewCacheEntry>();
   let conversationViewSaveTimer: number | null = null;
-  const RETRYABLE_FAILED_TURN_NOTICE_MARKERS = [
-    'Your tool results have been saved. Please try sending your message again.',
-    'A model error occurred while generating the response.',
-    'Turn failed: the model did not produce output',
-  ];
 
   function isChatV2MessageStreaming(item: ChatV2TimelineItem): boolean {
     return item.kind === 'message'
@@ -2126,60 +2125,6 @@ import X from 'lucide-svelte/icons/x';
 
   function isInlineLiveChatV2Item(item: ChatV2TimelineItem): boolean {
     return isChatV2MessageStreaming(item) || isChatV2ThinkingStreaming(item) || isChatV2ToolActive(item);
-  }
-
-  function isRecoverableFailedTurnChatV2Notice(item: ChatV2TimelineItem): boolean {
-    if (item.kind === 'error') {
-      return item.recoverable === true;
-    }
-    if (item.kind === 'notice') {
-      const text = `${item.title ?? ''}\n${item.message ?? ''}`;
-      return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => text.includes(marker));
-    }
-    if (item.kind === 'message' && item.role === 'system') {
-      if (item.notice_kind === 'model_error') {
-        return item.notice_scope == null || item.notice_scope === 'failed_turn';
-      }
-      return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => item.content.includes(marker));
-    }
-    return false;
-  }
-
-  function retryableFailedTurnIdFromTailChatV2(items: ChatV2TimelineItem[]): string | null {
-    let latestUserTurnId: string | null | undefined = null;
-    let latestUserOrderKey: string | null = null;
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const item = items[index];
-      if (item?.kind === 'message' && item.role === 'user') {
-        latestUserTurnId = item.turn_id ?? null;
-        latestUserOrderKey = item.sort_key ?? null;
-        break;
-      }
-    }
-    if (latestUserTurnId == null && latestUserOrderKey == null) return null;
-
-    let sawCompletedAssistant = false;
-    let sawFailureNotice = false;
-    for (const item of items) {
-      if (
-        item.kind === 'message'
-        && item.role === 'assistant'
-        && item.partial !== true
-        && (
-          (latestUserTurnId != null && item.turn_id === latestUserTurnId)
-          || (latestUserTurnId == null && latestUserOrderKey != null && (item.sort_key ?? '') > latestUserOrderKey)
-        )
-      ) {
-        sawCompletedAssistant = true;
-      }
-      if (isRecoverableFailedTurnChatV2Notice(item)) {
-        const noticeOrderKey = item.sort_key ?? null;
-        if (latestUserOrderKey === null || noticeOrderKey === null || noticeOrderKey > latestUserOrderKey) {
-          sawFailureNotice = true;
-        }
-      }
-    }
-    return !sawCompletedAssistant && sawFailureNotice ? (latestUserTurnId ?? null) : null;
   }
 
   function findPendingStepRequestInputCallFromChatV2(): ReturnType<typeof selectPendingInputToolCall> {
@@ -9032,6 +8977,7 @@ import X from 'lucide-svelte/icons/x';
       await chatV2Api.retryTurn(currentConversation.conversation_id, turnId, {
         client_txn_id: crypto.randomUUID()
       });
+      suppressedRecoverableTurnId = turnId;
       lastRecoverableMessage = '';
       lastRecoverableTurnId = null;
       await recoverChatV2Canonical(currentConversation.conversation_id);
@@ -9163,7 +9109,7 @@ import X from 'lucide-svelte/icons/x';
     try {
       const beforeIds = new Set(renderableVisibleItems.map(item => item.id));
       const beforeCursor = olderMessagesCursor;
-      const response = await bindTimeline(conversationId).older(olderMessagesCursor, controller.signal);
+      const response = await bindTimeline(conversationId).olderVisible(olderMessagesCursor, controller.signal);
       if (
         controller.signal.aborted
         || currentConversation?.conversation_id !== conversationId
@@ -9287,7 +9233,7 @@ import X from 'lucide-svelte/icons/x';
         requestLoadId = loadRequestId;
         olderMessagesAbortController?.abort();
         olderMessagesAbortController = controller;
-        const response = await bindTimeline(conversationId).older(olderMessagesCursor, controller.signal);
+        const response = await bindTimeline(conversationId).olderVisible(olderMessagesCursor, controller.signal);
         if (
           controller.signal.aborted
           || currentConversation?.conversation_id !== conversationId
@@ -10332,6 +10278,11 @@ import X from 'lucide-svelte/icons/x';
     await loadConversationPage(true);
   }
 
+  provideChatNavigation(
+    () => childView ? childViewScope(childView) : conversationTimelineScope(currentConversation?.conversation_id ?? routeConversationId),
+    handleViewSession,
+  );
+
   function handleViewSession(sessionId: string, selectedNode?: WorkstreamRef): void {
     if (!currentConversation) return;
     const nodes = scopedRootActivityOverview?.workstreams ?? [];
@@ -10452,48 +10403,33 @@ import X from 'lucide-svelte/icons/x';
     });
   }
 
+  let childManagedSelectionGeneration = 0;
+  $effect(() => {
+    childView?.sessionId;
+    childView?.conversationId;
+    childManagedSelectionGeneration += 1;
+    childManagedBusy = null;
+  });
+
   async function runChildManagedAction(
     action: 'stop' | 'send' | 'take-control',
     payload?: Record<string, unknown>,
   ): Promise<void> {
     if (!childManagedConversation || childManagedBusy) return;
-    if (action === 'take-control') {
-      const confirmed = await confirmAction({
-        title: 'Take control of managed conversation?',
-        message: 'The managed conversation will be closed read-only and forked into a normal conversation.',
-        confirmLabel: 'Take control',
-      });
-      if (!confirmed) return;
-    }
     childManagedBusy = action;
     childManagedError = '';
+    const conversationId = childManagedConversation.conversation_id;
+    const generation = childManagedSelectionGeneration;
     try {
-      const response = await api.conversations.managedAction(
-        childManagedConversation.conversation_id,
-        action,
-        payload,
-      );
-      if (response.managed_agent) {
-        childManagedConversation = {
-          ...childManagedConversation,
-          managed_agent: response.managed_agent,
-          has_active_turn: ['running', 'queued'].includes(response.managed_agent.turn_state ?? ''),
-        };
-      } else {
-        childManagedConversation = await api.conversations.detail(
-          childManagedConversation.conversation_id,
-          { includeState: false },
-        );
-      }
+      const result = await performManagedAction(childManagedConversation, action, payload);
+      if (generation !== childManagedSelectionGeneration || childManagedConversation?.conversation_id !== conversationId) return;
+      if (result) childManagedConversation = result.conversation;
       scheduleTreeRefresh();
-      const followUpId = typeof response.result?.conversation_id === 'string'
-        ? response.result.conversation_id
-        : response.managed_agent?.follow_up_conversation_id;
-      if (action === 'take-control' && followUpId) await goto(conversationUrl(followUpId));
+      if (result?.followUpConversationId) await goto(conversationUrl(result.followUpConversationId));
     } catch (caughtError) {
-      childManagedError = asApiError(caughtError).message;
+      if (generation === childManagedSelectionGeneration && childManagedConversation?.conversation_id === conversationId) childManagedError = asApiError(caughtError).message;
     } finally {
-      childManagedBusy = null;
+      if (generation === childManagedSelectionGeneration && childManagedConversation?.conversation_id === conversationId) childManagedBusy = null;
     }
   }
 
@@ -10831,22 +10767,31 @@ import X from 'lucide-svelte/icons/x';
     return renderableVisibleItems.slice(start, end);
   });
   let displayedTimelineHasStreaming = $derived(displayedTimeline.some((item) => isInlineLiveChatV2Item(item)));
-  const retryableFailedTurnId = $derived.by(() =>
+  const failedTurnRecovery = $derived.by(() =>
     currentConversation
       && !turnInProgress
       && !awaitingAssistantStart
       && !pendingDirectQuestion
       && !directQuestionSubmitting
       && !isReadOnly(currentConversation)
-      ? (() => {
-          const turnId = retryableFailedTurnIdFromTailChatV2(displayedTimeline);
-          return turnId === suppressedRecoverableTurnId ? null : turnId;
-        })()
+      ? selectFailedTurnRecovery(chatV2Store.visibleItems, chatV2Store.snapshot.runtime, {
+          suppressedTurnId: suppressedRecoverableTurnId,
+        })
       : null
   );
-  const canRetryFailedTurn = $derived.by(() =>
-    retryableFailedTurnId !== null
-  );
+  const retryableFailedTurnId = $derived(failedTurnRecovery?.turnId ?? null);
+  $effect(() => {
+    if (lastRecoverableTurnId && (
+      turnInProgress || awaitingAssistantStart
+      || suppressedRecoverableTurnId === lastRecoverableTurnId
+      || (chatV2Store.snapshot.runtime?.authority
+        && chatV2Store.snapshot.runtime.authority.turn_id !== lastRecoverableTurnId)
+    )) {
+      error = '';
+      lastRecoverableTurnId = null;
+      lastRecoverableMessage = '';
+    }
+  });
   let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
   let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
 
@@ -11955,19 +11900,7 @@ import X from 'lucide-svelte/icons/x';
             >
               <Search class="h-4 w-4" />
             </button>
-            {#if inspectorPresentation === 'pinned' || (!headerInfoOpen && canPinInspector)}
-              <button
-                type="button"
-                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground"
-                aria-label={headerInfoOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'}
-                aria-expanded={headerInfoOpen}
-                aria-controls="conversation-info-drawer"
-                data-testid="chat-header-info"
-                onclick={toggleHeaderInfo}
-              >{#if headerInfoOpen}<ChevronsRight class="h-4 w-4" />{:else}<ChevronsLeft class="h-4 w-4" />{/if}</button>
-            {:else}
-              <SessionDetailsButton open={headerInfoOpen} loading={sessionInfoLoading} ariaControls="conversation-info-drawer" testId="chat-header-info" onclick={toggleHeaderInfo} />
-            {/if}
+            <SessionDetailsButton open={headerInfoOpen} loading={sessionInfoLoading} ariaControls="conversation-info-drawer" testId="chat-header-info" onclick={toggleHeaderInfo} />
           </div>
         </div>
       </div>
@@ -12032,9 +11965,6 @@ import X from 'lucide-svelte/icons/x';
              <h3 class="mb-2 text-xs font-semibold uppercase tracking-widest text-quiet">Conversation</h3>
              {@render conversationMetadata('sidebar')}
            </section>
-           {#if !childView}
-             <TimelineDiagnosticExport clientState={chatV2Store.snapshot} visibleItems={chatV2Store.visibleItems} />
-           {/if}
            {#if focusedSessionId}
               <button type="button" class="mb-3 inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover" onclick={navigateToStructuralParent}>
                <ArrowLeft class="h-3.5 w-3.5" /> Back
@@ -12086,7 +12016,7 @@ import X from 'lucide-svelte/icons/x';
                    onViewSession={handleViewSession}
                 />
            {:else}
-          {#if !sessionInfo && latestRuntimeSelection?.sessionId === currentConversation.active_session_id}
+          {#if !sessionInfo && latestRuntimeSelection && latestRuntimeSelection.sessionId === currentConversation.active_session_id}
             <section class="text-xs text-secondary" data-testid="pending-session-selected-runtime">
               <p>Selected for next message</p>
               <p>Profile: {latestRuntimeSelection.selection.profile_id}</p>
@@ -12101,6 +12031,9 @@ import X from 'lucide-svelte/icons/x';
             {@const panelContextUsage = mergeContextUsage(activeContextUsage(), loadedSessionInfo.context_usage ?? null)!}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
             {#if true}
+              {#snippet timelineDiagnosticsFooter()}
+                <TimelineDiagnosticExport clientState={chatV2Store.snapshot} visibleItems={chatV2Store.visibleItems} />
+              {/snippet}
               <SessionDetailsContent
                 detail={sessionInfo}
                 sessionId={focusedSessionId ?? currentConversation.active_session_id ?? sessionInfo.intaris_session_id}
@@ -12125,6 +12058,7 @@ import X from 'lucide-svelte/icons/x';
                 onArchive={canManageInspectorConversationLifecycle ? archiveConversation : undefined}
                 onRestore={canManageInspectorConversationLifecycle ? restoreConversation : undefined}
                 onDelete={canManageInspectorConversationLifecycle ? deleteConversation : undefined}
+                runtimeDetailsFooter={!childView ? timelineDiagnosticsFooter : undefined}
              />
             {:else}
             {#if narrativeText}
@@ -12459,7 +12393,7 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if error}
+        {#if error && !failedTurnRecovery && !lastRecoverableTurnId}
           <div class="rounded-2xl border border-danger-border bg-danger-subtle px-3 py-3 text-sm text-danger">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="min-w-0 flex-1 break-words">{error}</p>
@@ -12480,15 +12414,23 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if !error && canRetryFailedTurn}
-          <div class="rounded-2xl border border-danger-border bg-danger-subtle px-3 py-3 text-sm text-danger">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <p class="min-w-0 flex-1 break-words">
-                The last turn failed after your message. Retry it instead of typing continue.
-              </p>
-              <Button size="sm" variant="secondary" onclick={continueFailedTurn}>Retry failed turn</Button>
-            </div>
-          </div>
+        {#if failedTurnRecovery}
+          <RecoveryBanner message={failedTurnRecovery.message} actionLabel="Retry failed turn" onRetry={continueFailedTurn}>
+            {#if failedTurnRecovery.providerId && failedTurnRecovery.model && currentConversation}
+              {@const retryConversationId = currentConversation.conversation_id}
+              <RateLimitProviderSwitch
+                conversationId={retryConversationId}
+                turnId={failedTurnRecovery.turnId}
+                providerId={failedTurnRecovery.providerId ?? null}
+                model={failedTurnRecovery.model ?? null}
+                onResponse={async (response) => {
+                  if (currentConversation?.conversation_id === retryConversationId) await applyCommandResponse(response);
+                }}
+              />
+            {/if}
+          </RecoveryBanner>
+        {:else if error && lastRecoverableTurnId && !turnInProgress && !awaitingAssistantStart}
+          <RecoveryBanner message={error} onRetry={retryLastTurn} />
         {/if}
 
         {#if initialLoadTimedOut && !currentConversation && !error && !connectivityOwnsNotices}

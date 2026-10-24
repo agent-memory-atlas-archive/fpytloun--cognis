@@ -4,6 +4,22 @@
 
 ### Shared browser timeline ownership
 
+`ChatWorkspace.svelte` owns the reusable dashboard, pinned, and task-log shell:
+responsive inspector, nested-session selection, structural parent return, and
+managed controls. Surface adapters supply canonical scope and read-only policy.
+All hosts retain the existing timeline controller, viewport, and item-renderer
+owners; main-chat windowing and search remain view-local. User-requested backfill
+crosses a bounded sequence of event-only pages in the shared controller, so a
+top-edge scrollbar does not require a second wheel event. Read-only scopes do
+not hydrate or overwrite conversation drafts.
+
+Task-step and session REST reads and WebSocket subscriptions opt into root-session
+continuation lookup. It follows only `previous_session_id` edges in the same
+owner/conversation/agent/parent/activity/delegation lane. Source-session forks
+remain separate attempts. Route authorization, read transactions, live execution,
+cancellation, and persistence ownership are unchanged; no content is copied and
+no schema, write, lock, or retry lifecycle is added.
+
 Canonical append notifications wake local readers before remote cluster
 publication, including when cluster transport is disabled or fails. An admission
 hint can precede persistence; it is not a substitute for this post-append wake-up.
@@ -107,6 +123,19 @@ history renders. Live work, missing or conflicting coordinates, and canonical
 identity matches remain eligible for merging. Suppression does not delete stored
 items or change runtime authority; backfill restores older canonical history in
 its canonical position.
+
+Completed local admissions and rotated compaction cards can also outlive the
+canonical page containing them. Their sentinel keys must not place proven
+pre-window history after recent activity. For a partial conversation window,
+`local-history-placement.ts` gives eligible local copies a presentation-only
+position immediately before its durable head. An identified admission requires
+head execution in its turn, execution in a later different turn, no active
+same-turn authority, and no queue or canonical confirmation. A completed rotation
+requires its target to match the head's unambiguous Intaris source session.
+Ambiguous, live, runtime-supplied, and unconfirmed rows keep their placement.
+This bucket preserves deterministic fallback order, not reconstructed chronology.
+Canonical backfill takes precedence; raw keys, source references, cache state,
+runtime authority and membership are never modified.
 
 Native tool-input progress is not tool admission: it must neither advance the
 assistant phase nor clear the preceding assistant stream before persistence.

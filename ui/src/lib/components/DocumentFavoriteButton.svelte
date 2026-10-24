@@ -3,7 +3,7 @@
   import { auth } from '$lib/stores/auth';
   import { favoriteItems, favoriteKey, loadFavorite, saveFavorite } from '$lib/document-favorites';
   import type { LibraryItem, LibraryKind } from '$lib/library';
-  let { kind, id, initial }: { kind: LibraryKind; id: string; initial?: LibraryItem } = $props();
+  let { kind, id, initial, showLabel = false }: { kind: LibraryKind; id: string; initial?: LibraryItem; showLabel?: boolean } = $props();
   let busy = $state(false);
   let error = $state('');
   const item = $derived($favoriteItems[favoriteKey(kind, id)]);
@@ -30,6 +30,7 @@
     aria-pressed={item?.is_favorite ?? false} disabled={busy || (!item && !error)}
     title={error || (item?.is_favorite ? 'Remove from favorites' : 'Add to favorites')} onclick={toggle}>
     <Star size={14} fill={item?.is_favorite ? 'currentColor' : 'none'} />
+    {#if showLabel}<span>{item?.is_favorite ? 'Remove from favorites' : 'Add to favorites'}</span>{/if}
   </button>
   {#if error}<span role="status" class="sr-only">{error}</span>{/if}
 {/if}

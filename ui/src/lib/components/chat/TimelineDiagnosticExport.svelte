@@ -1,7 +1,8 @@
 <script lang="ts">
   import { version } from '$app/environment';
   import Download from 'lucide-svelte/icons/download';
-  import { captureClientDiagnostic } from '$lib/chat-v2/client-diagnostic';
+  import { captureClientDiagnostic, clientDiagnosticFilename } from '$lib/chat-v2/client-diagnostic';
+  import Button from '$lib/components/ui/Button.svelte';
   import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
   import type { TimelineItem } from '$lib/chat-v2/types';
 
@@ -20,7 +21,7 @@
       });
       url = URL.createObjectURL(new Blob([JSON.stringify(capture, null, 2)], { type: 'application/json' }));
       anchor.href = url;
-      anchor.download = 'cognis-chat-diagnostic.json';
+      anchor.download = clientDiagnosticFilename(capture.scope.conversation_id);
       document.body.appendChild(anchor);
       anchor.click();
     } catch {
@@ -36,20 +37,23 @@
   }
 </script>
 
-<details class="rounded-lg border border-border p-3 text-xs" data-testid="timeline-diagnostic-export">
-  <summary class="cursor-pointer text-muted">Chat diagnostics</summary>
-  <p class="mt-2 text-quiet">
-    Export IDs and ordering metadata from this device. No message text, tool inputs or outputs are included.
-    The file stays on your device unless you share it.
-  </p>
-  <button
-    type="button"
-    class="mt-3 inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-muted transition hover:bg-surface-hover hover:text-strong disabled:opacity-50"
+<section class="mt-4 space-y-3 border-t border-separator pt-3" aria-label="Chat diagnostics" data-testid="timeline-diagnostic-export">
+  <div class="space-y-1">
+    <h4 class="text-xs font-medium text-foreground">Chat diagnostics</h4>
+    <p class="text-xs leading-5 text-quiet">
+      Export IDs and ordering metadata from this device. No message text, tool inputs or outputs are included.
+      The file stays on your device unless you share it.
+    </p>
+  </div>
+  <Button
+    variant="secondary"
+    size="sm"
+    class="min-h-[44px] w-full gap-2 sm:w-auto"
     disabled={!clientState.scopeKey}
     onclick={download}
   >
-    <Download class="h-3.5 w-3.5" />
+    <Download class="h-3.5 w-3.5" aria-hidden="true" />
     Download chat diagnostics
-  </button>
-  {#if failed}<p role="alert" class="mt-2 text-danger">Could not prepare the diagnostic file. Please try again.</p>{/if}
-</details>
+  </Button>
+  {#if failed}<p role="alert" class="text-xs text-danger">Could not prepare the diagnostic file. Please try again.</p>{/if}
+</section>

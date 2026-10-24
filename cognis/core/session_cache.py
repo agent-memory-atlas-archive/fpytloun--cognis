@@ -49,6 +49,7 @@ from cognis.core.project_context import (
     project_metadata_from_event_data,
 )
 from cognis.core.redis_service import RedisService
+from cognis.core.tool_output_recovery import COMPACT_RESULT_RENDERING_POLICY_VERSION
 from cognis.guardrails_redaction import redact_runtime_evidence
 from cognis.logging import get_logger
 from cognis.models.config import GenerationPerformanceSnapshot
@@ -3005,7 +3006,14 @@ class SessionCache:
                             "omit_event",
                             "omit_tool_group",
                         }
-                        or version != 1
+                        or not isinstance(version, int)
+                        or isinstance(version, bool)
+                        or version
+                        not in (
+                            (1, COMPACT_RESULT_RENDERING_POLICY_VERSION)
+                            if operation == "compact_result"
+                            else (1,)
+                        )
                         or not parameters_are_bounded_numeric
                         or len(json.encode(parameters)) > 512
                     ):

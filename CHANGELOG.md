@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [0.18.2] - 2026-10-24
+
+### Highlights
+
+- **Cognis on your Mac.** Menu-bar chats, pinned conversations, native notifications, and simple tool approvals.
+- **Reusable agent hooks.** Configure reminders, memory consolidation, and skill learning, and inspect hook runs in chat.
+- **Continue elsewhere with `/handoff`.** Prepare a continuation brief to copy or open in a new conversation.
+- **A Library for ongoing work.** Organize documents, inspect revisions, manage sharing, and favorite deliverables.
+- **Make the workspace yours.** Porcelain, Classic, Gruvbox, and Paper themes with Light, Dark, and System modes.
+- **Offline continuity.** Read cached PWA content, queue uploads, and switch between cached chats faster.
+- **Find work with Spotlight.** Search agents, conversations, projects, tasks, and Library documents.
+- **Latest recovery and chat fixes.** Concise tool-output recovery guidance, compact session headers, correct attempt ordering, and historical-window placement.
+
+### Changed
+
+- Chat deliverables now flow with assistant responses, using chat typography and colors without a nested document frame. Right-aligned icons provide fullscreen, download, sharing, and responsive contents navigation; less frequent actions live under the three-dot control. Revision history stays below the content. Fullscreen and standalone readers retain their publication layout.
+- Move chat diagnostic downloads to the bottom of the Session tab's collapsed context and runtime details, match the session panel styling, and include the conversation identifier in the filename.
+- Keep the documented incomplete regression baseline: no further unit, contract, GUI/browser, or live-model tests are rerun at the operator's request, and skipped checks are not passing qualification. Ad-hoc Mac packages remain unnotarized and use normal app-icon/text notifications.
+### Fixed
+
+- Reduce prompt-cache invalidation by reusing accepted within-turn context when only a soft sizing target is crossed, while retaining exact pressure checks, protected evidence, and durable projection decisions.
+- Keep completed local admissions and session compactions that demonstrably precede a partial history window before that window, instead of trailing recent activity. Preserve canonical history, live work and cached source data.
+- Unify compact task and subsession headers with consistent info controls, chronological attempt selection below the step title, and a subtle running indicator without redundant follow labels or refresh rows.
+- Reduce repeated tool-output recovery guidance in context placeholders and truncated previews while preserving recovery handles, anchors, artifact references, and existing replayed context.
+- Use the standard square-and-up-arrow share icon consistently across document readers and native attachment sharing, keeping it distinct from copy-link and open-in-new-window controls.
+- Chat now opens reliably after sign-in or delayed device-storage initialization without requiring a detour through the dashboard.
+- Restore Classic Dark's original translucent warning, success, error, and information colors in deliverables, including callouts, badges, and status treatments. Other themes now preserve semantic background and border transparency.
+- Restore Classic as the default theme and its subdued dark color treatments, improve neutral Porcelain surfaces and Paper typography, and align tool, approval, queued-message and mobile overlay styling with the selected theme family.
+
+  Explicitly accept a 405 KiB chat-critical JavaScript budget for this release's measured 402.0 KiB graph; CSS and largest-chunk limits remain unchanged.
+- Recover transient inference admission failures and preserve provider-directed waits in task steps without spending workflow quality attempts. Failed turns and tasks show the actual error with a recovery action; chat recovery controls clear when execution resumes or a newer message supersedes the failure, including after reconnect.
+- Task logs retain compacted session history, expose earlier retry attempts, and share the dashboard and pinned chat workspace with work inspection and parent navigation. Upward history loading advances through event-only pages without requiring another scroll gesture.
+- Allow task retries after pre-execution setup failures to create their first step session when the current attempt has no execution evidence, while keeping missing previously-started context and history-dependent initialization fail-closed.
 ## [0.18.1] - 2026-10-24
 
 ### Highlights

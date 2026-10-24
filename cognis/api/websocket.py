@@ -2443,7 +2443,7 @@ class WebSocketConnectionManager:
 
         async with factory() as db_session:
             rows, truncated = await get_child_session_continuation_chain(
-                db_session, scope.session_id
+                db_session, scope.session_id, include_root=True
             )
         # An unsubscribe/replacement while the query was pending owns the state.
         if connection.chat_v2_scopes.get(scope.key) is not scope:
@@ -4591,7 +4591,7 @@ async def _handle_chat_v2_subscribe(
 
         async with app.state.session_factory() as db_session:
             rows, truncated = await get_child_session_continuation_chain(
-                db_session, scope.session_id
+                db_session, scope.session_id, include_root=True
             )
         if truncated or not rows:
             await manager.send_error(

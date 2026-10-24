@@ -2434,6 +2434,7 @@ export interface WorkflowState {
   pending_pause_type?: string | null;
   pending_pause_payload?: Record<string, unknown> | null;
   current_step_status?: string | null;
+  resume_failed_step?: boolean;
 }
 
 export interface Dependency {

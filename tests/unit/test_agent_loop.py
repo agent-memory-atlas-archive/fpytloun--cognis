@@ -17094,7 +17094,7 @@ async def test_partial_tool_call_is_discarded_after_named_rejection() -> None:
         ("content_policy", 1, False),
     ],
 )
-@pytest.mark.parametrize("output_mode", ["legacy", "native", "empty", "role"])
+@pytest.mark.parametrize("output_mode", ["legacy", "native", "empty", "role", "admission"])
 async def test_exhausted_model_stream_requests_bounded_successor(
     category: str, attempts: int, successor: bool, output_mode: str
 ) -> None:
@@ -17112,7 +17112,11 @@ async def test_exhausted_model_stream_requests_bounded_successor(
                 yield {"choices": [{"delta": {"content": "Incomplete output"}}]}
             raise LLMStreamProviderError(
                 "Stream failed",
-                payload={"category": category, "message": "Stream failed"},
+                payload={
+                    "category": category,
+                    "message": "Stream failed",
+                    "recovery_exhausted": output_mode not in {"legacy", "admission"},
+                },
             )
 
     fake_llm = FailingLLM()
@@ -24796,9 +24800,9 @@ async def test_finalize_regular_tool_result_derives_producer_truncation_and_reco
     event_data = recorded_events[-1].data
     assert event_data["result"] == messages[-1]["content"]
     assert event_data["result"] != raw_output
-    assert "Recover with call_id 'call-final'" in event_data["result"]
+    assert "Recover only if needed: read_tool_output(call_id='call-final')" in event_data["result"]
     assert "call-final" in event_data["result"]
-    assert "list_tool_output_anchors" in event_data["result"]
+    assert "Anchors: media:1." in event_data["result"]
     assert "read_tool_output" in event_data["result"]
     assert event_data["agent_visible"] is True
     assert event_data["agent_visible_truncated"] is False

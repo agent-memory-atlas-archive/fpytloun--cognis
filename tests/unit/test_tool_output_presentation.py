@@ -45,8 +45,9 @@ def test_recovery_hint_includes_anchor_tools_only_with_anchors() -> None:
         anchors=["errors"],
     )
 
-    assert "list_tool_output_anchors(call_id='call_1')" in presentation.result
-    assert "read_tool_output_anchor(call_id='call_1', anchor='errors')" in presentation.result
+    assert "read_tool_output(call_id='call_1')" in presentation.result
+    assert "Anchors: errors." in presentation.result
+    assert presentation.result.count("call_1") == 1
     assert presentation.anchors_available
     assert presentation.anchor_count == 1
 

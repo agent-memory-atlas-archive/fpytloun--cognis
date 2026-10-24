@@ -131,7 +131,7 @@
   </div>
 {:else if item.kind === 'assistant_deliverable'}
   <div data-kind="assistant_deliverable" class="flex min-w-0 w-full max-w-full justify-start">
-    <AssistantDeliverableBlock item={item as AssistantDeliverableTimelineItem} />
+    <AssistantDeliverableBlock item={item as AssistantDeliverableTimelineItem} conversational />
   </div>
 {:else if item.kind === 'user_interaction'}
   <div data-kind="user_interaction" class="flex min-w-0 justify-end">

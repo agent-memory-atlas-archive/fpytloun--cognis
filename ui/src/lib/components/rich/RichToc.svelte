@@ -14,6 +14,7 @@
   // navigation state and avoid switching between sidebar/drawer modes.
   export let visible = true;
   export let dismissibleSidebar = false;
+  export let side: 'left' | 'right' = 'left';
   export let onClose: (() => void) | undefined = undefined;
   export let layout: 'auto' | 'sidebar' | 'drawer' = 'auto';
   export let theme: 'light' | 'dark' | undefined = undefined;
@@ -213,7 +214,7 @@
     {#if dismissibleSidebar}<header>
       <strong>Contents</strong>
       <button type="button" aria-label="Close table of contents" on:click={() => void closeSidebar()}>
-        <ViewerIcon name="collapse" />
+        <ViewerIcon name={side === 'right' ? 'expand' : 'collapse'} />
       </button>
     </header>{/if}
     <nav aria-label="Table of contents">

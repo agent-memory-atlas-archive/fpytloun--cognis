@@ -18,8 +18,11 @@ from cognis.core.redis_service import RedisUnavailableError
 from cognis.providers.llm.availability import AvailabilityPermit, InferenceAvailability
 from cognis.providers.llm.bindings import BindingSnapshot, InferenceBindings
 from cognis.providers.llm.errors import (
+    FastModeFallbackRequired,
+    LLMStreamFailure,
     LLMStreamProviderError,
     MidStreamErrorPayload,
+    OpenAIToolSearchFallbackRequired,
     classify_llm_exception,
 )
 from cognis.providers.llm.recovery_policy import RecoveryPolicy, RouteTarget
@@ -38,6 +41,7 @@ _RECOVERABLE = frozenset(
         "idle_timeout_raw",
         "idle_timeout_activity",
         "idle_timeout_reasoning",
+        "other",
     }
 )
 
@@ -446,6 +450,10 @@ class InferenceRecovery:
                                     yield buffered
                             await self._report("success", permit, policy)
                             return
+                        except (FastModeFallbackRequired, OpenAIToolSearchFallbackRequired):
+                            # These signals request a changed provider request,
+                            # not an identical transport retry or route fallback.
+                            raise
                         except Exception as exc:
                             if (
                                 isinstance(exc, (IncompatibleCandidate, InferenceUnavailable))
@@ -485,9 +493,9 @@ class InferenceRecovery:
                                         retry_after_seconds=_retry_after(payload),
                                         failure_category=str(category),
                                     )
-                                raise
+                                raise self._exhausted(exc) from exc
                             if not replay_safe or not (recoverable or quota):
-                                raise
+                                raise self._exhausted(exc) from exc
                             now = time.monotonic()
                             if budget.recovery_until is None:
                                 budget.recovery_until = now + policy.target_recovery_window_seconds
@@ -551,6 +559,15 @@ class InferenceRecovery:
             raise self._unavailable(last_error, route_delay, category)
 
     @staticmethod
+    def _exhausted(exc: Exception) -> Exception:
+        payload = classify_llm_exception(exc)
+        payload["recovery_exhausted"] = True
+        if isinstance(exc, LLMStreamFailure):
+            exc.payload = payload
+            return exc
+        return LLMStreamProviderError(str(exc), payload=payload)
+
+    @staticmethod
     def _unavailable(
         last_error: Exception | None, delay: float | None, category: str | None
     ) -> Exception:
@@ -561,12 +578,16 @@ class InferenceRecovery:
             if delay is not None:
                 return LLMStreamProviderError(
                     str(last_error),
-                    payload={**classify_llm_exception(last_error), "retry_after_seconds": delay},
+                    payload={
+                        **classify_llm_exception(last_error),
+                        "retry_after_seconds": delay,
+                        "recovery_exhausted": True,
+                    },
                 )
-            return last_error
+            return InferenceRecovery._exhausted(last_error)
         if category:
-            return InferenceUnavailable(delay or 0, category=category)
-        return last_error or InferenceUnavailable(delay or 0)
+            return InferenceRecovery._exhausted(InferenceUnavailable(delay or 0, category=category))
+        return InferenceRecovery._exhausted(last_error or InferenceUnavailable(delay or 0))
 
     async def _admit(
         self, candidate: InferenceCandidate, plan: InferencePlan, deadline: float

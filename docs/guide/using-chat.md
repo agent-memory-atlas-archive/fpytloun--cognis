@@ -62,6 +62,17 @@ That first message is also used to bootstrap Intaris intention generation right 
 
 ## What the chat UI shows
 
+Recoverable model failures use bounded automatic retries. Errors that happen
+before provider recovery starts still receive the turn's retry allowance.
+Exhausting automatic retries does not remove the ability to retry manually:
+the red recovery bar shows the saved error cause and **Retry failed turn**.
+Assistant progress messages before the failure do not hide this action.
+
+The recovery bar belongs only to the latest unresolved request. It disappears
+when a retry starts, the request recovers, or you send a newer message. Reload,
+reconnect, and scrolling through history do not make an old failure actionable
+again. Historical error details remain available in the timeline.
+
 Depending on what the agent is doing, the conversation can display:
 
 - streaming assistant responses
@@ -75,6 +86,15 @@ Previously viewed conversations can show cached content immediately. Dashboard
 and pinned chats reconcile silently without inserting a refresh row above the
 messages. Refresh failures still offer recovery. Live invalidations received
 during a load retain a trailing refresh.
+
+Dashboard windows, pinned chats, and task logs share the same workspace and
+message presentation. Their inspector provides **Overview**, **Work**, and
+**Session** tabs and adapts to the available window width. Delegation and managed
+conversation cards use the same navigation as the work tree. The back arrow returns
+to the parent view; the link also supports opening the parent conversation in a
+new tab. Read-only task and child logs do not expose the normal chat composer.
+While a turn is running, three subtle dots at the transcript tail provide progress
+feedback; no follow-status banner is shown in the header or transcript.
 
 Full chat, dashboard windows, and pinned chats share one composer for each
 conversation: text, attachments, and message mode stay in sync. Opening an empty
@@ -518,8 +538,10 @@ When installed:
 ## Diagnosing device-specific history ordering
 
 If one device shows old messages or activity after recent history, open the
-conversation information panel (**ⓘ**), expand **Chat diagnostics**, and select
-**Download chat diagnostics** while the problem is visible.
+conversation information panel (**ⓘ**), select **Session**, expand
+**Show context & runtime details**, and select **Download chat diagnostics**
+at the bottom while the problem is visible. The filename includes the conversation
+identifier so captures from different conversations are easy to distinguish.
 
 The JSON file records that device's frontend build, projection version, item
 identities, source references, and sort keys. Canonical history, local fallbacks,

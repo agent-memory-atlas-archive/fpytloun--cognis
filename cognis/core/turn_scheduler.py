@@ -4255,7 +4255,6 @@ class TurnScheduler:
             False,
             replace(
                 error,
-                recoverable=False,
                 transient=False,
                 detail=detail,
             ),

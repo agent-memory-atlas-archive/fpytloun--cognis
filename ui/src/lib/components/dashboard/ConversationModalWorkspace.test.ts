@@ -1,11 +1,20 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { tick } from 'svelte';
 
 import ConversationModalWorkspace from './ConversationModalWorkspace.svelte';
+const requests = vi.hoisted(() => ({
+  detail: vi.fn(), managedAction: vi.fn(), activityOverview: vi.fn(), goto: vi.fn(),
+}));
+vi.mock('$app/navigation', () => ({ goto: requests.goto }));
+vi.mock('$lib/stores/confirm', () => ({ confirmAction: vi.fn(async () => true) }));
+vi.mock('$lib/chat-v2/api', () => ({ chatV2Api: { activityOverview: requests.activityOverview } }));
 
 vi.mock('$lib/api/client', () => ({
   api: {
     conversations: {
+      detail: requests.detail,
+      managedAction: requests.managedAction,
       sessions: vi.fn(async () => [
         {
           session_id: 'session-root',
@@ -39,6 +48,12 @@ let observedWidth = 1000;
 const resizeCallbacks = new Set<ResizeObserverCallback>();
 
 describe('ConversationModalWorkspace inspector', () => {
+  beforeEach(() => {
+    requests.detail.mockReset();
+    requests.managedAction.mockReset();
+    requests.goto.mockReset();
+    requests.activityOverview.mockReset().mockResolvedValue({ workstreams: [] });
+  });
   beforeAll(() => {
     vi.stubGlobal('ResizeObserver', class {
       constructor(private readonly callback: ResizeObserverCallback) {}
@@ -69,6 +84,71 @@ describe('ConversationModalWorkspace inspector', () => {
       configurable: true,
       value: () => true,
     });
+  });
+
+  it('uses the canonical root backing sessions, including successors of the selected session', async () => {
+    requests.activityOverview.mockResolvedValue({ workstreams: [{
+      key: 'root', root_key: 'root', session_id: 'session-next',
+      backing_session_ids: ['session-predecessor', 'session-root', 'session-next'],
+    }] });
+    const scopeChanged = vi.fn();
+    render(ConversationModalWorkspace, {
+      conversationId: 'conversation-one', sessionId: 'session-root', onDisplayedScopeChange: scopeChanged,
+    });
+    await waitFor(() => expect(screen.getByTestId('compact-chat-controller-sessions')).toHaveTextContent('session-predecessor,session-root,session-next'));
+    expect(scopeChanged).toHaveBeenLastCalledWith(expect.objectContaining({ key: 'conversation:conversation-one' }), 'session-next');
+  });
+
+  it('refreshes managed controls when a selected conversation becomes idle', async () => {
+    const managed = (turn_state: string) => ({
+      conversation_id: 'conversation-managed-a', has_active_turn: turn_state === 'running',
+      managed_agent: { conversation_state: 'open', turn_state },
+    });
+    requests.detail.mockResolvedValue(managed('running'));
+    render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled());
+    expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-managed-a');
+    requests.detail.mockResolvedValue(managed('idle'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Runtime idle' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled());
+  });
+
+  it('opens the take-control follow-up when the managed conversation remains selected', async () => {
+    requests.detail.mockImplementation(async (id: string) => ({
+      conversation_id: id, has_active_turn: false,
+      managed_agent: { conversation_state: 'open', turn_state: 'idle' },
+    }));
+    requests.managedAction.mockResolvedValue({
+      managed_agent: { conversation_state: 'closed', turn_state: 'idle' },
+      result: { conversation_id: 'conversation-follow-up-a' },
+    });
+    render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Take control' })).not.toBeDisabled());
+    await fireEvent.click(screen.getByRole('button', { name: 'Take control' }));
+    await waitFor(() => expect(requests.goto).toHaveBeenCalledWith('/chat/conversation-follow-up-a'));
+  });
+
+  it.each(['Continue', 'Take control'])('does not apply delayed %s to a subsequently selected conversation', async (actionLabel) => {
+    requests.detail.mockImplementation(async (id: string) => ({
+      conversation_id: id, has_active_turn: false,
+      managed_agent: { conversation_state: 'open', turn_state: 'idle' },
+    }));
+    let complete!: (response: unknown) => void;
+    requests.managedAction.mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled());
+    await fireEvent.click(screen.getByRole('button', { name: actionLabel }));
+    await waitFor(() => expect(requests.managedAction).toHaveBeenCalledOnce());
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-b' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled());
+    complete({ managed_agent: { conversation_state: 'open', turn_state: 'running' }, result: { conversation_id: 'conversation-follow-up-a' } });
+    await tick();
+    expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-managed-b');
+    expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled();
+    expect(requests.goto).not.toHaveBeenCalled();
   });
 
   beforeEach(() => {
@@ -188,7 +268,7 @@ describe('ConversationModalWorkspace inspector', () => {
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('session:session-child');
     expect(screen.getByTestId('dashboard-conversation-session-header')).toHaveTextContent('Child session');
     expect(screen.getByTestId('dashboard-conversation-chat')).toHaveClass('flex', 'flex-col');
-    await fireEvent.click(screen.getByRole('button', { name: 'Back to parent conversation' }));
+    await fireEvent.click(screen.getByRole('link', { name: 'Back to parent conversation' }));
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-one');
   });
 });

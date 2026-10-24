@@ -13,14 +13,12 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 
+from cognis.core.tool_output_recovery import format_recovery_hint
+
 # Minimum size below which middle-truncation is pointless — just
 # return the full text.  The marker itself takes ~120-200 chars.
 _MIN_TRUNCATION_SIZE = 500
 
-# How many real anchors to enumerate inline in the truncation marker.
-# More than this gets noisy and bloats the marker; the model can call
-# ``list_tool_output_anchors`` for the full set.
-_MAX_INLINE_ANCHORS = 5
 _SAFE_ANCHOR_RE = re.compile(r"[^A-Za-z0-9._:-]+")
 
 
@@ -194,28 +192,11 @@ def _build_marker(
             if name and name not in seen:
                 anchor_names.append(name)
                 seen.add(name)
-        has_anchors = bool(anchor_names)
-        recovery_calls = []
-        if has_anchors:
-            recovery_calls.append(f"list_tool_output_anchors(call_id='{call_id}')")
-        if anchor_names:
-            recovery_calls.append(
-                f"read_tool_output_anchor(call_id='{call_id}', anchor='{anchor_names[0]}')"
+        parts.append(
+            ". "
+            + format_recovery_hint(
+                call_id, anchor_names=anchor_names, anchors_available=bool(anchor_names)
             )
-        recovery_calls.extend(
-            [
-                f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword')",
-                f"read_tool_output(call_id='{call_id}')",
-            ]
         )
-        parts.append(", use " + ", ".join(recovery_calls))
-        if anchor_names:
-            preview = anchor_names[:_MAX_INLINE_ANCHORS]
-            suffix = (
-                ""
-                if len(anchor_names) <= _MAX_INLINE_ANCHORS
-                else f", +{len(anchor_names) - _MAX_INLINE_ANCHORS} more"
-            )
-            parts.append(f". Available anchors: {', '.join(preview)}{suffix}")
     parts.append("] ...\n\n")
     return "".join(parts)

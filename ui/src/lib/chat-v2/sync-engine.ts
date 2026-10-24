@@ -18,6 +18,7 @@ import type {
 import type { AttachmentRef } from '$lib/types/api';
 import { conversationTimelineScope, type TimelineScope } from './types';
 import { runtimeHistoryVisibility } from './runtime-history';
+import { localHistoryPlacement } from './local-history-placement';
 
 export type ChatV2SyncOutcome =
   | 'applied'
@@ -1058,6 +1059,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
 
   const visible = [...baseItems];
   const keepRuntimeHistory = runtimeHistoryVisibility(state.timelineItems);
+  const placeLocalHistory = localHistoryPlacement(state, canonicalIds, canonicalClientMessageIds);
   const visibleById = baseItems === state.timelineItems
     ? new Map(derived.timelineById)
     : buildTimelineById(baseItems);
@@ -1077,7 +1079,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
     ) {
       continue;
     }
-    upsertVisibleTimelineItem(visible, visibleById, item);
+    upsertVisibleTimelineItem(visible, visibleById, placeLocalHistory(item));
   }
   for (const item of runtimeItems) {
     if (!keepRuntimeHistory(item)) continue;

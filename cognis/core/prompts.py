@@ -170,7 +170,9 @@ use `include_domains` and `exclude_domains` instead of `site:` operators wheneve
 - Keep Tavily `query` values focused on the actual subject or identifier \
 rather than transport syntax. For exact identifiers, prefer shorter \
 queries and enable `exact_match` when appropriate.
-- For structured saved outputs such as numbered search results, prefer \
+- Recover omitted tool output only when a specific missing detail is needed. \
+Use the saved call_id with search_tool_output for a known term or \
+read_tool_output for paginated text. For structured saved outputs, prefer \
 list_tool_output_anchors then read_tool_output_anchor over reloading the \
 entire output."""
 

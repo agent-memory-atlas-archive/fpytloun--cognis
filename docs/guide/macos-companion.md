@@ -5,9 +5,9 @@ second chat client. Requires macOS 15+, Xcode/Swift 6 and Node/npm for builds.
 The initial public distribution is an **ad-hoc-signed prerelease**, not an Apple
 Developer ID-signed or notarized application. macOS or managed-device policy may
 restrict installation. GUI/browser acceptance remains unqualified for the initial
-0.18.1 prerelease; skipping it is not a passing result.
+0.18.2 prerelease; skipping it is not a passing result.
 
-Use the [macOS release](https://github.com/fpytloun/cognis/releases/tag/macos-v0.18.1)
+Use the [macOS release](https://github.com/fpytloun/cognis/releases/tag/macos-v0.18.2)
 for Apple Silicon and Intel disk images. Once the matching release and cask are
 published, install with:
 

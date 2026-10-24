@@ -15,6 +15,8 @@ ui/standalone-build/
 ui/coverage/
 ui/playwright-report/
 ui/test-results/
+ui/.chat-workspace-results/
+ui/e2e/window-drag/node_modules/
 ui/review-artifacts/
 cognis/ui_dist/
 .playwright-mcp/

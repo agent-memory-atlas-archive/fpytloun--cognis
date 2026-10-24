@@ -2221,6 +2221,21 @@ async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
 
+@router.post("/api/v1/tasks/{task_id}/retry", response_model=TaskActionResponse)
+async def task_retry(request: Request, task_id: str) -> TaskActionResponse:
+    """Resume a failed task from its saved workflow position, without cloning it."""
+    forbid_mutation_for_viewer(request)
+    task = await _require_task(request, task_id)
+    await _validate_agent_access(request, task.agent_id, task.project_id)
+    try:
+        task = await request.app.state.task_queue.retry_failed_task(
+            task_id, preserve_step_context=True
+        )
+    except ValueError as exc:
+        raise api_exception(409, "conflict", str(exc)) from exc
+    return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
+
+
 @router.post("/api/v1/tasks/{task_id}/rerun", response_model=TaskRerunResponse)
 async def task_rerun(request: Request, task_id: str) -> TaskRerunResponse:
     forbid_mutation_for_viewer(request)

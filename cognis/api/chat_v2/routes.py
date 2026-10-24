@@ -1701,7 +1701,9 @@ async def _load_session_context(request: Request, session_id: str) -> dict[str, 
         if conversation_row is None or getattr(conversation_row, "status", None) == "deleted":
             raise api_exception(404, "not_found", "Owning conversation not found")
         require_resource_owner(request, conversation_row.user_email)
-        session_rows, truncated = await get_child_session_continuation_chain(session, session_id)
+        session_rows, truncated = await get_child_session_continuation_chain(
+            session, session_id, include_root=True
+        )
         if truncated:
             raise api_exception(
                 409,
@@ -1745,7 +1747,7 @@ async def _load_task_step_context(request: Request, step_run_id: str) -> dict[st
             ):
                 raise api_exception(404, "not_found", "Task step session linkage is invalid")
             session_rows, truncated = await get_child_session_continuation_chain(
-                session, session_row.session_id
+                session, session_row.session_id, include_root=True
             )
             if truncated:
                 raise api_exception(
@@ -2387,7 +2389,9 @@ async def _retry_source_from_failed_turn(
     failed_turn_found = False
     completed_turn_found = False
     user_event: RawSessionEvent | None = None
-    for ref in reversed(session_refs):
+    user_events: dict[str, tuple[int, RawSessionEvent]] = {}
+    retry_sources: dict[str, str] = {}
+    for session_index, ref in reversed(list(enumerate(session_refs))):
         before_seq: int | None = None
         for _ in range(20):
             page = await _required_ref_reader(ref).read_session_events(
@@ -2401,6 +2405,18 @@ async def _retry_source_from_failed_turn(
             for event in page.events:
                 event_turn_id = _event_turn_id(event)
                 retry_source_turn_id = _str_or_none(event.data.get("retry_source_turn_id"))
+                if event_turn_id:
+                    if event.type == "user_message":
+                        prior = user_events.get(event_turn_id)
+                        if prior is None or (session_index, event.seq) > (prior[0], prior[1].seq):
+                            user_events[event_turn_id] = (session_index, event)
+                    if (
+                        event.type == "system_message"
+                        and event.data.get("kind") == "model_recovery"
+                        and retry_source_turn_id
+                        and retry_source_turn_id != event_turn_id
+                    ):
+                        retry_sources[event_turn_id] = retry_source_turn_id
                 if event.data.get("event") == "retry_source_consumed" and (
                     retry_source_turn_id == turn_id
                 ):
@@ -2418,6 +2434,19 @@ async def _retry_source_from_failed_turn(
             before_seq = page.first_seq
     if completed_turn_found:
         return None, False
+    source_turn_id = turn_id
+    visited: set[str] = set()
+    while source_turn_id in retry_sources and source_turn_id not in visited:
+        visited.add(source_turn_id)
+        source_turn_id = retry_sources[source_turn_id]
+    source = user_events.get(source_turn_id)
+    if source is not None:
+        user_event = source[1]
+        latest_user = max(user_events.values(), key=lambda item: (item[0], item[1].seq))
+        if (latest_user[0], latest_user[1].seq) > (source[0], source[1].seq):
+            # A newer request supersedes this failure, even if a late error
+            # arrived afterwards. Never retry an obsolete source message.
+            return None, False
     if failed_turn_found and user_event is not None:
         return (
             {

@@ -2,10 +2,18 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import RichViewerChrome from './RichViewerChrome.svelte';
 import RichDeliverable from './RichDeliverable.svelte';
+import ViewerIcon from './ViewerIcon.svelte';
 import { heroBadges } from './hero-badges';
 import { setViewerTheme } from './viewer-theme';
 
 describe('viewer chrome', () => {
+  it('uses the same square-and-up-arrow share glyph as native sharing controls', () => {
+    const { container } = render(ViewerIcon, { name: 'share' });
+    const icon = container.querySelector('[data-viewer-icon="share"]');
+    expect(icon).toHaveClass('lucide-share');
+    expect(icon).toHaveAttribute('aria-hidden', 'true');
+    expect(icon).not.toHaveClass('lucide-link', 'lucide-external-link', 'lucide-share-2');
+  });
   beforeEach(() => setViewerTheme('system'));
   afterEach(() => {
     document.documentElement.removeAttribute('data-resolved-theme');

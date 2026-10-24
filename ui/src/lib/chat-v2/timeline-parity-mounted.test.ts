@@ -161,6 +161,32 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     full.unmount();
   });
 
+  it('keeps chat diagnostics inside the Session tab context and runtime disclosure', async () => {
+    const activeConversation = { ...conversation, active_session_id: 'mounted-intaris-session' };
+    vi.mocked(api.conversations.detail).mockResolvedValue(activeConversation as never);
+    vi.mocked(chatV2Api.snapshot).mockImplementation(async () => ({
+      ...snapshot(), conversation: activeConversation,
+    }));
+    vi.spyOn(api.sessions, 'intarisDetail').mockResolvedValue({
+      intaris_session_id: 'mounted-intaris-session', intention: 'Synthetic session details',
+      summary: null, status: 'running', total_calls: 12, approved_count: 12, denied_count: 0, escalated_count: 0,
+    } as never);
+    const full = render(FullChat);
+    await screen.findByText('Canonical mounted parity row');
+    await fireEvent.click(screen.getByTestId('chat-header-info'));
+    expect(screen.queryByTestId('timeline-diagnostic-export')).toBeNull();
+    await fireEvent.click(screen.getByRole('tab', { name: /^Session$/ }));
+    const runtimeDetails = await screen.findByTestId('session-details-diagnostics');
+    const diagnostics = within(runtimeDetails).getByTestId('timeline-diagnostic-export');
+    expect(runtimeDetails).not.toHaveAttribute('open');
+    expect(runtimeDetails.lastElementChild).toBe(diagnostics);
+    await fireEvent.click(runtimeDetails.querySelector('summary')!);
+    expect(within(diagnostics).getByRole('button', { name: 'Download chat diagnostics' })).toBeEnabled();
+    await fireEvent.click(screen.getByRole('tab', { name: /^Overview$/ }));
+    expect(screen.queryByTestId('timeline-diagnostic-export')).toBeNull();
+    full.unmount();
+  });
+
   it.each(['command', 'clarification'])('consumes an autosaved %s without restoring it on reopen', async kind => {
     const value = kind === 'command' ? '/help' : 'The clarification answer';
     if (kind === 'clarification') {
@@ -297,7 +323,7 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
         const header = full.container.querySelector<HTMLElement>('[data-testid="child-header"]');
         expect(header).not.toBeNull();
         expect(header!.isConnected).toBe(true);
-        await fireEvent.click(within(header!).getByRole('button', { name: 'Back to parent conversation' }));
+        await fireEvent.click(within(header!).getByRole('link', { name: 'Back to parent conversation' }));
         await waitFor(() => expect(full.container.querySelector('[data-testid="child-header"]')).toBeNull());
         expect(keys()).toEqual(before);
       }

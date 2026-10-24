@@ -23,6 +23,7 @@
   let loadingSlowTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let resolution = 0;
+  let requestedLocation: string | null = null;
 
   function storedAgentIds(value: string | null): string[] {
     if (!value || value === 'all') return [];
@@ -189,7 +190,17 @@
     }
   }
 
+  function openRequestedConversation(): void {
+    const location = window.location.href;
+    if (disposed || requestedLocation === location) return;
+    requestedLocation = location;
+    void openDefaultConversation();
+  }
+
   onMount(() => {
+    // Auth and device-storage gates may mount this page after navigation finished.
+    // Do not rely on afterNavigate to deliver that already-completed navigation.
+    openRequestedConversation();
     return () => {
       disposed = true;
       resolution++;
@@ -197,7 +208,7 @@
     };
   });
   // SvelteKit reuses this page when only the requested main agent changes.
-  afterNavigate(() => { void openDefaultConversation(); });
+  afterNavigate(openRequestedConversation);
 </script>
 
 <svelte:head>

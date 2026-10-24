@@ -1,13 +1,12 @@
 <script lang="ts">
-  import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+  import ParentChatLink from './ParentChatLink.svelte';
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
-  import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
-  import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
   import X from 'lucide-svelte/icons/x';
   import ExternalLink from 'lucide-svelte/icons/external-link';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
-  import LiveDots from '$lib/components/LiveDots.svelte';
+  import SessionLogHeader from './SessionLogHeader.svelte';
+  import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
   import ScopedChatV2Timeline, { type ScopedChatV2Realtime } from './ScopedChatV2Timeline.svelte';
   import type { ChatV2ApiClient } from '$lib/chat-v2/api';
   import TimelineOngoingWorkDrawer from '$lib/components/timeline/TimelineOngoingWorkDrawer.svelte';
@@ -19,7 +18,6 @@
   import { onDestroy } from 'svelte';
   import {
     displaySessionStatus,
-    isEffectiveSessionRunning,
     isTerminalSessionStatus,
   } from '$lib/session-status';
 
@@ -41,7 +39,6 @@
   const displayName = $derived(node.agent_display_name ?? agent?.display_name ?? agent?.name ?? node.agent_id);
   const avatarUrl = $derived(node.agent_avatar_url ?? agent?.avatar_url ?? null);
   const normalizedStatus = $derived(displaySessionStatus(node.status, node.activity_state, false, node.execution_state));
-  const executionActive = $derived(isEffectiveSessionRunning(node.status, node.activity_state, false, node.execution_state));
   async function copySessionId(): Promise<void> {
     await navigator.clipboard?.writeText(view.sessionId);
     copied = true;
@@ -58,42 +55,34 @@
   style="padding-bottom: var(--app-bottom-control-inset);"
   data-testid="child-chat-view"
 >
-  <header
-    class="app-keyboard-stable-header chat-header-shell relative z-20 flex shrink-0 items-center gap-2 border-b border-separator px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3"
-    style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));"
-    data-testid="child-header"
-  >
-    <button class="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-muted hover:bg-surface-hover hover:text-strong sm:h-8 sm:w-8" type="button" aria-label="Back to parent conversation" onclick={onBack}><ArrowLeft class="h-4 w-4" /></button>
-    <AgentAvatar name={displayName} {avatarUrl} class="h-8 w-8 shrink-0" />
-    <div class="min-w-0 flex-1">
-      <h2 class="truncate text-sm font-semibold text-foreground">{node.title}</h2>
-      <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted">
+  <SessionLogHeader title={node.title} testId="child-header">
+    {#snippet leading()}
+      <ParentChatLink conversationId={view.controllerRootConversationId} {onBack} />
+      <AgentAvatar name={displayName} {avatarUrl} class="h-8 w-8 shrink-0" />
+    {/snippet}
+    {#snippet metadata()}
+      <div class="flex min-w-0 gap-1 text-xs text-muted">
         <span class="truncate text-foreground">{displayName}</span>
-        {#if node.agent_profile_id}<span class="hidden sm:inline">profile {node.agent_profile_id}</span>{/if}
-        {#if node.model}<span class="hidden sm:inline">{node.model}</span>{/if}
-        {#if node.reasoning_effort}<span class="hidden sm:inline">thinking {node.reasoning_effort}</span>{/if}
-        <span>{view.kind}</span><span>{normalizedStatus}</span>
-        {#if executionActive}<LiveDots inline size="sm" tone={userScrolledUp ? 'slate' : 'sky'} label={userScrolledUp ? 'Live follow paused' : 'Following latest'} />{/if}
+        <span aria-hidden="true">·</span><span class="shrink-0">{normalizedStatus}</span>
       </div>
-    </div>
-    <div class="flex shrink-0 items-center gap-0.5 sm:gap-1.5" data-testid="child-header-actions">
-      <button class="flex h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 font-mono text-[10px] text-quiet hover:bg-surface-hover hover:text-foreground sm:h-8 sm:min-w-0 sm:px-1.5 sm:py-1" type="button" aria-label="Copy canonical session ID" title="Copy canonical session ID" onclick={() => void copySessionId()}>
-        <span class="hidden sm:inline">{view.sessionId.slice(0, 12)}</span>
-        {#if copied}<Check class="h-3.5 w-3.5 text-success sm:h-3 sm:w-3" />{:else}<Copy class="h-3.5 w-3.5 sm:h-3 sm:w-3" />{/if}
+    {/snippet}
+    {#snippet actions()}
+      <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground" type="button" aria-label="Copy canonical session ID" title="Copy canonical session ID" onclick={() => void copySessionId()}>
+        {#if copied}<Check class="h-4 w-4 text-success" />{:else}<Copy class="h-4 w-4" />{/if}
       </button>
       {#if view.kind === 'managed'}
         <a
-          class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 sm:h-8 sm:w-8"
+          class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
           href={`/chat/${encodeURIComponent(view.conversationId)}`}
           target="_blank"
           rel="noopener noreferrer"
           aria-label={`Open ${node.title} in new window`}
         ><ExternalLink class="h-4 w-4" /></a>
       {/if}
-      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground sm:h-8 sm:w-8" type="button" aria-label={inspectorOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'} aria-expanded={inspectorOpen} aria-controls="conversation-info-drawer" data-testid="child-header-inspector" onclick={(event) => onToggleInspector(event.currentTarget as HTMLElement)}>{#if inspectorOpen}<ChevronsRight class="h-4 w-4" />{:else}<ChevronsLeft class="h-4 w-4" />{/if}</button>
-      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-muted hover:bg-surface-hover hover:text-strong sm:h-8 sm:w-8" type="button" aria-label="Close child conversation" onclick={onClose}><X class="h-4 w-4" /></button>
-    </div>
-  </header>
+      <SessionDetailsButton open={inspectorOpen} ariaControls="conversation-info-drawer" testId="child-header-inspector" onclick={(event) => onToggleInspector(event.currentTarget as HTMLElement)} />
+      <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-strong" type="button" aria-label="Close child conversation" onclick={onClose}><X class="h-4 w-4" /></button>
+    {/snippet}
+  </SessionLogHeader>
   {#if work.length || todos.length}
     <div class="shrink-0 px-4 pt-3">
       <TimelineOngoingWorkDrawer {todos} {work} truncated={workTruncated} bind:open={ongoingWorkOpen} {onViewSession} />

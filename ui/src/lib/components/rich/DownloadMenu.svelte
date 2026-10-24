@@ -6,6 +6,7 @@
   export let pdfUrl = '';
   export let htmlUrl = '';
   export let markdownUrl = '';
+  export let label = '';
 
   let root: HTMLDetailsElement;
 
@@ -39,7 +40,7 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <details bind:this={root} class="download-menu" on:keydown|capture={onMenuKeydown}>
-  <summary class="document-icon-action" aria-label="Download document" title="Download document"><ViewerIcon name="download" /></summary>
+  <summary class="document-icon-action" aria-label="Download document" title="Download document"><ViewerIcon name="download" />{#if label}<span>{label}</span>{/if}</summary>
   <!-- Re-measured when the menu opens (ResizeObserver sees it become visible). -->
   <div class="download-options" aria-label="Download format" use:keepInViewport>
     {#if pdfUrl}<a href={pdfUrl} on:click={close}>PDF</a>{/if}

@@ -22,7 +22,7 @@ function render(_: typeof RichDeliverable, props: { payload: unknown; surface?: 
 }
 
 describe('RichDeliverable component rendering', () => {
-  it('only applies the wide inline sidebar layout while the TOC is open', async () => {
+  it.each([false, true])('only applies the wide inline sidebar layout while the TOC is open (conversational=%s)', async (conversational) => {
     const resizeObserverDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'ResizeObserver');
     class WideResizeObserver {
       constructor(private readonly callback: ResizeObserverCallback) {}
@@ -37,6 +37,7 @@ describe('RichDeliverable component rendering', () => {
     try {
       const { container } = render(RichDeliverable, {
         surface: 'embedded',
+        conversational,
         content: 'Fallback',
         payload: {
           metadata: { toc: { enabled: true } },

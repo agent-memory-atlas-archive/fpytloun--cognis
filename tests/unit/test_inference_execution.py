@@ -75,6 +75,56 @@ async def service(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fallback", ["fast", "tool_search"])
+async def test_compatibility_fallback_signals_bypass_exhausted_transport_recovery(
+    service,
+    monkeypatch,
+    fallback,
+):
+    from cognis.providers.llm.errors import (
+        FastModeFallbackRequired,
+        OpenAIToolSearchFallbackRequired,
+    )
+
+    await InferenceRouteStore(service.session_factory).save(
+        NamedRouteConfig(
+            name="compatibility",
+            targets=[{"provider_id": "primary", "model": "gpt-4o-mini", "priority": 0}],
+            recovery={"max_retries_per_target": 0},
+        ),
+        owner=SYSTEM_USER_EMAIL,
+    )
+    signal = (
+        FastModeFallbackRequired(
+            provider_id="primary", model_id="gpt-4o-mini", reason="unsupported"
+        )
+        if fallback == "fast"
+        else OpenAIToolSearchFallbackRequired(
+            provider_id="primary", model_id="gpt-4o-mini", reason="unsupported"
+        )
+    )
+    calls = []
+
+    async def stream(self, messages, model=None, **kwargs):
+        calls.append(kwargs["provider_id"])
+        raise signal
+        yield
+
+    monkeypatch.setattr(LiteLLMProvider, "stream_generate", stream)
+    with pytest.raises(type(signal)) as failure:
+        _ = [
+            chunk
+            async for chunk in service.stream_generate(
+                [],
+                model="cognis/compatibility",
+                acting_user_email=SYSTEM_USER_EMAIL,
+            )
+        ]
+    assert failure.value is signal
+    assert calls == ["primary"]
+
+
+@pytest.mark.asyncio
 async def test_shared_all_target_limits_reach_stream_and_nonstream_callers(service, monkeypatch):
     from unittest.mock import AsyncMock
 

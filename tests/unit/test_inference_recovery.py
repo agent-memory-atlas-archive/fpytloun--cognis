@@ -2,6 +2,7 @@
 
 import time
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -33,6 +34,54 @@ def plan(*, retries=1, targets=2):
 
 async def collect(stream):
     return [chunk async for chunk in stream]
+
+
+@pytest.mark.asyncio
+async def test_unclassified_failure_recovers_before_output(recovery_clock):
+    now, sleeps = recovery_clock
+    calls = []
+
+    async def attempt(candidate, budget):
+        calls.append(budget.attempts)
+        if len(calls) == 1:
+            raise RuntimeError("Temporary inference admission fault")
+        yield {"choices": [{"delta": {"content": "recovered"}}]}
+
+    chunks = await collect(
+        InferenceRecovery(InferenceAvailability()).stream(
+            plan(targets=1), attempt, deadline=now[0] + 60
+        )
+    )
+    assert calls == [1, 2]
+    assert len(sleeps) == 1
+    assert chunks[-1]["choices"][0]["delta"]["content"] == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_is_explicit_but_admission_failure_is_not(recovery_clock):
+    from cognis.core.redis_service import RedisUnavailableError
+
+    now, _ = recovery_clock
+
+    async def attempt(candidate, budget):
+        raise LLMStreamProviderError("Connection reset", payload={"category": "connection"})
+        yield
+
+    with pytest.raises(LLMStreamProviderError) as exhausted:
+        await collect(
+            InferenceRecovery(InferenceAvailability()).stream(
+                plan(targets=1, retries=0), attempt, deadline=now[0] + 60
+            )
+        )
+    assert classify_llm_exception(exhausted.value)["recovery_exhausted"] is True
+
+    availability = InferenceAvailability()
+    availability.limit = AsyncMock(side_effect=RedisUnavailableError("Admission state unavailable"))
+    with pytest.raises(RedisUnavailableError) as admission:
+        await collect(
+            InferenceRecovery(availability).stream(plan(targets=1), attempt, deadline=now[0] + 60)
+        )
+    assert classify_llm_exception(admission.value).get("recovery_exhausted") is not True
 
 
 @pytest.fixture
@@ -196,6 +245,7 @@ async def test_all_attempted_limits_expose_route_earliest_retry(recovery_clock):
         "category": "rate_limit",
         "code": "rate_limit_error",
         "retry_after_seconds": 120,
+        "recovery_exhausted": True,
     }
 
 
@@ -451,5 +501,6 @@ async def test_prelude_limit_does_not_limit_semantic_chunks(semantic):
     if semantic:
         assert len(await collect(stream)) == 1
     else:
-        with pytest.raises(ValueError, match="prelude"):
+        with pytest.raises(LLMStreamProviderError, match="prelude") as failure:
             await collect(stream)
+        assert failure.value.to_payload()["recovery_exhausted"] is True

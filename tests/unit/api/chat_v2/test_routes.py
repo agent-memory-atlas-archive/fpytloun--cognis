@@ -1752,7 +1752,10 @@ async def test_child_session_context_resolves_complete_lineage_from_successor(
         conversation_row=conversation_row,
     )
 
-    async def get_child_chain(_session: Any, _session_id: str) -> tuple[list[Any], bool]:
+    async def get_child_chain(
+        _session: Any, _session_id: str, *, include_root: bool
+    ) -> tuple[list[Any], bool]:
+        assert include_root is True
         return [original, successor], False
 
     async def session_read_ref(
@@ -1883,7 +1886,10 @@ async def test_session_routes_reject_ambiguous_or_truncated_lineage(
         conversation_row=conversation_row,
     )
 
-    async def invalid_chain(_session: Any, _session_id: str) -> tuple[list[Any], bool]:
+    async def invalid_chain(
+        _session: Any, _session_id: str, *, include_root: bool
+    ) -> tuple[list[Any], bool]:
+        assert include_root is True
         return [session_row], True
 
     build_snapshot = AsyncMock()
@@ -1937,8 +1943,10 @@ async def test_task_step_route_denies_task_owner_mismatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parent_session_id", [None, "session-parent"])
 async def test_task_step_context_preserves_previous_session_lineage(
     monkeypatch: pytest.MonkeyPatch,
+    parent_session_id: str | None,
 ) -> None:
     request = _scoped_request("alice@example.com")
     step = SimpleNamespace(
@@ -1954,13 +1962,13 @@ async def test_task_step_context_preserves_previous_session_lineage(
         "session-original",
         owner="alice@example.com",
         conversation_id="conv-1",
-        parent_session_id="session-parent",
+        parent_session_id=parent_session_id,
     )
     successor = _session(
         "session-1",
         owner="alice@example.com",
         conversation_id="conv-1",
-        parent_session_id="session-parent",
+        parent_session_id=parent_session_id,
     )
     successor.previous_session_id = original.session_id
     _patch_scope_queries(
@@ -1971,7 +1979,10 @@ async def test_task_step_context_preserves_previous_session_lineage(
         conversation_row=_conversation("conv-1", owner="alice@example.com"),
     )
 
-    async def get_child_chain(_session: Any, _session_id: str) -> tuple[list[Any], bool]:
+    async def get_child_chain(
+        _session: Any, _session_id: str, *, include_root: bool
+    ) -> tuple[list[Any], bool]:
+        assert include_root is True
         return [original, successor], False
 
     async def session_read_ref(
@@ -1985,7 +1996,7 @@ async def test_task_step_context_preserves_previous_session_lineage(
     monkeypatch.setattr(chat_v2_routes, "_session_read_ref", session_read_ref)
 
     context = await _load_task_step_context(request, "step-1")
-    assert context["scope"].parent_session_id == "session-parent"
+    assert context["scope"].parent_session_id == parent_session_id
     assert context["scope"].session_id == "session-1"
     assert context["session_refs"] == ["session-original", "session-1"]
 
@@ -2414,7 +2425,10 @@ def _patch_scope_queries(
     async def get_step(_session: Any, _step_run_id: str) -> Any:
         return step_run
 
-    async def get_child_chain(_session: Any, session_id: str) -> tuple[list[Any], bool]:
+    async def get_child_chain(
+        _session: Any, session_id: str, *, include_root: bool
+    ) -> tuple[list[Any], bool]:
+        assert include_root is True
         return (
             [session_row]
             if session_row is not None and session_row.session_id == session_id

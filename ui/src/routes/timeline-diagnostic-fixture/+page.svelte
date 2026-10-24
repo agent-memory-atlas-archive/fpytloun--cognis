@@ -1,5 +1,6 @@
 <script lang="ts">
   import TimelineDiagnosticExport from '$lib/components/chat/TimelineDiagnosticExport.svelte';
+  import SessionDetailsContent from '$lib/components/session/SessionDetailsContent.svelte';
   import { emptyChatV2State } from '$lib/chat-v2/sync-engine';
   import { conversationTimelineScope, type MessageTimelineItem } from '$lib/chat-v2/types';
 
@@ -18,5 +19,12 @@
 
 <main class="mx-auto max-w-lg p-6">
   <h1 class="mb-4">Synthetic timeline diagnostic fixture</h1>
-  <TimelineDiagnosticExport clientState={state} visibleItems={[item]} />
+  <SessionDetailsContent detail={{
+    intaris_session_id: 'diagnostic-session', intention: 'Synthetic session details',
+    summary: null, status: 'running', total_calls: 12, approved_count: 12, denied_count: 0, escalated_count: 0,
+  }}>
+    {#snippet runtimeDetailsFooter()}
+      <TimelineDiagnosticExport clientState={state} visibleItems={[item]} />
+    {/snippet}
+  </SessionDetailsContent>
 </main>

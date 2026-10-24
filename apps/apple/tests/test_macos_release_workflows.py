@@ -134,9 +134,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         source = textwrap.dedent(workflow.split("run: |\n", 1)[1].split("\n  build:", 1)[0])
         for ref_type, tag, valid in (
-            ("tag", "v0.18.1", True),
-            ("branch", "v0.18.1", False),
-            ("tag", "0.18.1", False),
+            ("tag", "v0.18.2", True),
+            ("branch", "v0.18.2", False),
+            ("tag", "0.18.2", False),
             ("tag", "v0.17.1", False),
         ):
             with self.subTest(ref_type=ref_type, tag=tag):

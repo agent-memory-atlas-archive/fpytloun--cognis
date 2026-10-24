@@ -1,16 +1,16 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { portal } from '$lib/actions/portal';
   import ArrowLeft from 'lucide-svelte/icons/arrow-left';
   import Maximize2 from 'lucide-svelte/icons/maximize-2';
   import Minimize2 from 'lucide-svelte/icons/minimize-2';
+  import X from 'lucide-svelte/icons/x';
   import { api } from '$lib/api/client';
-  import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
+  import { wsClient } from '$lib/ws/client';
+  import ChatWorkspace from '$lib/components/chat-v2/ChatWorkspace.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
-  import LiveDots from '$lib/components/LiveDots.svelte';
+  import SessionLogHeader from '$lib/components/chat-v2/SessionLogHeader.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
-  import SharedInspectorTabs from '$lib/components/inspector/SharedInspectorTabs.svelte';
-  import Button from '$lib/components/ui/Button.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import type { Agent, Escalation, Notification, StepRun } from '$lib/types/api';
   import type { TimelineScope } from '$lib/chat-v2/types';
@@ -23,6 +23,8 @@
     stepName = '',
     agent = null,
     stepRun = null,
+    attempts = [],
+    agents = [],
     backLabel = 'Parent session',
     onBack,
     onViewSession,
@@ -35,6 +37,8 @@
     stepName?: string;
     agent?: Agent | null;
     stepRun?: StepRun | null;
+    attempts?: StepRun[];
+    agents?: Agent[];
     backLabel?: string;
     onBack?: (() => void) | undefined;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
@@ -49,35 +53,83 @@
   let escalationBusy = $state<string | null>(null);
   let sessionDetailsOpen = $state(false);
   let fullscreen = $state(false);
+  let workspace: ChatWorkspace | undefined = $state();
+  let chosenAttempt = $state<StepRun | null>(null);
+  let attemptError = $state('');
+  let attemptLoading = $state(false);
+  let attemptGeneration = 0;
+  let focusedScope = $state<TimelineScope | null>(null);
+  let focusedRootKey = $state('');
+  let focusedSessionId = $state('');
+  let escalationGeneration = 0;
+  let escalationRequest = 0;
+  let escalationError = $state('');
+  const displayedStepRun = $derived(chosenAttempt ?? stepRun);
+  const displayedSessionId = $derived(chosenAttempt?.session_id ?? sessionId);
+  const displayedConversationId = $derived(chosenAttempt?.conversation_id ?? conversationId);
+  const displayedStepRunId = $derived(chosenAttempt?.step_run_id ?? stepRunId);
+  const displayedAgent = $derived(agents.find((item: Agent) => item.agent_id === displayedStepRun?.agent_id) ?? agent);
+  const stepAttempts = $derived(attempts
+    .filter((item: StepRun) => item.step_name === displayedStepRun?.step_name && item.session_id)
+    .toSorted((left: StepRun, right: StepRun) =>
+      (left.attempt_number ?? 1) - (right.attempt_number ?? 1) || left.attempt - right.attempt));
+  const displayedAttemptNumber = $derived(
+    stepAttempts.findIndex((item: StepRun) => item.step_run_id === displayedStepRunId) + 1
+      || displayedStepRun?.attempt_number || displayedStepRun?.attempt || 1);
 
-  const scope = $derived.by<TimelineScope>(() => stepRunId && taskId
+  $effect(() => {
+    void stepRunId;
+    chosenAttempt = null;
+    attemptGeneration += 1;
+    attemptLoading = false;
+    attemptError = '';
+  });
+
+  async function selectAttempt(id: string): Promise<void> {
+    const generation = ++attemptGeneration;
+    attemptLoading = true;
+    attemptError = '';
+    try {
+      const detail = await api.tasks.stepRunDetail(id);
+      if (generation === attemptGeneration) chosenAttempt = detail;
+    } catch (error) {
+      if (generation === attemptGeneration) attemptError = error instanceof Error ? error.message : 'Could not load attempt.';
+    } finally {
+      if (generation === attemptGeneration) attemptLoading = false;
+    }
+  }
+
+  const scope = $derived.by<TimelineScope>(() => displayedStepRunId && taskId
     ? {
-        key: `task_step:${stepRunId}`,
+        key: `task_step:${displayedStepRunId}`,
         kind: 'task_step',
-        conversation_id: conversationId,
-        session_id: sessionId,
+        conversation_id: displayedConversationId,
+        session_id: displayedSessionId,
         task_id: taskId,
-        step_run_id: stepRunId,
+        step_run_id: displayedStepRunId,
         label: stepName
       }
     : {
-        key: `session:${sessionId}`,
+        key: `session:${displayedSessionId}`,
         kind: 'session',
-        conversation_id: conversationId,
-        session_id: sessionId,
+        conversation_id: displayedConversationId,
+        session_id: displayedSessionId,
         label: stepName
       });
+  const interactionScope = $derived(focusedRootKey === scope.key && focusedScope ? focusedScope : scope);
+  const interactionSessionId = $derived(focusedRootKey === scope.key && focusedSessionId ? focusedSessionId : displayedSessionId);
+  const interactionKey = $derived(`${interactionScope.key}:${interactionSessionId}`);
 
   function handleKeydown(event: KeyboardEvent): void {
     if (!isTopOverlay(overlayId)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       event.stopImmediatePropagation();
-      onclose();
+      if (!workspace?.handleEscape()) onclose();
       return;
     }
     if (event.key !== 'Tab' || !panel) return;
-    const elements = Array.from(panel.querySelectorAll<HTMLElement>('button, [href], [tabindex]:not([tabindex="-1"])'))
+    const elements = Array.from(panel.querySelectorAll<HTMLElement>('button, select, [href], [tabindex]:not([tabindex="-1"])'))
       .filter((element) => !element.hasAttribute('disabled'));
     if (elements.length === 0) return;
     const first = elements[0];
@@ -96,7 +148,7 @@
   }
 
   function notificationEscalation(item: Notification): Escalation | null {
-    if (item.notification_type !== 'escalation' || item.status !== 'pending' || item.session_id !== sessionId) return null;
+    if (item.notification_type !== 'escalation' || item.status !== 'pending' || item.session_id !== interactionSessionId) return null;
     return {
       call_id: item.notification_id,
       session_id: item.session_id,
@@ -117,7 +169,10 @@
   }
 
   async function refreshEscalations(): Promise<void> {
-    const notifications = await api.notifications.list(conversationId, { sessionId });
+    const selectedScope = interactionKey;
+    const request = ++escalationRequest;
+    const notifications = await api.notifications.list(interactionScope.conversation_id ?? displayedConversationId, { sessionId: interactionSessionId });
+    if (interactionKey !== selectedScope || request !== escalationRequest) return;
     escalations = notifications
       .map(notificationEscalation)
       .filter((item): item is Escalation => item !== null)
@@ -129,28 +184,27 @@
   }
 
   async function resolveEscalation(item: Escalation, decision: 'approve' | 'deny'): Promise<void> {
+    const generation = escalationGeneration;
     escalationBusy = item.call_id;
     try {
       await api.notifications.resolve(item.call_id, { decision });
-      await refreshEscalations();
+      if (generation === escalationGeneration) await refreshEscalations();
+    } catch (error) {
+      if (generation === escalationGeneration) escalationError = error instanceof Error ? error.message : 'Could not resolve pending action.';
     } finally {
-      escalationBusy = null;
+      if (generation === escalationGeneration) escalationBusy = null;
     }
   }
 
-  const activityLabel = $derived(stepRun
-    ? stepRun.status === 'evaluating'
+  const activityLabel = $derived(displayedStepRun
+    ? displayedStepRun.status === 'evaluating'
       ? 'Evaluator is reviewing…'
-      : stepRun.status === 'running'
+      : displayedStepRun.status === 'running'
         ? 'Agent is working…'
-        : stepRun.status || 'Paused'
+        : displayedStepRun.status || 'Paused'
     : runtimeActive
       ? 'Agent is working…'
       : 'Paused'
-  );
-  const activityLive = $derived(stepRun
-    ? stepRun.status === 'running' || stepRun.status === 'evaluating'
-    : runtimeActive
   );
 
   onMount(() => {
@@ -158,12 +212,32 @@
     const handle = registerOverlay({ kind: 'sheet', blocksChrome: true });
     overlayId = handle.id;
     queueMicrotask(() => panel?.querySelector<HTMLElement>('button')?.focus());
-    void refreshEscalations();
+    const unsubscribe = wsClient.subscribe(message => {
+      if ((message.type === 'escalation' && message.session_id === interactionSessionId)
+        || (message.type === 'escalation_resolved' && escalations.some(item => item.call_id === message.call_id))
+        || (message.type === 'scope_invalidated' && message.reason === 'notification_state_changed'
+          && (message.session_id === interactionSessionId || message.conversation_id === interactionScope.conversation_id))) {
+        void refreshEscalations().catch(() => {});
+      }
+    });
     return () => {
+      unsubscribe();
+      attemptGeneration += 1;
+      escalationGeneration += 1;
+      escalationRequest += 1;
       handle.unregister();
       overlayId = null;
       queueMicrotask(() => previousFocus?.focus());
     };
+  });
+
+  $effect(() => {
+    void interactionKey;
+    escalationGeneration += 1;
+    escalationBusy = null;
+    escalationError = '';
+    escalations = [];
+    untrack(() => { void refreshEscalations().catch(() => {}); });
   });
 </script>
 
@@ -180,31 +254,40 @@
 >
   <div
     bind:this={panel}
-    class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-control-border bg-elevated shadow-overlay ${fullscreen ? 'max-w-none' : 'max-w-2xl'}`}
+    class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-control-border bg-elevated shadow-overlay ${fullscreen ? 'max-w-none' : 'max-w-6xl'}`}
     role="dialog"
     aria-modal="true"
     aria-label={`Session logs: ${stepName || sessionId}`}
     data-testid="session-logs-panel"
     data-fullscreen={fullscreen}
   >
-    <div class="flex shrink-0 items-center justify-between border-b border-separator px-4 py-3">
-      <div class="flex min-w-0 items-center gap-3">
+    <SessionLogHeader title={stepName || sessionId} testId="session-logs-header">
+      {#snippet leading()}
         {#if onBack}
-          <Button size="sm" variant="ghost" class="shrink-0" onclick={onBack} title={`Back to ${backLabel}`}>
-            <ArrowLeft class="mr-1.5 h-3.5 w-3.5" /> Back
-          </Button>
+          <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg text-muted hover:bg-raised hover:text-strong" onclick={onBack} title={`Back to ${backLabel}`} aria-label={`Back to ${backLabel}`} type="button">
+            <ArrowLeft class="h-4 w-4" />
+          </button>
         {/if}
-        <div class="min-w-0">
-          <p class="text-xs uppercase tracking-widest text-quiet">{onBack ? 'Sub-session logs' : 'Session logs'}</p>
-          <h3 class="truncate text-sm font-semibold text-strong">{stepName || sessionId}</h3>
-          <div class="mt-1 text-xs text-muted" data-testid="session-activity-status">
-            {#if activityLive}<LiveDots inline size="sm" label={activityLabel} />{:else}{activityLabel}{/if}
-          </div>
+      {/snippet}
+      {#snippet metadata()}
+        <div class={stepAttempts.length > 1 ? 'relative h-[32px]' : undefined} data-testid="session-activity-status">
+          {#if stepAttempts.length > 1}
+            <!-- Keep the native touch target full-sized without expanding the metadata line. -->
+            <select class="touch-target-compact absolute bottom-0 left-0 !w-auto max-w-full rounded-lg border-0 bg-transparent text-xs text-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" aria-label="Step attempt"
+              value={displayedStepRunId ?? ''} disabled={attemptLoading}
+              onchange={(event) => { void selectAttempt(event.currentTarget.value); }}>
+              {#each stepAttempts as attempt, index (attempt.step_run_id)}
+                <option value={attempt.step_run_id}>Attempt {index + 1} of {stepAttempts.length} · {attempt.status}</option>
+              {/each}
+            </select>
+          {:else}
+            {#if displayedStepRun}Attempt {displayedAttemptNumber} · {/if}{activityLabel}
+          {/if}
         </div>
-      </div>
-      <div class="flex items-center gap-2">
+      {/snippet}
+      {#snippet actions()}
         <button
-          class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong sm:h-8 sm:w-8"
+          class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong"
           onclick={() => { fullscreen = !fullscreen; }}
           aria-label={fullscreen ? 'Exit fullscreen logs' : 'Open fullscreen logs'}
           aria-pressed={fullscreen}
@@ -214,18 +297,15 @@
         </button>
         <SessionDetailsButton
           open={sessionDetailsOpen}
-          ariaControls={`session-logs-info-${sessionId}`}
+          ariaControls={workspace?.getInspectorState().controlsId ?? `dashboard-conversation-inspector-${displayedConversationId}`}
           testId="session-logs-header-info"
-          onclick={() => { sessionDetailsOpen = !sessionDetailsOpen; }}
+          onclick={() => { void workspace?.toggleInspector(); }}
         />
-        <button class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong sm:h-8 sm:w-8" onclick={onclose} aria-label="Close" type="button">&times;</button>
-      </div>
-    </div>
-    {#if sessionDetailsOpen}
-      <div id={`session-logs-info-${sessionId}`} class="min-h-0 flex-1 overflow-y-auto border-b border-separator p-4">
-        <SharedInspectorTabs {scope} {sessionId} agents={agent ? [agent] : []} onViewSession={onViewSession ? (id) => { void onViewSession?.(id); } : undefined} />
-      </div>
-    {/if}
+        <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong" onclick={onclose} aria-label="Close" type="button"><X class="h-4 w-4" /></button>
+      {/snippet}
+    </SessionLogHeader>
+    {#if attemptError}<p class="px-4 py-2 text-xs text-danger" role="alert">{attemptError}</p>{/if}
+    {#if escalationError}<p class="px-4 py-2 text-xs text-danger" role="alert">{escalationError}</p>{/if}
     {#if escalations.length > 0}
       {@const escalation = escalations[0]}
       <div class="shrink-0 border-b border-separator px-4 py-3">
@@ -239,13 +319,25 @@
         />
       </div>
     {/if}
-    <ScopedChatV2Timeline
-      {scope}
-      {agent}
-      {onViewSession}
-      activityStatus={stepRun?.status ?? ''}
-      {stepRun}
+    <ChatWorkspace
+      bind:this={workspace}
+      conversationId={displayedConversationId}
+      sessionId={displayedSessionId}
+      timelineScope={scope}
+      agent={displayedAgent}
+      agents={agents.length ? agents : agent ? [agent] : []}
+      stepRun={displayedStepRun}
+      readOnly
+      inspectorOpen={false}
+      inspectorControlInHeader
+      inspectorAsRegion
+      onInspectorStateChange={(open) => { sessionDetailsOpen = open; }}
       onRuntimeActiveChange={(active) => { runtimeActive = active; }}
+      onDisplayedScopeChange={(next, selectedSessionId) => {
+        focusedRootKey = scope.key;
+        focusedScope = next;
+        focusedSessionId = selectedSessionId;
+      }}
       emptyLabel="No events recorded yet."
     />
   </div>

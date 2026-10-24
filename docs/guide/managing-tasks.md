@@ -58,9 +58,32 @@ The task detail page shows the full workflow run, including:
 
 This view is the best place to understand why a task is waiting, revising, or failing.
 
+Task steps honor provider-directed rate-limit waits just like chat. A deferred
+step releases its worker, keeps its session and saved tool results, and resumes
+after the retry delay without consuming workflow quality attempts. Automatic
+recovery is bounded; if it is exhausted, the task retains the actual failure
+cause and offers a gate or a manual recovery action. **Continue task** resumes
+a paused task; **Retry task** resumes a failed task at its saved workflow
+position. It does not clone the task or repeat already accepted steps.
+
 When a step runs more than once, the displayed accumulated duration includes all
 attempts. Latest-attempt timing remains available as secondary detail where the
 API/UI needs to distinguish it from total step time.
+
+### Step history
+
+Step logs use the shared chat workspace, including the **Overview**, **Work**,
+and **Session** inspector. Open delegated sessions from their cards or the work
+tree, and use the back arrow in the header to return. The logs remain read-only;
+managed conversations keep their explicit send, stop, and take-control actions.
+
+When a step has multiple attempts, the picker below the step title selects an
+earlier attempt without retrying or resuming execution. Attempts are numbered
+oldest to newest, so the latest of five is **Attempt 5 of 5**. Each attempt keeps
+its own status and
+history. Session continuations created by compaction remain part of that
+attempt's history; separate retry forks are not merged into one transcript.
+Scroll upward or use **Load earlier history** to retrieve older messages.
 
 ## Gates and step questions
 

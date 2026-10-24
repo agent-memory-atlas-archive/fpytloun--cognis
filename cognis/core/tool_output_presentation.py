@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cognis.core.tool_output_recovery import format_recovery_hint
 from cognis.core.truncation import middle_truncate
 
 MAX_ANCHOR_NAME_LENGTH = 120
@@ -209,21 +210,16 @@ def build_recovery_hint(
     anchors_available: bool = False,
     anchor_count: int | None = None,
     anchor_names: Sequence[str] | None = None,
+    legacy: bool = False,
 ) -> str:
     """Return deterministic recovery calls for model-facing compact placeholders."""
 
-    quoted = repr(call_id)
-    calls = [
-        f"read_tool_output(call_id={quoted})",
-        f"search_tool_output(call_id={quoted}, pattern='error|timeout|keyword')",
-    ]
-    names = safe_anchor_names(anchor_names)
-    if names:
-        calls.append(f"list_tool_output_anchors(call_id={quoted})")
-        calls.append(f"read_tool_output_anchor(call_id={quoted}, anchor={names[0]!r})")
-    elif anchors_available and isinstance(anchor_count, int) and anchor_count > 0:
-        calls.append(f"list_tool_output_anchors(call_id={quoted})")
-    return f"Recover with call_id {quoted}: " + ", ".join(calls) + "."
+    return format_recovery_hint(
+        call_id,
+        anchor_names=safe_anchor_names(anchor_names),
+        anchors_available=anchors_available and isinstance(anchor_count, int) and anchor_count > 0,
+        legacy=legacy,
+    )
 
 
 def present_tool_output(

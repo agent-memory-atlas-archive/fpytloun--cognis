@@ -47,6 +47,17 @@ The download menu offers the available formats in embedded, full, and
 standalone views. Share links can download the same formats while valid; the
 downloaded files do not extend the life of a share token.
 
+In chat, deliverables read as part of the assistant response: they use chat
+typography and colors without a surrounding document card or toolbar. Tables,
+charts, and figures can use the chat column while prose keeps its reading
+measure. Revision history sits below the content on the left; icon-only
+fullscreen, download, and sharing controls align on the right like assistant
+message actions. The three-dot control contains copy, library, favorites, and
+collapse actions. A side arrow opens Contents at the right of the deliverable:
+a sticky sidebar in wide document areas, or a right-side drawer on narrow
+screens. It collapses automatically when the document area narrows. Library
+and standalone readers retain their document layout.
+
 Virtual deliverable preview URLs open the original deliverable viewer, not a
 reconstructed Markdown file preview. Converting a signed preview link preserves
 its exact expiry; Markdown downloads are unchanged. Installed-app previews have

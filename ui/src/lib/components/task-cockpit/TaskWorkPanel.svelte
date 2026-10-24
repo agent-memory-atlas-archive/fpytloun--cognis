@@ -49,7 +49,7 @@
       signal?: AbortSignal,
     ) => Promise<ActivityOverviewResponse>;
     loadDeliverableForStepRun?: (stepRunId: string, deliverableId: string) => Promise<Deliverable>;
-    onViewSession?: (sessionId: string) => void;
+    onViewSession?: (sessionId: string, node?: import('$lib/chat-v2/types').WorkstreamRef) => void;
     onViewWork?: (scope: TimelineScope, category: 'files' | 'commands' | 'mutations' | 'artifacts' | 'deliverables') => void;
     agents?: Agent[];
     view?: 'all' | 'activity' | 'deliverable';

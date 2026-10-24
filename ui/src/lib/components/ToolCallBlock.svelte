@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { chatNavigation, followConversationLink } from '$lib/chat-v2/navigation';
+  const navigation = chatNavigation();
   import Check from 'lucide-svelte/icons/check';
   import Clock from 'lucide-svelte/icons/clock';
   import Copy from 'lucide-svelte/icons/copy';
@@ -1247,6 +1249,7 @@
                   <a
                     class="rounded-lg border border-control-border bg-surface px-3 py-1.5 text-xs font-medium text-accent transition hover:border-accent hover:bg-accent-subtle hover:text-accent-hover"
                     href={managedConversationHref(managedPresentation.primaryConversation.conversationId)}
+                    onclick={(event) => followConversationLink(event, managedPresentation.primaryConversation!.conversationId!, navigation)}
                   >
                     Open conversation
                   </a>
@@ -1292,7 +1295,7 @@
                           </p>
                         </div>
                         {#if conversation.conversationId}
-                          <a class="rounded-lg border border-control-border bg-surface/70 px-2.5 py-1 text-[11px] font-medium text-accent transition hover:border-accent hover:bg-accent-subtle hover:text-accent-hover" href={managedConversationHref(conversation.conversationId)}>Open</a>
+                          <a class="rounded-lg border border-control-border bg-surface/70 px-2.5 py-1 text-[11px] font-medium text-accent transition hover:border-accent hover:bg-accent-subtle hover:text-accent-hover" href={managedConversationHref(conversation.conversationId)} onclick={(event) => followConversationLink(event, conversation.conversationId!, navigation)}>Open</a>
                         {/if}
                       </div>
                     {/each}

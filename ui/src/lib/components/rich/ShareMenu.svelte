@@ -6,12 +6,14 @@
   export let createLink: (options: ShareLinkOptions) => Promise<string>;
   export let allowModeChoice = false;
   export let defaultMode: 'view' | 'download' = 'view';
+  export let label = '';
   let open = false;
   let copied = false;
 </script>
 
 <button class="document-icon-action" type="button" aria-label="Share public link" title="Share public link" aria-haspopup="dialog" aria-expanded={open} on:click={() => { open = true; copied = false; }}>
   <span data-testid={copied ? 'rich-share-copied-icon' : 'rich-share-icon'}><ViewerIcon name={copied ? 'check' : 'share'} /></span>
+  {#if label}<span>{label}</span>{/if}
 </button>
 {#if open}
   <PublicLinkDialog {createLink} {allowModeChoice} {defaultMode} onClose={() => { open = false; }} onCopied={() => { copied = true; }} />

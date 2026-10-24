@@ -331,6 +331,27 @@ export class TimelineController {
     }
   }
 
+  /** An upward user action must cross event-only pages without needing another
+   * scroll event at an already-reached top edge. DOM anchoring stays view-owned.
+   */
+  async olderVisible(before: string, signal?: AbortSignal): Promise<TimelineBackfillResponse | null> {
+    const generation = this.lineageGeneration;
+    const visibleIds = new Set(this.store.visibleItems.map(item => item.id));
+    const seen = new Set<string>();
+    let response: TimelineBackfillResponse | null = null;
+    for (let page = 0; page < 8; page += 1) {
+      if (seen.has(before)) break;
+      seen.add(before);
+      response = await this.older(before, signal);
+      if (!response || generation !== this.lineageGeneration) return null;
+      if (this.store.visibleItems.some(item => !visibleIds.has(item.id))) break;
+      const state = this.store.snapshot;
+      if (!state.hasMoreBefore || !state.beforeCursor) break;
+      before = state.beforeCursor;
+    }
+    return response;
+  }
+
   older(before: string, signal?: AbortSignal): Promise<TimelineBackfillResponse | null> {
     this.assertCurrent();
     signal?.throwIfAborted();

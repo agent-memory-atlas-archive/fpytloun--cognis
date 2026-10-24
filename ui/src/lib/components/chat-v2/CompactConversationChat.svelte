@@ -17,8 +17,6 @@
   import { ComposerSubmission } from '$lib/chat-v2/composer-submission';
   import { hydrateComposer, selectLegacyInput, canSelectRecovery, type RecoveryScope, type LegacyComposerInput } from '$lib/chat-v2/composer-hydration';
   import LegacyComposerRecovery from './LegacyComposerRecovery.svelte';
-  const liveComposer = typeof window === 'undefined' ? null : conversationComposer();
-  const composerDrafts = liveComposer?.drafts ?? new DocumentDrafts();
   import { chatV2Api } from '$lib/chat-v2/api';
   import {
     dispatchChatComposerMessage,
@@ -97,6 +95,8 @@
     controllerSessionIds = [],
     onViewSession,
     readOnly = false,
+    stepRun = null,
+    onOpenWork,
   } = $props<{
     conversationId: string;
     agent?: Agent | null;
@@ -112,6 +112,8 @@
     controllerSessionIds?: string[];
     onViewSession?: (sessionId: string, node?: WorkstreamRef) => void;
     readOnly?: boolean;
+    stepRun?: import('$lib/types/api').StepRun | null;
+    onOpenWork?: (category: import('$lib/chat-v2/types').WorkCategory, sessionId: string, path?: string, sourceItemId?: string) => void;
   }>();
 
   let message = $state('');
@@ -164,6 +166,9 @@
    const outbox: ChatV2Outbox = typeof indexedDB === 'undefined' ? createMemoryChatV2Outbox() : createIndexedDbChatV2Outbox();
   const scope = $derived(timelineScope ?? conversationTimelineScope(conversationId));
   const editableScope = $derived(!readOnly && scope.kind === 'conversation');
+  const liveComposer = $derived(editableScope && typeof window !== 'undefined' ? conversationComposer() : null);
+  const fallbackDrafts = new DocumentDrafts();
+  const composerDrafts = $derived(liveComposer?.drafts ?? fallbackDrafts);
   const ongoingWork = $derived(
     mergeCurrentCycleDelegations(projectedWork, currentCycleWork),
   );
@@ -239,6 +244,7 @@
   $effect(() => {
     const currentId = conversationId;
     const scopeKey = scope.key;
+    if (!editableScope) return;
     if (currentId === activeConversationId && scopeKey === hydratedScopeKey) return;
     if (activeConversationId && !legacyRecovery) {
       // Capture A's complete input before retiring it; storage remains owned by A.
@@ -729,7 +735,8 @@
     bind:userScrolledUp
     {scope}
     {agent}
-    compact
+    {stepRun}
+    activityStatus={stepRun?.status ?? ''}
     hasEditableComposer={editableScope}
     showQueuedMessages={false}
     showTodoDrawer={false}
@@ -737,6 +744,7 @@
     onRuntimeActiveChange={setRuntimeActive}
     onInitialLoaded={handleInitialLoaded}
     {onViewSession}
+    {onOpenWork}
     onTodosChange={(next) => { todos = next; }}
     onOngoingWorkChange={(next) => { currentCycleWork = next; }}
     onQueueChange={(queue) => {

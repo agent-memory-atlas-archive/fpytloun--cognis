@@ -28,6 +28,7 @@
     onArchive,
     onRestore,
     onDelete,
+    runtimeDetailsFooter,
   }: SessionDetailsProps = $props();
   // Routes have no quota: show the provider actually serving this LLM session.
   const providerId = $derived(
@@ -345,6 +346,7 @@
           {/if}
         </dl>
       </div>
+      {@render runtimeDetailsFooter?.()}
     </details>
   </section>
 </div>

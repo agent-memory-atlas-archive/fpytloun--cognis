@@ -12,30 +12,35 @@
   --rich-accent-soft: rgb(var(--color-accent));
   --rich-surface-wash-deep: rgb(var(--color-inset));
   --rich-surface-wash: rgb(var(--color-inset));
-  --rich-tone-neutral-fg: rgb(var(--color-secondary));
-  --rich-tone-neutral-border: rgb(var(--color-separator));
-  --rich-tone-neutral-bg: rgb(var(--color-inset));
-  --rich-tone-info-fg: rgb(var(--color-info));
-  --rich-tone-info-border: rgb(var(--color-info-border));
-  --rich-tone-info-bg: rgb(var(--color-info-subtle));
-  --rich-tone-success-fg: rgb(var(--color-success));
-  --rich-tone-success-border: rgb(var(--color-success-border));
-  --rich-tone-success-bg: rgb(var(--color-success-subtle));
-  --rich-tone-success-accent: rgb(var(--color-success));
-  --rich-tone-warning-fg: rgb(var(--color-warning));
-  --rich-tone-warning-border: rgb(var(--color-warning-border));
-  --rich-tone-warning-bg: rgb(var(--color-warning-subtle));
-  --rich-tone-warning-accent: rgb(var(--color-warning));
-  --rich-tone-danger-fg: rgb(var(--color-danger));
-  --rich-tone-danger-border: rgb(var(--color-danger-border));
-  --rich-tone-danger-bg: rgb(var(--color-danger-subtle));
-  --rich-tone-danger-accent: rgb(var(--color-danger));
   --rich-syntax-keyword: rgb(var(--color-syntax-keyword));
   --rich-syntax-string: rgb(var(--color-syntax-string));
   --rich-syntax-number: rgb(var(--color-syntax-number));
   --rich-syntax-comment: rgb(var(--color-syntax-comment));
   --rich-syntax-title: rgb(var(--color-syntax-title));
   --rich-syntax-deletion: rgb(var(--color-danger));
+}
+
+/* Classic Dark retains the original rich tone triples below. Other palettes
+   use app semantics, including the alpha channel of translucent treatments. */
+.theme-palette[data-theme-family][data-resolved-theme][data-viewer-theme]:is(.rich-deliverable, .rich-full, .rich-toc-drawer-root):not([data-theme-family="classic"][data-resolved-theme="dark"]) {
+  --rich-tone-neutral-fg: rgb(var(--color-secondary));
+  --rich-tone-neutral-border: rgb(var(--color-separator));
+  --rich-tone-neutral-bg: rgb(var(--color-inset));
+  --rich-tone-info-fg: rgb(var(--color-info));
+  --rich-tone-info-border: rgb(var(--color-info-border) / var(--alpha-info-border, 1));
+  --rich-tone-info-bg: rgb(var(--color-info-subtle) / var(--alpha-info-subtle, 1));
+  --rich-tone-success-fg: rgb(var(--color-success));
+  --rich-tone-success-border: rgb(var(--color-success-border) / var(--alpha-success-border, 1));
+  --rich-tone-success-bg: rgb(var(--color-success-subtle) / var(--alpha-success-subtle, 1));
+  --rich-tone-success-accent: rgb(var(--color-success));
+  --rich-tone-warning-fg: rgb(var(--color-warning));
+  --rich-tone-warning-border: rgb(var(--color-warning-border) / var(--alpha-warning-border, 1));
+  --rich-tone-warning-bg: rgb(var(--color-warning-subtle) / var(--alpha-warning-subtle, 1));
+  --rich-tone-warning-accent: rgb(var(--color-warning));
+  --rich-tone-danger-fg: rgb(var(--color-danger));
+  --rich-tone-danger-border: rgb(var(--color-danger-border) / var(--alpha-danger-border, 1));
+  --rich-tone-danger-bg: rgb(var(--color-danger-subtle) / var(--alpha-danger-subtle, 1));
+  --rich-tone-danger-accent: rgb(var(--color-danger));
 }
 
 .theme-palette[data-theme-family="paper"][data-resolved-theme] :is(.document-title, .rich-body h1, .rich-body h2, .rich-body h3, .rich-body h4) {

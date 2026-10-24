@@ -792,6 +792,7 @@ class WorkflowState(BaseModel):
     ) = None
     pending_pause_payload: dict[str, Any] | None = None
     current_step_status: Literal["running", "paused"] | None = None
+    resume_failed_step: bool = False
 
     @field_validator("current_step_status", mode="before")
     @classmethod

@@ -311,6 +311,17 @@ skill state, including slash-command reloads. Legacy events retain their origina
 supersession behavior. Live project-exposure notices carry their canonical audit
 source and role so provider wrappers do not change on cold replay.
 
+Within-turn soft-target projection can reuse the accepted rendering plus new
+messages after exact counting passes the existing loop-pressure, hard, and
+available-budget gates. A complete source-prefix hash (excluding mutable token
+estimates) is turn-owned `ProjectionTurnState` metadata, copied through the
+existing offload fork and published only after cancellation/fence checks.
+Unknown or changed source hashes cannot authorize this optimization. Existing
+cheap cached retries remain compatible; they do not establish a source hash
+when source identity is unknown. Projection decisions still commit through the
+existing delivery boundary. No new side effects, locks, retries, event formats,
+durable snapshots, or cross-turn threshold changes are introduced.
+
 ### Controller tool contracts
 
 - Controller-injected tool schemas have one source of truth in

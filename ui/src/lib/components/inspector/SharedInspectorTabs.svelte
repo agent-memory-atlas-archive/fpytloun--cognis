@@ -146,7 +146,7 @@
     onChange?.(activeTab);
   }
 
-  function openWork(category: WorkCategory): void {
+  export function openWork(category: WorkCategory): void {
     workCategory = category === 'deliverables' ? 'results' : category;
     activeTab = 'work';
   }

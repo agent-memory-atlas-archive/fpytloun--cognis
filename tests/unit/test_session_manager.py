@@ -1857,6 +1857,60 @@ async def test_child_continuation_chain_detects_branch_and_cycles(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_task_root_continuation_chain_retains_compaction_history_without_forks(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    conversation, original = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Task step history",
+    )
+    successor = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=original,
+        intention="Resume step after compaction",
+        compaction_summary="Step progress",
+    )
+    async with session_factory() as db:
+        fork = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            source_session_id=successor.session_id,
+            activity_scope_id=original.activity_scope_id,
+        )
+        child = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=successor.session_id,
+            activity_scope_id=original.activity_scope_id,
+        )
+        await db.commit()
+        for selected in (original.session_id, successor.session_id):
+            chain, truncated = await get_child_session_continuation_chain(
+                db, selected, include_root=True
+            )
+            assert [row.session_id for row in chain] == [original.session_id, successor.session_id]
+            assert truncated is False
+            assert fork.session_id not in {row.session_id for row in chain}
+            assert child.session_id not in {row.session_id for row in chain}
+        bounded, truncated = await get_child_session_continuation_chain(
+            db, successor.session_id, include_root=True, max_depth=1
+        )
+        assert len(bounded) == 1
+        assert truncated is True
+        default, _ = await get_child_session_continuation_chain(db, successor.session_id)
+        assert [row.session_id for row in default] == [successor.session_id]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_child_continuation_chain_rejects_missing_predecessor_but_allows_scope_boundary(
     tmp_path,
 ) -> None:

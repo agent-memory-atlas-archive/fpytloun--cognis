@@ -305,3 +305,69 @@ async def test_cancelled_or_superseded_attempt_invalidates_fence_immediately(
             await fence.assert_current()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_workflow_provider_deferral_uses_real_task_fence_and_compare_and_set(
+    tmp_path: object,
+    cancelled: bool,
+) -> None:
+    from cognis.core.task_execution import bind_task_execution_fence, reset_task_execution_fence
+    from cognis.core.workflow_engine import WorkflowEngine
+    from cognis.models.workflow import StepDefinition, StepOutput, Workflow, WorkflowState
+    from cognis.store.queries import get_task
+
+    engine, factory = await _database(tmp_path)
+    try:
+        store = TaskExecutionStore(
+            factory,
+            owner_id="controller-a:provider-recovery",
+            max_active_global=1,
+            max_active_per_agent=1,
+        )
+        claim = await store.claim_ready()
+        assert claim is not None
+        async with factory() as session:
+            task = await get_task(session, claim.task_id)
+        assert task is not None
+        if cancelled:
+            async with factory() as session:
+                row = await session.get(Task, claim.task_id)
+                row.status = "cancelled"
+                await session.commit()
+        state = WorkflowState()
+        step = StepDefinition(name="run", type="run", prompt="Do work")
+        workflow = Workflow(workflow_id="wf:provider-recovery", name="Recovery", steps=[step])
+        failure = StepOutput(
+            summary="Provider rate limited",
+            error="Provider reset in 600 seconds",
+            metadata={"model_error": {"transient": True, "retry_after_seconds": 600}},
+        )
+        workflow_engine = object.__new__(WorkflowEngine)
+        workflow_engine._session_factory = factory
+        fence = TaskExecutionFence(store, claim, asyncio.Event())
+        token = bind_task_execution_fence(fence)
+        try:
+            if cancelled:
+                with pytest.raises(StaleTaskExecutionOwner):
+                    await workflow_engine._defer_step_recovery(task, step, state, workflow, failure)
+            else:
+                assert await workflow_engine._defer_step_recovery(
+                    task,
+                    step,
+                    state,
+                    workflow,
+                    failure,
+                )
+        finally:
+            reset_task_execution_fence(token)
+        async with factory() as session:
+            row = await session.get(Task, claim.task_id)
+            assert row.status == ("cancelled" if cancelled else "ready")
+            if not cancelled:
+                assert row.result_summary == failure.error
+                assert row.workflow_state["loop_iterations"] == {"recovery:run": 1}
+                assert row.scheduled_for is not None
+    finally:
+        await engine.dispose()

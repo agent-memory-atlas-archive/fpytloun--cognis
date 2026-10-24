@@ -89,10 +89,10 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
 
     assert result.mutable_start_index == 2
     assert "Tool output omitted from prompt." in str(result.messages[1]["content"])
-    assert "call_id 'call-1'" in str(result.messages[1]["content"])
-    assert "Recover with" in str(result.messages[1]["content"])
+    assert "call_id='call-1'" in str(result.messages[1]["content"])
+    assert "Recover only if needed" in str(result.messages[1]["content"])
     assert "read_tool_output(call_id='call-1')" in str(result.messages[1]["content"])
-    assert "search_tool_output(call_id='call-1'" in str(result.messages[1]["content"])
+    assert str(result.messages[1]["content"]).count("call-1") == 1
     assistant_args = result.messages[0]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(assistant_args, str)
     assert "Arguments cleared -" in assistant_args
@@ -394,7 +394,7 @@ def test_project_messages_uses_helper_recovery_call_id_for_helper_results() -> N
     result = project_messages(messages, preserve_recent_completed_tool_groups=0)
 
     placeholder = str(result.messages[1]["content"])
-    assert "call_id 'helper-call'" in placeholder
+    assert "call_id='helper-call'" in placeholder
     assert "source call_id 'source-call'" in placeholder
     assert "anchor='result:1'" not in placeholder
     assert "read_tool_output(call_id='helper-call')" in placeholder
@@ -447,8 +447,8 @@ def test_project_messages_defaults_keep_safer_verbatim_tool_tail() -> None:
         if "Tool output omitted from prompt." in str(message.get("content", ""))
     ]
     assert len(compacted_contents) == 2
-    assert "call_id 'call-0'" in compacted_contents[0]
-    assert "call_id 'call-1'" in compacted_contents[1]
+    assert "call_id='call-0'" in compacted_contents[0]
+    assert "call_id='call-1'" in compacted_contents[1]
     assert result.messages[-1]["content"] == _evidence("evidence 11")
 
 
@@ -553,9 +553,9 @@ def test_project_messages_pressure_mode_compacts_older_latest_turn_tool_outputs(
     )
 
     assert "Tool output omitted from prompt." in str(result.messages[2]["content"])
-    assert "call_id 'call-0'" in str(result.messages[2]["content"])
+    assert "call_id='call-0'" in str(result.messages[2]["content"])
     assert "Tool output omitted from prompt." in str(result.messages[4]["content"])
-    assert "call_id 'call-1'" in str(result.messages[4]["content"])
+    assert "call_id='call-1'" in str(result.messages[4]["content"])
     assert result.messages[6]["content"] == "log output 2" * 1000
 
 
@@ -612,7 +612,7 @@ def test_prune_tool_outputs_only_modifies_mutable_tail() -> None:
 
     assert result[1]["content"] == messages[1]["content"]
     assert "Tool output omitted from prompt." in str(result[3]["content"])
-    assert "call_id 'source-call'" in str(result[3]["content"])
+    assert "call_id='source-call'" in str(result[3]["content"])
 
 
 def test_controller_critical_tool_results_are_preserved() -> None:
@@ -699,7 +699,7 @@ def test_project_messages_critical_mode_preserves_protected_and_newest_latest_tu
 
     assert result.messages[2]["content"] == "terminal todos"
     assert "Tool output omitted from prompt." in str(result.messages[4]["content"])
-    assert "call_id 'call-0'" in str(result.messages[4]["content"])
+    assert "call_id='call-0'" in str(result.messages[4]["content"])
     assert result.messages[6]["content"] == "evidence 1" * 1000
     assert result.messages[8]["content"] == "evidence 2" * 1000
 
@@ -862,7 +862,7 @@ def test_prune_tool_outputs_pressure_mode_can_prune_latest_turn_recovered_eviden
     )
 
     assert "Tool output omitted from prompt." in str(result[2]["content"])
-    assert "call_id 'recover-call-1'" in str(result[2]["content"])
+    assert "call_id='recover-call-1'" in str(result[2]["content"])
     assert result[4]["content"] == "Recovered current weather"
 
 

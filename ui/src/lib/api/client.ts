@@ -1945,6 +1945,12 @@ export const api = {
       });
     },
 
+    retry(taskId: string): Promise<{ ok: boolean; task_id: string; status: string }> {
+      return request<{ ok: boolean; task_id: string; status: string }>(
+        `/api/v1/tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' }
+      );
+    },
+
     chat(taskId: string): Promise<TaskChatResponse> {
       return request<TaskChatResponse>(`/api/v1/tasks/${taskId}/chat`, {
         method: 'POST'
