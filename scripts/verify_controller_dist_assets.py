@@ -171,7 +171,20 @@ def verify_dockerfile(path: Path) -> None:
     if missing:
         raise RuntimeError(f"{path} is missing required image settings: {missing}")
     forbidden_fragments = ("curl", "uv sync", "COPY packages/executor", "HEALTHCHECK CMD curl")
-    present = [fragment for fragment in forbidden_fragments if fragment in content]
+    boundary_lines = []
+    stage = None
+    for line in content.splitlines():
+        words = line.split()
+        if words and words[0].upper() == "FROM":
+            stage = words[-1] if len(words) >= 4 and words[-2].upper() == "AS" else None
+        # uv export needs workspace manifests, never executor implementation.
+        if stage == "controller-wheel" and line.strip() == (
+            "COPY packages/executor/pyproject.toml ./packages/executor/pyproject.toml"
+        ):
+            continue
+        boundary_lines.append(line)
+    boundary_content = "\n".join(boundary_lines)
+    present = [fragment for fragment in forbidden_fragments if fragment in boundary_content]
     if present:
         raise RuntimeError(f"{path} contains forbidden image settings: {present}")
 

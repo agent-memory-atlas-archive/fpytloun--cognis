@@ -68,3 +68,13 @@ Release notes are prepared independently of publishing. Follow
 [`changelog.d/README.md`](../../changelog.d/README.md) to preview/export the
 candidate notes. Finalizing fragments, bumping packages, tagging, pushing,
 publishing a release, and deploying are separate explicit actions.
+
+## Retrying controller publication
+
+For an already-published immutable project tag, dispatch the current
+`python-publish.yml` with its required `release_tag` input. The workflow keeps
+its boundary verifier outside the application checkout, then checks out that
+exact tag and verifies its canonical versions before building. This permits a
+packaging-verifier correction without retagging or publishing newer application
+source under an existing version. Existing common and executor distributions
+are not republished by a manual controller retry.
