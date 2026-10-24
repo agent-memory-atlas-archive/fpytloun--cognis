@@ -6,11 +6,12 @@
 
 **Cloud-native Agent OS for self-hosted AI agents.** Cognis is not only a place to chat with agents. It is a workspace where agents perform, coordinate, and expose real work. Use it at your desk, at home, or from your phone.
 
-Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
+![Cognis desktop workspace with an agent conversation and its Work inspector](docs/assets/screenshots/showcase/desktop-workspace.png)
 
-<p align="center">
-  <img src="docs/assets/images/cognis-cloud-native-agent-os.svg" alt="Cognis cloud-native Agent OS architecture" />
-</p>
+*A desktop conversation with its work history alongside it. Fictional demo data.
+[Explore the product showcase](docs/guide/showcase.md).*
+
+Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
 Cognis works with companion services for memory and guardrails:
 
@@ -35,25 +36,41 @@ Cognis works with companion services for memory and guardrails:
 
 ## Screenshots
 
-### One workspace for real work
+Screenshots use fictional demo data. Example metrics are not product benchmarks.
 
-Open several conversations and tasks from the dashboard. Keep active work in
-separate windows, switch between them, and inspect rich deliverables without
-losing your place.
-
-### See what agents are doing
+### Inspect the work behind a reply
 
 The activity sidebar shows the files, commands, mutations, artifacts, and
 deliverables for the current work graph. Open command output or inspect a diff
 while the agent continues its work.
 
-### Keep working from mobile
+![An inline file diff beside the agent conversation](docs/assets/screenshots/showcase/desktop-diff.png)
 
-Monitor ongoing sessions, inspect the activity overview, and review changed
-files from the installable mobile app.
+### Keep approvals in your hands
 
-[See the complete product showcase](docs/guide/showcase.md), including window
-management, desktop activity inspection, mobile diffs, and command output.
+Tasks have visible phases, step results, and approval gates. Review the evidence
+and decide whether work should continue.
+
+![A task cockpit paused at a human approval gate](docs/assets/screenshots/showcase/task-approval.png)
+
+### Get more than a wall of text
+
+Rich deliverables turn results into readable reports, comparisons, dashboards,
+and versioned documents. The example below uses synthetic dashboard data.
+
+![A rich deliverable with example metrics and a grouped chart](docs/assets/screenshots/showcase/rich-dashboard.png)
+
+### Continue from your phone
+
+The responsive mobile workspace keeps task context and approval controls
+accessible away from your desk.
+
+<p align="center">
+  <img src="docs/assets/screenshots/showcase/mobile-approval.png" alt="Mobile task view with an approval gate and bottom navigation" width="330" />
+</p>
+
+[See the complete product showcase](docs/guide/showcase.md) for desktop windows,
+activity inspection, task approvals, rich deliverables, and mobile views.
 
 ## Features
 
@@ -82,6 +99,8 @@ to compare versions and review upgrade notes. Contributors maintain release
 fragments as described in [changelog.d](changelog.d/README.md).
 
 ## Architecture
+
+![Cognis cloud-native Agent OS architecture](docs/assets/images/cognis-cloud-native-agent-os.svg)
 
 ![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
 
