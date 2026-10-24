@@ -6,6 +6,7 @@
   import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineItem as ChatV2TimelineItem, TimelineScope } from '$lib/chat-v2/types';
   import type { Agent } from '$lib/types/api';
+  import type { CommandV2Response } from '$lib/chat-v2/types';
 
   let {
     item,
@@ -17,7 +18,8 @@
     getToolCall = () => null,
     onViewSession,
     pinnedTransient = false,
-    scope
+    scope,
+    providerRecovery
   } = $props<{
     item: ChatV2TimelineItem;
     agent?: Agent | null;
@@ -29,6 +31,7 @@
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
     pinnedTransient?: boolean;
     scope?: TimelineScope | undefined;
+    providerRecovery?: { conversationId: string; turnId: string; onResponse: (response: CommandV2Response) => Promise<void> };
   }>();
 
   const markdownStreamers = new Map<string, MarkdownStreamer>();
@@ -46,7 +49,7 @@
       streamer = createMarkdownStreamer();
       markdownStreamers.set(key, streamer);
     }
-    return streamer.render(content) || (content ? renderMarkdown(content) : '');
+    return streamer.render(content);
   };
 
   $effect(() => {
@@ -75,5 +78,6 @@
     {onViewSession}
     {pinnedTransient}
     {scope}
+    {providerRecovery}
   />
 {/if}

@@ -47,12 +47,13 @@
   onClose={onclose}
   titleId="web-backend-edit-title"
   dismissible={!busy}
+  backdropDismissible={JSON.stringify(draft) === JSON.stringify(backendValue)}
 >
   {#snippet header()}
     <div class="flex items-center justify-between gap-3">
       <div>
-        <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Web search backend</p>
-        <h2 class="mt-1 text-lg font-semibold text-white" id="web-backend-edit-title">
+        <p class="text-xs uppercase tracking-[0.25em] text-muted">Web search backend</p>
+        <h2 class="mt-1 text-lg font-semibold text-strong" id="web-backend-edit-title">
           Edit {backendLabel(backendValue.backend)}
         </h2>
       </div>
@@ -62,44 +63,44 @@
 
   {#snippet children()}
     <div class="space-y-5">
-      <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200">
+      <label class="flex items-start gap-3 rounded-2xl border border-separator bg-surface/60 px-4 py-3 text-sm text-foreground">
         <input
           bind:checked={draft.enabled}
-          class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300"
+          class="mt-1 rounded border-control-border bg-canvas text-accent focus:ring-accent"
           type="checkbox"
         />
         <span>
-          <span class="block font-medium text-slate-100">Enabled</span>
-          <span class="mt-1 block text-xs leading-5 text-slate-400">
+          <span class="block font-medium text-foreground">Enabled</span>
+          <span class="mt-1 block text-xs leading-5 text-muted">
             Disabled backends keep their configuration but are hidden from web tools and backend selectors.
           </span>
         </span>
       </label>
 
       {#if draft.backend === 'searxng'}
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Instance URL</span>
           <Input bind:value={draft.searxngUrl} placeholder="http://localhost:8888" />
         </label>
         <div class="grid gap-4 sm:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Engines</span>
             <Input bind:value={draft.searxngEngines} placeholder="google,bing,duckduckgo" />
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Categories</span>
             <Input bind:value={draft.searxngCategories} placeholder="general" />
           </label>
         </div>
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Language</span>
           <Input bind:value={draft.searxngLanguage} placeholder="all or en-US" />
         </label>
-        <p class="text-xs leading-5 text-slate-400">
+        <p class="text-xs leading-5 text-muted">
           Engines, categories, and language are optional comma-separated defaults sent to your SearXNG instance.
         </p>
       {:else}
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>{configured ? 'Replace API key' : 'API key'}</span>
           <Input
             bind:value={draft.apiKey}
@@ -108,7 +109,7 @@
           />
         </label>
         {#if configured}
-          <p class="text-xs leading-5 text-slate-400">
+          <p class="text-xs leading-5 text-muted">
             The existing key is encrypted and cannot be displayed. Enter a new value only when replacing it.
           </p>
         {/if}

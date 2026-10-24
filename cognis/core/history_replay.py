@@ -9,6 +9,27 @@ from typing import Any
 from cognis import json_codec as json
 
 
+def format_tool_result_message(
+    *,
+    call_id: Any,
+    content: str,
+    tool_name: Any = None,
+    is_error: bool = False,
+    protected: bool = False,
+) -> dict[str, Any]:
+    """Build the shared model-facing base shape for live and replayed results."""
+    message: dict[str, Any] = {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+        "_tool_name": tool_name,
+        "_tool_is_error": is_error,
+    }
+    if protected:
+        message["_protected_tool_output"] = True
+    return message
+
+
 def recorded_tool_output(data: dict[str, Any]) -> str | None:
     """Read current or legacy output without treating empty text as absent."""
     result = data.get("result")
@@ -63,6 +84,8 @@ def is_model_history_event(event: Any) -> bool:
     if kind == "evaluation":
         return bool(data.get("event") == "evaluation_feedback")
     if kind == "lifecycle":
+        if data.get("model_context") is False:
+            return False
         return data.get("event") in {
             "task_result",
             "task_failed",
@@ -91,7 +114,11 @@ def defer_tool_batch_notices(events: list[Any]) -> Iterator[Any]:
     for event in events:
         kind = event.get("type") if isinstance(event, dict) else event.type
         data = event.get("data", {}) if isinstance(event, dict) else event.data
-        if kind in {"lifecycle", "evaluation", "delegation", "developer_message"} and pending:
+        if (
+            kind in {"lifecycle", "evaluation", "delegation", "developer_message"}
+            and pending
+            and data.get("tool_context_notice_version") != 1
+        ):
             deferred.append(event)
             continue
         if kind in {"user_message", "assistant_message"}:

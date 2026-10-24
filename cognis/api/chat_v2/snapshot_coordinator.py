@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -21,6 +22,7 @@ from cognis.api.chat_v2.schemas import (
 )
 from cognis.api.chat_v2.shared_snapshot_cache import CachedSnapshotStatus, SnapshotRequestTrace
 from cognis.api.chat_v2.snapshot_metrics import (
+    SNAPSHOT_CACHE_METRICS,
     SnapshotRequestTier,
     WarmFailureReason,
 )
@@ -37,7 +39,7 @@ from cognis.api.chat_v2.sync import (
     state_view_from_snapshot,
 )
 from cognis.api.common import api_exception
-from cognis.core.attachment_utils import hydrate_attachment_refs
+from cognis.core.attachment_utils import hydrate_attachment_ref_groups
 from cognis.core.conversation_state import snapshot_for_conversation
 from cognis.store.queries import (
     get_conversation,
@@ -60,6 +62,9 @@ class ConversationSnapshotContext:
     event_post_processor: EventPostProcessor
     owner_email: str
     conversation_id: str
+    # Authorized project reader (not the author): only durable history may be
+    # served. Enforced in _apply_mutable_snapshot_overlay and kept on reloads.
+    shared_reader: bool = False
 
 
 async def load_conversation_snapshot_context(
@@ -67,9 +72,17 @@ async def load_conversation_snapshot_context(
     *,
     user_email: str,
     conversation_id: str,
+    shared_reader: bool = False,
 ) -> ConversationSnapshotContext:
-    """Load an explicitly authorized conversation snapshot context without HTTP coupling."""
+    """Load an explicitly authorized conversation snapshot context without HTTP coupling.
 
+    ``user_email`` is the history authority (the conversation author).
+    ``shared_reader`` marks a project reader the caller already authorized:
+    only durable history is returned, never the author's queue, pending
+    state, or live runtime overlays.
+    """
+
+    started = time.perf_counter()
     async with app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
         if row is None or getattr(row, "status", None) == "deleted" or row.user_email != user_email:
@@ -114,14 +127,18 @@ async def load_conversation_snapshot_context(
         session_cache=getattr(app.state, "session_cache", None),
     )
     runtime_input = await _hydrate_runtime_input(app, conversation_id, runtime_input)
-    return ConversationSnapshotContext(
+    queue = queue_state_from_messages(queued_messages)
+    state = state_view_from_snapshot(state_snapshot)
+    if shared_reader:
+        queue, state, runtime_input = _shared_reader_mutable_state(runtime_input)
+    context = ConversationSnapshotContext(
         scope=scope,
         conversation=conversation,
         session_refs=session_refs,
         event_store=None,
         cursor_secret=_cursor_secret(app),
-        queue=queue_state_from_messages(queued_messages),
-        state=state_view_from_snapshot(state_snapshot),
+        queue=queue,
+        state=state,
         runtime_input=runtime_input,
         session_cache=getattr(app.state, "session_cache", None),
         event_post_processor=event_attachment_post_processor(
@@ -131,6 +148,24 @@ async def load_conversation_snapshot_context(
         ),
         owner_email=user_email,
         conversation_id=conversation_id,
+        shared_reader=shared_reader,
+    )
+    SNAPSHOT_CACHE_METRICS.request_stage("context", time.perf_counter() - started)
+    return context
+
+
+def _shared_reader_mutable_state(
+    runtime_input: RuntimeOverlayInput,
+) -> tuple[QueueState, ConversationStateView, RuntimeOverlayInput]:
+    """Empty queue, state, and runtime overlays for project readers."""
+
+    return (
+        queue_state_from_messages([]),
+        state_view_from_snapshot(None),
+        RuntimeOverlayInput(
+            runtime_epoch=runtime_input.runtime_epoch,
+            runtime_revision=runtime_input.runtime_revision,
+        ),
     )
 
 
@@ -205,6 +240,7 @@ async def rebuild_chat_snapshot_coordinated(
         app,
         user_email=context.owner_email,
         conversation_id=context.conversation_id,
+        shared_reader=context.shared_reader,
     )
     base = await _build_immutable_snapshot(fresh)
     return await _apply_mutable_snapshot_overlay(app, base, fresh)
@@ -243,12 +279,16 @@ async def get_cached_chat_snapshot_coordinated(
         return None, "unavailable"
     if any(token is None for token in tokens):
         return None, "ineligible"
-    result = await cache.get_cached_result(
-        authority_token=_conversation_authority_token(app, context),
-        scope_key=context.scope.key,
-        session_refs=context.session_refs,
-        cursor_secret=context.cursor_secret,
-    )
+    started = time.perf_counter()
+    try:
+        result = await cache.get_cached_result(
+            authority_token=_conversation_authority_token(app, context),
+            scope_key=context.scope.key,
+            session_refs=context.session_refs,
+            cursor_secret=context.cursor_secret,
+        )
+    finally:
+        SNAPSHOT_CACHE_METRICS.request_stage("immutable", time.perf_counter() - started)
     if result.snapshot is None:
         return None, result.status
     return (
@@ -277,31 +317,36 @@ async def _build_chat_snapshot_coordinated(
         built = True
         return await _build_immutable_snapshot(context)
 
-    if cache is None or any(token is None for token in tokens):
-        if request_trace is not None:
-            request_trace.select("bypass")
-        base = await build()
-        tier: SnapshotRequestTier = "bypass"
-    else:
-        cache_result = await cache.get_or_build_result(
-            authority_token=_conversation_authority_token(app, context),
-            scope_key=context.scope.key,
-            session_refs=context.session_refs,
-            cursor_secret=context.cursor_secret,
-            build=build,
-            request_trace=request_trace,
-        )
-        base = cache_result.snapshot
-        tier = cache_result.tier
-        if base is None:
+    started = time.perf_counter()
+    try:
+        if cache is None or any(token is None for token in tokens):
+            if request_trace is not None:
+                request_trace.select("bypass")
             base = await build()
-            tier = "bypass"
+            tier: SnapshotRequestTier = "bypass"
+        else:
+            cache_result = await cache.get_or_build_result(
+                authority_token=_conversation_authority_token(app, context),
+                scope_key=context.scope.key,
+                session_refs=context.session_refs,
+                cursor_secret=context.cursor_secret,
+                build=build,
+                request_trace=request_trace,
+            )
+            base = cache_result.snapshot
+            tier = cache_result.tier
+            if base is None:
+                base = await build()
+                tier = "bypass"
+    finally:
+        SNAPSHOT_CACHE_METRICS.request_stage("immutable", time.perf_counter() - started)
 
     if built:
         fresh = await load_conversation_snapshot_context(
             app,
             user_email=context.owner_email,
             conversation_id=context.conversation_id,
+            shared_reader=context.shared_reader,
         )
         original_lineage = [
             (ref.event_store_session_id, ref.authority_token, ref.ordinal)
@@ -333,24 +378,33 @@ async def _apply_mutable_snapshot_overlay(
     """Apply authorized mutable state and request-time attachment hydration."""
 
     now = datetime.now(UTC)
+    queue, state, runtime_input = (
+        _shared_reader_mutable_state(context.runtime_input)
+        if context.shared_reader
+        else (context.queue, context.state, context.runtime_input)
+    )
     overlaid = base.model_copy(
         update={
             "scope": context.scope,
             "conversation": context.conversation,
-            "queue": context.queue,
-            "state": context.state,
-            "runtime": _runtime_overlay(context.runtime_input, generated_at=now),
+            "queue": queue,
+            "state": state,
+            "runtime": _runtime_overlay(runtime_input, generated_at=now),
             "activity_overview": None,
             "server_time": now.isoformat(),
         }
     )
-    return await _hydrate_snapshot_attachments(
-        app,
-        overlaid,
-        owner_email=context.owner_email,
-        conversation_id=context.conversation_id,
-        session_refs=context.session_refs,
-    )
+    started = time.perf_counter()
+    try:
+        return await _hydrate_snapshot_attachments(
+            app,
+            overlaid,
+            owner_email=context.owner_email,
+            conversation_id=context.conversation_id,
+            session_refs=context.session_refs,
+        )
+    finally:
+        SNAPSHOT_CACHE_METRICS.request_stage("attachments", time.perf_counter() - started)
 
 
 async def warm_chat_snapshot_coordinated(
@@ -391,24 +445,29 @@ def event_attachment_post_processor(
     async def hydrate(events: list[RawSessionEvent]) -> list[RawSessionEvent]:
         if not any(isinstance(event.data.get("attachments"), list) for event in events):
             return list(events)
-        hydrated_events = []
-        for event in events:
+        groups: dict[str | None, list[int]] = {}
+        for index, event in enumerate(events):
             attachments = event.data.get("attachments")
-            if not isinstance(attachments, list):
-                hydrated_events.append(event)
+            if not isinstance(attachments, list) or not attachments:
                 continue
             source_session_id = event.data.get("cognis_session_id")
-            hydrated = await hydrate_attachment_refs(
+            key = str(source_session_id) if source_session_id is not None else None
+            groups.setdefault(key, []).append(index)
+        hydrated_events = list(events)
+        for source_session_id, indices in groups.items():
+            hydrated_groups = await hydrate_attachment_ref_groups(
                 app.state.session_factory,
                 app.state.artifact_store,
-                attachments,
+                [events[index].data["attachments"] for index in indices],
                 owner_email=owner_email,
                 conversation_id=conversation_id,
-                session_id=(str(source_session_id) if source_session_id is not None else None),
+                session_id=source_session_id,
             )
-            hydrated_events.append(
-                event.model_copy(update={"data": {**event.data, "attachments": hydrated}})
-            )
+            for index, hydrated in zip(indices, hydrated_groups, strict=True):
+                event = events[index]
+                hydrated_events[index] = event.model_copy(
+                    update={"data": {**event.data, "attachments": hydrated}}
+                )
         return hydrated_events
 
     return hydrate
@@ -482,26 +541,36 @@ async def _hydrate_snapshot_attachments(
     if not any(getattr(item, "attachments", None) for item in items):
         return snapshot
     session_ids = {ref.event_store_session_id: ref.session_id for ref in session_refs}
-    hydrated_items = []
-    for item in items:
+    groups: dict[str | None, list[int]] = {}
+    for index, item in enumerate(items):
         attachments = getattr(item, "attachments", None)
         if not attachments:
-            hydrated_items.append(item)
             continue
         source_session_id = (
             session_ids.get(item.source_refs[0].session_id) if item.source_refs else None
         )
-        hydrated = await hydrate_attachment_refs(
+        groups.setdefault(source_session_id, []).append(index)
+    hydrated_items = list(items)
+    for source_session_id, indices in groups.items():
+        hydrated_groups = await hydrate_attachment_ref_groups(
             app.state.session_factory,
             app.state.artifact_store,
-            [attachment.model_dump(mode="json") for attachment in attachments],
+            [
+                [
+                    attachment.model_dump(mode="json")
+                    for attachment in getattr(items[index], "attachments", [])
+                ]
+                for index in indices
+            ],
             owner_email=owner_email,
             conversation_id=conversation_id,
             session_id=source_session_id,
         )
-        hydrated_items.append(
-            item.__class__.model_validate({**item.model_dump(mode="json"), "attachments": hydrated})
-        )
+        for index, hydrated in zip(indices, hydrated_groups, strict=True):
+            item = items[index]
+            hydrated_items[index] = item.__class__.model_validate(
+                {**item.model_dump(mode="json"), "attachments": hydrated}
+            )
     return snapshot.model_copy(
         update={"timeline": snapshot.timeline.model_copy(update={"items": hydrated_items})}
     )

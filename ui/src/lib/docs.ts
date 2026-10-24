@@ -67,10 +67,13 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/architecture.md': '/docs/architecture',
   'docs/guide/configuring-providers.md': '/docs/configuring-providers',
   'docs/guide/creating-agents.md': '/docs/creating-agents',
+  'docs/guide/agent-hooks.md': '/docs/agent-hooks',
+  'docs/guide/actionable-approvals.md': '/docs/actionable-approvals',
   'docs/guide/customizing-your-harness.md': '/docs/customizing-your-harness',
   'docs/guide/security-and-privacy.md': '/docs/security-and-privacy',
   'docs/guide/settings.md': '/docs/settings',
   'docs/guide/using-chat.md': '/docs/using-chat',
+  'docs/guide/chat-modes.md': '/docs/chat-modes',
   'docs/guide/context-management.md': '/docs/context-management',
   'docs/guide/projects.md': '/docs/projects',
   'docs/guide/managing-tasks.md': '/docs/managing-tasks',
@@ -86,6 +89,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/executors.md': '/docs/executors',
   'docs/guide/macos-executor.md': '/docs/macos-executor',
   'docs/guide/deployment.md': '/docs/deployment',
+  'docs/guide/inference-api.md': '/docs/inference-api',
   'docs/guide/high-availability.md': '/docs/high-availability',
   'docs/guide/ha-e2e.md': '/docs/ha-e2e',
   'docs/guide/troubleshooting.md': '/docs/troubleshooting'
@@ -162,11 +166,12 @@ function resolveRelativeMarkdownTarget(sourcePath: string, rawTarget: string): s
   ) {
     return null;
   }
-  const resolvedTarget = resolveDocRelativePath(sourcePath, rawTarget);
+  const [targetPath, fragment] = rawTarget.split('#', 2);
+  const resolvedTarget = resolveDocRelativePath(sourcePath, targetPath);
   const bundledAsset = lookupAssetUrl(resolvedTarget);
   if (bundledAsset) return bundledAsset;
   const embeddedDocRoute = EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH[resolvedTarget];
-  if (embeddedDocRoute) return embeddedDocRoute;
+  if (embeddedDocRoute) return embeddedDocRoute + (fragment ? `#${fragment}` : '');
   const normalized = resolvedTarget.replace(/\/$/, '');
   if (normalized.startsWith('docs/specs/') || DOC_REPO_URLS.has(normalized)) {
     return getGitHubRepoUrl(resolvedTarget);

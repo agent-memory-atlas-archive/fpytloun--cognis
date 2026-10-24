@@ -1,5 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AttachmentRef } from '$lib/types/api';
 import AttachmentPreviewModal from './AttachmentPreviewModal.svelte';
@@ -30,6 +30,7 @@ describe('AttachmentPreviewModal', () => {
   beforeEach(() => {
     mocks.textPreview.mockReset();
   });
+  afterEach(() => vi.unstubAllGlobals());
 
   it('renders Markdown through the sanitized rich viewer', async () => {
     mocks.textPreview.mockResolvedValue({
@@ -49,7 +50,7 @@ describe('AttachmentPreviewModal', () => {
       attachment: attachment('report.md', 'text/markdown'),
       kind: 'markdown',
       onClose: vi.fn(),
-      onDownload: vi.fn(),
+      resolveDownloadUrl: vi.fn(),
     });
 
     expect(await screen.findByRole('heading', { name: 'Preview title' })).toBeTruthy();
@@ -82,7 +83,7 @@ describe('AttachmentPreviewModal', () => {
       attachment: attachment('data.csv', 'text/csv'),
       kind: 'csv',
       onClose: vi.fn(),
-      onDownload: vi.fn(),
+      resolveDownloadUrl: vi.fn(),
     });
 
     await screen.findByRole('table');
@@ -91,17 +92,37 @@ describe('AttachmentPreviewModal', () => {
   });
 
   it('keeps HTML previews inside a sandboxed modal iframe', async () => {
-    render(AttachmentPreviewModal, {
+    const controller = new AbortController();
+    const url = new URL(`/api/v1/artifacts/view/attachments/att_preview/page.html?exp=9999999999&sig=${'a'.repeat(64)}`, window.location.origin).href;
+    const revoke = vi.fn();
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = vi.fn(() => 'blob:https://cognis.test/modal-preview');
+      static revokeObjectURL = revoke;
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<h1>Preview</h1>', {
+      headers: { 'content-type': 'text/html' },
+    })));
+    const view = render(AttachmentPreviewModal, {
       attachment: attachment('page.html', 'text/html'),
       kind: 'html',
-      mediaUrl: 'https://cognis.test/signed-view',
+      htmlSource: { url, lease: {
+        owner: 'modal-preview', epoch: '1', signal: controller.signal,
+        assertCurrent() { controller.signal.throwIfAborted(); },
+        async validate() { controller.signal.throwIfAborted(); },
+      } },
       onClose: vi.fn(),
-      onDownload: vi.fn(),
+      resolveDownloadUrl: vi.fn(),
     });
 
     await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull());
     const iframe = document.querySelector('iframe');
-    expect(iframe?.getAttribute('src')).toBe('https://cognis.test/signed-view');
+    expect(iframe?.getAttribute('src')).toBe('blob:https://cognis.test/modal-preview');
     expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(fetch).toHaveBeenCalledWith(url, expect.objectContaining({
+      credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer',
+    }));
+    view.unmount();
+    expect(iframe?.isConnected).toBe(false);
+    expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:https://cognis.test/modal-preview');
   });
 });

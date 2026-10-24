@@ -67,6 +67,9 @@ def test_render_escalation_notification_includes_required_details() -> None:
             "tool_name": "bash",
             "risk": "high",
             "reasoning": "Needs network access and may change files.",
+            "call_id": "approval-1",
+            "arguments_display": {"command": "printf ready", "password": "do-not-display"},
+            "expires_at": "2030-01-01T12:00:00Z",
         }
     )
 
@@ -76,6 +79,10 @@ def test_render_escalation_notification_includes_required_details() -> None:
     assert "/approve" in content
     assert "/deny" in content
     assert "optionally add a note" in content
+    assert "--id approval-1" in content
+    assert "printf ready" in content
+    assert "do-not-display" not in content
+    assert "2030-01-01T12:00:00Z" in content
 
 
 @pytest.mark.asyncio
@@ -142,15 +149,15 @@ def test_render_credential_request_notification_includes_form_link() -> None:
 
     content = service._render_credential_request_notification(
         {
-            "label": "Cocky Kontaktni Google login",
-            "message": "Need password for Google login.",
+            "label": "Sample site account",
+            "message": "Need password for the sample account.",
             "required_fields": ["username", "password"],
         },
         notification_id="auth_123",
     )
 
-    assert "*[credential]* Cocky Kontaktni Google login" in content
-    assert "Need password for Google login." in content
+    assert "*[credential]* Sample site account" in content
+    assert "Need password for the sample account." in content
     assert "Required fields: username, password" in content
     assert "https://cognis.example.com/notifications/auth_123" in content
     assert "Do not send credential values in this chat." in content
@@ -166,6 +173,7 @@ def test_render_escalation_notification_includes_managed_origin_context() -> Non
             "reasoning": "runs a command",
             "managed_conversation_title": "Research sub-task",
             "managed_target_agent_id": "agent-researcher",
+            "call_id": "managed-approval",
         }
     )
 
@@ -179,7 +187,9 @@ def test_render_escalation_notification_includes_managed_origin_context() -> Non
 @pytest.mark.asyncio
 async def test_notification_event_prepends_managed_origin_for_non_escalation() -> None:
     service = _make_service()
-    service._resolve_channel = AsyncMock(return_value=("matrix", "acct-1", "!room:fpy.cz", None))  # type: ignore[method-assign]
+    service._resolve_channel = AsyncMock(
+        return_value=("matrix", "acct-1", "!room:matrix.example.com", None)
+    )  # type: ignore[method-assign]
     service.send_to_conversation = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     event = Event(
@@ -207,7 +217,9 @@ async def test_notification_event_prepends_managed_origin_for_non_escalation() -
 @pytest.mark.asyncio
 async def test_notification_event_escalation_does_not_double_prefix_managed_origin() -> None:
     service = _make_service()
-    service._resolve_channel = AsyncMock(return_value=("matrix", "acct-1", "!room:fpy.cz", None))  # type: ignore[method-assign]
+    service._resolve_channel = AsyncMock(
+        return_value=("matrix", "acct-1", "!room:matrix.example.com", None)
+    )  # type: ignore[method-assign]
     service.send_to_conversation = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     event = Event(
@@ -258,7 +270,7 @@ async def test_notification_event_delivers_rich_escalation_text() -> None:
     service.send_to_conversation.assert_awaited_once()
     content = service.send_to_conversation.await_args.args[1]
     assert "Approval required for tool `bash`." in content
-    assert "Reply /approve to allow it or /deny to block it." in content
+    assert "No approval ID is available" in content
 
 
 @pytest.mark.asyncio
@@ -877,6 +889,7 @@ async def test_deliver_outbox_persists_signal_uncertainty_without_resend(
 ) -> None:
     row = SimpleNamespace(
         delivery_id="cdel-signal-worker",
+        direct_turn_request_id=None,
         account_id="acct-1",
         channel_type="signal",
         chat_id="chat-1",

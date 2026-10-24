@@ -5,6 +5,8 @@ import type { ActivitySegmentRow, ToolGroupRow } from '$lib/chat-v2/tool-groups'
 import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 import ActivitySegmentBlock from './ActivitySegmentBlock.svelte';
 import ToolCallGroupBlock from './ToolCallGroupBlock.svelte';
+import { activeActivityGroupId } from '$lib/chat-v2/activity-progress';
+import type { RuntimeOverlaySnapshot, ThinkingTimelineItem } from '$lib/chat-v2/types';
 
 const scopes: TimelineScope[] = [
   {
@@ -30,6 +32,7 @@ function tool(): ToolCallTimelineItem {
     status: 'complete',
     stable: true,
     call_id: 'call_1',
+    turn_id: 'turn_1',
     tool_name: 'read',
     arguments: { file_path: '/tmp/file.txt' },
     result_preview: 'content',
@@ -90,6 +93,71 @@ function expansionButton(
 afterEach(cleanup);
 
 describe('activity group scope parity', () => {
+  it.each([false, true])('uses the same dense expanded spacing as tool groups (compact=%s)', async (compact) => {
+    const tools = render(ToolCallGroupBlock, { row: toolGroup(true), compact });
+    const segment = render(ActivitySegmentBlock, { row: activitySegment(true), compact });
+    await waitFor(() => {
+      const toolBody = tools.container.querySelector('[data-kind="tool_group"] > div');
+      const segmentBody = segment.container.querySelector('[data-kind="activity_segment"] > div');
+      expect(toolBody).not.toBeNull();
+      expect(segmentBody).not.toBeNull();
+      // Tailwind's sibling-spacing utility is the expanded list's layout contract.
+      expect(segmentBody?.className.match(/\bspace-y-\S+/)?.[0])
+        .toBe(toolBody?.className.match(/\bspace-y-\S+/)?.[0]);
+    });
+  });
+  const runtime: RuntimeOverlaySnapshot = {
+    runtime_epoch: 'epoch_1', runtime_revision: 1, generated_at: '2026-08-25T20:00:00Z',
+    has_active_turn: true, active_turn: { turn_id: 'turn_1', session_id: 'sess_1', status: 'running' },
+    volatile_items: [],
+  };
+
+  it('keeps a completed tool group active through thinking and between cycles', () => {
+    const group = toolGroup(false);
+    const thinking: ThinkingTimelineItem = {
+      id: 'thinking_1', kind: 'thinking', sort_key: '2', source_refs: [],
+      stable: false, status: 'running', turn_id: 'turn_1', blocks: [],
+    };
+    expect(activeActivityGroupId([group], runtime)).toBe(group.id);
+    expect(activeActivityGroupId([group, { kind: 'item', item: thinking }], runtime)).toBe(group.id);
+    const next = { ...group, id: 'tool-group:2' };
+    expect(activeActivityGroupId([group, next], runtime)).toBe(next.id);
+  });
+
+  it('stops for waiting, cancellation, a different turn, or a finished runtime', () => {
+    const group = toolGroup(false);
+    for (const status of ['waiting', 'cancelling'] as const) {
+      expect(activeActivityGroupId([group], {
+        ...runtime, active_turn: { ...runtime.active_turn!, status },
+      })).toBeNull();
+    }
+    expect(activeActivityGroupId([group], { ...runtime, has_active_turn: false })).toBeNull();
+    expect(activeActivityGroupId([group], {
+      ...runtime, active_turn: { ...runtime.active_turn!, turn_id: 'turn_2' },
+    })).toBeNull();
+    expect(activeActivityGroupId([group], null)).toBeNull();
+  });
+
+  it.each(['failed', 'denied'] as const)('keeps progress during recovery from a %s tool', (status) => {
+    const group = toolGroup(false);
+    group.summary.status = status;
+    const thinking: ThinkingTimelineItem = {
+      id: 'thinking_1', kind: 'thinking', sort_key: '2', source_refs: [],
+      stable: false, status: 'running', turn_id: 'turn_1', blocks: [],
+    };
+    expect(activeActivityGroupId([group, { kind: 'item', item: thinking }], runtime)).toBe(group.id);
+    group.items.push({ ...tool(), id: 'tool:call_2', call_id: 'call_2', status: 'running' });
+    expect(activeActivityGroupId([group], runtime)).toBe(group.id);
+    expect(activeActivityGroupId([group], { ...runtime, has_active_turn: false })).toBeNull();
+  });
+
+  it('animates a completed group while its owning activity remains active', async () => {
+    const view = render(ToolCallGroupBlock, { row: toolGroup(false), active: true });
+    expect(view.container.querySelector('.running-label')).not.toBeNull();
+    await view.rerender({ row: toolGroup(false), active: false });
+    expect(view.container.querySelector('.running-label')).toBeNull();
+  });
+
   it.each(scopes)('keeps completed tool groups collapsed in $kind scope', async (scope) => {
     const view = render(ToolCallGroupBlock, {
       row: toolGroup(false),

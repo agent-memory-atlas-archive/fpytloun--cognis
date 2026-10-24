@@ -754,6 +754,7 @@ class InboundPipeline:
             client_message_id=message.message_id,
             channel_default_agent_profile_id=config.default_agent_profile_id,
             channel_account_id=config.account_id,
+            channel_assistant_delivery_mode=_assistant_delivery_mode_for_config(config),
             channel_delivery=ChannelDeliveryDescriptor(
                 channel_type=message.channel_type,
                 account_id=message.account_id,

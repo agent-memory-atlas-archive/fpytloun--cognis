@@ -42,15 +42,46 @@ function newestFirst<T extends { sort_key?: string }>(items: T[]): T[] {
   return [...items].sort((left, right) => (right.sort_key ?? '').localeCompare(left.sort_key ?? ''));
 }
 
+/** Revisions of one deliverable share a lineage; Work shows one entry per lineage. */
+export function workDeliverableLineageKey(item: Pick<WorkDeliverable, 'deliverable_id' | 'lineage_id'>): string {
+  return item.lineage_id || item.deliverable_id;
+}
+
+function newerRevision(current: WorkDeliverable | undefined, candidate: WorkDeliverable, preferCandidate: boolean): boolean {
+  if (!current) return true;
+  const currentRevision = current.revision ?? 1;
+  const candidateRevision = candidate.revision ?? 1;
+  if (candidateRevision !== currentRevision) return candidateRevision > currentRevision;
+  return preferCandidate;
+}
+
+function mergeDeliverables(
+  current: WorkDeliverable[],
+  incoming: WorkDeliverable[],
+  preferIncoming: boolean,
+): WorkDeliverable[] {
+  const merged = new Map<string, WorkDeliverable>();
+  for (const item of current) {
+    const key = workDeliverableLineageKey(item);
+    if (newerRevision(merged.get(key), item, true)) merged.set(key, item);
+  }
+  for (const item of incoming) {
+    const key = workDeliverableLineageKey(item);
+    if (newerRevision(merged.get(key), item, preferIncoming)) merged.set(key, item);
+  }
+  return newestFirst([...merged.values()]);
+}
+
 export function orderedWorkDeliverables(
   items: WorkDeliverable[],
   primary: WorkDeliverable | null | undefined,
 ): WorkDeliverable[] {
   const merged = new Map<string, WorkDeliverable>();
-  if (primary && !items.some((item) => item.deliverable_id === primary.deliverable_id)) {
-    merged.set(primary.deliverable_id, primary);
+  if (primary) merged.set(workDeliverableLineageKey(primary), primary);
+  for (const item of items) {
+    const key = workDeliverableLineageKey(item);
+    if (newerRevision(merged.get(key), item, true)) merged.set(key, item);
   }
-  for (const item of items) merged.set(item.deliverable_id, item);
   return [...merged.values()].sort((left, right) => {
     if (!left.sort_key || !right.sort_key) return 0;
     return right.sort_key.localeCompare(left.sort_key);
@@ -87,10 +118,9 @@ function mergeWorkProjections(
   for (const item of incoming.workstreams ?? []) {
     if (preferIncoming || !workstreams.has(item.key)) workstreams.set(item.key, item);
   }
-  const deliverables = mergeEvidence(
+  const deliverables = mergeDeliverables(
     current.deliverables ?? [],
     incoming.deliverables ?? [],
-    (item) => item.deliverable_id,
     preferIncoming,
   );
   return {

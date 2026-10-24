@@ -5,6 +5,11 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any, Protocol
 
+from cognis.core.workflow_step_scope import (
+    WorkflowEvaluationBinding,
+    WorkflowStepDeclaration,
+    WorkflowStepReceipt,
+)
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import (
     Cost,
@@ -122,6 +127,14 @@ class MemoryProvider(Protocol):
 
 
 class GuardrailsProvider(Protocol):
+    async def declare_workflow_step(
+        self,
+        declaration: WorkflowStepDeclaration,
+        *,
+        user_email: str,
+        agent_id: str,
+    ) -> WorkflowStepReceipt: ...
+
     def add_event_append_listener(self, listener: EventAppendListener) -> bool: ...
     def remove_event_append_listener(self, listener: EventAppendListener) -> bool: ...
 
@@ -142,6 +155,8 @@ class GuardrailsProvider(Protocol):
         tool_name: str,
         arguments: dict[str, Any],
         context: dict[str, Any] | None = None,
+        *,
+        workflow_binding: WorkflowEvaluationBinding | None = None,
     ) -> EvaluationResult: ...
 
     async def report_reasoning(
@@ -335,7 +350,7 @@ class LLMProvider(Protocol):
     ) -> TextToSpeechResult: ...
     def count_tokens(self, text: str, model: str) -> int: ...
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int: ...
-    async def list_models(self) -> list[dict[str, Any]]: ...
+    async def list_models(self, acting_user_email: str | None = None) -> list[dict[str, Any]]: ...
     async def get_cost(self, usage: TokenUsage, model: str) -> Cost: ...
     async def health(self) -> ProviderHealth: ...
 
@@ -388,6 +403,16 @@ class AuthProvider(Protocol):
         token_version: int = 0,
     ) -> str: ...
     def sign_controller_jwt(self, owner_id: str, ttl_seconds: int = 30) -> str: ...
+    def sign_workflow_step_jwt(
+        self,
+        subject: str,
+        agent_id: str,
+        *,
+        session_id: str,
+        governing_execution_id: str,
+        governing_snapshot_id: str,
+        declaration_digest: str,
+    ) -> str: ...
     def verify_controller_jwt(self, token: str) -> dict[str, Any]: ...
     def sign_exchange_token(self, subject: str, target: str) -> str: ...
     def verify_jwt(self, token: str, audience: list[str] | None = None) -> dict[str, Any]: ...

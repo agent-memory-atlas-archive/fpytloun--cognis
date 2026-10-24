@@ -172,7 +172,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div
   use:portal
-  class="app-viewport-overlay z-[95] flex justify-end overflow-hidden bg-black/60"
+  class="app-viewport-overlay z-[95] flex justify-end overflow-hidden bg-scrim/60"
   onclick={handleBackdropClick}
   role="presentation"
   data-testid="session-logs-overlay"
@@ -180,14 +180,14 @@
 >
   <div
     bind:this={panel}
-    class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-slate-700 bg-slate-900 shadow-2xl ${fullscreen ? 'max-w-none' : 'max-w-2xl'}`}
+    class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-control-border bg-elevated shadow-overlay ${fullscreen ? 'max-w-none' : 'max-w-2xl'}`}
     role="dialog"
     aria-modal="true"
     aria-label={`Session logs: ${stepName || sessionId}`}
     data-testid="session-logs-panel"
     data-fullscreen={fullscreen}
   >
-    <div class="flex shrink-0 items-center justify-between border-b border-slate-800 px-4 py-3">
+    <div class="flex shrink-0 items-center justify-between border-b border-separator px-4 py-3">
       <div class="flex min-w-0 items-center gap-3">
         {#if onBack}
           <Button size="sm" variant="ghost" class="shrink-0" onclick={onBack} title={`Back to ${backLabel}`}>
@@ -195,16 +195,16 @@
           </Button>
         {/if}
         <div class="min-w-0">
-          <p class="text-xs uppercase tracking-widest text-slate-500">{onBack ? 'Sub-session logs' : 'Session logs'}</p>
-          <h3 class="truncate text-sm font-semibold text-white">{stepName || sessionId}</h3>
-          <div class="mt-1 text-xs text-slate-400" data-testid="session-activity-status">
+          <p class="text-xs uppercase tracking-widest text-quiet">{onBack ? 'Sub-session logs' : 'Session logs'}</p>
+          <h3 class="truncate text-sm font-semibold text-strong">{stepName || sessionId}</h3>
+          <div class="mt-1 text-xs text-muted" data-testid="session-activity-status">
             {#if activityLive}<LiveDots inline size="sm" label={activityLabel} />{:else}{activityLabel}{/if}
           </div>
         </div>
       </div>
       <div class="flex items-center gap-2">
         <button
-          class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8"
+          class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong sm:h-8 sm:w-8"
           onclick={() => { fullscreen = !fullscreen; }}
           aria-label={fullscreen ? 'Exit fullscreen logs' : 'Open fullscreen logs'}
           aria-pressed={fullscreen}
@@ -218,17 +218,17 @@
           testId="session-logs-header-info"
           onclick={() => { sessionDetailsOpen = !sessionDetailsOpen; }}
         />
-        <button class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8" onclick={onclose} aria-label="Close" type="button">&times;</button>
+        <button class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong sm:h-8 sm:w-8" onclick={onclose} aria-label="Close" type="button">&times;</button>
       </div>
     </div>
     {#if sessionDetailsOpen}
-      <div id={`session-logs-info-${sessionId}`} class="min-h-0 flex-1 overflow-y-auto border-b border-slate-800 p-4">
+      <div id={`session-logs-info-${sessionId}`} class="min-h-0 flex-1 overflow-y-auto border-b border-separator p-4">
         <SharedInspectorTabs {scope} {sessionId} agents={agent ? [agent] : []} onViewSession={onViewSession ? (id) => { void onViewSession?.(id); } : undefined} />
       </div>
     {/if}
     {#if escalations.length > 0}
       {@const escalation = escalations[0]}
-      <div class="shrink-0 border-b border-slate-800 px-4 py-3">
+      <div class="shrink-0 border-b border-separator px-4 py-3">
         <EscalationPrompt
           item={escalation}
           secondsRemaining={secondsRemaining(escalation)}

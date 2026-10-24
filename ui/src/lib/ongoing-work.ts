@@ -12,6 +12,7 @@ const inactiveBackgroundStatuses = new Set([
   'error',
   'failed',
   'cancelled',
+  'killed',
   'interrupted',
   'idle',
 ]);
@@ -269,8 +270,10 @@ export function mergeCurrentCycleDelegations(
   projected: readonly BackgroundWorkItem[],
   cycleDelegations: readonly BackgroundWorkItem[],
 ): BackgroundWorkItem[] {
-  const merged = new Map(projected.map((item) => [item.work_id, item]));
-  for (const item of cycleDelegations) {
+  // Timeline entries are discovery fallbacks, not live child TODO/status owners.
+  // An unopened child can keep its original delegation snapshot in the timeline.
+  const merged = new Map(cycleDelegations.map((item) => [item.work_id, item]));
+  for (const item of projected) {
     merged.set(item.work_id, item);
   }
   return [...merged.values()];

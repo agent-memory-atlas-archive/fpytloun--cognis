@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import 'fake-indexeddb/auto';
+import { documentCoordination } from '$lib/document-coordination';
 
 import { ChatV2ApiClient, ChatV2ApiError } from './api';
 import { sessionTimelineScope, taskStepTimelineScope } from './types';
@@ -11,6 +13,10 @@ function jsonResponse(payload: unknown): Response {
 }
 
 describe('ChatV2ApiClient', () => {
+  beforeEach(async () => {
+    await documentCoordination().beginLogin();
+    await documentCoordination().verified('api-fixture@cognis.test');
+  });
   const originalFetch = global.fetch;
 
   afterEach(() => {
@@ -31,6 +37,52 @@ describe('ChatV2ApiClient', () => {
       body: undefined,
       signal: expect.any(AbortSignal)
     });
+  });
+
+  it.each([200, 503])('bounds a stalled %s response body after immediate headers and cancels its stream', async (status) => {
+    const cancel = vi.fn();
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"detail":')); },
+      cancel,
+    }), { status, headers: jsonHeaders }));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    await expect(client.snapshot('body-deadline-fixture', { timeoutMs: 20 })).rejects.toMatchObject({
+      code: 'request_timeout', status: 0,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  });
+
+  it('keeps navigation cancellation distinct from deadline expiry while parsing the body', async () => {
+    const cancel = vi.fn();
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(new ReadableStream({ cancel }), {
+      headers: jsonHeaders,
+    }));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    const navigation = new AbortController();
+    const request = client.snapshot('body-navigation-fixture', { signal: navigation.signal, timeoutMs: 1000 });
+    const rejection = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    navigation.abort();
+    await rejection;
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  });
+
+  it('includes the coordination lease wait in its deadline and never fetches after a late grant', async () => {
+    const coordination = documentCoordination();
+    const lease = coordination.capture();
+    let grant!: () => void;
+    const validate = vi.fn(() => new Promise<void>(resolve => { grant = resolve; }));
+    vi.spyOn(coordination, 'capture').mockReturnValue({ ...lease, validate });
+    const fetchMock = vi.fn<typeof fetch>();
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    await expect(client.snapshot('lease-deadline-fixture', { timeoutMs: 20 })).rejects.toMatchObject({
+      code: 'request_timeout',
+    });
+    grant();
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('forwards abort signals for scoped timeline reads', async () => {
@@ -347,6 +399,27 @@ describe('ChatV2ApiClient', () => {
     expect(JSON.parse(String(init?.body))).toEqual({ client_txn_id: 'retry-1' });
   });
 
+  it('moves a running tool call to the background with an encoded bodiless POST', async () => {
+    const payload = {
+      conversation_id: 'conv-1',
+      call_id: 'toolu/1',
+      tool_name: 'bash',
+      status: 'requested',
+      server_time: '2026-01-01T00:00:00Z'
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await expect(client.backgroundToolCall('conv-1', 'toolu/1')).resolves.toEqual(payload);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/chat/v2/conversations/conv-1/tool-calls/toolu%2F1/background'
+    );
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.method).toBe('POST');
+    expect(init?.body).toBeUndefined();
+  });
+
   it('updates queued messages with PATCH and JSON payload', async () => {
     const payload = {
       conversation_id: 'conv-1',
@@ -397,13 +470,14 @@ describe('ChatV2ApiClient', () => {
   });
 
   it('turns stalled requests into structured timeout errors', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const fetchMock = vi.fn<typeof fetch>().mockImplementation((_input, init) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
     }));
     const client = new ChatV2ApiClient({ fetch: fetchMock });
 
     const promise = client.snapshot('conv-1').catch((error: unknown) => error);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     await vi.advanceTimersByTimeAsync(30_000);
 
     await expect(promise).resolves.toMatchObject({

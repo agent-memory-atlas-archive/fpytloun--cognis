@@ -16,9 +16,11 @@ from cognis.core.json_utils import (
 from cognis.logging import get_logger
 from cognis.models.tool import (
     AUTO_PROFILE_GROUPS,
+    NATIVE_TOOL_SOURCE_TYPES,
     RESERVED_PROFILE_GROUPS,
     ToolCapability,
     ToolDefinition,
+    native_tool_classification_error,
     stable_tool_id,
     tool_capabilities,
     tool_profile_group,
@@ -276,18 +278,19 @@ _WEB_HINTS = (
 def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
     """Apply deterministic classification to a tool definition."""
 
+    if tool.source.type in NATIVE_TOOL_SOURCE_TYPES:
+        error = native_tool_classification_error(tool)
+        if error is not None:
+            raise ValueError(f"native tool {tool.name!r}: {error}")
+        return tool
     if tool.classification_source and tool.capabilities and tool.profile_group:
         return tool
     profile_group = _heuristic_profile_group(tool)
     capabilities = sorted(_heuristic_capabilities(tool), key=str)
-    source = tool.classification_source or (
-        "declared"
-        if tool.source.type in {"builtin", "executor"} and tool.category not in {"skill", "mcp"}
-        else "heuristic"
-    )
+    source = tool.classification_source or "heuristic"
     confidence = tool.classification_confidence
     if confidence is None:
-        confidence = 1.0 if source == "declared" else 0.6
+        confidence = 0.6
     return tool.model_copy(
         update={
             "category": tool.category,

@@ -13,7 +13,8 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.knowledgebase.chunking import chunk_document
-from cognis.knowledgebase.extraction import extract_artifact_bytes_bounded
+from cognis.knowledgebase.extraction import extract_artifact_bytes_bounded, image_mime_type
+from cognis.knowledgebase.image_extraction import extract_image
 from cognis.knowledgebase.vector import VectorPoint, sparse_vector_from_text
 from cognis.logging import get_logger
 from cognis.store.coordination import DatabaseLeaseStore, Lease
@@ -554,9 +555,22 @@ class KnowledgebaseIndexer:
             artifact.namespace, artifact.object_id, artifact.filename
         )
         content_hash = hashlib.sha256(content).hexdigest()
-        document = await extract_artifact_bytes_bounded(
-            content, filename=artifact.filename, mime_type=artifact.mime_type
-        )
+        image_mime = image_mime_type(filename=artifact.filename, mime_type=artifact.mime_type)
+        if image_mime is not None:
+            if not artifact.owner_email or artifact.owner_email != knowledgebase.owner_email:
+                raise RuntimeError("knowledgebase_image_owner_mismatch")
+            document = await extract_image(
+                content,
+                filename=artifact.filename,
+                mime_type=image_mime,
+                owner_email=artifact.owner_email,
+                llm=self._llm,
+                session_factory=self._session_factory,
+            )
+        else:
+            document = await extract_artifact_bytes_bounded(
+                content, filename=artifact.filename, mime_type=artifact.mime_type
+            )
         attachment_metadata = _merge_extracted_metadata(
             extracted=document.metadata,
             attached=attachment_metadata,

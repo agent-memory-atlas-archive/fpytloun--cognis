@@ -6,11 +6,15 @@ import hashlib
 import logging
 import math
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from cognis.logging import get_logger
 from cognis.models.tool import (
     NativeToolDefinition as ToolDefinition,
+)
+from cognis.models.tool import (
+    ToolDefinition as BaseToolDefinition,
 )
 from cognis.models.tool import (
     ToolSource,
@@ -30,11 +34,14 @@ SEARCH_TOOLS_TOOL = ToolDefinition(
     description=(
         "Required discovery path for additional tools available in this session. "
         "You MUST call this tool when you need a capability that is not currently visible, "
-        "including Slack, Alertmanager, Mimir/Loki observability, skill_load, browser, "
-        "filesystem, shell, or other MCP/external-service capabilities. "
+        "including filesystem, shell, development, web, skill, or external-service capabilities. "
+        "For example, if terminal execution is not visible, search for a shell command or test "
+        "runner; use only the exact tools returned by discovery and never guess a hidden name. "
+        "Discovery does not add direct-call schemas. Invoke a discovered tool through "
+        "call_tool unless its schema is already in the visible tool list. "
         "The optional category is only a hint; omit it unless you are confident. "
-        "Examples: shell for terminal/bash tools, filesystem for file tools, "
-        "mcp for external service tools."
+        "Examples: shell for terminal or bash execution, filesystem for file tools, "
+        "mcp for authorized external service tools."
     ),
     parameters={
         "type": "object",
@@ -163,22 +170,30 @@ CALL_TOOL_TOOL = ToolDefinition(
 )
 
 
-def resolve_inventory_tool(
-    tools: list[ToolDefinition],
+def resolve_inventory_tool[T: BaseToolDefinition](
+    tools: Sequence[T],
     identifier: str,
-) -> ToolDefinition | None:
-    """Resolve an authorized inventory tool by stable ID, then unique callable name."""
+) -> T | None:
+    """Resolve a reference within the supplied inventory, rejecting ambiguous aliases."""
 
+    matches = _inventory_reference_matches(tools, identifier)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _inventory_reference_matches[T: BaseToolDefinition](
+    tools: Sequence[T], identifier: str
+) -> list[T]:
     normalized = identifier.strip()
     if not normalized:
-        return None
+        return []
     stable_matches = [tool for tool in tools if stable_tool_id(tool) == normalized]
-    if len(stable_matches) == 1:
-        return stable_matches[0]
+    if stable_matches:
+        return stable_matches
     name_matches = [tool for tool in tools if tool.name == normalized]
-    if len(name_matches) == 1:
-        return name_matches[0]
-    return None
+    if name_matches:
+        return name_matches
+    alias = _normalize_select_identifier(normalized)
+    return [tool for tool in tools if alias in _select_aliases(tool, tool.name)]
 
 
 def search_inventory(
@@ -217,6 +232,23 @@ def search_inventory(
             already_visible_tool_ids=already_visible_tool_ids,
             log_context=extra_data,
         )[:limit]
+    # Explicit references are lookups, not relevance queries. Include already-visible
+    # matches so rediscovery cannot incorrectly imply a capability is unavailable.
+    exact_matches = _inventory_reference_matches(tools, query)
+    scoped_terms = normalized_query.lstrip("+").split()
+    if not exact_matches and len(scoped_terms) == 2:
+        exact_matches = _inventory_reference_matches(
+            tools, f"mcp:{scoped_terms[0]}:{scoped_terms[1]}"
+        )
+    if len(exact_matches) > 1:
+        return []
+    if exact_matches:
+        return _select_inventory(
+            tools,
+            [stable_tool_id(exact_matches[0])],
+            already_visible_tool_ids=already_visible_tool_ids,
+            log_context=extra_data,
+        )
     candidates: list[tuple[ToolDefinition, str, str, str]] = []
     for tool in tools:
         if tool.name == SEARCH_TOOLS_TOOL.name:
@@ -374,19 +406,13 @@ def _select_inventory(
     unmatched_selectors: list[str] = []
     seen_tool_ids: set[str] = set()
     for selector in selectors:
-        normalized_selector = _normalize_select_identifier(selector)
-        match = next(
-            (
-                candidate
-                for candidate in candidates
-                if _candidate_matches_selector(candidate[0], candidate[1], normalized_selector)
-            ),
-            None,
-        )
-        if match is None:
+        resolved = resolve_inventory_tool(tools, selector)
+        if resolved is None or resolved.name == SEARCH_TOOLS_TOOL.name:
             unmatched_selectors.append(selector)
             continue
-        tool, display_name, profile_group, already_visible = match
+        tool, display_name, profile_group, already_visible = next(
+            candidate for candidate in candidates if candidate[0] is resolved
+        )
         tool_id = stable_tool_id(tool)
         if tool_id in seen_tool_ids:
             continue
@@ -436,14 +462,6 @@ def _select_inventory(
     return matches
 
 
-def _candidate_matches_selector(
-    tool: ToolDefinition,
-    display_name: str,
-    selector: str,
-) -> bool:
-    return selector in _select_aliases(tool, display_name)
-
-
 def _normalize_select_identifier(selector: str) -> str:
     normalized = selector.strip().lower()
     if normalized.startswith(_CLAUDE_MCP_PREFIX):
@@ -451,7 +469,7 @@ def _normalize_select_identifier(selector: str) -> str:
     return normalized
 
 
-def _select_aliases(tool: ToolDefinition, display_name: str) -> set[str]:
+def _select_aliases(tool: BaseToolDefinition, display_name: str) -> set[str]:
     aliases = {
         tool.name,
         display_name,
@@ -468,6 +486,9 @@ def _select_aliases(tool: ToolDefinition, display_name: str) -> set[str]:
                 f"mcp:{server_id}:{raw_name}",
             }
         )
+    if raw_name and tool.source.server_name:
+        # Persisted skill links use qualified server names; IDs remain canonical.
+        aliases.add(f"mcp:{tool.source.server_name}:{raw_name}")
     normalized_aliases = {_normalize_select_identifier(alias) for alias in aliases if alias}
     expanded_aliases: set[str] = set()
     for alias in normalized_aliases:

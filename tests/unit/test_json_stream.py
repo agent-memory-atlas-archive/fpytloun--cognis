@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
+import pytest
+
+from cognis.json_stream import (
+    _is_structural_continuation,
+    merge_incremental_json_fragment,
+    recover_trailing_json_object,
+)
 
 
 def test_empty_incoming_is_a_noop() -> None:
@@ -18,6 +24,58 @@ def test_empty_existing_seeds_accumulator() -> None:
     result = merge_incremental_json_fragment("", '{"a": 1')
     assert result.merged == '{"a": 1'
     assert result.emitted == '{"a": 1'
+
+
+def test_longer_nested_value_is_not_a_corrected_top_level_replay() -> None:
+    prefix = '{"action":"settings_update","agent_id":"sample_agent","settings":'
+    nested = (
+        '{"executor_id":"sample_executor","memory_backend":"mnemory",'
+        '"memory_backend_options":{"mode":"full_auto"}}'
+    )
+    assert len(nested) > len(prefix)
+    result = merge_incremental_json_fragment(prefix, nested)
+    assert result.merged == prefix + nested
+    assert result.emitted == nested
+    assert not result.replaced
+    closed = merge_incremental_json_fragment(result.merged, "}")
+    assert json.loads(closed.merged)["action"] == "settings_update"
+    assert closed.emitted == "}"
+
+
+def test_nested_opening_and_repeated_closing_delimiters_are_not_replays() -> None:
+    fragments = ['{"arguments":', "{", '"settings":', '{"mode":"full_auto"}', "}", "}"]
+    merged = ""
+    for fragment in fragments:
+        result = merge_incremental_json_fragment(merged, fragment)
+        assert result.emitted == fragment
+        assert not result.replaced
+        merged = result.merged
+    assert json.loads(merged) == {"arguments": {"settings": {"mode": "full_auto"}}}
+
+
+def test_array_nested_objects_preserve_repeated_delimiters() -> None:
+    fragments = ['{"items":[', '{"key":"value"}', ",", '{"other":"value"}', "]", "}"]
+    merged = ""
+    for fragment in fragments:
+        merged = merge_incremental_json_fragment(merged, fragment).merged
+    assert json.loads(merged) == {"items": [{"key": "value"}, {"other": "value"}]}
+
+
+@pytest.mark.parametrize(
+    ("existing", "incoming"),
+    [
+        ('{"settings" garbage:', '{"mode":"full_auto"}'),
+        ('{"broken":tru,"settings":', '{"mode":"full_auto"}'),
+        ('{"settings":"unfinished', '{"mode":"full_auto"}'),
+        ('{"settings":[', "}"),
+        ('{"settings":{}', "}}"),
+        ('{"action":"read"}', '{"action":"write"}'),
+    ],
+)
+def test_structural_continuation_rejects_invalid_container_prefixes(
+    existing: str, incoming: str
+) -> None:
+    assert not _is_structural_continuation(existing, incoming)
 
 
 def test_duplicate_replay_is_deduplicated() -> None:

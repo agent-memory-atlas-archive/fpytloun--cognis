@@ -1,7 +1,7 @@
 import { get, writable, type Readable } from 'svelte/store';
 
 export type WorkspaceDeviceClass = 'desktop' | 'tablet' | 'phone';
-export type WorkspaceEntityKind = 'conversation' | 'agent' | 'task' | 'schedule' | 'attention';
+export type WorkspaceEntityKind = 'conversation' | 'agent' | 'task' | 'schedule' | 'attention' | 'artifact' | 'deliverable';
 export type WorkspacePreset = 'center' | 'left' | 'right' | 'maximize' | 'restore';
 export type WorkspaceSnapTarget = 'left' | 'right' | 'maximize';
 
@@ -41,6 +41,36 @@ export interface WorkspaceWindowState extends WorkspaceWindowInput {
   resolvedConversationId?: string | null;
 }
 
+/** Opaque manager-owned gesture, never persisted or projected. */
+export interface WorkspaceInteraction {
+  readonly key: string;
+  readonly id: symbol;
+}
+
+export interface WorkspaceInteractionPreview {
+  rect: WorkspaceRect;
+  snapTarget: WorkspaceSnapTarget | null;
+}
+
+interface GeometryInteraction {
+  kind: 'move' | 'resize';
+  expected: WorkspaceWindowState;
+  startX: number;
+  startY: number;
+  origin: WorkspaceRect;
+  pointerRatioX: number;
+  titleOffsetY: number;
+  detached: boolean;
+  lastPointer: { x: number; y: number } | null;
+  preview: WorkspaceInteractionPreview | null;
+}
+
+function sameRect(left: WorkspaceRect | null, right: WorkspaceRect | null): boolean {
+  return left === right || !!left && !!right
+    && left.x === right.x && left.y === right.y
+    && left.width === right.width && left.height === right.height;
+}
+
 interface PersistedWorkspaceState {
   version: 1;
   windows: WorkspaceWindowState[];
@@ -48,7 +78,8 @@ interface PersistedWorkspaceState {
 
 export type WorkspaceOpenResult =
   | { status: 'opened' | 'focused'; key: string }
-  | { status: 'capped'; limit: number };
+  | { status: 'capped'; limit: number; scope?: 'visible' | 'retained' | 'pinned-agents' }
+  | { status: 'failed'; reason: string };
 export type WorkspaceRestoreResult =
   | { status: 'restored'; key: string }
   | { status: 'capped'; limit: number };
@@ -299,7 +330,8 @@ function persistedWindow(
   if (!value || typeof value !== 'object') return null;
   const item = value as Record<string, unknown>;
   if (
-    !['conversation', 'agent', 'task', 'schedule'].includes(String(item.kind))
+    !(item.kind === 'conversation' || item.kind === 'agent' || item.kind === 'task'
+      || item.kind === 'schedule' || item.kind === 'artifact' || item.kind === 'deliverable')
     || typeof item.entityId !== 'string'
     || !item.entityId
     || item.entityId.length > 500
@@ -309,7 +341,7 @@ function persistedWindow(
     || safeCanonicalHref(item.canonicalHref) === null
     || !isFiniteRect(item.rect)
   ) return null;
-  const kind = item.kind as WorkspaceEntityKind;
+  const kind = item.kind;
   const entityId = item.entityId;
   const restoreRect = item.restoreRect === null
     ? null
@@ -385,6 +417,29 @@ export function parseWorkspaceWindows(
 }
 
 export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
+  private readonly closeGuards = new Map<string, () => boolean>();
+
+  registerCloseGuard(key: string, guard: () => boolean): () => void {
+    this.closeGuards.set(key, guard);
+    return () => {
+      if (this.closeGuards.get(key) === guard) this.closeGuards.delete(key);
+    };
+  }
+
+  private readonly interactions = new Map<WorkspaceInteraction, GeometryInteraction>();
+  private reconcilingSafeRect = false;
+  private membership: {
+    open(input: WorkspaceWindowInput): Promise<WorkspaceOpenResult>;
+    close(key: string): Promise<void>;
+    resolve(key: string, conversationId: string): Promise<void>;
+  } | null = null;
+  setMembershipActions(actions: WorkspaceManager['membership']): void { this.membership = actions; }
+  async requestOpen(input: WorkspaceWindowInput): Promise<WorkspaceOpenResult> {
+    if (this.membership && (input.kind === 'conversation' || input.kind === 'agent')) {
+      return this.membership.open(input);
+    }
+    return this.open(input);
+  }
   private readonly store = writable<WorkspaceWindowState[]>([]);
   // This is intentionally session-only. Any explicit window action clears it so the
   // dashboard control never revives a window after the workspace has changed.
@@ -398,7 +453,24 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
       window: WorkspaceWindowState,
       visible: boolean,
     ) => void,
-  ) {}
+  ) {
+    this.store.subscribe((windows) => {
+      for (const [token, session] of this.interactions) {
+        const current = windows.find((window) => window.key === token.key);
+        if (!current || current.minimized || current.kind !== session.expected.kind
+            || current.entityId !== session.expected.entityId
+            || current.resolvedConversationId !== session.expected.resolvedConversationId
+            || !this.reconcilingSafeRect && (
+              !sameRect(current.rect, session.expected.rect)
+              || !sameRect(current.restoreRect, session.expected.restoreRect)
+            )) {
+          this.interactions.delete(token);
+        } else {
+          session.expected = current;
+        }
+      }
+    });
+  }
 
   subscribe = this.store.subscribe;
 
@@ -416,6 +488,88 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
 
   getSafeRect(): WorkspaceSafeRect {
     return { ...this.safeRect };
+  }
+
+  beginInteraction(
+    key: string, kind: 'move' | 'resize', pointerX: number, pointerY: number,
+  ): WorkspaceInteraction | null {
+    const window = get(this.store).find((item) => item.key === key);
+    if (!window || window.minimized) return null;
+    for (const token of this.interactions.keys()) {
+      if (token.key === key) this.interactions.delete(token);
+    }
+    const token = { key, id: Symbol(key) };
+    this.interactions.set(token, {
+      kind, expected: window, startX: pointerX, startY: pointerY,
+      origin: { ...window.rect },
+      pointerRatioX: Math.max(0, Math.min(1, (pointerX - window.rect.x) / window.rect.width)),
+      titleOffsetY: Math.max(0, pointerY - window.rect.y),
+      detached: window.restoreRect === null,
+      lastPointer: null,
+      preview: null,
+    });
+    return token;
+  }
+
+  isInteractionActive(token: WorkspaceInteraction): boolean {
+    return this.interactions.has(token);
+  }
+
+  previewInteraction(
+    token: WorkspaceInteraction, pointerX: number, pointerY: number,
+  ): WorkspaceInteractionPreview | null {
+    const session = this.interactions.get(token);
+    if (!session || !Number.isFinite(pointerX) || !Number.isFinite(pointerY)) return null;
+    let dx = pointerX - session.startX;
+    let dy = pointerY - session.startY;
+    if (session.kind === 'move' && !session.detached) {
+      if (Math.hypot(dx, dy) < 16) return null;
+      const source = clampWorkspaceRect(session.expected.restoreRect!, this.safeRect);
+      session.origin = clampWorkspaceRect({
+        ...source,
+        x: pointerX - source.width * session.pointerRatioX,
+        y: pointerY - session.titleOffsetY,
+      }, this.safeRect);
+      session.startX = pointerX;
+      session.startY = pointerY;
+      session.detached = true;
+      dx = 0;
+      dy = 0;
+    }
+    const rect = clampWorkspaceRect(session.kind === 'move'
+      ? { ...session.origin, x: session.origin.x + dx, y: session.origin.y + dy }
+      : { ...session.origin, width: session.origin.width + dx, height: session.origin.height + dy },
+    this.safeRect);
+    session.lastPointer = { x: pointerX, y: pointerY };
+    session.preview = {
+      rect,
+      snapTarget: session.kind === 'move'
+        ? workspaceSnapTarget(pointerX, pointerY, this.safeRect) : null,
+    };
+    return session.preview;
+  }
+
+  finishInteraction(token: WorkspaceInteraction, cancelled = false): void {
+    const session = this.interactions.get(token);
+    // A safe-area publication can race the component's next visual frame.
+    // Recompute both geometry and snap at the canonical commit boundary.
+    if (session?.lastPointer) {
+      this.previewInteraction(token, session.lastPointer.x, session.lastPointer.y);
+    }
+    this.interactions.delete(token);
+    if (!session?.preview) return;
+    const previewRect = clampWorkspaceRect(session.preview.rect, this.safeRect);
+    const snap = cancelled ? null : session.preview.snapTarget;
+    this.clearDashboardSnapshot();
+    this.store.update((windows) => windows.map((window) => window.key !== token.key ? window : {
+      ...window,
+      rect: snap ? workspacePresetRect(snap, this.safeRect, this.device) : previewRect,
+      restoreRect: snap ? previewRect : null,
+    }));
+  }
+
+  abandonInteraction(token: WorkspaceInteraction): void {
+    this.interactions.delete(token);
   }
 
   hasDashboardSnapshot(): boolean {
@@ -444,6 +598,29 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
     }
   }
 
+  replaceProjection(windows: WorkspaceWindowState[]): void {
+    const previous = get(this.store);
+    const next = cloneWindows(windows).map((window) => ({
+      ...window, rect: clampWorkspaceRect(window.rect, this.safeRect),
+    }));
+    const visible = new Set(next.filter((window) => !window.minimized)
+      .sort((a, b) => b.zOrder - a.zOrder).slice(0, workspaceCapacity(this.device))
+      .map((window) => window.key));
+    for (const window of next) if (!visible.has(window.key)) window.minimized = true;
+    for (const window of previous) {
+      if (!next.some((item) => item.key === window.key)) this.onClosed?.(window);
+      if (!window.minimized && !next.some((item) => item.key === window.key && !item.minimized)) {
+        this.onVisibilityChanged?.(window, false);
+      }
+    }
+    this.store.set(next);
+    for (const window of next) {
+      if (!window.minimized && !previous.some((item) => item.key === window.key && !item.minimized)) {
+        this.onVisibilityChanged?.(window, true);
+      }
+    }
+  }
+
   focusedTopVisibleKey(): string | null {
     return activeWorkspaceWindowKey(get(this.store));
   }
@@ -458,27 +635,35 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
   setSafeRect(safeRect: WorkspaceSafeRect): void {
     const previousSafeRect = this.safeRect;
     this.safeRect = safeRect;
-    this.store.update((windows) => windows.map((window) => {
-      const preset = (['maximize', 'left', 'right'] as const).find((candidate) => {
-        const rect = workspacePresetRect(candidate, previousSafeRect, this.device);
-        return (
-          window.rect.x === rect.x
-          && window.rect.y === rect.y
-          && window.rect.width === rect.width
-          && window.rect.height === rect.height
-        );
-      });
-      return {
-        ...window,
-        rect: preset
-          ? workspacePresetRect(preset, safeRect, this.device)
-          : clampWorkspaceRect(window.rect, safeRect),
-        restoreRect: window.restoreRect ? { ...window.restoreRect } : null,
-      };
-    }));
+    this.reconcilingSafeRect = true;
+    try {
+      this.store.update((windows) => windows.map((window) => {
+        const preset = (['maximize', 'left', 'right'] as const).find((candidate) => {
+          const rect = workspacePresetRect(candidate, previousSafeRect, this.device);
+          return (
+            window.rect.x === rect.x
+            && window.rect.y === rect.y
+            && window.rect.width === rect.width
+            && window.rect.height === rect.height
+          );
+        });
+        return {
+          ...window,
+          rect: preset
+            ? workspacePresetRect(preset, safeRect, this.device)
+            : clampWorkspaceRect(window.rect, safeRect),
+          restoreRect: window.restoreRect ? { ...window.restoreRect } : null,
+        };
+      }));
+    } finally {
+      this.reconcilingSafeRect = false;
+    }
   }
 
   open(input: WorkspaceWindowInput): WorkspaceOpenResult {
+    if (this.membership && (input.kind === 'conversation' || input.kind === 'agent')) {
+      throw new Error('Retained membership requires awaiting requestOpen');
+    }
     this.clearDashboardSnapshot();
     const key = workspaceKey(input.kind, input.entityId);
     const current = get(this.store);
@@ -562,11 +747,35 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
     return true;
   }
 
-  close(key: string): void {
+  async close(key: string): Promise<void> {
+    if (this.closeGuards.get(key)?.() === false) return;
+    const entry = get(this.store).find((item) => item.key === key);
+    if (this.membership && entry && (entry.kind === 'conversation' || entry.kind === 'agent')) {
+      return this.membership.close(key);
+    }
     this.clearDashboardSnapshot();
     const closed = get(this.store).find((window) => window.key === key);
     this.store.update((windows) => windows.filter((window) => window.key !== key));
     if (closed) this.onClosed?.(closed);
+  }
+
+  /** Library-confirmed revision transitions replace identity without duplicating a revision window. */
+  navigateDocument(
+    key: string,
+    input: WorkspaceWindowInput & { kind: 'artifact' | 'deliverable' },
+  ): void {
+    const current = get(this.store);
+    const source = current.find((window) => window.key === key);
+    if (!source || (source.kind !== 'artifact' && source.kind !== 'deliverable')) return;
+    const nextKey = workspaceKey(input.kind, input.entityId);
+    if (nextKey === key) return;
+    this.clearDashboardSnapshot();
+    const existing = current.find((window) => window.key === nextKey);
+    this.store.set(current.filter((window) => window.key !== key).concat(existing ? [] : [{
+      ...source, ...input, key: nextKey,
+    }]));
+    if (existing?.minimized) this.restore(nextKey);
+    else this.focus(nextKey);
   }
 
   minimize(key: string): void {
@@ -660,7 +869,8 @@ export class WorkspaceManager implements Readable<WorkspaceWindowState[]> {
     )));
   }
 
-  setResolvedConversation(key: string, conversationId: string): void {
+  async setResolvedConversation(key: string, conversationId: string): Promise<void> {
+    if (this.membership) return this.membership.resolve(key, conversationId);
     this.store.update((windows) => windows.map((window) => (
       window.key === key
         ? {

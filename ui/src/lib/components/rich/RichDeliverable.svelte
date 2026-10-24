@@ -1,9 +1,9 @@
 <script lang="ts">
   import { afterUpdate, onDestroy, onMount, tick } from 'svelte';
+  import type { Snippet } from 'svelte';
   import { renderInlineMarkdown, renderMarkdown } from '$lib/markdown';
   import { portal } from '$lib/actions/portal';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
-  import { addToast } from '$lib/stores/toasts';
   import {
     blockTitle,
     blockText,
@@ -18,9 +18,13 @@
   import RichBlockList from './RichBlockList.svelte';
   import RichToc from './RichToc.svelte';
   import RichViewerChrome from './RichViewerChrome.svelte';
+  import DownloadMenu from './DownloadMenu.svelte';
   import ViewerIcon from './ViewerIcon.svelte';
+  import ShareMenu from './ShareMenuLoader.svelte';
+  import DocumentLinkActions from './DocumentLinkActions.svelte';
+  import type { ShareLinkOptions } from './share-options';
   import './rich-publication.css';
-  import { loadViewerTheme, observeViewerTheme, viewerTheme } from './viewer-theme';
+  import { loadViewerTheme, observeViewerTheme, resolveViewerTheme, viewerTheme } from './viewer-theme';
   import {
     buildCitationRegistry,
     buildTocItems,
@@ -36,12 +40,20 @@
   export let content = '';
   export let title = '';
   export let surface: 'embedded' | 'standalone';
+  export let exportMode = false;
+  export let closePreview: (() => void) | null = null;
+  export let expiredLink = false;
   export let compact = false;
   export let collapsedByDefault = false;
   export let standaloneUrl = '';
   export let pdfUrl = '';
-  export let shareLinkCallback: (() => Promise<string>) | null = null;
+  export let htmlUrl = '';
+  export let markdownUrl = '';
+  export let shareLinkCallback: ((options: ShareLinkOptions) => Promise<string>) | null = null;
   export let instanceId = '';
+  export let internalUrl = '';
+  export let hosted = false;
+  export let extraActions: Snippet | undefined = undefined;
   export let mediaUrlFor: RichMediaUrlFor = (mediaKey: string) => instanceId
     ? privateDeliverableMediaUrl(instanceId, mediaKey)
     : '';
@@ -105,10 +117,10 @@
   let copyError = '';
   let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
   let systemDark = true;
-  $: resolvedViewerTheme = $viewerTheme === 'system' ? (systemDark ? 'dark' : 'light') : $viewerTheme;
-  let shareCopied = false;
-  let shareError = '';
-  let shareCopyResetTimer: ReturnType<typeof setTimeout> | null = null;
+  let appTheme: string | null = null;
+  let appFamily: string | null = null;
+  $: viewerFamily = surface === 'embedded' && !exportMode ? appFamily : null;
+  $: resolvedViewerTheme = resolveViewerTheme($viewerTheme, surface, appTheme, systemDark);
   let root: HTMLDivElement;
   let modalPanel: HTMLDivElement;
   let closeButton: HTMLButtonElement;
@@ -145,20 +157,14 @@
     replaceFragment(`#${item.anchor}`);
   }
 
-  function openContextualToc() {
+  async function openContextualToc() {
     if (showToc) { tocChosen = true; tocOpen = true; }
+    await tick();
+    const visibleRoot = fullOpen ? modalPanel : root;
+    visibleRoot?.querySelector<HTMLButtonElement>('aside.rich-toc button[aria-label="Close table of contents"]')?.focus({ preventScroll: true });
   }
 
   function closeToc() { tocChosen = true; tocOpen = false; }
-
-  function downloadMarkdown() {
-    const url = URL.createObjectURL(new Blob([content || JSON.stringify(normalized, null, 2)], { type: 'text/markdown;charset=utf-8' }));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${(effectiveTitle || 'deliverable').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 100)}.md`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
 
   function toggleInlineDocument() {
     inlineExpanded = !inlineExpanded;
@@ -226,24 +232,6 @@
     }
   }
 
-  async function copyShareLink() {
-    if (!shareLinkCallback) return;
-    shareError = '';
-    try {
-      const url = await shareLinkCallback();
-      await navigator.clipboard.writeText(url);
-      shareCopied = true;
-      if (shareCopyResetTimer) clearTimeout(shareCopyResetTimer);
-      shareCopyResetTimer = setTimeout(() => {
-        shareCopied = false;
-        shareCopyResetTimer = null;
-      }, 3_000);
-      addToast('Copied into clipboard', 'success');
-    } catch (err) {
-      shareError = err instanceof Error ? err.message : 'Share link failed';
-    }
-  }
-
   /** Resolve live `--rich-*` tokens into a Mermaid themeVariables object so
    * diagrams follow the resolved light/dark theme instead of always
    * rendering with hardcoded dark colors (Mermaid draws its own inline SVG
@@ -278,12 +266,7 @@
     const accentSoft = style.getPropertyValue('--rich-accent-soft').trim();
     const line = style.getPropertyValue('--rich-line').trim();
     if (!surface || !text || !accent) return { darkMode: true, themeVariables: fallbackDark };
-    // Deliverables default to dark regardless of OS preference (see
-    // rich-blocks.css); only an explicit data-resolved-theme="light"
-    // (reserved for a future app-wide theme switch) should render a light
-    // mermaid diagram. No matchMedia fallback here, or diagrams would
-    // follow the OS light preference while the rest of the deliverable
-    // stayed dark.
+    // Use the same resolved boundary as charts and document tokens.
     const isLight = el.closest('[data-viewer-theme]')?.getAttribute('data-viewer-theme') === 'light'
       || (!el.closest('[data-viewer-theme]') && document.documentElement.getAttribute('data-resolved-theme') === 'light');
     return {
@@ -389,7 +372,15 @@
     systemDark = query?.matches ?? true;
     const change = (event: MediaQueryListEvent) => systemDark = event.matches;
     query?.addEventListener('change', change);
-    const stopThemeObservation = observeViewerTheme(root, refreshMermaidTheme);
+    const updateAppTheme = () => {
+      appTheme = document.documentElement.getAttribute('data-resolved-theme');
+      appFamily = document.documentElement.getAttribute('data-theme-family');
+    };
+    updateAppTheme();
+    const stopThemeObservation = observeViewerTheme(root, () => {
+      updateAppTheme();
+      refreshMermaidTheme();
+    });
     root.addEventListener('click', handleRootClick, true);
     root.addEventListener('rich-toc-request', openContextualToc);
     rewriteInternalLinks();
@@ -415,7 +406,6 @@
     root?.removeEventListener('rich-toc-request', openContextualToc);
     unregisterOverlay?.();
     rootResizeObserver?.disconnect();
-    if (shareCopyResetTimer) clearTimeout(shareCopyResetTimer);
     if (copyResetTimer) clearTimeout(copyResetTimer);
   });
   $: if (fullOpen) scheduleMermaidRender();
@@ -461,6 +451,7 @@
     if (!fullOpen || !isTopOverlay(overlayId)) return;
     event.stopPropagation();
     if (event.key === 'Escape') {
+      if (event.target instanceof Element && event.target.closest('.download-menu[open]')) return;
       closeFullView();
       return;
     }
@@ -483,7 +474,11 @@
   bind:this={root}
   class:compact
   class:embedded={surface === 'embedded'}
+  class:hosted
   class="rich-deliverable"
+  class:theme-palette={Boolean(viewerFamily)}
+  data-theme-family={viewerFamily}
+  data-resolved-theme={viewerFamily ? resolvedViewerTheme : undefined}
   class:pulse={presentation === 'pulse'}
   class:dashboard={presentation === 'dashboard'}
   data-presentation={presentation}
@@ -493,17 +488,18 @@
   data-has-contextual-toc={showToc ? 'true' : undefined}
   data-inline-toc-layout={inlineTocWide ? 'sidebar' : 'drawer'}
   data-testid="rich-deliverable"
-  data-viewer-theme={surface === 'standalone' ? resolvedViewerTheme : undefined}
+  data-viewer-theme={resolvedViewerTheme}
 >
   {#if surface === 'standalone'}
-    <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
-      {#if showToc && (!inlineTocWide || !tocOpen)}<button class="viewer-extra-control" type="button" aria-label="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>{/if}
-      {#if shareLinkCallback}<button class="viewer-extra-control" type="button" title={shareCopied ? 'Copied into clipboard' : 'Copy share link'} aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><span data-testid={shareCopied ? 'rich-share-copied-icon' : 'rich-share-icon'}><ViewerIcon name={shareCopied ? 'check' : 'share'} /></span></button>{/if}
+    <RichViewerChrome {exportMode} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {htmlUrl} {markdownUrl} {copied} onCopy={copyFallback} progress={readingProgress} showProgress={showToc} showTocControl={showToc} {tocOpen} tocLayout={inlineTocWide ? 'sidebar' : 'drawer'} onOpenToc={openContextualToc} onClose={closePreview}>
+       {#if internalUrl}<DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
+      {:else if shareLinkCallback}<ShareMenu createLink={shareLinkCallback} />{/if}
     </RichViewerChrome>
   {/if}
 
-  <header class="rich-toolbar" class:actions-only={payloadOwnsIdentity && inlineExpanded} data-testid="rich-deliverable-toolbar">
-    {#if !payloadOwnsIdentity || !inlineExpanded}
+  {#if !hosted}
+  <header class="rich-toolbar" class:actions-only={(payloadOwnsIdentity && inlineExpanded) || surface === 'standalone'} data-testid="rich-deliverable-toolbar">
+    {#if surface !== 'standalone' && (!payloadOwnsIdentity || !inlineExpanded)}
     <div>
       {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
       <h1>{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
@@ -540,27 +536,22 @@
         <button type="button" aria-label="Open full view" title="Open full view" on:click={openFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg></button>
         {#if standaloneUrl}<a href={standaloneUrl} target="_blank" rel="noreferrer" aria-label="Open standalone page" title="Open standalone page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 11 13M10 6H5a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5" /></svg></a>{/if}
       {/if}
-      {#if pdfUrl}<a href={pdfUrl} aria-label="Download PDF" title="Download PDF"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 20h14" /></svg></a>{/if}
-      {#if shareLinkCallback}
-        <button
-          class:rich-action-copied={shareCopied}
-          type="button"
-          aria-label={shareCopied ? 'Share link copied' : 'Copy share link'}
-          title={shareCopied ? 'Copied into clipboard' : 'Copy share link'}
-          on:click={copyShareLink}
-        >
-          {#if shareCopied}
-            <svg data-testid="rich-share-copied-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg>
-          {:else}
-            <svg data-testid="rich-share-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5" /><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="19" r="2.5" /><path d="m8.2 10.8 7.6-4.5M8.2 13.2l7.6 4.5" /></svg>
-          {/if}
-        </button>
+      {#if pdfUrl || htmlUrl || markdownUrl}<DownloadMenu {pdfUrl} {htmlUrl} {markdownUrl} />{/if}
+       {#if internalUrl}
+          <DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
+       {:else if shareLinkCallback}
+        <ShareMenu createLink={shareLinkCallback} />
       {/if}
-      <button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>
+       {#if !internalUrl}<button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>{/if}
     </nav>
     {/if}
   </header>
-  {#if shareError}<p class="rich-action-error">{shareError}</p>{/if}
+  {/if}
+  {#if hosted && showToc && (!inlineTocWide || !tocOpen)}
+    <div class="rich-hosted-navigation">
+      <button class="document-icon-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>
+    </div>
+  {/if}
   {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
 
   {#if !fullOpen && inlineExpanded}
@@ -581,12 +572,22 @@
         layout={inlineTocWide ? 'sidebar' : 'drawer'}
         visible={inlineTocWide ? tocOpen : true}
         dismissibleSidebar={true}
-        theme={surface === 'standalone' ? resolvedViewerTheme : undefined}
+        theme={resolvedViewerTheme}
+        family={viewerFamily}
         documentRoot={() => root}
       />
     {/if}
 
     <div class="rich-body" data-testid="rich-deliverable-body">
+      {#if expiredLink}<p class="preview-notice" role="status"><strong>Shared link expired</strong> — viewing through your authenticated owner access.</p>{/if}
+      {#if surface === 'standalone' && !payloadOwnsIdentity}
+        {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
+        <h1 class="document-title">{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
+        {#if subtitle}<p class="document-lede">{@html renderInlineMarkdown(subtitle)}</p>{/if}
+        {#if badges.length > 0}
+          <div class="rich-badges">{#each badges as badge}<span>{@html renderInlineMarkdown(badge)}</span>{/each}</div>
+        {/if}
+      {/if}
       {#if normalized.blocks.length > 0}
           <RichBlockList blocks={documentBlocks} sources={normalized.sources} mediaUrlFor={authorizedMediaUrlFor} />
       {:else}
@@ -611,22 +612,23 @@
       data-rich-density={density}
       data-rich-canvas={canvas}
       data-viewer-theme={resolvedViewerTheme}
+      class:theme-palette={Boolean(viewerFamily)}
+      data-theme-family={viewerFamily}
+      data-resolved-theme={viewerFamily ? resolvedViewerTheme : undefined}
       on:keydown|capture={handleKeydown}
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="rich-full-panel" bind:this={modalPanel} tabindex="0" use:bindPanelInteractions>
-         <RichViewerChrome title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {copied} onCopy={copyFallback} onDownload={downloadMarkdown} progress={readingProgress} showProgress={showToc}>
-           {#if shareLinkCallback}<button class="viewer-extra-control" type="button" aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} on:click={copyShareLink}><ViewerIcon name="share" /></button>{/if}
-           {#if showToc && !tocOpen}
-             <button class="viewer-extra-control" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>
-           {/if}
+          <RichViewerChrome {surface} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {htmlUrl} {markdownUrl} {copied} onCopy={copyFallback} progress={readingProgress} showProgress={showToc} showTocControl={showToc} {tocOpen} onOpenToc={openContextualToc}>
+            {#if internalUrl}<DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
+           {:else if shareLinkCallback}<ShareMenu createLink={shareLinkCallback} />{/if}
            <button class="viewer-extra-control" bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><ViewerIcon name="close" /></button>
          </RichViewerChrome>
          {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
         <div class="rich-full-body">
               <div class:has-toc={showToc && tocOpen} class="rich-document">
                {#if showToc}
-                  <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} bind:progress={readingProgress} onClose={closeToc} layout="auto" visible={tocOpen} dismissibleSidebar={true} theme={resolvedViewerTheme} documentRoot={() => modalPanel} />
+                   <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} bind:progress={readingProgress} onClose={closeToc} layout="auto" visible={tocOpen} dismissibleSidebar={true} theme={resolvedViewerTheme} family={viewerFamily} documentRoot={() => modalPanel} />
                 {/if}
 
             <div class="rich-body">
@@ -645,6 +647,10 @@
 </div>
 
 <style>
+  .rich-deliverable.hosted {
+    border: 0; border-radius: 0; box-shadow: none; background: transparent;
+  }
+  .rich-hosted-navigation { display: flex; justify-content: flex-end; padding: .5rem 1rem; }
   .rich-deliverable {
     position: relative;
     isolation: isolate;
@@ -656,6 +662,26 @@
     border: 1px solid var(--rich-line);
     border-radius: .35rem;
     background: var(--rich-surface);
+  }
+
+  /* The card clips its content; open action menus must escape the clip. */
+  .rich-deliverable:has(:global(.download-menu[open])),
+  .rich-deliverable:has(:global(.share-menu .share-panel)) {
+    overflow: visible;
+    z-index: 5;
+  }
+
+  /* Action size for child-component triggers (download, share), which
+     cannot be reached by this component's scoped button rules. Mirrors the
+     button sizes below for each surface. */
+  .rich-deliverable {
+    --rich-action-size: 2.75rem;
+    --rich-action-radius: 7px;
+  }
+
+  .rich-deliverable.pulse {
+    --rich-action-size: 2.25rem;
+    --rich-action-radius: 999px;
   }
 
   .rich-deliverable.compact {
@@ -746,9 +772,11 @@
      padding-block: .2rem;
    }
 
-   .rich-deliverable.dashboard .rich-actions {
-     gap: .3rem;
-   }
+    .rich-deliverable.dashboard .rich-actions {
+      gap: .3rem;
+      --rich-action-size: 2rem;
+      --rich-action-radius: .45rem;
+    }
 
    .rich-deliverable.dashboard .rich-actions button,
    .rich-deliverable.dashboard .rich-actions a {
@@ -1081,6 +1109,6 @@
   .rich-deliverable:not(.embedded) .rich-document,
   .rich-full-body { max-width: 100rem; margin-inline: auto; padding: clamp(1rem, 3vw, 3rem); }
   .rich-body { width: 100%; margin-inline: auto; }
-  .document-title { color: var(--rich-text); font-size: clamp(2rem, 4vw, 3.6rem); line-height: 1.12; letter-spacing: -.035em; overflow-wrap: anywhere; }
+  .document-title { color: var(--rich-text); font-size: clamp(1.875rem, 3vw, 2.75rem); line-height: 1.14; letter-spacing: -.035em; overflow-wrap: anywhere; margin: 0 0 24px; }
   .document-lede { color: var(--rich-text-secondary); max-width: 68ch; font-size: 1.2rem; line-height: 1.7; }
 </style>

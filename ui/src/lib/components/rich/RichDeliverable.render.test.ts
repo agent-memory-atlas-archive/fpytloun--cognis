@@ -1,4 +1,4 @@
-import { fireEvent, render as renderComponent, screen, within } from '@testing-library/svelte';
+import { fireEvent, render as renderComponent, screen, within, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -66,7 +66,6 @@ describe('RichDeliverable component rendering', () => {
   });
 
   it('shows share copy feedback and a clipboard icon after copying the share link', async () => {
-    vi.useFakeTimers();
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -81,18 +80,25 @@ describe('RichDeliverable component rendering', () => {
         shareLinkCallback,
       });
 
-      await fireEvent.click(screen.getByRole('button', { name: 'Copy share link' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Share public link' })).toBeEnabled());
+      const share = screen.getByRole('button', { name: 'Share public link' });
+      await fireEvent.click(share);
+      expect(shareLinkCallback).not.toHaveBeenCalled();
+      expect(screen.getByRole('dialog', { name: 'Public link' })).toBeInTheDocument();
+      expect(screen.getByRole('combobox', { name: 'Public link validity' })).toHaveValue('7');
+      await fireEvent.click(screen.getByRole('button', { name: 'Create public link' }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('https://cognis.example/share'));
 
       expect(shareLinkCallback).toHaveBeenCalledOnce();
+      expect(shareLinkCallback).toHaveBeenCalledWith({ ttl_seconds: 7 * 86400 });
       expect(writeText).toHaveBeenCalledWith('https://cognis.example/share');
-      expect(screen.getByRole('button', { name: 'Share link copied' })).toHaveAttribute('title', 'Copied into clipboard');
+      expect(screen.getByRole('textbox', { name: 'Public link URL' })).toHaveValue('https://cognis.example/share');
+      expect(screen.getByText('Public link · Copied')).toBeInTheDocument();
       expect(screen.getByTestId('rich-share-copied-icon')).toBeTruthy();
       expect(screen.queryByTestId('rich-share-icon')).toBeNull();
-      expect(mocks.addToast).toHaveBeenCalledWith('Copied into clipboard', 'success');
-
-      await vi.advanceTimersByTimeAsync(3_000);
-
-      expect(screen.getByRole('button', { name: 'Copy share link' })).toHaveAttribute('title', 'Copy share link');
+      await fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+      expect(screen.queryByRole('dialog', { name: 'Public link' })).not.toBeInTheDocument();
+      await fireEvent.click(share);
       expect(screen.getByTestId('rich-share-icon')).toBeTruthy();
       expect(screen.queryByTestId('rich-share-copied-icon')).toBeNull();
     } finally {
@@ -187,17 +193,17 @@ describe('RichDeliverable component rendering', () => {
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(screen.queryByTestId('rich-deliverable-toc')).toBeNull();
     expect(screen.queryByText(/Figure 1\./)).toBeNull();
-    const image = screen.getByRole('img', { name: /Lovosice a České středohoří/ });
+    const image = screen.getByRole('img', { name: /Abstraktní ilustrace fiktivního města/ });
     expect(image).toHaveAttribute('width', '1600');
     expect(image).toHaveAttribute('height', '900');
-    expect(screen.getByText(/Cognis acceptance fixture/)).toBeTruthy();
-    expect(screen.getByRole('region', { name: 'Úterý 14. července' })).toBeTruthy();
-    expect(screen.getByText('Odeslat rozhodnutí')).toBeTruthy();
+    expect(screen.getByText(/Cognis synthetic acceptance specimen/)).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Ukázkový den 16. dubna' })).toBeTruthy();
+    expect(screen.getByText('Kontrola demonstračních popisků')).toBeTruthy();
     expect(screen.getByLabelText('Aktuální čas 08:20')).toBeTruthy();
-    expect(screen.getByLabelText('Todoist úkoly')).toHaveTextContent('Potvrdit prioritu');
-    expect(screen.getByText('Před delší cestou stačí ověřit jedinou trasu.')).toBeTruthy();
+    expect(screen.getByLabelText('Todoist úkoly')).toHaveTextContent('Vybrat demonstrační popisek');
+    expect(screen.getByText('Ověřit ukázkový katalog a pak pokračovat ve fiktivní expozici.')).toBeTruthy();
     expect(screen.getAllByText('Chart data table').length).toBeGreaterThan(0);
-    expect(screen.getAllByRole('link', { name: 'Lovosice po hodinách' })).toSatisfy(
+    expect(screen.getAllByRole('link', { name: 'Syntetický průběh teplot' })).toSatisfy(
       (links: HTMLElement[]) => links.every((link) => link.getAttribute('href') === 'https://example.org/pulse/weather'),
     );
   });
@@ -243,7 +249,7 @@ describe('RichDeliverable component rendering', () => {
         blocks: [
           {
             type: 'figure',
-            src: '/fixtures/daily-pulse-lovosice.svg',
+            src: '/fixtures/daily-pulse-sample-town.svg',
             alt: 'Fixture',
             timestamp: '07:10 CEST',
           },

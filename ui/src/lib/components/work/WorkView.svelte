@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { findTarget } from '$lib/find';
   import { onDestroy, untrack } from 'svelte';
   import Filter from 'lucide-svelte/icons/filter';
   import RefreshCw from 'lucide-svelte/icons/refresh-cw';
@@ -8,6 +9,7 @@
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import { asApiError } from '$lib/api/client';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import { ChatV2ApiError, chatV2Api } from '$lib/chat-v2/api';
   import { sessionTimelineScope } from '$lib/chat-v2/types';
   import type {
@@ -117,6 +119,16 @@
   let loadingOlder = $state(false);
   let latestError = $state<string | null>(null);
   let olderError = $state<string | null>(null);
+  // Errors stay hidden while the global connection banner applies; on restore
+  // the newest evidence reloads (older-page errors clear; scrolling refetches).
+  const net = useSectionConnectivity({
+    hasError: () => Boolean(latestError || olderError),
+    retry: () => {
+      olderError = null;
+      if (latestError) return loadLatest(initialized);
+    },
+  });
+  const waitingForConnection = $derived(net.hideErrors && Boolean(latestError));
   let sentinelVisible = $state(false);
   let activeTab = $state<WorkTab>('files');
   let workstreamFilter = $state('all');
@@ -320,6 +332,8 @@
       id: `deliverable:${item.deliverable_id}`,
       kind: 'assistant_deliverable',
       deliverable_id: item.deliverable_id,
+      lineage_id: item.lineage_id,
+      revision: item.revision,
       format: item.format,
       title: item.title,
       content: item.content,
@@ -1115,14 +1129,14 @@
 >
   <header class="flex flex-wrap items-center justify-between gap-3">
     <div class="min-w-0">
-      <h2 class="text-sm font-semibold text-white">Work</h2>
-      <p class="scrollbar-hidden-x mt-0.5 text-xs text-slate-500">Files, commands, mutations, artifacts, and deliverables.</p>
+      <h2 class="text-sm font-semibold text-strong">Work</h2>
+      <p class="scrollbar-hidden-x mt-0.5 text-xs text-quiet">Files, commands, mutations, artifacts, and deliverables.</p>
     </div>
     <div class="relative ml-auto flex max-w-full flex-wrap items-center justify-end gap-2" data-testid="work-toolbar">
       {#if workstreams.length > 1}
         <button
           type="button"
-          class="work-filter-toggle inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-2 text-xs text-slate-200 hover:bg-slate-800"
+          class="work-filter-toggle inline-flex h-9 items-center gap-1.5 rounded-lg border border-control-border px-2 text-xs text-foreground hover:bg-raised"
           aria-expanded={filtersOpen}
           aria-controls="work-filter-panel"
           onclick={() => { filtersOpen = !filtersOpen; }}
@@ -1134,86 +1148,86 @@
       {/if}
       <button
         type="button"
-        class="h-9 rounded-lg border border-slate-700 px-2 text-xs text-slate-300 hover:bg-slate-800"
+        class="h-9 rounded-lg border border-control-border px-2 text-xs text-secondary hover:bg-raised"
         aria-label="Choose Work time range"
         aria-expanded={timeRangeOpen}
         data-testid="work-time-range-picker"
         onclick={() => { timeRangeOpen = !timeRangeOpen; }}
       >{timeRange.label}</button>
       {#if timeRangeOpen}
-        <div class="absolute right-0 top-11 z-30 w-72 rounded-xl border border-slate-700 bg-slate-950 p-3 shadow-xl" data-testid="work-time-range-popover">
+        <div class="absolute right-0 top-11 z-30 w-72 rounded-xl border border-control-border bg-canvas p-3 shadow-xl" data-testid="work-time-range-popover">
           <div class="mb-2 grid grid-cols-2 gap-1">
             {#each ['All time', 'Today', 'Yesterday', 'This week', 'Last 1h', 'Last 6h', 'Last 24h', 'Last 7d'] as preset}
               {@const next = preset === 'All time' ? ALL_TIME_RANGE : preset === 'Last 7d'
                 ? { ...quickWorkRange('Last 168h'), label: preset } : quickWorkRange(preset)}
               {#if !['Today', 'Yesterday', 'This week'].includes(preset) || workRangeOverlaps(next, rawProjection?.available_range)}
-                <button type="button" class="rounded border border-slate-700 px-2 py-1 text-left text-[11px] text-slate-300 hover:bg-slate-800" onclick={() => applyTimeRange(next)}>{preset}</button>
+                <button type="button" class="rounded border border-control-border px-2 py-1 text-left text-[11px] text-secondary hover:bg-raised" onclick={() => applyTimeRange(next)}>{preset}</button>
               {/if}
             {/each}
           </div>
-          <label class="block text-[11px] text-slate-400">From<input aria-label="Work range from" type="datetime-local" bind:value={rangeFromInput} class="mt-1 h-8 w-full rounded border border-slate-700 bg-slate-900 px-2 text-xs" /></label>
-          <label class="mt-2 block text-[11px] text-slate-400">To<input aria-label="Work range to" type="datetime-local" bind:value={rangeToInput} class="mt-1 h-8 w-full rounded border border-slate-700 bg-slate-900 px-2 text-xs" /></label>
-          {#if rangeError}<p class="mt-2 text-xs text-rose-300" role="alert">{rangeError}</p>{/if}
-          <button type="button" class="mt-3 w-full rounded bg-sky-500 px-2 py-1.5 text-xs font-medium text-slate-950" onclick={applyAbsoluteTimeRange}>Apply range</button>
+          <label class="block text-[11px] text-muted">From<input aria-label="Work range from" type="datetime-local" bind:value={rangeFromInput} class="mt-1 h-8 w-full rounded border border-control-border bg-surface px-2 text-xs" /></label>
+          <label class="mt-2 block text-[11px] text-muted">To<input aria-label="Work range to" type="datetime-local" bind:value={rangeToInput} class="mt-1 h-8 w-full rounded border border-control-border bg-surface px-2 text-xs" /></label>
+          {#if rangeError}<p class="mt-2 text-xs text-danger" role="alert">{rangeError}</p>{/if}
+          <button type="button" class="mt-3 w-full rounded bg-accent px-2 py-1.5 text-xs font-medium text-on-accent" onclick={applyAbsoluteTimeRange}>Apply range</button>
         </div>
       {/if}
-       <button type="button" class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800" disabled={refreshing || hydrating || recoveryPromise !== null} onclick={() => void refreshExplicitly()} aria-label="Refresh work" title="Refresh work">
+       <button type="button" class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-control-border text-secondary hover:bg-raised" disabled={refreshing || hydrating || recoveryPromise !== null} onclick={() => void refreshExplicitly()} aria-label="Refresh work" title="Refresh work">
         <RefreshCw class={`h-3.5 w-3.5 ${refreshing || hydrating ? 'animate-spin' : ''}`} />
       </button>
     </div>
   </header>
   {#if sessionId}
     <div class="flex min-w-0 items-center gap-2" data-testid="work-session-filter">
-      <span class="scrollbar-hidden-x min-w-0 rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 font-mono text-[10px] text-sky-200">Session {sessionId}</span>
-      {#if onClearSessionFilter}<button type="button" class="text-xs text-sky-300 underline" onclick={onClearSessionFilter}>Clear session filter</button>{/if}
+      <span class="scrollbar-hidden-x min-w-0 rounded-full border border-accent/30 bg-accent-subtle px-2.5 py-1 font-mono text-[10px] text-accent">Session {sessionId}</span>
+      {#if onClearSessionFilter}<button type="button" class="text-xs text-accent underline" onclick={onClearSessionFilter}>Clear session filter</button>{/if}
     </div>
   {/if}
 
   {#if workstreams.length > 1}
-    <div id="work-filter-panel" hidden={!filtersOpen} class="work-filters w-full min-w-0 gap-2 rounded-xl border border-slate-800/80 bg-transparent p-3" data-testid="workstream-filters">
+    <div id="work-filter-panel" hidden={!filtersOpen} class="work-filters w-full min-w-0 gap-2 rounded-xl border border-separator/80 bg-transparent p-3" data-testid="workstream-filters">
       <div class="col-span-full flex items-center justify-between gap-2">
-        <span class="text-xs font-medium text-slate-300">Filters</span>
-        {#if activeFilterCount}<button type="button" class="text-xs text-sky-200 underline" onclick={clearFilters} data-testid="work-filter-clear">Clear filters</button>{/if}
+        <span class="text-xs font-medium text-secondary">Filters</span>
+        {#if activeFilterCount}<button type="button" class="text-xs text-accent underline" onclick={clearFilters} data-testid="work-filter-clear">Clear filters</button>{/if}
       </div>
-      <label class="min-w-0 text-[10px] text-slate-500">Workstream
-        <select bind:value={workstreamFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs text-slate-200">
+      <label class="min-w-0 text-[10px] text-quiet">Workstream
+        <select bind:value={workstreamFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground">
           <option value="all">All workstreams</option><option value="root">This conversation / root</option>
           {#each workstreams as item (item.key)}<option value={item.key}>{item.parent_key ? '↳ ' : ''}{item.title} · {item.agent_id}</option>{/each}
         </select>
       </label>
-      <label class="min-w-0 text-[10px] text-slate-500">Agent<select bind:value={agentFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs text-slate-200"><option value="all">All agents</option>{#each agentOptions as agent}<option value={agent}>{agent}</option>{/each}</select></label>
-      <label class="min-w-0 text-[10px] text-slate-500">Status<select bind:value={statusFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs text-slate-200"><option value="all">All statuses</option>{#each statusOptions as status}<option value={status}>{status}</option>{/each}</select></label>
-      <label class="min-w-0 text-[10px] text-slate-500">Search<input bind:value={workstreamSearch} placeholder="Workstream or agent" class="mt-1 h-9 w-full min-w-0 rounded-lg border border-slate-700 bg-slate-950 px-2 text-xs text-slate-200" /></label>
+      <label class="min-w-0 text-[10px] text-quiet">Agent<select bind:value={agentFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground"><option value="all">All agents</option>{#each agentOptions as agent}<option value={agent}>{agent}</option>{/each}</select></label>
+      <label class="min-w-0 text-[10px] text-quiet">Status<select bind:value={statusFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground"><option value="all">All statuses</option>{#each statusOptions as status}<option value={status}>{status}</option>{/each}</select></label>
+      <label data-find-scope class="min-w-0 text-[10px] text-quiet">Search<input use:findTarget bind:value={workstreamSearch} placeholder="Workstream or agent" class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground" /></label>
     </div>
   {/if}
 
-  {#if !initialized && (loading || hydrating)}
+  {#if !initialized && (loading || hydrating || waitingForConnection)}
     <div class="space-y-3" aria-live="polite" aria-label="Loading work">
       {#if hydrating}
-        <div class="flex items-center gap-3 rounded-xl border border-sky-500/20 bg-sky-500/10 p-4 text-sm text-sky-100">
+        <div class="flex items-center gap-3 rounded-xl border border-accent/20 bg-accent-subtle p-4 text-sm text-accent">
           <RefreshCw class="h-4 w-4 shrink-0 animate-spin" />
           <span>Loading Work history from cache…</span>
         </div>
       {/if}
-      <div class="h-11 animate-pulse rounded-xl bg-slate-800/60"></div><div class="h-64 animate-pulse rounded-2xl bg-slate-800/40"></div>
+      <div class="h-11 animate-pulse rounded-xl bg-raised/60"></div><div class="h-64 animate-pulse rounded-2xl bg-raised/40"></div>
     </div>
   {:else if !initialized && latestError}
-    <div class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100"><p>{latestError}</p><button class="mt-2 underline" type="button" onclick={() => void loadLatest()}>Retry loading newest evidence</button></div>
+    <div class="rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger"><p>{latestError}</p><button class="mt-2 underline" type="button" onclick={() => void loadLatest()}>Retry loading newest evidence</button></div>
   {:else if initialized && shellProjection}
-    {#if latestError && workState}<div class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"><p>{latestError}</p><button type="button" class="mt-1 underline" onclick={() => void loadLatest(true)}>Retry refreshing newest evidence</button></div>{/if}
+    {#if latestError && workState && !net.hideErrors}<div class="rounded-lg border border-warning-border bg-warning-subtle px-3 py-2 text-xs text-warning"><p>{latestError}</p><button type="button" class="mt-1 underline" onclick={() => void loadLatest(true)}>Retry refreshing newest evidence</button></div>{/if}
     <ActivityLifecycleStatus {materialization} onRetry={() => void loadLatest(true)} />
 
-      {#if rawProjection?.graph_truncated}<p class="text-xs text-amber-200" data-testid="work-graph-truncated">The authorized work graph reached its safety limit.</p>{/if}
+      {#if rawProjection?.graph_truncated}<p class="text-xs text-warning" data-testid="work-graph-truncated">The authorized work graph reached its safety limit.</p>{/if}
 
       <AccessibleTabs {tabs} activeId={activeTab} idPrefix="work" ariaLabel="Work content" onChange={setActiveTab} sticky={true} testIdPrefix="work-tab" />
 
       <div id={`work-panel-${activeTab}`} aria-labelledby={`work-tab-${activeTab}`} role="tabpanel" class="min-w-0" data-testid={`work-panel-${activeTab}`}>
-      {#if !projection && (loading || hydrating)}
-        <div class="rounded-xl border border-slate-700 p-8 text-center text-sm text-slate-400" data-testid="work-panel-loading" role="status">
+      {#if !projection && (loading || hydrating || waitingForConnection)}
+        <div class="rounded-xl border border-control-border p-8 text-center text-sm text-muted" data-testid="work-panel-loading" role="status">
           <RefreshCw class="mx-auto mb-2 h-4 w-4 animate-spin" />Loading {tabs.find((tab) => tab.id === activeTab)?.label.toLowerCase()}…
         </div>
       {:else if !projection && latestError}
-        <div class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" data-testid="work-panel-error">
+        <div class="rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" data-testid="work-panel-error">
           <p>{latestError}</p><button class="mt-2 underline" type="button" onclick={() => void loadLatest()}>Retry loading newest evidence</button>
         </div>
       {:else if projection && activeTab === 'files'}
@@ -1226,18 +1240,18 @@
             {initialFocus}
           />
           {#if projection.summary.omitted_files}
-            <p class="mt-2 text-xs text-amber-200">{projection.summary.omitted_files} changed files do not have diff previews. Exact page totals and available bounded file metadata remain visible.</p>
+            <p class="mt-2 text-xs text-warning">{projection.summary.omitted_files} changed files do not have diff previews. Exact page totals and available bounded file metadata remain visible.</p>
           {/if}
           {#if omittedFileStats}
-            <p class="mt-2 text-xs text-amber-200">{omittedFileStats} older file metadata entries are outside this bounded page. Load older evidence to reach them.</p>
+            <p class="mt-2 text-xs text-warning">{omittedFileStats} older file metadata entries are outside this bounded page. Load older evidence to reach them.</p>
           {/if}
-        {:else}<p class="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-500">No changed files.</p>{/if}
+        {:else}<p class="rounded-xl border border-dashed border-control-border p-8 text-center text-sm text-quiet">No changed files.</p>{/if}
       {:else if projection && activeTab === 'commands'}
         {#if projection.commands.length > 0}
         <div class="mb-2 flex justify-end" data-testid="work-command-label-mode">
-          <div class="inline-flex rounded-lg border border-slate-700 p-0.5" role="group" aria-label="Command label">
+          <div class="inline-flex rounded-lg border border-control-border p-0.5" role="group" aria-label="Command label">
             {#each ['command', 'description'] as mode}
-              <button type="button" class={`rounded-md px-2 py-1 text-[11px] ${commandLabelMode === mode ? 'bg-slate-700 text-white' : 'text-slate-400'}`} aria-pressed={commandLabelMode === mode} onclick={() => setCommandLabelMode(mode as 'command' | 'description')}>{mode === 'command' ? 'Command' : 'Description'}</button>
+              <button type="button" class={`rounded-md px-2 py-1 text-[11px] ${commandLabelMode === mode ? 'bg-inset text-strong' : 'text-muted'}`} aria-pressed={commandLabelMode === mode} onclick={() => setCommandLabelMode(mode as 'command' | 'description')}>{mode === 'command' ? 'Command' : 'Description'}</button>
             {/each}
           </div>
         </div>
@@ -1273,7 +1287,7 @@
           {/each}
         </ol>
       {:else if projection && activeTab === 'artifacts'}
-        <div class="work-evidence-list">{#each projection.artifacts as artifact (artifact.artifact_id)}<div class="mb-2">{#if artifact.source_workstream}<p class="mb-1 text-[10px] text-slate-500">{artifact.source_workstream.agent_id} · {artifact.source_workstream.title}</p>{/if}<MessageAttachments attachments={[artifactAttachment(artifact)]} /></div>{/each}</div>
+        <div class="work-evidence-list">{#each projection.artifacts as artifact (artifact.artifact_id)}<div class="mb-2">{#if artifact.source_workstream}<p class="mb-1 text-[10px] text-quiet">{artifact.source_workstream.agent_id} · {artifact.source_workstream.title}</p>{/if}<MessageAttachments attachments={[artifactAttachment(artifact)]} /></div>{/each}</div>
       {:else if projection}
         <div class="space-y-4">
           {#if deliverables.length}
@@ -1285,8 +1299,8 @@
                     data-testid={`work-deliverable-${item.deliverable_id}`}
                     data-primary={item.deliverable_id === primaryResult?.deliverable_id ? 'true' : undefined}
                   >
-                    {#if item.deliverable_id === primaryResult?.deliverable_id}<span class="mb-1 inline-flex rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-200">Primary</span>{/if}
-                    {#if item.source_workstream}<p class="mb-1 text-[10px] text-slate-500">{item.source_workstream.agent_id} · {item.source_workstream.title} · {item.source_workstream.status}</p>{/if}
+                    {#if item.deliverable_id === primaryResult?.deliverable_id}<span class="mb-1 inline-flex rounded bg-accent-subtle px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent">Primary</span>{/if}
+                    {#if item.source_workstream}<p class="mb-1 text-[10px] text-quiet">{item.source_workstream.agent_id} · {item.source_workstream.title} · {item.source_workstream.status}</p>{/if}
                     <AssistantDeliverableBlock item={deliverableItem(item)} collapsedByDefault />
                   </div>
                 {/each}
@@ -1300,15 +1314,15 @@
     {#if workState && projection && showScrollStatus}
       <div
         use:infiniteScroll
-        class="min-h-8 py-2 text-center text-xs text-slate-500"
+        class="min-h-8 py-2 text-center text-xs text-quiet"
         data-testid="work-scroll-sentinel"
         role="status"
         aria-live="polite"
       >
         {#if loadingOlder}
           Loading older evidence…
-        {:else if olderError && workState.beforeCursor}
-          <span>{olderError} </span><button type="button" class="text-sky-200 underline" onclick={() => void loadOlder()}>Retry loading older evidence</button>
+        {:else if olderError && workState.beforeCursor && !net.hideErrors}
+          <span>{olderError} </span><button type="button" class="text-accent underline" onclick={() => void loadOlder()}>Retry loading older evidence</button>
         {:else if workState.exhausted}
           All Work history loaded.
         {:else}
@@ -1319,7 +1333,7 @@
         <span class="sr-only">Older evidence is available.</span>
       {/if}
     {/if}
-    {#if projection && (!materialization || materialization.state === 'live') && !deliverables.length && fileDiffs.length === 0 && projection.commands.length === 0 && genericMutations.length === 0 && projection.artifacts.length === 0}<p class="text-center text-xs text-slate-500" data-testid="work-empty">No activity yet.</p>{/if}
+    {#if projection && (!materialization || materialization.state === 'live') && !deliverables.length && fileDiffs.length === 0 && projection.commands.length === 0 && genericMutations.length === 0 && projection.artifacts.length === 0}<p class="text-center text-xs text-quiet" data-testid="work-empty">No activity yet.</p>{/if}
   {/if}
 </section>
 

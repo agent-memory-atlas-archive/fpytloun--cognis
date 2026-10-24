@@ -76,6 +76,14 @@ export const embeddedDocsMeta: DocMeta[] = [
     relatedSlugs: ['customizing-your-harness', 'configuring-providers', 'using-chat', 'tools-and-skills']
   },
   {
+    slug: 'agent-hooks',
+    title: 'Agent Hooks',
+    description: 'Assign reusable reminders and background actions to agents.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/agent-hooks.md',
+    relatedSlugs: ['creating-agents', 'workflows', 'tools-and-skills']
+  },
+  {
     slug: 'customizing-your-harness',
     title: 'How to Customize Your Harness',
     description: 'Customize agent roles, profiles, coding guidance, and coordination conventions.',
@@ -106,6 +114,22 @@ export const embeddedDocsMeta: DocMeta[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/using-chat.md',
     relatedSlugs: ['getting-started', 'context-management', 'managing-tasks', 'creating-agents']
+  },
+  {
+    slug: 'actionable-approvals',
+    title: 'Approve one specific action',
+    description: 'Resolve targeted approvals safely and understand retry ownership.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/actionable-approvals.md',
+    relatedSlugs: ['using-chat', 'creating-agents', 'security-and-privacy']
+  },
+  {
+    slug: 'chat-modes',
+    title: 'Planning and execution intent',
+    description: 'Planning intent, explicit read-only restrictions, and Intaris compatibility.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/chat-modes.md',
+    relatedSlugs: ['using-chat', 'security-and-privacy', 'creating-agents']
   },
   {
     slug: 'context-management',
@@ -228,6 +252,14 @@ export const embeddedDocsMeta: DocMeta[] = [
     relatedSlugs: ['high-availability', 'executors', 'security-and-privacy', 'troubleshooting']
   },
   {
+    slug: 'inference-api',
+    title: 'Inference API',
+    description: 'Use the authenticated OpenAI-compatible models, chat, and embeddings endpoints.',
+    category: 'operations',
+    sourcePath: 'docs/guide/inference-api.md',
+    relatedSlugs: ['deployment', 'configuring-providers', 'security-and-privacy']
+  },
+  {
     slug: 'high-availability',
     title: 'High availability',
     description: 'Deploy and operate multiple Cognis controllers with durable failover.',
@@ -259,6 +291,9 @@ export const ONBOARDING_DOC_SLUGS = [
   'architecture',
   'configuring-providers',
   'creating-agents',
+  'agent-hooks',
+  'actionable-approvals',
+  'chat-modes',
   'customizing-your-harness',
   'security-and-privacy',
   'settings',
@@ -272,6 +307,7 @@ export const ONBOARDING_DOC_SLUGS = [
   'executors',
   'macos-executor',
   'deployment',
+  'inference-api',
   'high-availability',
   'ha-e2e',
   'tools-and-skills',

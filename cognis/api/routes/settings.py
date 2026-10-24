@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from time import monotonic
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import APIRouter, Request
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from cognis.api.common import (
     api_exception,
@@ -27,9 +26,9 @@ from cognis.api.models import (
     LLMProviderResponse,
     LLMProviderTestResponse,
     LLMProviderUpdateRequest,
-    ModelRoutingEntry,
     ModelRoutingResponse,
     ModelRoutingUpdateRequest,
+    ProviderMonitorResponse,
     ProviderUsageResponse,
     SettingResponse,
     SettingsCategoryResponse,
@@ -37,6 +36,7 @@ from cognis.api.models import (
     StepProfileCreateRequest,
     StepProfileResponse,
     StepProfileUpdateRequest,
+    UserDisplayPreferences,
     UserPreferencesResponse,
     UserPreferencesUpdateRequest,
     WebBackendUpdateRequest,
@@ -51,48 +51,26 @@ from cognis.api.web_reconfigure import (
 from cognis.api.web_reconfigure import (
     web_settings_distributed_lock as _web_settings_distributed_lock,
 )
-from cognis.core.executor_resolution import labels_match
+from cognis.core.step_profile_management import StepProfileManagement
 from cognis.core.step_profiles import (
     STEP_PROFILE_CUSTOM_SETTING_KEY,
     STEP_PROFILE_OVERRIDES_SETTING_KEY,
-    StepProfileDefinition,
-    serialize_step_profile_override,
 )
 from cognis.logging import get_logger
-from cognis.models.config import normalize_reasoning_level
-from cognis.models.executor_inference import executor_local_inference_configured
-from cognis.models.workflow import StepProfileConfig, StepProfileMode
 from cognis.ownership import SYSTEM_USER_EMAIL
-from cognis.providers.llm.message_projection import VALID_MESSAGE_PROJECTION_POLICIES
 from cognis.runtime_settings import apply_runtime_setting
 from cognis.settings_schema import get_setting_spec, validate_setting_value
-from cognis.store.local_models import lock_local_model_dispatch_guard
 from cognis.store.models import (
     LLMProvider,
     LocalModelDeployment,
-    LocalModelOperation,
-    Setting,
-    SystemWorkflowOverride,
-    User,
-    WorkflowRow,
 )
 from cognis.store.queries import (
     AUTO_RECAP_ENABLED_STATE_KEY,
-    create_llm_provider,
-    delete_llm_provider,
-    delete_model_routing,
-    delete_setting,
-    get_executor_row,
-    get_llm_provider,
     get_setting,
     get_user_ui_state_value,
     get_visible_llm_provider,
-    list_executors,
     list_llm_providers,
-    list_model_routing,
     list_settings,
-    update_llm_provider,
-    upsert_model_routing,
     upsert_setting,
     upsert_user_ui_state,
 )
@@ -102,133 +80,6 @@ logger = get_logger(__name__)
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
 SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
 USER_PREFERENCES_STATE_KEY = "ui.preferences"
-_ROUTING_TASK_TYPES: tuple[str, ...] = (
-    "default",
-    "classifier",
-    "compaction",
-    "evaluator",
-    "speech_to_text",
-    "text_to_speech",
-    "image_generation",
-    "attachment_analysis",
-    "embedding",
-)
-_TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
-_STEP_PROFILE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9:_-]{1,80}$")
-
-
-def _step_profile_response(registry: Any, definition: StepProfileDefinition) -> StepProfileResponse:
-    return StepProfileResponse(
-        profile_id=definition.profile_id,
-        name=definition.name,
-        mode=str(definition.mode),
-        config=definition.config.model_dump(mode="json"),
-        has_override=registry.has_override(definition.profile_id),
-        is_custom=registry.is_custom(definition.profile_id),
-    )
-
-
-def _profile_id_in_definition(definition: Any, profile_id: str) -> bool:
-    if not isinstance(definition, dict):
-        return False
-    steps = definition.get("steps")
-    if not isinstance(steps, list):
-        return False
-    return any(
-        isinstance(step, dict) and step.get("step_profile_id") == profile_id for step in steps
-    )
-
-
-def _profile_id_in_step_overrides(step_overrides: Any, profile_id: str) -> bool:
-    if not isinstance(step_overrides, dict):
-        return False
-    return any(
-        isinstance(payload, dict) and payload.get("step_profile_id") == profile_id
-        for payload in step_overrides.values()
-    )
-
-
-async def _ensure_step_profile_not_in_use(session: Any, profile_id: str) -> None:
-    workflow_rows = (await session.execute(select(WorkflowRow.definition))).scalars().all()
-    if any(_profile_id_in_definition(definition, profile_id) for definition in workflow_rows):
-        raise api_exception(409, "conflict", "Step profile is still used by a workflow")
-    override_rows = (
-        (await session.execute(select(SystemWorkflowOverride.step_overrides))).scalars().all()
-    )
-    if any(
-        _profile_id_in_step_overrides(step_overrides, profile_id)
-        for step_overrides in override_rows
-    ):
-        raise api_exception(
-            409,
-            "conflict",
-            "Step profile is still used by a system workflow override",
-        )
-
-
-def _looks_like_transcription_model(model_name: str) -> bool:
-    normalized = model_name.strip().lower().replace("_", "-")
-    return any(token in normalized for token in ("transcribe", "whisper", "speech-to-text"))
-
-
-def _looks_like_tts_model(model_name: str) -> bool:
-    normalized = model_name.strip().lower().replace("_", "-")
-    return any(
-        token in normalized
-        for token in (
-            "tts",
-            "text-to-speech",
-            "speech-1",
-            "eleven",
-            "elevenlabs",
-            "piper",
-        )
-    )
-
-
-def _route_model_is_eligible(
-    task_type: str,
-    *,
-    model_id: str,
-    model_info: Any,
-) -> bool:
-    if task_type == "speech_to_text":
-        display_name = getattr(model_info, "display_name", None)
-        return _looks_like_transcription_model(model_id) or (
-            isinstance(display_name, str) and _looks_like_transcription_model(display_name)
-        )
-    if task_type == "text_to_speech":
-        display_name = getattr(model_info, "display_name", None)
-        return _looks_like_tts_model(model_id) or (
-            isinstance(display_name, str) and _looks_like_tts_model(display_name)
-        )
-    if task_type == "image_generation":
-        return bool(getattr(model_info, "supports_image_generation", False))
-    if task_type == "attachment_analysis":
-        return bool(
-            getattr(model_info, "supports_vision", False)
-            or getattr(model_info, "supports_pdf_input", False)
-            or getattr(model_info, "supports_audio_input", False)
-            or getattr(model_info, "supports_file_input", False)
-        )
-    if task_type == "embedding":
-        return bool(getattr(model_info, "supports_embedding", False))
-    return True
-
-
-def _routing_entry_from_row(task_type: str, row: Any | None) -> dict[str, str | None]:
-    if row is None:
-        return {"model": None, "reasoning_effort": None}
-    reasoning_effort: str | None = None
-    if task_type in _TEXT_ROUTING_TASK_TYPES and isinstance(getattr(row, "config", None), dict):
-        reasoning_effort = normalize_reasoning_level(row.config.get("reasoning_effort"))
-        if reasoning_effort == "default":
-            reasoning_effort = None
-    return {"model": getattr(row, "model", None), "reasoning_effort": reasoning_effort}
-
-
-def _routing_entry_model(task_type: str, row: Any | None) -> ModelRoutingEntry:
-    return ModelRoutingEntry(**_routing_entry_from_row(task_type, row))
 
 
 def _apply_last_test_metadata(
@@ -241,105 +92,9 @@ def _apply_last_test_metadata(
 
 
 def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] | None) -> None:
-    if not isinstance(config, dict):
-        return
-    preset = str(config.get("preset") or "").strip().lower()
-    anthropic_protocol = config.get("protocol", "auto")
-    if preset == "anthropic":
-        protocol = str(anthropic_protocol).strip().lower()
-        if protocol not in {"auto", "anthropic_messages", "litellm"}:
-            raise api_exception(
-                400,
-                "validation_error",
-                "Anthropic protocol must be 'auto', 'anthropic_messages', or 'litellm'",
-            )
-    message_projection_policy = config.get("message_projection_policy")
-    if message_projection_policy is not None:
-        value = str(message_projection_policy).strip().lower()
-        if value not in VALID_MESSAGE_PROJECTION_POLICIES:
-            allowed = ", ".join(sorted(VALID_MESSAGE_PROJECTION_POLICIES))
-            raise api_exception(
-                400,
-                "validation_error",
-                f"message_projection_policy must be one of: {allowed}",
-            )
-    codex_transport = config.get("codex_transport")
-    if codex_transport is not None:
-        value = str(codex_transport).strip().lower()
-        if value not in {"litellm", "direct"}:
-            raise api_exception(
-                400,
-                "validation_error",
-                "codex_transport must be either 'litellm' or 'direct'",
-            )
-        if value == "direct" and preset != "chatgpt":
-            raise api_exception(
-                400,
-                "validation_error",
-                "Direct Codex transport is only supported for ChatGPT providers",
-            )
-    if preset == "chatgpt" and location == "executor":
-        raise api_exception(
-            400,
-            "validation_error",
-            "ChatGPT OAuth providers must use controller execution location",
-        )
-    auth_config = config.get("auth_config")
-    auth_provider = ""
-    auth_mode = ""
-    if isinstance(auth_config, dict):
-        auth_mode = str(auth_config.get("mode") or "").strip().lower()
-        auth_provider = str(auth_config.get("provider") or "").strip().lower()
-    if (
-        preset == "anthropic"
-        and auth_mode == "oauth"
-        and auth_provider in {"anthropic", "anthropic_subscription", "claude_subscription"}
-        and location == "executor"
-    ):
-        raise api_exception(
-            400,
-            "validation_error",
-            "Claude subscription OAuth providers must use controller execution location",
-        )
-    if preset == "anthropic" and auth_mode == "oauth" and protocol == "litellm":
-        raise api_exception(
-            400,
-            "validation_error",
-            "Claude subscription OAuth requires the native Anthropic Messages protocol",
-        )
-    if location != "executor":
-        return
-    executor_id = config.get("executor_id")
-    has_executor_id = isinstance(executor_id, str) and bool(executor_id.strip())
-    executor_labels = config.get("executor_labels")
-    valid_executor_labels = False
-    if isinstance(executor_labels, dict):
-        valid_executor_labels = bool(executor_labels) and all(
-            isinstance(key, str)
-            and bool(key.strip())
-            and isinstance(value, str)
-            and bool(value.strip())
-            for key, value in executor_labels.items()
-        )
-        if executor_labels and not valid_executor_labels:
-            raise api_exception(
-                400,
-                "validation_error",
-                "Executor-routed provider executor_labels must contain only non-empty string keys and values",
-            )
-    has_executor_labels = valid_executor_labels
-    if has_executor_id and has_executor_labels:
-        raise api_exception(
-            400,
-            "validation_error",
-            "Executor-routed providers must choose either executor_id or executor_labels, not both",
-        )
-    if not has_executor_id and not has_executor_labels:
-        raise api_exception(
-            400,
-            "validation_error",
-            "Executor-routed providers must specify executor_id or executor_labels",
-        )
+    from cognis.core.provider_management import validate_provider
+
+    validate_provider(location, config)
 
 
 async def _validate_provider_executor_eligibility(
@@ -351,41 +106,23 @@ async def _validate_provider_executor_eligibility(
 ) -> None:
     """Reject new provider selectors that cannot target local inference."""
 
-    if location != "executor":
-        return
-    executor_id = config.get("executor_id")
-    if isinstance(executor_id, str) and executor_id.strip():
-        row = await get_executor_row(
-            session,
-            executor_id.strip(),
-            owner_email=owner_email,
-            include_shared=True,
-        )
-        if row is None or not executor_local_inference_configured(row):
-            raise api_exception(
-                400,
-                "validation_error",
-                "Selected executor is unavailable or has local inference disabled",
-            )
-        return
-    selector = config.get("executor_labels")
-    if not isinstance(selector, dict):
-        return
-    rows = await list_executors(session, owner_email=owner_email, include_shared=True)
-    if not any(
-        executor_local_inference_configured(row) and labels_match(row.labels or {}, selector)
-        for row in rows
-    ):
-        raise api_exception(
-            400,
-            "validation_error",
-            "Executor labels match no active executor with local inference enabled",
-        )
+    from cognis.core.provider_management import validate_executor_eligibility
+
+    await validate_executor_eligibility(
+        session, location=location, config=config, owner_email=owner_email
+    )
 
 
 def _preferences_from_state(value: dict[str, Any] | None) -> UserPreferencesResponse:
     if not value:
         return UserPreferencesResponse()
+    display = value.get("display")
+    if isinstance(display, dict):
+        family = UserDisplayPreferences.model_fields["theme_family"]
+        # Read-time fallback for future/invalid families; leave stored JSON
+        # and the rest of the account's preferences untouched.
+        if display.get("theme_family", family.default) not in get_args(family.annotation):
+            value = {**value, "display": {**display, "theme_family": family.default}}
     return UserPreferencesResponse.model_validate(value)
 
 
@@ -407,7 +144,17 @@ async def user_preferences_update(
     preferences = UserPreferencesResponse.model_validate(payload.model_dump(mode="json"))
     async with request.app.state.session_factory() as session:
         previous = await get_user_ui_state_value(session, user.email, USER_PREFERENCES_STATE_KEY)
-        was_enabled = UserPreferencesResponse.model_validate(previous or {}).chat.auto_recap
+        previous_preferences = _preferences_from_state(previous)
+        # Deployed clients send a full display object without this newer key.
+        # Preserve their account's family, but retain top-level {} /
+        # omitted-display reset semantics. New clients reset explicitly by
+        # sending Classic. Remove when clients without theme_family retire.
+        if (
+            "display" in payload.model_fields_set
+            and "theme_family" not in payload.display.model_fields_set
+        ):
+            preferences.display.theme_family = previous_preferences.display.theme_family
+        was_enabled = previous_preferences.chat.auto_recap
         if was_enabled != preferences.chat.auto_recap:
             await upsert_user_ui_state(
                 session,
@@ -449,10 +196,13 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
 @router.get("/api/v1/settings/step-profiles", response_model=list[StepProfileResponse])
 async def settings_step_profiles(request: Request) -> list[StepProfileResponse]:
     require_admin(request)
-    registry = request.app.state.step_profile_registry
-    return [
-        _step_profile_response(registry, definition) for definition in registry.list_definitions()
-    ]
+    return (await _profile_service(request).read())["profiles"]
+
+
+def _profile_service(request: Request) -> StepProfileManagement:
+    return StepProfileManagement(
+        request.app.state.session_factory, request.app.state.step_profile_registry
+    )
 
 
 @router.post("/api/v1/settings/step-profiles", response_model=StepProfileResponse)
@@ -461,39 +211,13 @@ async def settings_step_profile_create(
     payload: StepProfileCreateRequest,
 ) -> StepProfileResponse:
     user = require_admin(request)
-    registry = request.app.state.step_profile_registry
-    profile_id = payload.profile_id.strip()
-    if not profile_id:
-        raise api_exception(400, "validation_error", "profile_id is required")
-    if not _STEP_PROFILE_ID_PATTERN.fullmatch(profile_id):
-        raise api_exception(400, "validation_error", "profile_id must match ^[a-zA-Z0-9:_-]{1,80}$")
-    if registry.get_definition(profile_id) is not None:
-        raise api_exception(409, "conflict", "Step profile already exists")
-    try:
-        mode = StepProfileMode(payload.mode)
-        config = StepProfileConfig.model_validate(payload.config)
-    except Exception as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
-    async with request.app.state.session_factory() as session:
-        raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-        custom_profiles = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-        custom_profiles[profile_id] = serialize_step_profile_override(
-            name=payload.name or profile_id,
-            mode=mode,
-            config=config,
+    from cognis.core.management_access import ManagementActor
+
+    return StepProfileResponse.model_validate(
+        await _profile_service(request).mutate(
+            ManagementActor(user.email, user.role), "create", payload.profile_id.strip(), payload
         )
-        await upsert_setting(
-            session,
-            key=STEP_PROFILE_CUSTOM_SETTING_KEY,
-            value=custom_profiles,
-            category="workflow",
-            updated_by=user.email,
-        )
-        await session.commit()
-    await registry.refresh()
-    definition = registry.get_definition(profile_id)
-    assert definition is not None
-    return _step_profile_response(registry, definition)
+    )
 
 
 @router.put("/api/v1/settings/step-profiles/{profile_id}", response_model=StepProfileResponse)
@@ -503,112 +227,25 @@ async def settings_step_profile_update(
     payload: StepProfileUpdateRequest,
 ) -> StepProfileResponse:
     user = require_admin(request)
-    registry = request.app.state.step_profile_registry
-    existing = registry.get_definition(profile_id)
-    if existing is None:
-        raise api_exception(404, "not_found", "Step profile not found")
-    if not _STEP_PROFILE_ID_PATTERN.fullmatch(profile_id):
-        raise api_exception(400, "validation_error", "invalid profile_id")
-    try:
-        mode = StepProfileMode(payload.mode)
-        config = StepProfileConfig.model_validate(payload.config)
-    except Exception as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
+    from cognis.core.management_access import ManagementActor
 
-    async with request.app.state.session_factory() as session:
-        if registry.is_custom(profile_id):
-            raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-            custom_profiles = (
-                dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-            )
-            custom_profiles[profile_id] = serialize_step_profile_override(
-                name=payload.name or existing.name,
-                mode=mode,
-                config=config,
-            )
-            await upsert_setting(
-                session,
-                key=STEP_PROFILE_CUSTOM_SETTING_KEY,
-                value=custom_profiles,
-                category="workflow",
-                updated_by=user.email,
-            )
-        else:
-            raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
-            overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-            overrides[profile_id] = serialize_step_profile_override(
-                name=payload.name,
-                mode=mode,
-                config=config,
-            )
-            await upsert_setting(
-                session,
-                key=STEP_PROFILE_OVERRIDES_SETTING_KEY,
-                value=overrides,
-                category="workflow",
-                updated_by=user.email,
-            )
-        await session.commit()
-    await registry.refresh()
-    definition = registry.get_definition(profile_id)
-    assert definition is not None
-    return _step_profile_response(registry, definition)
+    return StepProfileResponse.model_validate(
+        await _profile_service(request).mutate(
+            ManagementActor(user.email, user.role), "update", profile_id, payload
+        )
+    )
 
 
 @router.delete("/api/v1/settings/step-profiles/{profile_id}", response_model=StepProfileResponse)
 async def settings_step_profile_reset(request: Request, profile_id: str) -> StepProfileResponse:
     user = require_admin(request)
-    registry = request.app.state.step_profile_registry
-    existing = registry.get_definition(profile_id)
-    if existing is None:
-        raise api_exception(404, "not_found", "Step profile not found")
-    was_custom = registry.is_custom(profile_id)
-    async with request.app.state.session_factory() as session:
-        if was_custom:
-            await _ensure_step_profile_not_in_use(session, profile_id)
-            raw = await get_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-            custom_profiles = (
-                dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-            )
-            custom_profiles.pop(profile_id, None)
-            if custom_profiles:
-                await upsert_setting(
-                    session,
-                    key=STEP_PROFILE_CUSTOM_SETTING_KEY,
-                    value=custom_profiles,
-                    category="workflow",
-                    updated_by=user.email,
-                )
-            else:
-                await delete_setting(session, STEP_PROFILE_CUSTOM_SETTING_KEY)
-        else:
-            raw = await get_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
-            overrides = dict(raw.value) if raw is not None and isinstance(raw.value, dict) else {}
-            overrides.pop(profile_id, None)
-            if overrides:
-                await upsert_setting(
-                    session,
-                    key=STEP_PROFILE_OVERRIDES_SETTING_KEY,
-                    value=overrides,
-                    category="workflow",
-                    updated_by=user.email,
-                )
-            else:
-                await delete_setting(session, STEP_PROFILE_OVERRIDES_SETTING_KEY)
-        await session.commit()
-    await registry.refresh()
-    if was_custom:
-        return StepProfileResponse(
-            profile_id=existing.profile_id,
-            name=existing.name,
-            mode=str(existing.mode),
-            config=existing.config.model_dump(mode="json"),
-            has_override=False,
-            is_custom=True,
+    from cognis.core.management_access import ManagementActor
+
+    return StepProfileResponse.model_validate(
+        await _profile_service(request).mutate(
+            ManagementActor(user.email, user.role), "reset", profile_id
         )
-    definition = registry.get_definition(profile_id)
-    assert definition is not None
-    return _step_profile_response(registry, definition)
+    )
 
 
 @router.get("/api/v1/settings/{key}", response_model=SettingResponse)
@@ -634,80 +271,21 @@ async def _persist_and_apply_setting(
 ) -> SettingResponse:
     """Serialize local mutations, persist, hot-apply, and converge on DB state."""
 
-    spec = get_setting_spec(key, require_exposed=True)
-    async with request.app.state.settings_update_lock:
-        async with request.app.state.session_factory() as session:
-            previous = await get_setting(session, key)
-            previous_value = previous.value if previous is not None else spec.default
-            previous_updated_by = previous.updated_by if previous is not None else None
-            row = await upsert_setting(
-                session,
-                key=key,
-                value=value,
-                category=spec.category,
-                updated_by=updated_by,
-            )
-            await session.commit()
-            await session.refresh(row)
-            committed_updated_at = row.updated_at
+    from cognis.core.settings_management import SettingsManagement
 
-        if spec.application_scope == "hot":
-            try:
-                await apply_runtime_setting(request.app, key, value)
-            except Exception as exc:
-                async with request.app.state.session_factory() as session:
-                    result = await session.execute(
-                        update(Setting)
-                        .where(
-                            Setting.key == key,
-                            Setting.updated_at == committed_updated_at,
-                        )
-                        .values(
-                            value=previous_value,
-                            category=spec.category,
-                            updated_by=previous_updated_by,
-                        )
-                    )
-                    if result.rowcount == 1:
-                        await session.commit()
-                        recovery_value = previous_value
-                    else:
-                        await session.rollback()
-                        latest = await get_setting(session, key)
-                        recovery_value = latest.value if latest is not None else spec.default
-                try:
-                    await apply_runtime_setting(request.app, key, recovery_value)
-                except Exception:
-                    logger.exception(
-                        "settings: failed to restore runtime value",
-                        extra={"extra_data": {"key": key}},
-                    )
-                raise api_exception(
-                    500,
-                    "runtime_apply_failed",
-                    "Setting could not be applied locally; the previous value was restored.",
-                ) from exc
-
-            # A concurrent writer in another worker may have committed after us.
-            # Re-read once so this worker converges to the latest durable value.
-            async with request.app.state.session_factory() as session:
-                latest = await get_setting(session, key)
-            if latest is not None and latest.value != value:
-                try:
-                    await apply_runtime_setting(request.app, key, latest.value)
-                except Exception as exc:
-                    logger.exception(
-                        "settings: failed to converge to latest durable value",
-                        extra={"extra_data": {"key": key}},
-                    )
-                    raise api_exception(
-                        500,
-                        "runtime_apply_failed",
-                        "A newer durable value could not be applied locally.",
-                    ) from exc
-                row = latest
-
-        return setting_to_response(row, spec)
+    return SettingResponse.model_validate(
+        await SettingsManagement(
+            session_factory=request.app.state.session_factory,
+            update_lock=request.app.state.settings_update_lock,
+            apply=lambda setting_key, setting_value: apply_runtime_setting(
+                request.app, setting_key, setting_value
+            ),
+            secrets=getattr(request.app.state.providers, "secrets", None),
+            finalize_web=lambda: finalize_web_executor_reconfigure_for_app(
+                request.app, reason="web_setting_update"
+            ),
+        ).put(key=key, value=value, updated_by=updated_by)
+    )
 
 
 @router.put("/api/v1/settings/{key}", response_model=SettingResponse)
@@ -783,24 +361,14 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
         searxng_engines = await get_setting_value(session, "web.searxng_engines", "")
         searxng_categories = await get_setting_value(session, "web.searxng_categories", "")
         searxng_language = await get_setting_value(session, "web.searxng_language", "")
+        from cognis.core.web_management import configured_web_backends
 
-    tavily_configured = False
-    brave_configured = False
-    secrets_provider = getattr(request.app.state.providers, "secrets", None)
-    if secrets_provider is not None:
-        for secret_name in ("tavily_api_key", "brave_api_key"):
-            try:
-                await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
-                if secret_name == "tavily_api_key":
-                    tavily_configured = True
-                else:
-                    brave_configured = True
-            except KeyError:
-                pass  # Secret not configured — expected
-            except Exception:
-                pass  # Provider error — treat as not configured
-
-    searxng_configured = bool(isinstance(searxng_url, str) and searxng_url.strip())
+        configured = await configured_web_backends(
+            session, getattr(request.app.state.providers, "secrets", None)
+        )
+    tavily_configured = configured["tavily"]
+    brave_configured = configured["brave"]
+    searxng_configured = configured["searxng"]
     tavily_enabled = bool(tavily_enabled)
     brave_enabled = bool(brave_enabled)
     searxng_enabled = bool(searxng_enabled)
@@ -1165,123 +733,27 @@ async def _guard_local_provider_update(
     next_config: dict[str, Any],
     next_status: str,
 ) -> None:
-    existing_config = existing.config if isinstance(existing.config, dict) else {}
-    routing_changed = (
-        next_owner_email != (existing.owner_email or SYSTEM_USER_EMAIL)
-        or next_location != existing.location
-        or next_status != existing.status
-        or next_config.get("preset") != existing_config.get("preset")
-        or next_config.get("executor_id") != existing_config.get("executor_id")
-        or next_config.get("executor_labels") != existing_config.get("executor_labels")
-    )
-    deployment_ids = await _provider_deployment_ids(session, existing.provider_id)
-    if routing_changed and existing.managed_local_key is not None:
-        raise api_exception(
-            409,
-            "local_model_dependencies",
-            "Cognis-managed local provider routing is immutable",
-            details={"deployment_ids": deployment_ids},
-        )
-    if not deployment_ids:
-        return
-    active_operation = (
-        await session.execute(
-            select(LocalModelOperation.operation_id)
-            .where(
-                LocalModelOperation.deployment_id.in_(deployment_ids),
-                LocalModelOperation.state.in_(
-                    ["queued", "running", "cancel_requested", "interrupted"]
-                ),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if routing_changed and active_operation is not None:
-        raise api_exception(
-            409,
-            "local_model_dependencies",
-            "cannot change provider routing while local-model operations are active",
-            details={"deployment_ids": deployment_ids},
-        )
-    if not routing_changed:
-        return
+    from cognis.core.provider_management import guard_local_update
 
-    from cognis.core.local_model_providers import LocalModelProviderResolver
-    from cognis.core.local_model_service import resolve_authorized_deployment_executors
-
-    proposed = LLMProvider(
-        provider_id=existing.provider_id,
-        display_name=existing.display_name,
-        location=next_location,
-        backend=existing.backend,
-        owner_email=next_owner_email,
-        config=next_config,
-        status=next_status,
+    await guard_local_update(
+        session,
+        existing,
+        next_owner_email=next_owner_email,
+        next_location=next_location,
+        next_config=next_config,
+        next_status=next_status,
     )
-    deployments = (
-        await session.execute(
-            select(LocalModelDeployment).where(
-                LocalModelDeployment.deployment_id.in_(deployment_ids)
-            )
-        )
-    ).scalars()
-    for deployment in deployments:
-        shared = deployment.owner_email == SYSTEM_USER_EMAIL
-        owner = await session.get(User, deployment.owner_email)
-        owner_role = owner.role if owner is not None else ("admin" if shared else "user")
-        resolved = await LocalModelProviderResolver().resolve(
-            session,
-            proposed,
-            actor_email=deployment.owner_email,
-            actor_role=owner_role,
-            shared=shared,
-        )
-        provider_host_ids = (
-            {row.executor_id for row in resolved.hosts} if resolved is not None else set()
-        )
-        target_ids = {
-            row.executor_id
-            for row in await resolve_authorized_deployment_executors(session, deployment)
-        }
-        if not target_ids or not target_ids.issubset(provider_host_ids):
-            raise api_exception(
-                409,
-                "local_model_dependencies",
-                "provider routing would exclude referenced deployment targets",
-                details={"deployment_ids": deployment_ids},
-            )
 
 
 @router.post("/api/v1/llm-providers", response_model=LLMProviderResponse)
 async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> LLMProviderResponse:
     user = require_current_user(request)
-    from cognis.api.common import slugify
+    from cognis.core.management_access import ManagementActor
+    from cognis.core.provider_management import ProviderManagement
 
-    _validate_llm_provider_payload(payload.location, payload.config)
-    provider_id = payload.provider_id or slugify(payload.display_name)
-    owner_email = _provider_owner_for_create(user, payload.config)
-    async with request.app.state.session_factory() as session:
-        existing = await get_llm_provider(session, provider_id)
-        if existing is not None:
-            raise api_exception(409, "conflict", "LLM provider already exists")
-        await _validate_provider_executor_eligibility(
-            session,
-            location=payload.location,
-            config=payload.config,
-            owner_email=owner_email,
-        )
-        row = await create_llm_provider(
-            session,
-            provider_id=provider_id,
-            display_name=payload.display_name,
-            location=payload.location,
-            backend=payload.backend,
-            owner_email=owner_email,
-            config=payload.config,
-            status=payload.status,
-        )
-        await session.commit()
-        await session.refresh(row)
+    row = await ProviderManagement(
+        request.app.state.session_factory, request.app.state.providers.llm
+    ).create(ManagementActor(user.email, user.role), payload)
     return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 
@@ -1302,118 +774,38 @@ async def llm_provider_update(
     payload: LLMProviderUpdateRequest,
 ) -> LLMProviderResponse:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        await lock_local_model_dispatch_guard(session)
-        existing = await get_visible_llm_provider(session, provider_id, user.email)
-        if existing is None:
-            raise api_exception(404, "not_found", "LLM provider not found")
-        owner_email = existing.owner_email or SYSTEM_USER_EMAIL
-        _require_provider_manager(request, owner_email)
-        next_owner_email = _provider_owner_for_update(request, owner_email, payload.owner_scope)
-        next_config = dict(payload.config or existing.config or {})
-        if payload.owner_scope is not None:
-            next_config["scope"] = "system" if next_owner_email == SYSTEM_USER_EMAIL else "user"
-        next_location = payload.location if payload.location is not None else existing.location
-        _validate_llm_provider_payload(next_location, next_config)
-        existing_config = existing.config if isinstance(existing.config, dict) else {}
-        selector_changed = (
-            next_location != existing.location
-            or next_config.get("executor_id") != existing_config.get("executor_id")
-            or next_config.get("executor_labels") != existing_config.get("executor_labels")
-        )
-        if selector_changed:
-            await _validate_provider_executor_eligibility(
-                session,
-                location=next_location,
-                config=next_config,
-                owner_email=next_owner_email,
-            )
-        await _guard_local_provider_update(
-            session,
-            existing,
-            next_owner_email=next_owner_email,
-            next_location=payload.location if payload.location is not None else existing.location,
-            next_config=next_config,
-            next_status=payload.status if payload.status is not None else existing.status,
-        )
-        ok = await update_llm_provider(
-            session,
-            provider_id,
-            display_name=payload.display_name,
-            location=payload.location,
-            backend=payload.backend,
-            owner_email=next_owner_email,
-            config=next_config,
-            status=payload.status,
-        )
-        if not ok:
-            raise api_exception(404, "not_found", "LLM provider not found")
-        row = await get_llm_provider(session, provider_id)
-        await session.commit()
+    from cognis.core.management_access import ManagementActor
+    from cognis.core.provider_management import ProviderManagement
+
+    row = await ProviderManagement(
+        request.app.state.session_factory, request.app.state.providers.llm
+    ).update(ManagementActor(user.email, user.role), provider_id, payload)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
-    # Admin edits may fix the very issue (e.g. a tier cap, a different
-    # endpoint, toggling use_responses_api) that caused a model to be marked
-    # as broken for JSON mode or native OpenAI tool search. Clear the
-    # provider's cached runtime downgrades so the next call re-probes.
-    llm_provider_impl = getattr(request.app.state.providers, "llm", None)
-    invalidate = getattr(
-        llm_provider_impl,
-        "invalidate_runtime_capability_cache_for_provider",
-        None,
-    )
-    if not callable(invalidate):
-        invalidate = getattr(llm_provider_impl, "invalidate_json_mode_cache_for_provider", None)
-    if callable(invalidate):
-        invalidate(provider_id)
     return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
 
 @router.delete("/api/v1/llm-providers/{provider_id}", response_model=dict)
 async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, bool]:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        await lock_local_model_dispatch_guard(session)
-        existing = await get_visible_llm_provider(session, provider_id, user.email)
-        if existing is None:
-            raise api_exception(404, "not_found", "LLM provider not found")
-        owner_email = existing.owner_email or SYSTEM_USER_EMAIL
-        _require_provider_manager(request, owner_email)
-        deployment_ids = await _provider_deployment_ids(session, provider_id)
-        if deployment_ids:
-            raise api_exception(
-                409,
-                "local_model_dependencies",
-                "cannot delete a provider referenced by local-model deployments",
-                details={"deployment_ids": deployment_ids},
-            )
-        ok = await delete_llm_provider(session, provider_id)
-        await session.commit()
-    return {"ok": ok}
+    from cognis.core.management_access import ManagementActor
+    from cognis.core.provider_management import ProviderManagement
+
+    return await ProviderManagement(
+        request.app.state.session_factory, request.app.state.providers.llm
+    ).delete(ManagementActor(user.email, user.role), provider_id)
 
 
 @router.post("/api/v1/llm-providers/{provider_id}/set-default")
 async def llm_provider_set_default(request: Request, provider_id: str) -> dict[str, Any]:
     """Mark a provider as the default. Clears any existing default."""
     user = require_current_user(request)
-    from cognis.store.models import LLMProvider as LLMProviderRow
+    from cognis.core.management_access import ManagementActor
+    from cognis.core.provider_management import ProviderManagement
 
-    async with request.app.state.session_factory() as session:
-        target = await get_visible_llm_provider(session, provider_id, user.email)
-        if target is None:
-            raise api_exception(404, "not_found", "LLM provider not found")
-        _require_provider_manager(request, target.owner_email or SYSTEM_USER_EMAIL)
-        # Clear existing defaults
-        from sqlalchemy import update
-
-        await session.execute(
-            update(LLMProviderRow)
-            .where(LLMProviderRow.owner_email == target.owner_email)
-            .values(is_default=False)
-        )
-        target.is_default = True
-        await session.commit()
-    return {"ok": True, "provider_id": provider_id}
+    return await ProviderManagement(
+        request.app.state.session_factory, request.app.state.providers.llm
+    ).set_default(ManagementActor(user.email, user.role), provider_id)
 
 
 @router.post("/api/v1/llm-providers/{provider_id}/test", response_model=LLMProviderTestResponse)
@@ -1475,6 +867,8 @@ async def llm_provider_chatgpt_oauth_status(
         raise api_exception(400, "validation_error", str(exc)) from exc
     except Exception as exc:
         raise api_exception(502, "provider_error", f"Failed to check OAuth: {exc!s}"[:300]) from exc
+    if status.pop("authorization_completed", False):
+        await request.app.state.provider_monitor.invalidate(provider_id)
     status.pop("provider_id", None)
     return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
 
@@ -1489,6 +883,7 @@ async def llm_provider_chatgpt_oauth_clear(request: Request, provider_id: str) -
         ok = await request.app.state.providers.llm.clear_chatgpt_oauth(provider_id)
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
+    await request.app.state.provider_monitor.invalidate(provider_id)
     return {"ok": ok}
 
 
@@ -1528,6 +923,7 @@ async def llm_provider_anthropic_oauth_complete(
         raise api_exception(
             502, "provider_error", f"Failed to complete OAuth: {exc!s}"[:300]
         ) from exc
+    await request.app.state.provider_monitor.invalidate(provider_id)
     status.pop("provider_id", None)
     return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
 
@@ -1560,21 +956,14 @@ async def llm_provider_anthropic_oauth_clear(request: Request, provider_id: str)
         ok = await request.app.state.providers.llm.clear_anthropic_oauth(provider_id)
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
+    await request.app.state.provider_monitor.invalidate(provider_id)
     return {"ok": ok}
 
 
 @router.get("/api/v1/llm-providers/{provider_id}/codex/usage", response_model=CodexUsageResponse)
 async def llm_provider_codex_usage(request: Request, provider_id: str) -> CodexUsageResponse:
     require_admin(request)
-    try:
-        usage = await request.app.state.providers.llm.get_codex_usage(provider_id)
-    except ValueError as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
-    except Exception as exc:
-        raise api_exception(
-            502, "provider_error", f"Failed to fetch Codex usage: {exc!s}"[:300]
-        ) from exc
-    return CodexUsageResponse(provider_id=provider_id, **usage)
+    return await llm_provider_usage(request, provider_id)
 
 
 @router.get("/api/v1/llm-providers/{provider_id}/usage", response_model=ProviderUsageResponse)
@@ -1586,15 +975,64 @@ async def llm_provider_usage(request: Request, provider_id: str) -> ProviderUsag
         provider = await get_visible_llm_provider(session, provider_id, user.email)
     if provider is None:
         raise api_exception(404, "not_found", "LLM provider not found")
+    result = await _provider_monitor_result(request, provider_id)
+    return result.usage or ProviderUsageResponse(
+        provider_id=provider_id,
+        ok=False,
+        source="unsupported",
+        unavailable_reason=result.error or "not_checked",
+    )
+
+
+@router.get("/api/v1/provider-monitor")
+async def provider_monitor_list(request: Request) -> list[ProviderMonitorResponse]:
+    """Return cached, user-visible enabled providers without upstream calls."""
+    user = require_current_user(request)
+    from cognis.core.provider_monitor import ProviderMonitor
+
+    monitor: ProviderMonitor = request.app.state.provider_monitor
+    return await monitor.list_visible(user.email)
+
+
+async def _provider_monitor_result(
+    request: Request, provider_id: str, *, force: bool = False
+) -> ProviderMonitorResponse:
+    from cognis.core.provider_monitor import ProviderMonitor
+
+    monitor: ProviderMonitor = request.app.state.provider_monitor
     try:
-        usage = await request.app.state.providers.llm.get_provider_usage(provider_id)
-    except ValueError as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
-    except Exception as exc:
-        raise api_exception(
-            502, "provider_error", f"Failed to fetch provider usage: {exc!s}"[:300]
-        ) from exc
-    return ProviderUsageResponse(provider_id=provider_id, **usage)
+        return await monitor.get(provider_id, force=force)
+    except TimeoutError:
+        cached = await monitor.get(provider_id, refresh_if_due=False)
+        return cached.model_copy(
+            update={"error": "Refresh still in progress; try again shortly", "stale": True}
+        )
+
+
+@router.get("/api/v1/provider-monitor/{provider_id}", response_model=ProviderMonitorResponse)
+async def provider_monitor_detail(request: Request, provider_id: str) -> ProviderMonitorResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        provider = await get_visible_llm_provider(session, provider_id, user.email)
+    if provider is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    return await _provider_monitor_result(request, provider_id)
+
+
+@router.post(
+    "/api/v1/provider-monitor/{provider_id}/refresh", response_model=ProviderMonitorResponse
+)
+async def provider_monitor_refresh(request: Request, provider_id: str) -> ProviderMonitorResponse:
+    """Explicit manual refresh, even when automatic checks are disabled."""
+    from cognis.api.common import forbid_mutation_for_viewer
+
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        provider = await get_visible_llm_provider(session, provider_id, user.email)
+    if provider is None or provider.status != "active":
+        raise api_exception(404, "not_found", "Enabled LLM provider not found")
+    return await _provider_monitor_result(request, provider_id, force=True)
 
 
 @router.post("/api/v1/llm-providers/discover-models-preview")
@@ -1644,11 +1082,21 @@ async def llm_provider_discover_models_preview(request: Request) -> dict[str, An
             preset=preset,
             base_url=base_url,
             api_key=api_key,
+            aws_config={
+                key: body[key].strip()
+                for key in ("aws_region_name", "aws_profile_name")
+                if isinstance(body.get(key), str) and body[key].strip()
+            },
             secret_name=secret_name,
             env_var=env_var,
             location=location,
             executor_id=executor_id,
             executor_labels=executor_labels,
+            **(
+                {"catalog_provider": body["catalog_provider"]}
+                if isinstance(body.get("catalog_provider"), str)
+                else {}
+            ),
         )
     except Exception as exc:
         raise api_exception(
@@ -1735,6 +1183,11 @@ async def llm_provider_enrich_models_preview(
                 preset=payload.preset,
                 base_url=payload.base_url,
                 api_key=resolved_key or None,
+                **(
+                    {"catalog_provider": payload.catalog_provider}
+                    if payload.catalog_provider
+                    else {}
+                ),
             )
             models.append(info.model_dump())
         except Exception:
@@ -1745,24 +1198,10 @@ async def llm_provider_enrich_models_preview(
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)
 async def model_routing_get(request: Request) -> ModelRoutingResponse:
     require_admin(request)
-    async with request.app.state.session_factory() as session:
-        rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)
-    route_by_task = {row.task_type: row for row in rows}
-    return ModelRoutingResponse(
-        default=_routing_entry_model("default", route_by_task.get("default")),
-        classifier=_routing_entry_model("classifier", route_by_task.get("classifier")),
-        compaction=_routing_entry_model("compaction", route_by_task.get("compaction")),
-        evaluator=_routing_entry_model("evaluator", route_by_task.get("evaluator")),
-        speech_to_text=_routing_entry_model("speech_to_text", route_by_task.get("speech_to_text")),
-        text_to_speech=_routing_entry_model("text_to_speech", route_by_task.get("text_to_speech")),
-        image_generation=_routing_entry_model(
-            "image_generation", route_by_task.get("image_generation")
-        ),
-        attachment_analysis=_routing_entry_model(
-            "attachment_analysis", route_by_task.get("attachment_analysis")
-        ),
-        embedding=_routing_entry_model("embedding", route_by_task.get("embedding")),
-    )
+    from cognis.core.routing_management import get_bindings
+
+    response, _ = await get_bindings(request.app.state.session_factory)
+    return response
 
 
 @router.put("/api/v1/model-routing", response_model=ModelRoutingResponse)
@@ -1770,125 +1209,15 @@ async def model_routing_put(
     request: Request,
     payload: ModelRoutingUpdateRequest,
 ) -> ModelRoutingResponse:
-    require_admin(request)
-    updates = {task_type: getattr(payload, task_type) for task_type in _ROUTING_TASK_TYPES}
-    llm = request.app.state.providers.llm
-    prepared_updates: dict[str, tuple[str | None, str | None, dict[str, str] | None]] = {}
-    for task_type, entry in updates.items():
-        if entry.model is None or not entry.model.strip():
-            if entry.reasoning_effort not in {None, "", "default"}:
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    f"{task_type} reasoning_effort requires an explicit model",
-                )
-            prepared_updates[task_type] = (None, None, None)
-            continue
+    user = require_admin(request)
+    from cognis.core.management_access import ManagementActor
+    from cognis.core.routing_management import put_bindings
 
-        normalized_model_input = entry.model.strip()
-        if normalized_model_input == SAME_SESSION_MODEL_SENTINEL:
-            if task_type != "compaction":
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    f"{task_type} cannot use the same-session model sentinel",
-                )
-            if entry.reasoning_effort not in {None, "", "default"}:
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    "compaction reasoning_effort cannot be set when using the same-session model",
-                )
-            prepared_updates[task_type] = (normalized_model_input, None, None)
-            continue
-        try:
-            if hasattr(llm, "resolve_model_reference"):
-                normalized_model, resolved_provider_id = await llm.resolve_model_reference(
-                    normalized_model_input,
-                    acting_user_email=SYSTEM_USER_EMAIL,
-                )
-            else:
-                normalized_model = normalized_model_input
-                resolved_provider_id = await llm.find_provider_for_model(
-                    normalized_model, acting_user_email=SYSTEM_USER_EMAIL
-                )
-        except ValueError as exc:
-            raise api_exception(
-                422,
-                "validation_error",
-                f"{task_type} {exc}",
-            ) from exc
-        if resolved_provider_id is None:
-            raise api_exception(
-                422,
-                "validation_error",
-                f"{task_type} model {normalized_model!r} is not present in configured providers",
-            )
-        model_info = await llm.get_model_info(
-            normalized_model,
-            provider_id=resolved_provider_id,
-            acting_user_email=SYSTEM_USER_EMAIL,
+    return ModelRoutingResponse.model_validate(
+        await put_bindings(
+            request.app.state.session_factory,
+            request.app.state.providers.llm,
+            ManagementActor(user.email, user.role),
+            payload,
         )
-        if not _route_model_is_eligible(
-            task_type,
-            model_id=normalized_model,
-            model_info=model_info,
-        ):
-            raise api_exception(
-                422,
-                "validation_error",
-                f"{task_type} model {normalized_model!r} is not eligible for that route",
-            )
-        config: dict[str, str] | None = None
-        if isinstance(entry.reasoning_effort, str) and entry.reasoning_effort.strip():
-            normalized_effort = normalize_reasoning_level(entry.reasoning_effort)
-            if normalized_effort is None:
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    f"{task_type} reasoning_effort {entry.reasoning_effort!r} is invalid",
-                )
-        else:
-            normalized_effort = None
-        if normalized_effort == "default":
-            normalized_effort = None
-        if normalized_effort is not None:
-            if task_type not in _TEXT_ROUTING_TASK_TYPES:
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    f"{task_type} does not support reasoning_effort",
-                )
-            if normalized_effort not in model_info.reasoning_efforts:
-                raise api_exception(
-                    422,
-                    "validation_error",
-                    f"{task_type} reasoning_effort {normalized_effort!r} is not supported by model {normalized_model!r}",
-                )
-            config = {"reasoning_effort": normalized_effort}
-        explicit_provider_reference = normalized_model_input != normalized_model
-        prepared_updates[task_type] = (
-            normalized_model,
-            resolved_provider_id if explicit_provider_reference else None,
-            config,
-        )
-
-    async with request.app.state.session_factory() as session:
-        existing_rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)
-        for row in existing_rows:
-            if row.task_type not in _ROUTING_TASK_TYPES:
-                await delete_model_routing(session, row.task_type, owner_email=SYSTEM_USER_EMAIL)
-        for task_type, (normalized_model, resolved_provider_id, config) in prepared_updates.items():
-            if normalized_model is None:
-                await delete_model_routing(session, task_type, owner_email=SYSTEM_USER_EMAIL)
-                continue
-            await upsert_model_routing(
-                session,
-                task_type=task_type,
-                provider_id=resolved_provider_id,
-                model=normalized_model,
-                owner_email=SYSTEM_USER_EMAIL,
-                config=config,
-            )
-        await session.commit()
-    return await model_routing_get(request)
+    )

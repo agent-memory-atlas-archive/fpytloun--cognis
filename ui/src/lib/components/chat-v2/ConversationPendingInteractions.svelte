@@ -22,8 +22,8 @@
   }>();
   const floating = $derived(presentation === 'floating');
   const passiveClass = $derived(floating
-    ? 'pointer-events-auto rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-xs text-slate-400 shadow-2xl'
-    : 'shrink-0 border-t border-slate-800 px-4 py-3 text-xs text-slate-400');
+    ? 'pointer-events-auto rounded-2xl border border-control-border bg-elevated px-4 py-3 text-xs text-muted shadow-2xl'
+    : 'shrink-0 border-t border-separator px-4 py-3 text-xs text-muted');
 
   let notifications = $state<Notification[]>([]);
   let loading = $state(true);
@@ -34,6 +34,8 @@
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let connectionStateInitialized = false;
   let wasConnected = false;
+  let alive = true;
+  let readController: AbortController | null = null;
 
   const pending = $derived(notifications.filter((item) => item.status === 'pending'));
   const escalationNotification = $derived(pending.find((item) => item.notification_type === 'escalation') ?? null);
@@ -121,17 +123,22 @@
   });
 
   async function refresh(): Promise<void> {
+    if (!alive) return;
     const currentId = conversationId;
     const requestGeneration = ++generation;
+    readController?.abort();
+    const controller = new AbortController();
+    readController = controller;
     try {
-      const next = await api.notifications.list(currentId);
+      const next = await api.notifications.list(currentId, { signal: controller.signal });
       if (requestGeneration !== generation || currentId !== conversationId) return;
       notifications = next;
       error = '';
     } catch (caught) {
-      if (requestGeneration !== generation || currentId !== conversationId) return;
+      if (controller.signal.aborted || requestGeneration !== generation || currentId !== conversationId) return;
       error = asApiError(caught).message;
     } finally {
+      if (readController === controller) readController = null;
       if (requestGeneration === generation && currentId === conversationId) loading = false;
     }
   }
@@ -195,7 +202,10 @@
     error = '';
     void refresh();
     return () => {
-      if (currentId === conversationId) generation += 1;
+      generation += 1;
+      readController?.abort();
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
+      refreshTimer = null;
     };
   });
 
@@ -241,6 +251,9 @@
   const clock = setInterval(() => { secondsNow = Date.now(); }, 1000);
 
   onDestroy(() => {
+    alive = false;
+    ++generation;
+    readController?.abort();
     unsubscribe();
     unsubscribeConnection();
     clearInterval(clock);
@@ -256,8 +269,8 @@
 {:else if error && pending.length === 0}
   <div
     class={floating
-      ? 'pointer-events-auto rounded-2xl border border-rose-700/70 bg-slate-950 px-4 py-3 text-xs text-rose-200 shadow-2xl'
-      : 'shrink-0 border-t border-rose-900/60 bg-rose-950/30 px-4 py-3 text-xs text-rose-200'}
+      ? 'pointer-events-auto rounded-2xl border border-danger-border bg-elevated px-4 py-3 text-xs text-danger shadow-2xl'
+      : 'shrink-0 border-t border-danger-border bg-danger-subtle px-4 py-3 text-xs text-danger'}
     data-presentation={presentation}
     role="alert"
   >
@@ -267,13 +280,13 @@
 {:else if pending.length > 0}
   <section
     class={floating
-      ? 'pointer-events-auto max-h-full space-y-3 overflow-y-auto overscroll-contain rounded-2xl border border-slate-700 bg-slate-950 p-3 shadow-2xl'
-      : 'max-h-[45%] shrink-0 space-y-3 overflow-y-auto border-t border-slate-800 bg-slate-950/90 p-3'}
+      ? 'pointer-events-auto max-h-full space-y-3 overflow-y-auto overscroll-contain rounded-2xl border border-control-border bg-elevated p-3 shadow-2xl'
+      : 'max-h-[45%] shrink-0 space-y-3 overflow-y-auto border-t border-separator bg-chrome/90 p-3'}
     aria-label="Pending conversation requests"
     data-presentation={presentation}
     data-testid="pending-conversation-interactions"
   >
-    {#if error}<p class="text-xs text-rose-200" role="alert">{error}</p>{/if}
+    {#if error}<p class="text-xs text-danger" role="alert">{error}</p>{/if}
     {#if escalation && escalationNotification}
       <EscalationPrompt
         item={escalation}
@@ -292,20 +305,20 @@
     {#if inputPause && inputRequest}
       {#key inputRequest.notification_id}
         {#if isOAuthAuthorization}
-          <article class="rounded-2xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-50">
-            <p class="text-xs font-semibold uppercase tracking-[0.2em] text-amber-200">Authorization required</p>
+          <article class="rounded-2xl border border-warning-border bg-warning-subtle px-4 py-3 text-sm text-foreground">
+            <p class="text-xs font-semibold uppercase tracking-[0.2em] text-warning">Authorization required</p>
             <p class="mt-2">{typeof inputRequest.payload.message === 'string' ? inputRequest.payload.message : 'Complete authorization in the provider window.'}</p>
             <div class="mt-3 flex flex-wrap gap-2">
               {#if oauthAuthorization?.callbackMode === 'executor_loopback'}
-                <span class="w-full text-xs text-amber-100">Open this URL on executor {oauthAuthorization.executorName ?? 'selected executor'}:</span>
-                <code class="w-full break-all rounded-xl bg-slate-950/50 px-3 py-2">{oauthAuthorization.url}</code>
+                <span class="w-full text-xs text-secondary">Open this URL on executor {oauthAuthorization.executorName ?? 'selected executor'}:</span>
+                <code class="w-full break-all rounded-xl bg-inset px-3 py-2">{oauthAuthorization.url}</code>
               {:else if oauthAuthorization}
-                <a class="rounded-xl bg-amber-300 px-3 py-2 font-medium text-slate-950" href={oauthAuthorization.url} target="_blank" rel="noreferrer">Open authorization</a>
+                <a class="rounded-xl bg-accent px-3 py-2 font-medium text-on-accent hover:bg-accent-hover" href={oauthAuthorization.url} target="_blank" rel="noreferrer">Open authorization</a>
               {/if}
               {#if oauthAuthorization?.userCode}
-                <span class="rounded-xl border border-amber-300/40 px-3 py-2">Code: <code>{oauthAuthorization.userCode}</code></span>
+                <span class="rounded-xl border border-control-border px-3 py-2">Code: <code>{oauthAuthorization.userCode}</code></span>
               {/if}
-              <button class="rounded-xl border border-amber-300/40 px-3 py-2" type="button" disabled={busyId === inputRequest.notification_id} onclick={() => void resolve(inputRequest, { decision: 'cancel' })}>Cancel</button>
+              <button class="rounded-xl border border-control-border px-3 py-2 hover:bg-surface-hover" type="button" disabled={busyId === inputRequest.notification_id} onclick={() => void resolve(inputRequest, { decision: 'cancel' })}>Cancel</button>
             </div>
           </article>
         {:else}

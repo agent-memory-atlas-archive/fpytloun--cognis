@@ -8,7 +8,7 @@
 </script>
 
 <span
-  class="inline-flex shrink-0 items-center gap-1 rounded-full bg-slate-800/70 px-1.5 py-0.5 text-[10px]"
+  class="inline-flex shrink-0 items-center gap-1 rounded-full bg-raised/70 px-1.5 py-0.5 text-[10px] text-secondary"
   role={active ? 'status' : undefined}
   aria-busy={active ? 'true' : undefined}
   aria-live={active ? 'polite' : undefined}

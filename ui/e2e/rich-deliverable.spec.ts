@@ -146,16 +146,16 @@ test.describe('rich deliverable visual fixture', () => {
       await expect(pulse.getByRole('heading', { level: 1 })).toHaveCount(1);
       await expect(pulse.getByTestId('rich-deliverable-toc')).toHaveCount(0);
       await expect(pulse.getByText(/Figure 1\./)).toHaveCount(0);
-      const media = pulse.getByRole('img', { name: /Lovosice a České středohoří/ });
+      const media = pulse.getByRole('img', { name: /Abstraktní ilustrace fiktivního města/ });
       await expect(media).toBeVisible();
       await expect(media).toHaveAttribute('width', '1600');
       await expect(media).toHaveAttribute('height', '900');
       await expect(pulse.getByRole('heading', { name: 'Dnes udělat', exact: true })).toBeVisible();
-      await expect(pulse.getByRole('region', { name: 'Úterý 14. července' })).toBeVisible();
+      await expect(pulse.getByRole('region', { name: 'Ukázkový den 16. dubna' })).toBeVisible();
       await expect(pulse.getByLabel('Aktuální čas 08:20')).toBeVisible();
-      await expect(pulse.getByText('Odeslat rozhodnutí')).toBeVisible();
-      await expect(pulse.getByLabel('Todoist úkoly')).toContainText('Potvrdit prioritu');
-      await expect(pulse.getByText('Před delší cestou stačí ověřit jedinou trasu.')).toBeVisible();
+      await expect(pulse.getByText('Kontrola demonstračních popisků')).toBeVisible();
+      await expect(pulse.getByLabel('Todoist úkoly')).toContainText('Vybrat demonstrační popisek');
+      await expect(pulse.getByText('Demonstrační zpráva bez vztahu ke skutečné instituci.')).toBeVisible();
       await expect(pulse.getByRole('heading', { name: 'Vědět', exact: true })).toBeVisible();
       await expect(pulse.getByRole('heading', { name: 'Sledovat', exact: true })).toBeVisible();
       await expect(pulse.getByText('Dnešní kurz', { exact: true })).toBeVisible();
@@ -787,12 +787,12 @@ test.describe('multiple rich deliverables', () => {
       await expect(rich.getByTestId('rich-deliverable-toolbar')).toHaveClass(/actions-only/);
       await expect(rich.getByText('Idle · 0 open alerts')).toBeVisible();
       await expect(rich.locator('[data-rich-role="metadata"]')).toContainText('orchid-primary');
-      await expect(rich.locator('[data-rich-role="status"]')).toContainText('9 suggested indexes');
+      await expect(rich.locator('[data-rich-role="status"]')).toContainText('5 suggested indexes');
 
       // Four compact metrics with accessible progress bars.
       const metricProgressBars = rich.locator('[data-rich-block-type="metric"] [role="progressbar"]');
       await expect(metricProgressBars).toHaveCount(4);
-      await expect(metricProgressBars.first()).toHaveAttribute('aria-valuenow', '61');
+      await expect(metricProgressBars.first()).toHaveAttribute('aria-valuenow', '50');
       await expect(metricProgressBars.first()).toHaveAttribute('aria-valuemax', '100');
       const metricGrid = rich.locator('[data-rich-grid-layout="equal"]').first();
       const metricCards = metricGrid.locator('[data-rich-block-type="metric"]');
@@ -812,7 +812,7 @@ test.describe('multiple rich deliverables', () => {
       }
 
       // Status chips (generic cards, not a dashboard-only component).
-      await expect(rich.getByText('9 suggested indexes')).toBeVisible();
+      await expect(rich.getByText('5 suggested indexes')).toBeVisible();
       const actionListStyles = await rich.locator('.rich-card-status .rich-markdown').evaluate((element) => {
         const ordered = element.querySelector('ol')!;
         const unordered = element.querySelector('ul')!;
@@ -833,7 +833,7 @@ test.describe('multiple rich deliverables', () => {
       await expect(recommendationTable.locator('td[data-cell-type="code"] code')).toHaveCount(5);
       await expect(recommendationTable.locator('td[data-cell-type="badge"] .rich-table-badge')).toHaveCount(5);
       await expect(recommendationTable.locator('td[data-cell-type="number"]')).toHaveCount(5);
-      await expect(recommendationTable.getByText('1.08M → 0')).toBeVisible();
+      await expect(recommendationTable.getByText('240k → 2')).toBeVisible();
 
       // Mobile tables expose each row as a readable labelled card and hide
       // their sortable header. Verify the desktop interaction through the
@@ -856,7 +856,7 @@ test.describe('multiple rich deliverables', () => {
       // Seven-day traffic comparison and an accessible typed progress cell
       // reused from the same primitive as the metric progress bars.
       await expect(rich.getByText('Traffic — last 7 days')).toBeVisible();
-      await expect(rich.getByText('24.1 M (~40/s)')).toBeVisible();
+      await expect(rich.getByText('6.048 M (10/s)')).toBeVisible();
 
       // Asymmetric action summary: a wide scaling-guidance table spans two
       // tracks beside a narrower "Act now" card.

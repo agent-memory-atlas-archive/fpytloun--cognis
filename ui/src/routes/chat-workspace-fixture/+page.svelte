@@ -30,7 +30,7 @@
   }];
 </script>
 
-<main bind:this={shell} class="flex h-screen min-w-0 overflow-hidden bg-slate-950" data-testid="workspace-fixture">
+<main bind:this={shell} class="flex h-screen min-w-0 overflow-hidden bg-canvas text-foreground" data-testid="workspace-fixture">
   <section class={`min-w-0 flex-1 ${presentation === 'pinned' ? 'grid grid-cols-[minmax(32rem,1fr)_auto]' : 'flex'}`}>
     <div class="min-w-0 overflow-x-hidden p-4" data-testid="fixture-chat">
       <p class="break-words">chat-{`x`.repeat(300)}</p>

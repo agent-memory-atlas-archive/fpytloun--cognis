@@ -41,7 +41,7 @@ from cognis.core.managed_conversations import (
     ManagedConversationTurnObserver,
 )
 from cognis.core.message_envelope import render_user_message
-from cognis.core.runtime import TransientExecutorUnavailable
+from cognis.core.runtime import ExecutorConfigurationError, TransientExecutorUnavailable
 from cognis.core.trusted_evidence import (
     TRUSTED_EVIDENCE_ADMISSION_KEY,
     deserialize_evidence_admission,
@@ -606,6 +606,7 @@ async def test_absorbing_messages_remain_visible_as_committing() -> None:
             "updated_at": now.isoformat(),
             "status": "committing",
             "cancel_requested": False,
+            "can_edit": False,
             "position": 1,
         }
     ]
@@ -2127,6 +2128,7 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
             "turn_id": "turn-1",
             "content": "Hello world",
             "chunk_count": 2,
+            "text_streaming": True,
             "assistant_phase_index": 0,
             "assistant_phase_authoritative": True,
             "turn_cycle_index": 0,
@@ -2731,19 +2733,44 @@ async def test_normal_user_turn_does_not_persist_visible_turn_notice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pre_agent_executor_failure_persists_retryable_source_then_sanitized_error() -> None:
+@pytest.mark.parametrize(
+    ("failure", "message", "detail", "code", "recoverable"),
+    [
+        (
+            TransientExecutorUnavailable(
+                "Selected executor 'private-host' is not connected; token=secret",
+                executor_id="private-host",
+            ),
+            "The selected executor is temporarily unavailable. Try again shortly.",
+            None,
+            "executor_unavailable",
+            True,
+        ),
+        (
+            ExecutorConfigurationError(
+                "Agent must explicitly configure executor_id or executor_selector. "
+                "Configure an executor on the agent page before retrying."
+            ),
+            "Executor configuration is missing or invalid. Configure an executor on the agent page.",
+            "Agent must explicitly configure executor_id or executor_selector. "
+            "Configure an executor on the agent page before retrying.",
+            "executor_configuration_invalid",
+            False,
+        ),
+    ],
+)
+async def test_pre_agent_executor_failure_persists_retryable_source_then_sanitized_error(
+    failure: Exception,
+    message: str,
+    detail: str | None,
+    code: str,
+    recoverable: bool,
+) -> None:
     guardrails = _RecordingGuardrails()
     session_cache = SimpleNamespace(append_recorded_events=AsyncMock())
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
-        workflow_engine=SimpleNamespace(
-            run_direct_turn=AsyncMock(
-                side_effect=TransientExecutorUnavailable(
-                    "Selected executor 'private-host' is not connected; token=secret",
-                    executor_id="private-host",
-                )
-            )
-        ),
+        workflow_engine=SimpleNamespace(run_direct_turn=AsyncMock(side_effect=failure)),
         decision_engine=SimpleNamespace(
             decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
         ),
@@ -2760,6 +2787,9 @@ async def test_pre_agent_executor_failure_persists_retryable_source_then_sanitiz
         event_bus=EventBus(),
     )
     scheduler._suppress_absorbed_channel_delivery_intents = AsyncMock()  # type: ignore[method-assign]
+
+    publish = AsyncMock(wraps=scheduler._event_bus.publish)
+    scheduler._event_bus.publish = publish  # type: ignore[method-assign]
 
     await scheduler._run_turn(
         conversation=ConversationModel(
@@ -2814,10 +2844,10 @@ async def test_pre_agent_executor_failure_persists_retryable_source_then_sanitiz
         "error_id": "turn-failed",
         "turn_id": "turn-failed",
         "title": "Turn failed",
-        "message": "The selected executor is temporarily unavailable. Try again shortly.",
-        "error_detail": None,
-        "error_code": "executor_unavailable",
-        "recoverable": True,
+        "message": message,
+        "error_detail": detail,
+        "error_code": code,
+        "recoverable": recoverable,
         "chat_mode": "default",
         "chat_mode_source": "system_default",
     }
@@ -2825,6 +2855,33 @@ async def test_pre_agent_executor_failure_persists_retryable_source_then_sanitiz
     assert guardrails.calls[0]["idempotency_key"] == ("isess-1:admitted_user_message:turn-failed")
     assert guardrails.calls[1]["idempotency_key"] == "isess-1:turn_error:turn-failed"
     assert session_cache.append_recorded_events.await_count == 2
+
+    live_errors = [
+        call.args[0]
+        for call in publish.await_args_list
+        if call.args[0].type == EventType.TURN_ERROR
+    ]
+    assert len(live_errors) == 1
+    assert live_errors[0].data["error_code"] == code
+    assert live_errors[0].data["error_message"] == message
+    assert live_errors[0].data["error_detail"] == detail
+    assert live_errors[0].data["recoverable"] is recoverable
+
+    if isinstance(failure, ExecutorConfigurationError):
+        classified = await classify_turn_error(SimpleNamespace(), failure)
+        retry_store = AsyncMock()
+        scheduler._direct_turn_store = retry_store
+        fence = SimpleNamespace(assert_current=AsyncMock())
+        pending, returned_error = await scheduler._prepare_durable_transient_retry(
+            request_id="turn-failed",
+            lease=MagicMock(),
+            error=classified,
+            execution_fence=fence,
+        )
+        assert pending is False
+        assert returned_error is classified
+        retry_store.get.assert_not_awaited()
+        fence.assert_current.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3089,7 +3146,8 @@ async def test_active_tool_output_snapshots_include_progress_only_preparing_stat
                 46,
             )
         assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 55
-        assert scheduler._active_streams["conv-1"].snapshot() == streamed
+        paused = {**streamed, "text_streaming": False}
+        assert scheduler._active_streams["conv-1"].snapshot() == paused
         assert scheduler._assistant_phase_for_tool("conv-1", "turn-1", "call-patch") is None
         if not abandoned:
             # Persistence reads the same phase as streaming before tool dispatch.
@@ -3107,8 +3165,11 @@ async def test_active_tool_output_snapshots_include_progress_only_preparing_stat
             await on_tool_call("apply_patch", "call-patch", {"patch": "patch input"}, 46)
             assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 56
             await on_token("Next commentary.", 47)
+            assert scheduler._active_streams["conv-1"].snapshot()["text_streaming"] is True
             await on_progress("call-patch", "apply_patch", {"phase": "complete"}, 46)
             assert scheduler._active_streams["conv-1"].snapshot()["assistant_phase_index"] == 56
+            await on_progress("call-patch", "apply_patch", {"phase": "preparing_input"}, 46)
+            assert scheduler._active_streams["conv-1"].snapshot()["text_streaming"] is True
         await scheduler._update_active_tool_progress(
             conversation_id="conv-1",
             session_id="sess-1",
@@ -3151,7 +3212,7 @@ async def test_active_tool_output_snapshots_include_progress_only_preparing_stat
         if abandoned:
             await on_progress("call-patch", "apply_patch", {"phase": "input_abandoned"}, 46)
             assert scheduler._assistant_phase_by_turn[("conv-1", "turn-1")] == 55
-            assert scheduler._active_streams["conv-1"].snapshot() == streamed
+            assert scheduler._active_streams["conv-1"].snapshot() == paused
     finally:
         scheduler._active_turns["conv-1"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -9013,7 +9074,7 @@ def test_step_failure_error_detail_is_sanitized_for_live_clients() -> None:
         ("deterministic seed 500 failed validation", False),
         ("connection reset by peer", True),
         (
-            "anthropic-lumilens rate-limited claude-opus after 1 attempt(s). "
+            "anthropic-sample rate-limited claude-opus after 1 attempt(s). "
             "This request would exceed your account's rate limit.",
             False,
         ),
@@ -9063,11 +9124,12 @@ async def test_non_transient_step_error_persists_one_durable_channel_error() -> 
     delivery = SimpleNamespace(deliver_fenced_direct_turn=AsyncMock())
     scheduler._channel_delivery = delivery
     scheduler._direct_turn_store = SimpleNamespace(
+        effective_channel_delivery=AsyncMock(return_value=(None, None)),
         get=AsyncMock(
             return_value=SimpleNamespace(
                 conversation_id="conv-1", session_id="sess-1", turn_id="turn-1", payload={}
             )
-        )
+        ),
     )
     scheduler.channel_pending_sources = AsyncMock(return_value=("saved output", []))
     lease = SimpleNamespace(
@@ -10640,7 +10702,8 @@ async def test_retry_notice_uses_safe_reason_and_stable_lineage_id(
     text: str,
 ) -> None:
     guardrails = SimpleNamespace(
-        record_events=AsyncMock(return_value=SimpleNamespace(ok=True, count=1))
+        record_events=AsyncMock(return_value=SimpleNamespace(ok=True, count=1)),
+        read_events=AsyncMock(return_value=SimpleNamespace(events=[], last_seq=0, has_more=False)),
     )
     observer = SimpleNamespace(on_system_message=AsyncMock())
     scheduler = object.__new__(TurnScheduler)
@@ -10739,7 +10802,8 @@ async def test_run_turn_automatic_retry_persists_lineage_without_user_message() 
     event_bus.subscribe(EventType.USER_MESSAGE, _record)
     run_direct_turn = AsyncMock(return_value=SimpleNamespace(content="", attachments=[]))
     guardrails = SimpleNamespace(
-        record_events=AsyncMock(return_value=SimpleNamespace(ok=True, count=1))
+        record_events=AsyncMock(return_value=SimpleNamespace(ok=True, count=1)),
+        read_events=AsyncMock(return_value=SimpleNamespace(events=[], last_seq=0, has_more=False)),
     )
     session_cache = SimpleNamespace(
         refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
@@ -14565,3 +14629,67 @@ async def test_tool_recovery_runs_under_the_request_tenant() -> None:
 
     assert recovery.tenants == [("owner@example.com", "agent-shared", "owner@example.com")]
     assert current_user_email.get() is None, "tenant context must not leak past recovery"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned_available", [True, False])
+async def test_deferred_rotation_tail_restores_pinned_turn_admission(
+    pinned_available: bool,
+) -> None:
+    """Deferred rotation re-reads pinned anchors that precede the tail start."""
+    reads: list[dict[str, Any]] = []
+    source_events = {
+        2: {"seq": 2, "type": "user_message", "data": {"content": "goal", "turn_id": "t1"}},
+        3: {
+            "seq": 3,
+            "type": "system_message",
+            "data": {
+                "event": "system_notice",
+                "kind": "model_recovery",
+                "scope": "turn",
+                "retry_source_turn_id": "t1",
+                "turn_id": "t2",
+            },
+        },
+        50: {"seq": 50, "type": "tool_call", "data": {"call_id": "c1", "name": "bash"}},
+        51: {"seq": 51, "type": "tool_result", "data": {"call_id": "c1", "result": "ok"}},
+        # A later retry inside the preserved suffix also carries lineage.
+        52: {
+            "seq": 52,
+            "type": "system_message",
+            "data": {
+                "event": "system_notice",
+                "kind": "model_recovery",
+                "scope": "turn",
+                "retry_source_turn_id": "t2",
+                "turn_id": "t3",
+            },
+        },
+        53: {"seq": 53, "type": "system_message", "data": {"content": "other notice"}},
+        54: {"seq": 54, "type": "compaction_summary", "data": {"summary": "s"}},
+    }
+
+    async def read_events(**kwargs: Any) -> Any:
+        reads.append(kwargs)
+        seqs = kwargs.get("seqs")
+        if seqs is not None:
+            wanted = set(seqs) if pinned_available else set(seqs) - {3}
+            return SimpleNamespace(events=[source_events[seq] for seq in sorted(wanted)])
+        after_seq = kwargs["after_seq"]
+        return SimpleNamespace(
+            events=[event for seq, event in sorted(source_events.items()) if seq > after_seq]
+        )
+
+    scheduler = TurnScheduler.__new__(TurnScheduler)
+    scheduler._providers = SimpleNamespace(guardrails=SimpleNamespace(read_events=read_events))
+    session = SimpleNamespace(session_id="old", intaris_session_id="old")
+
+    tail = await scheduler._read_tail_events(cast(Any, session), 50, pinned_seqs=[3, 2])
+
+    if not pinned_available:
+        # Never seed a tail that silently drops the active instruction.
+        assert tail is None
+        return
+    assert tail is not None
+    assert [event.seq for event in tail] == [2, 3, 50, 51, 52]
+    assert reads[0]["seqs"] == [2, 3]

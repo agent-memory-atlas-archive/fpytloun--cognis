@@ -94,25 +94,25 @@
 >
   <button
     aria-label="Dismiss code block"
-    class="absolute inset-0 bg-slate-950/80 backdrop-blur"
+    class="absolute inset-0 bg-scrim/80 backdrop-blur"
     onclick={closeFromBackdrop}
     tabindex="-1"
     type="button"
   ></button>
   <div
     bind:this={panel}
-    class="relative z-10 flex max-h-full w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-card"
+    class="relative z-10 flex max-h-full w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-separator bg-surface shadow-card"
     role="dialog"
     aria-modal="true"
     data-blocking-overlay
     aria-labelledby="code-block-modal-title"
     tabindex="-1"
   >
-    <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800/80 px-5 py-4 sm:px-6">
+    <div class="flex shrink-0 items-center justify-between gap-3 border-b border-separator px-5 py-4 sm:px-6">
       <div class="min-w-0">
-        <h2 class="text-lg font-semibold text-slate-100" id="code-block-modal-title">Code block</h2>
+        <h2 class="text-lg font-semibold text-foreground" id="code-block-modal-title">Code block</h2>
         {#if language}
-          <p class="mt-0.5 text-xs text-slate-400">{language}</p>
+          <p class="mt-0.5 text-xs text-muted">{language}</p>
         {/if}
       </div>
       <div class="flex shrink-0 items-center gap-2">
@@ -129,7 +129,7 @@
       </div>
     </div>
     <div class="min-h-0 flex-1 overflow-auto p-5 sm:p-6">
-      <pre class="min-h-full rounded-xl bg-slate-900 p-4 text-sm leading-6 text-slate-100"><code>{code}</code></pre>
+      <pre class="min-h-full rounded-xl bg-inset p-4 text-sm leading-6 text-foreground"><code>{code}</code></pre>
     </div>
   </div>
 </div>

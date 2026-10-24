@@ -9,8 +9,15 @@ permissions:
   contents: read
 
 jobs:
+  release-gate:
+    if: github.event_name == 'release'
+    uses: ./.github/workflows/project-release-gate.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
+
   common-build:
-    if: ${{ github.event_name == 'release' }}
+    needs: release-gate
+    if: ${{ github.event_name == 'release' && needs.release-gate.outputs.project == 'true' }}
     runs-on: ubuntu-latest
 
     steps:

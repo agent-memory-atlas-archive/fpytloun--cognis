@@ -10,6 +10,8 @@ from cognis.core.agent_management import (
     handle_agent_management_action,
     result_to_json,
 )
+from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.models.hooks import HookAssignment, HookDefinition
 from cognis.models.tool import (
     NativeToolOperation,
     ToolCapability,
@@ -34,6 +36,25 @@ _SETTINGS_SCHEMA: dict[str, Any] = {
         "workflow_selection_mode": {
             "type": "string",
             "enum": ["automatic", "always_ask", "use_default"],
+        },
+        "executor_id": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": (
+                "Owner-visible or shared executor ID. Setting an ID clears the selector; "
+                "null clears only this binding. Omission preserves it."
+            ),
+        },
+        "executor_selector": {
+            "type": ["object", "null"],
+            "minProperties": 1,
+            "propertyNames": {"type": "string", "minLength": 1},
+            "additionalProperties": {"type": "string", "minLength": 1},
+            "description": (
+                "Non-empty label selector matching an owner-visible or shared executor. "
+                "Setting a selector clears the ID; null clears only this binding. "
+                "Do not set both executor fields to non-null values."
+            ),
         },
         "provider_id": {"type": ["string", "null"]},
         "model": {"type": ["string", "null"]},
@@ -91,18 +112,112 @@ _RUNTIME_PROFILE_SCHEMA: dict[str, Any] = {
         "system_prompt_extra": {"type": ["string", "null"]},
         "enabled": {"type": "boolean"},
         "agent_switchable": {"type": "boolean"},
+        "quick_switch": {
+            "type": "boolean",
+            "description": "Show this enabled profile in the chat quick switcher, independently of agent_switchable.",
+        },
+        "quick_switch_index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Position in the chat quick switcher, ascending; equal indexes sort by profile ID.",
+        },
+        "quick_switch_color": {
+            "type": "string",
+            "enum": ["neutral", "blue", "teal", "amber", "violet", "rose"],
+            "description": "Accent color of this profile in the chat quick switcher. Defaults to neutral.",
+        },
     },
 }
 
 _DESCRIPTION = (
     "Owner-scoped management for Cognis agents. Use this to list, inspect, create, update, "
     "archive, activate, suspend, sync personality, manage secondary bindings, remove/generate "
-    "avatars, and manage sharing grants for agents owned by the current user. This tool is "
+    "avatars, manage credential assignments without exposing secrets, and manage sharing grants "
+    "for primary and secondary agents owned by the current user. Shipped system:* agents are "
+    "managed through per-user overrides with the system_overrides_get, "
+    "system_overrides_update, system_overrides_reset, system_disable, and system_enable "
+    "actions. This tool is "
     "only available to root primary agents owned by the caller. The list action includes each "
     "agent's available runtime profile IDs and descriptions; inspect it before passing an "
     "agent_profile_id to orchestration tools. Deleting means archive-only. Call describe_tool "
     "before unfamiliar or complex mutations."
 )
+
+_SYSTEM_OVERRIDES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "minProperties": 1,
+    "additionalProperties": False,
+    "description": (
+        "Per-user override patch for a shipped system agent. Omitted fields keep the stored "
+        "override; null clears that override so the shipped value applies. Supplied objects "
+        "replace the whole field. Inspect system_overrides_get first."
+    ),
+    "properties": {
+        "llm_config": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "properties": {
+                "provider_id": {"type": ["string", "null"]},
+                "model": {"type": ["string", "null"]},
+                "temperature": {"type": ["number", "null"]},
+                "top_p": {"type": ["number", "null"]},
+                "max_tokens": {"type": ["integer", "null"]},
+                "reasoning_effort": {"type": ["string", "null"]},
+                "fast_mode": {"type": ["boolean", "null"]},
+            },
+        },
+        "skills": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["items"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "skill_id": {"type": "string", "minLength": 1},
+                            "enabled": {"type": "boolean"},
+                            "auto_load_instructions": {"type": "boolean"},
+                        },
+                        "required": ["skill_id"],
+                    },
+                }
+            },
+            "description": "Complete skill assignment list for the system agent.",
+        },
+        "tools": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["builtin_tools"],
+            "properties": {
+                field: {"type": "array", "items": {"type": "string"}}
+                for field in (
+                    "builtin_tools",
+                    "allow_tools",
+                    "deny_tools",
+                    "tool_groups",
+                    "disabled_tools",
+                    "disabled_categories",
+                    "disabled_mcp_servers",
+                )
+            },
+            "description": (
+                "Complete tool config; builtin_tools is the explicit enabled builtin list. "
+                "Tools beyond the shipped set must be in the caller-effective assignable "
+                "inventory. Management tools are never allowed."
+            ),
+        },
+        "permissions": {"type": ["object", "null"]},
+        "agent_profiles": {
+            "type": ["object", "null"],
+            "additionalProperties": {"type": "object"},
+            "description": "Complete runtime profile map keyed by profile ID.",
+        },
+        "default_agent_profile_id": {"type": ["string", "null"]},
+    },
+}
 
 _BASE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -112,6 +227,9 @@ _BASE_SCHEMA: dict[str, Any] = {
             "enum": [
                 "list",
                 "get",
+                "credentials_get",
+                "credentials_grant",
+                "credentials_revoke",
                 "settings_get",
                 "settings_update",
                 "runtime_profiles_list",
@@ -146,9 +264,19 @@ _BASE_SCHEMA: dict[str, Any] = {
                 "share_create",
                 "share_update",
                 "share_revoke",
+                "system_overrides_get",
+                "system_overrides_update",
+                "system_overrides_reset",
+                "system_disable",
+                "system_enable",
             ],
         },
         "agent_id": {"type": "string", "description": "Target agent ID."},
+        "credential_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact existing credential ID owned by the caller; never a secret value.",
+        },
         "name": {"type": "string"},
         "display_name": {"type": "string"},
         "description": {"type": "string"},
@@ -185,8 +313,13 @@ _BASE_SCHEMA: dict[str, Any] = {
         },
         "expected_updated_at": {
             "type": "string",
-            "description": "Optional ISO-8601 agent revision from a prior read for optimistic concurrency.",
+            "description": (
+                "Optional ISO-8601 agent revision from a prior read for optimistic concurrency. "
+                "For system_* actions use override_updated_at from system_overrides_get; an "
+                "empty string asserts that no override exists yet."
+            ),
         },
+        "overrides": _SYSTEM_OVERRIDES_SCHEMA,
         "tool_groups": {"type": "array", "items": {"type": "string"}},
         "allow_tools": {"type": "array", "items": {"type": "string"}},
         "deny_tools": {"type": "array", "items": {"type": "string"}},
@@ -256,8 +389,9 @@ def _operation(
     dynamic_options: list[ToolDynamicOption] | None = None,
     validator_ids: tuple[str, ...] = (),
     any_of: list[dict[str, Any]] | None = None,
+    field_schemas: dict[str, dict[str, Any]] | None = None,
 ) -> NativeToolOperation:
-    properties = _BASE_SCHEMA["properties"]
+    properties = {**_BASE_SCHEMA["properties"], **(field_schemas or {})}
     schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -267,6 +401,8 @@ def _operation(
         "required": ["action", *required],
         "additionalProperties": False,
     }
+    if name.startswith("hooks_") or name.startswith("hook_assignments_"):
+        schema["$defs"] = HookDefinition.model_json_schema().get("$defs", {})
     if any_of:
         schema["anyOf"] = any_of
     return NativeToolOperation(
@@ -284,6 +420,24 @@ def _operation(
 
 
 _AGENT_ID = ("agent_id",)
+_SYSTEM_AGENT_ID_SCHEMAS: dict[str, dict[str, Any]] = {
+    "agent_id": {
+        "type": "string",
+        "enum": sorted(
+            agent.agent_id for agent in SYSTEM_AGENTS.values() if agent.allow_user_override
+        ),
+        "description": "Shipped system agent ID that accepts per-user overrides.",
+    }
+}
+_SYSTEM_REVISION_SEMANTICS = ToolValueSemantics(
+    omitted="agent_id is required; expected_updated_at is optional",
+    null="not accepted",
+    arrays="not accepted",
+    concurrency=(
+        "optional compare-and-swap on the override revision from system_overrides_get; "
+        "re-read after conflict"
+    ),
+)
 _TOOL_FIELDS = ("agent_id", "tool_groups", "allow_tools", "deny_tools")
 _SKILL_FIELDS = ("agent_id", "skill_assignments")
 _KNOWLEDGEBASE_FIELDS = ("agent_id", "knowledgebase_ids")
@@ -310,6 +464,102 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
     description=_DESCRIPTION,
     parameters={},
     native_operations=[
+        *[
+            _operation(
+                name,
+                kind=ToolMutationKind.READ
+                if name
+                in {
+                    "hooks_list",
+                    "hooks_get",
+                    "hook_assignments_get",
+                    "hook_runs_list",
+                }
+                else ToolMutationKind.UPDATE,
+                fields=fields,
+                required=required,
+                example={
+                    "action": name,
+                    **{
+                        field: {
+                            "agent_id": "my-agent",
+                            "hook_id": "hook_working_reminder",
+                            "expected_revision": 1,
+                            "definition": {
+                                "name": "Working reminder",
+                                "trigger": "user_message",
+                                "prompt": "Verify results before claiming success.",
+                            },
+                            "assignment": {
+                                "hook_id": "system:working-reminder",
+                                "enabled": True,
+                            },
+                        }[field]
+                        for field in required
+                    },
+                },
+                field_schemas={
+                    "hook_id": {"type": "string"},
+                    "definition": HookDefinition.model_json_schema(),
+                    "assignment": HookAssignment.model_json_schema(),
+                    "expected_revision": {"type": "integer", "minimum": 1},
+                },
+            )
+            for name, fields, required in [
+                ("hooks_list", (), ()),
+                ("hooks_get", ("hook_id",), ("hook_id",)),
+                ("hooks_create", ("definition",), ("definition",)),
+                (
+                    "hooks_update",
+                    ("hook_id", "definition", "expected_revision"),
+                    ("hook_id", "definition", "expected_revision"),
+                ),
+                (
+                    "hooks_delete",
+                    ("hook_id", "expected_revision"),
+                    ("hook_id", "expected_revision"),
+                ),
+                ("hook_assignments_get", ("agent_id",), ("agent_id",)),
+                ("hook_assignments_put", ("agent_id", "assignment"), ("agent_id", "assignment")),
+                ("hook_assignments_remove", ("agent_id", "hook_id"), ("agent_id", "hook_id")),
+                ("hook_runs_list", ("agent_id", "hook_id"), ()),
+            ]
+        ],
+        _operation(
+            "credentials_get",
+            kind=ToolMutationKind.READ,
+            fields=("agent_id", "credential_id"),
+            required=("agent_id", "credential_id"),
+            example={
+                "action": "credentials_get",
+                "agent_id": "travel",
+                "credential_id": "travel-account",
+            },
+        ),
+        *[
+            _operation(
+                action,
+                kind=ToolMutationKind.UPDATE,
+                fields=("agent_id", "credential_id", "expected_updated_at"),
+                required=("agent_id", "credential_id", "expected_updated_at"),
+                example={
+                    "action": action,
+                    "agent_id": "travel",
+                    "credential_id": "travel-account",
+                    "expected_updated_at": "2030-01-01T00:00:00+00:00",
+                },
+                semantics=ToolValueSemantics(
+                    omitted="all fields are required; first read credentials_get",
+                    null="not accepted",
+                    arrays="not accepted; changes exactly one credential assignment",
+                    concurrency=(
+                        "compare-and-swap on expected_updated_at; re-read after conflict; "
+                        "idempotent desired state, including retries with a fresh revision"
+                    ),
+                ),
+            )
+            for action in ("credentials_grant", "credentials_revoke")
+        ],
         _operation("list", kind=ToolMutationKind.READ, example={"action": "list"}),
         _operation(
             "get",
@@ -660,6 +910,67 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
                 "grant_id": "grant-id",
             },
         ),
+        _operation(
+            "system_overrides_get",
+            kind=ToolMutationKind.READ,
+            fields=_AGENT_ID,
+            required=_AGENT_ID,
+            example={"action": "system_overrides_get", "agent_id": "system:explore"},
+            field_schemas={
+                "agent_id": {
+                    "type": "string",
+                    "description": "Shipped system agent ID (system:*).",
+                }
+            },
+        ),
+        _operation(
+            "system_overrides_update",
+            kind=ToolMutationKind.UPDATE,
+            fields=("agent_id", "overrides", "expected_updated_at"),
+            required=("agent_id", "overrides"),
+            example={
+                "action": "system_overrides_update",
+                "agent_id": "system:explore",
+                "overrides": {"llm_config": {"reasoning_effort": "medium"}},
+            },
+            semantics=ToolValueSemantics(
+                omitted="preserve every stored override field not supplied",
+                null="clears that override field so the shipped value applies",
+                arrays="supplied override objects replace the stored override field",
+                concurrency=_SYSTEM_REVISION_SEMANTICS.concurrency,
+            ),
+            dynamic_options=[
+                ToolDynamicOption(
+                    path="$.overrides.llm_config.provider_id",
+                    source="agent_management.llm_providers",
+                ),
+                ToolDynamicOption(
+                    path="$.overrides.skills.items[*].skill_id",
+                    source="agent_management.available_skills",
+                ),
+                ToolDynamicOption(
+                    path="$.overrides.tools.builtin_tools",
+                    source="agent_management.assignable_tools",
+                ),
+            ],
+            field_schemas=_SYSTEM_AGENT_ID_SCHEMAS,
+        ),
+        *[
+            _operation(
+                action,
+                kind=kind,
+                fields=("agent_id", "expected_updated_at"),
+                required=_AGENT_ID,
+                example={"action": action, "agent_id": "system:explore"},
+                semantics=_SYSTEM_REVISION_SEMANTICS,
+                field_schemas=_SYSTEM_AGENT_ID_SCHEMAS,
+            )
+            for action, kind in (
+                ("system_overrides_reset", ToolMutationKind.DELETE),
+                ("system_disable", ToolMutationKind.UPDATE),
+                ("system_enable", ToolMutationKind.UPDATE),
+            )
+        ],
     ],
     source=_SOURCE,
     category="agent_management",
@@ -703,6 +1014,11 @@ async def handle_agent_management_tool(
     self_mutation_approved: bool = False,
 ) -> ToolResult:
     """Execute an agent-management tool call."""
+    from cognis.core.intaris_policy import profile_mutation_error
+
+    profile_error = profile_mutation_error(arguments)
+    if profile_error is not None:
+        return profile_error
 
     if not is_agent_management_tool(tool_name):
         return ToolResult(output=f"Unknown agent-management tool: {tool_name}", is_error=True)

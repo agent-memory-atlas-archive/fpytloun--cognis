@@ -15,6 +15,7 @@
       content: string;
       attachments?: AttachmentRef[];
       clientMessageId: string;
+      follow?: boolean;
     }): boolean;
     reconcileMessageAdmission(input: {
       scopeKey: string;
@@ -74,7 +75,7 @@
     sending = true;
     error = '';
     const sentAttachments = [...attachments];
-    timeline?.stageOptimisticMessage({ scopeKey, content, attachments: sentAttachments, clientMessageId });
+    timeline?.stageOptimisticMessage({ scopeKey, content, attachments: sentAttachments, clientMessageId, follow: true });
     try {
       const response = await chatV2Api.sendMessage(conversationId, clientTxnId, {
         content,
@@ -149,8 +150,8 @@
 
 <section class="app-keyboard-avoiding-chat flex h-full min-h-0 flex-col" aria-label="Task control chat" data-testid="task-control-native-chat" use:keyboardAvoidance>
   <ScopedChatV2Timeline bind:this={timeline} {scope} {agent} compact emptyLabel="Start a task-control conversation." onRuntimeActiveChange={setRuntimeActive} />
-  <div class="task-control-composer shrink-0 border-t border-slate-800 bg-slate-950/95 px-3 pt-3">
-    {#if error}<p class="mb-2 text-xs text-rose-300" role="alert">{error}</p>{/if}
+  <div class="task-control-composer shrink-0 border-t border-separator bg-canvas/95 px-3 pt-3">
+    {#if error}<p class="mb-2 text-xs text-danger" role="alert">{error}</p>{/if}
     {#key chat.conversation_id}
       {@const recorderConversationId = chat.conversation_id}
       <ChatV2Composer

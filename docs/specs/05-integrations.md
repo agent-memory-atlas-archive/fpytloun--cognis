@@ -290,6 +290,18 @@ Agent Personality Sync:
 
 ## Guardrails Provider (Intaris)
 
+Agent outcome bounds and evaluation profiles are session policy even when no
+filesystem grants or interaction-mode override are present. Existing-session
+refresh must synchronize them independently of those optional fields.
+
+For an agent-backed session, `maximum_outcome` is sent explicitly, including
+`null` when the agent has no ceiling. Omission means retaining the previous
+remote value, not clearing it. `/yolo off` restores that canonical agent value
+with the same explicit-null semantics. Provider acknowledgement must match
+before the conversation override is removed. An unset agent default is not
+silently replaced with `escalate`; changing the default is a separate
+configuration decision.
+
 ### Protocol
 
 ```python
@@ -1046,9 +1058,10 @@ LLM request to maximize cache hits.
   LiteLLM's default-instructions helper so the prepend becomes a no-op.  Both
   patches are idempotent and respect operator
   overrides (set ``CHATGPT_DEFAULT_INSTRUCTIONS`` before startup to keep custom
-  framing).  Explicit cache-key attachment is disabled by default because Codex
-  currently rejects explicit keys; set ``COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=true``
-  or per-provider ``use_prompt_cache_key: true`` to opt in.  If the backend rejects the cache
+  framing).  The direct Codex transport sends a session-derived ``prompt_cache_key``
+  by default, matching the official Codex CLI; the LiteLLM ChatGPT path remains
+  opt-in.  Per-provider ``use_prompt_cache_key`` (true/false) or
+  ``COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED`` override the default.  If the backend rejects the cache
   params with an "Unknown parameter" error, Cognis marks the ``(provider_id,
   model)`` pair as broken, retries once without the params, and stops attaching
   them until the runtime capability fallback TTL expires (default one hour).

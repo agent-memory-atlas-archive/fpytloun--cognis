@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { registerFindWorkspace } from '$lib/find';
   import { portal } from '$lib/actions/portal';
   import AgentQuickChatModal from './AgentQuickChatModal.svelte';
   import FocusedAttentionAction from '$lib/components/attention/FocusedAttentionAction.svelte';
   import DashboardEntityModal from './DashboardEntityModal.svelte';
+  import DashboardDocument from './DashboardDocument.svelte';
   import WorkspaceDock from './WorkspaceDock.svelte';
   import WorkspaceWindow from './WorkspaceWindow.svelte';
+  import WorkspaceVeil from './WorkspaceVeil.svelte';
   import {
     workspaceDeviceClass,
     workspaceSafeRectFromContent,
@@ -30,6 +33,9 @@
     onAttentionUnavailable,
     onTaskMutationSettled,
     deviceClass,
+    onContinueConversation,
+    onOpenTask,
+    canMutateSchedule = true,
   } = $props<{
     manager: WorkspaceManager;
     agents?: Agent[];
@@ -41,6 +47,9 @@
     onAttentionUnavailable?: (actionId: string) => void | Promise<void>;
     onTaskMutationSettled?: (taskId: string, changed: boolean) => void | Promise<void>;
     deviceClass?: 'desktop' | 'tablet' | 'phone';
+    onContinueConversation?: (conversation: Conversation) => void;
+    onOpenTask?: (taskId: string) => void;
+    canMutateSchedule?: boolean;
   }>();
 
   let measuredDevice = $state<'desktop' | 'tablet' | 'phone'>('desktop');
@@ -53,6 +62,15 @@
   };
 
   let entityRefs = $state<Record<string, WorkspaceEntityRef | undefined>>({});
+  const findRoots = new Map<string, HTMLElement>();
+  function findWindow(node: HTMLElement, key: string) {
+    findRoots.set(key, node);
+    return { destroy: () => { findRoots.delete(key); } };
+  }
+  onMount(() => registerFindWorkspace(() => {
+    const key = device === 'phone' ? null : manager.focusedTopVisibleKey();
+    return key ? findRoots.get(key) ?? null : null;
+  }));
   let windowRefs = $state<Record<string, WorkspaceWindowRef | undefined>>({});
   let inspectorStates = $state<Record<string, boolean | undefined>>({});
   let dockLeft = $state(12);
@@ -213,14 +231,22 @@
     use:portal
     class="pointer-events-none fixed inset-0 z-[70]"
     class:hidden={device === 'phone'}
+    inert={device === 'phone'}
     data-testid="workspace-layer"
   >
     {#if device !== 'phone' && visibleWindows.length > 0}
-      <div
-        aria-hidden="true"
-        class="pointer-events-none fixed inset-0 bg-slate-950/10 backdrop-blur-[1px] motion-safe:transition-opacity motion-safe:duration-150"
-        data-testid="workspace-veil"
-      ></div>
+      <WorkspaceVeil />
+      <button
+        type="button"
+        tabindex="-1"
+        aria-label="Minimize all windows"
+        class="pointer-events-auto fixed inset-0 cursor-default border-0 bg-transparent p-0"
+        style:outline="none"
+        style:box-shadow="none"
+        data-testid="workspace-dismiss-backdrop"
+        onpointerdown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+        onclick={(event) => { event.stopPropagation(); manager.showDashboard(); }}
+      ></button>
     {/if}
     {#if device !== 'phone' && snapPreview}
       {@const previewRect = snapPreview === 'maximize'
@@ -234,13 +260,13 @@
           }}
       <div
         aria-hidden="true"
-        class="workspace-snap-preview pointer-events-none fixed rounded-2xl border-2 border-sky-300/70 bg-sky-400/15 shadow-[0_0_40px_rgba(56,189,248,0.2)]"
+        class="workspace-snap-preview pointer-events-none fixed rounded-2xl border-2 border-accent/70 bg-accent-subtle shadow-overlay"
         data-snap-target={snapPreview}
         data-testid="workspace-snap-preview"
         style={`left:${previewRect.x}px;top:${previewRect.y}px;width:${previewRect.width}px;height:${previewRect.height}px;z-index:79`}
       ></div>
     {/if}
-    {#each device !== 'phone' ? $manager : [] as workspaceWindow (workspaceWindow.key)}
+    {#each $manager.filter((window: WorkspaceWindowState) => device !== 'phone' || window.kind === 'artifact' || window.kind === 'deliverable') as workspaceWindow (workspaceWindow.key)}
       <WorkspaceWindow
         bind:this={windowRefs[workspaceWindow.key]}
         window={workspaceWindow}
@@ -252,6 +278,7 @@
         onToggleInspector={inspectorToggleHandler(workspaceWindow)}
       >
         {#snippet children()}
+          <div class="contents" data-find-window inert={workspaceWindow.minimized} use:findWindow={workspaceWindow.key}>
            {#if workspaceWindow.kind === 'attention'}
               <FocusedAttentionAction
                 actionId={workspaceWindow.entityId}
@@ -270,8 +297,9 @@
                 {agent}
                 embedded
                 onClose={() => closeWindow(workspaceWindow.key)}
-                onResolved={(conversationId) => {
-                  manager.setResolvedConversation(workspaceWindow.key, conversationId);
+                onResolved={async (conversationId) => {
+                  await manager.setResolvedConversation(workspaceWindow.key, conversationId);
+                  if (!manager.snapshot().some((entry: WorkspaceWindowState) => entry.key === workspaceWindow.key)) return;
                   manager.updateMetadata(workspaceWindow.key, {
                     title: agent.display_name ?? agent.name,
                     status: 'active',
@@ -284,6 +312,13 @@
                 onInspectorStateChange={(open) => setInspectorOpen(workspaceWindow.key, open, true)}
               />
             {/if}
+          {:else if workspaceWindow.kind === 'artifact' || workspaceWindow.kind === 'deliverable'}
+            <DashboardDocument
+              kind={workspaceWindow.kind}
+              id={workspaceWindow.entityId}
+              {manager}
+              windowKey={workspaceWindow.key}
+            />
           {:else}
             <DashboardEntityModal
               bind:this={entityRefs[workspaceWindow.key]}
@@ -297,12 +332,16 @@
                onClose={() => closeWindow(workspaceWindow.key)}
                {onConversationInitialLoaded}
                {onTaskMutationSettled}
+               {onContinueConversation}
+               {onOpenTask}
+               {canMutateSchedule}
               onMetadataChange={(metadata) => manager.updateMetadata(workspaceWindow.key, metadata)}
               inspectorOpen={inspectorOpen(workspaceWindow.key)}
               inspectorControlInHeader={workspaceWindow.kind === 'conversation'}
               onInspectorStateChange={(open) => setInspectorOpen(workspaceWindow.key, open, true)}
             />
           {/if}
+          </div>
         {/snippet}
       </WorkspaceWindow>
     {/each}

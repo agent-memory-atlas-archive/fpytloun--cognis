@@ -5,7 +5,7 @@
   import InspectorOverview from '$lib/components/InspectorOverview.svelte';
   import SessionDetailsContent, { type SessionDetailsData } from '$lib/components/session/SessionDetailsContent.svelte';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
-  import WorkView from '$lib/components/work/WorkView.svelte';
+  import WorkView from '$lib/components/work/LazyWorkView.svelte';
   import {
     getActivityOverviewEntry,
     isActivityOverviewAbort,
@@ -14,6 +14,7 @@
   import type { Agent, ContextUsage } from '$lib/types/api';
   import { untrack } from 'svelte';
   import { nodeMatchesFocus } from '$lib/activityTreeState';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
 
   let {
     scope,
@@ -70,6 +71,11 @@
   let overviewGeneration = 0;
   let sessionGeneration = 0;
   let overviewAbortController: AbortController | null = null;
+  // Hidden while the global connection banner applies; reload on restore.
+  const net = useSectionConnectivity({
+    hasError: () => Boolean(overviewError || sessionError),
+    retry: () => load(activeTab),
+  });
   const focusedSession = $derived(
     overview?.workstreams.find((node) => nodeMatchesFocus(node, sessionId)) ?? null,
   );
@@ -199,12 +205,12 @@
   />
   {#if !headerOnly}
   <div id={`${idPrefix}-panel-${activeTab}`} class="mt-4" role="tabpanel" aria-labelledby={`${idPrefix}-tab-${activeTab}`}>
-    {#if (activeTab === 'overview' && overviewLoading && !overview) || (activeTab === 'session' && sessionLoading && !session)}
-      <p class="text-xs text-slate-500">Loading inspector…</p>
+    {#if (activeTab === 'overview' && (overviewLoading || (overviewError && net.hideErrors)) && !overview) || (activeTab === 'session' && (sessionLoading || (sessionError && net.hideErrors)) && !session)}
+      <p class="text-xs text-quiet">Loading inspector…</p>
     {:else if activeTab === 'overview' && overviewError && !overview}
-      <p class="text-xs text-rose-300" role="alert">{overviewError}</p>
+      <p class="text-xs text-danger" role="alert">{overviewError}</p>
     {:else if activeTab === 'session' && sessionError && !session}
-      <p class="text-xs text-rose-300" role="alert">{sessionError}</p>
+      <p class="text-xs text-danger" role="alert">{sessionError}</p>
     {:else if activeTab === 'overview' && overview}
       <InspectorOverview {overview} {agents} {focusedSession} focusedSessionId={sessionId} {contextUsage} {diagnosticsFreshness} onOpenWork={openWork} {onViewSession} narrow />
     {:else if activeTab === 'work'}

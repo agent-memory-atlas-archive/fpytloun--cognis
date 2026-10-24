@@ -6,9 +6,25 @@ import {
   isMobile,
   isTouch,
   viewportCssPolicy,
+  viewportMetrics,
 } from './viewport';
 
 describe('viewport stores', () => {
+  it('defers focus-driven publication until after render teardown and stops after unsubscribe', async () => {
+    const listener = vi.fn();
+    const unsubscribe = viewportMetrics.subscribe(listener);
+    listener.mockClear();
+    window.dispatchEvent(new Event('focusout'));
+    expect(listener).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(listener).toHaveBeenCalledOnce();
+    listener.mockClear();
+    window.dispatchEvent(new Event('focusout'));
+    unsubscribe();
+    await Promise.resolve();
+    expect(listener).not.toHaveBeenCalled();
+    expect(document.documentElement.dataset.keyboard).toBeUndefined();
+  });
   const originalInnerWidth = window.innerWidth;
   const originalMatchMedia = window.matchMedia;
 

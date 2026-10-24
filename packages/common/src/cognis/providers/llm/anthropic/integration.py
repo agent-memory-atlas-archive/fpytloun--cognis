@@ -28,6 +28,11 @@ from cognis.providers.llm.anthropic.contracts import (
     resolve_anthropic_protocol,
     sha256_fingerprint,
 )
+from cognis.providers.llm.anthropic.model_policy import (
+    prepare_model_history,
+    validate_model_request,
+)
+from cognis.providers.llm.anthropic.thinking_replay import REPLAY_FINGERPRINTS
 from cognis.providers.llm.anthropic.tool_bundle import compile_anthropic_tool_bundle
 
 OFFICIAL_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages"
@@ -151,6 +156,8 @@ def build_native_request(
 ) -> tuple[ResolvedAnthropicRequestContext, dict[str, Any], Any]:
     """Build one native request without including a credential in metadata."""
 
+    validate_model_request(model, request_kwargs)
+    messages = prepare_model_history(model, messages)
     config = dict(getattr(provider, "config", {}) or {})
     auth = config.get("auth_config")
     is_oauth = isinstance(auth, dict) and str(auth.get("mode") or "").lower() == "oauth"
@@ -280,6 +287,14 @@ def build_native_request(
             or context.model_info.max_output_tokens
         ),
     }
+    payload[REPLAY_FINGERPRINTS] = [
+        fingerprint
+        for message in replay_messages
+        if isinstance(message.get("_anthropic_native_envelope"), Mapping)
+        for fingerprint in AnthropicNativeEnvelope.from_dict(
+            message["_anthropic_native_envelope"]
+        ).thinking_prefix_fingerprints_or_unknown
+    ]
     for key in (
         "temperature",
         "top_p",
@@ -758,7 +773,7 @@ def _content_to_anthropic_thinking_blocks(value: Any) -> list[dict[str, Any]]:
         block_type = item.get("type")
         if block_type == "thinking":
             thinking = item.get("thinking")
-            if not isinstance(thinking, str) or not thinking:
+            if not isinstance(thinking, str):
                 continue
             block = {"type": "thinking", "thinking": thinking}
             signature = item.get("signature")

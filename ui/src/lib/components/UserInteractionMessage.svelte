@@ -9,14 +9,14 @@
   const nowDate = $derived(new Date($nowStore));
   const tone = $derived(
     item.status === 'complete'
-      ? 'border-emerald-400/35 bg-emerald-500/15 text-emerald-50'
+      ? 'border-success-border bg-success-subtle text-foreground'
       : item.status === 'denied'
-        ? 'border-amber-400/35 bg-amber-500/15 text-amber-50'
+        ? 'border-warning-border bg-warning-subtle text-foreground'
         : item.status === 'failed'
-          ? 'border-rose-400/35 bg-rose-500/15 text-rose-50'
+          ? 'border-danger-border bg-danger-subtle text-foreground'
           : item.status === 'cancelled'
-            ? 'border-slate-600 bg-slate-900/70 text-slate-300'
-            : 'border-slate-600 bg-slate-800/80 text-slate-100'
+            ? 'border-control-border bg-surface/70 text-secondary'
+            : 'border-control-border bg-raised/80 text-foreground'
   );
   const approvalDetails = $derived.by(() => {
     if (item.interactionType !== 'escalation') return null;
@@ -67,7 +67,7 @@
       {:else if item.answers.length > 0}
         <dl class="mt-3 space-y-2 border-t border-current/15 pt-3">
           {#each item.answers as answer}
-            <div class="rounded-2xl bg-black/10 px-3 py-2">
+            <div class="rounded-2xl bg-inset px-3 py-2">
               {#if answer.question}
                 <dt class="text-sm font-semibold leading-5 opacity-85">{answer.question}</dt>
               {/if}

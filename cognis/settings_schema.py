@@ -41,7 +41,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "session.stale_after_seconds": ("session", 300),
     "session.llm_stream_idle_timeout_seconds": ("session", 300),
     "session.llm_stream_max_retries": ("session", 3),
-    "session.anthropic_cache_ttl": ("session", "5m"),
+    "session.route_failback_idle_seconds": ("session", 3600),
     "session.memory_instructions_max_tokens": ("session", 2000),
     "session.core_memories_max_tokens": ("session", 2000),
     "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
@@ -130,7 +130,7 @@ _HOT_KEYS: Final[set[str]] = {
     "session.step_timeout_seconds",
     "session.llm_stream_idle_timeout_seconds",
     "session.llm_stream_max_retries",
-    "session.anthropic_cache_ttl",
+    "session.route_failback_idle_seconds",
     "session.memory_instructions_max_tokens",
     "session.core_memories_max_tokens",
     "session.immutable_prefix_repair_cooldown_seconds",
@@ -187,7 +187,6 @@ if _UNCLASSIFIED_KEYS:
     raise RuntimeError(f"Settings lack runtime semantics: {sorted(_UNCLASSIFIED_KEYS)}")
 
 _ENUM_KEYS: Final[dict[str, tuple[str, ...]]] = {
-    "session.anthropic_cache_ttl": ("5m", "1h"),
     "security.mfa_policy": ("optional", "required"),
     "web.backend": ("direct", "tavily", "brave", "searxng"),
     "web.search_backend": ("direct", "tavily", "brave", "searxng"),
@@ -219,7 +218,7 @@ _DESCRIPTIONS: Final[dict[str, str]] = {
         "Maximum idle interval while waiting for meaningful LLM stream activity."
     ),
     "session.llm_stream_max_retries": "Maximum retries after a retryable LLM stream failure.",
-    "session.anthropic_cache_ttl": "Prompt-cache TTL used for Anthropic-compatible requests.",
+    "session.route_failback_idle_seconds": "Idle time before probing a higher-priority route target; capped by the serving model's known cache lifetime.",
     "session.max_delegation_depth": "Maximum permitted primary-agent delegation chain depth.",
     "session.cache_max_entries": "Maximum in-memory session-state entries retained by this worker.",
     "session.optional_recall_timeout_seconds": (

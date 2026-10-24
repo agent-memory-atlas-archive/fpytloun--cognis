@@ -9,6 +9,7 @@ import type {
   ChatRealtimeFrame,
   ChatSnapshot,
   QueueMutationResponse,
+  RuntimeOverlaySnapshot,
   TimelineBackfillResponse,
   TimelineItem
 } from './types';
@@ -59,6 +60,71 @@ function snapshot(items: TimelineItem[]): ChatSnapshot {
 }
 
 describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
+  it('prepares all retained views before one membership projection and unregisters on teardown', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([message()]));
+    const phases: string[] = [];
+    const stop = store.observeMembership((before, after) => {
+      expect(store.visibleItems).toBe(before);
+      expect(after.map(item => item.id)).toContain('older');
+      phases.push('prepare:first');
+      return () => { phases.push('commit:first'); expect(store.visibleItems).toBe(after); };
+    });
+    const stopSecond = store.observeMembership(() => {
+      phases.push('prepare:second');
+      return () => { phases.push('commit:second'); };
+    });
+    store.applyBackfill({
+      schema_version: 2, projection_version: 'chat-v2-test', conversation_id: 'conv-1',
+      items: [message({ id: 'older', sort_key: '0000' })],
+      has_more_before: false, before_cursor: null, server_time: '',
+    });
+    expect(phases).toEqual(['prepare:first', 'prepare:second', 'commit:first', 'commit:second']);
+    stop();
+    stopSecond();
+    store.addLocalSystemMessage({ id: 'notice', content: 'local' });
+    expect(phases).toHaveLength(4);
+  });
+
+  it('preserves runtime, optimistic and loaded history admissions while accepting a canonical base', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([message()]));
+    const watermark = store.refreshWatermark();
+    store.addOptimisticUser({ content: 'local admission', clientMessageId: 'recovery-client' });
+    store.applyBackfill({
+      schema_version: 2, projection_version: 'chat-v2-test', conversation_id: 'conv-1',
+      items: [message({ id: 'older', sort_key: '0000' })],
+      has_more_before: false, before_cursor: null, server_time: '',
+    });
+    store.applyRealtime({
+      type: 'chat_v2_frame', schema_version: 2, projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1', cursor_before: 'cursor-1', cursor_after: 'cursor-1', ops: [],
+      runtime: { ...snapshot([]).runtime!, runtime_revision: 10 }, server_time: '',
+    });
+    const recovered = snapshot([message({ content: 'recovered' })]);
+    recovered.timeline.has_more_before = true;
+    recovered.timeline.before_cursor = 'before:recovered';
+    expect(store.replaceFromSnapshotForRecovery(recovered, watermark)).toBe(true);
+    expect(store.visibleItems.map(item => item.id)).toContain('older');
+    expect(store.visibleItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ content: 'local admission' }), expect.objectContaining({ content: 'recovered' }),
+    ]));
+    expect(store.snapshot.runtime?.runtime_revision).toBe(10);
+  });
+
+  it('never lets a delayed recovery snapshot overwrite intervening canonical progress', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([message()]));
+    const watermark = store.refreshWatermark();
+    store.applyRealtime({
+      type: 'chat_v2_frame', schema_version: 2, projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1', cursor_before: 'cursor-1', cursor_after: 'cursor-2',
+      ops: [{ op: 'upsert_item', item: message({ content: 'new canonical' }) }], runtime: null, server_time: '',
+    });
+    expect(store.replaceFromSnapshotForRecovery(snapshot([message({ content: 'stale' })]), watermark)).toBe(false);
+    expect(store.visibleItems[0]).toMatchObject({ content: 'new canonical' });
+  });
+
   it('rejects a snapshot that resolves after a realtime cursor advanced', () => {
     const store = new ChatV2Store();
     store.replaceFromSnapshot(snapshot([message()]));
@@ -357,6 +423,13 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
         runtime_revision: 1,
         generated_at: '2026-07-07T00:00:00Z',
         has_active_turn: true,
+        authority: {
+          protocol: 'runtime_authority_v1',
+          direct_request_id: 'request-1',
+          turn_id: 'turn-1',
+          fencing_token: 1,
+          lifecycle: 'active',
+        },
         active_turn: {
           turn_id: 'turn-1',
           session_id: 'sess-1',
@@ -391,12 +464,66 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(preserved.runtime?.has_active_turn).toBe(true);
     expect(preserved.runtime?.volatile_items).toHaveLength(1);
     expect(cached.runtime?.has_active_turn).toBe(false);
+    expect(cached.runtime?.authority).toBeNull();
     expect(cached.runtime?.active_turn).toBeNull();
     expect(cached.runtime?.volatile_items).toEqual([]);
     expect(cached.cycleStates).toEqual([]);
     expect(store.snapshot.runtime?.has_active_turn).toBe(true);
+    expect(store.snapshot.runtime?.authority).toEqual(state.runtime?.authority);
     expect(store.snapshot.runtime?.volatile_items).toHaveLength(1);
   });
+
+  it.each(['new-cache', 'previous-cache', 'terminal-cache'] as const)(
+    'reconciles server runtime after restoring %s without weakening terminal ordering',
+    (cacheKind) => {
+      const liveSnapshot = snapshot([message()]);
+      const runtime: RuntimeOverlaySnapshot = {
+        ...liveSnapshot.runtime,
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        authority: {
+          protocol: 'runtime_authority_v1',
+          direct_request_id: 'request-1',
+          turn_id: 'turn-1',
+          fencing_token: 1,
+          lifecycle: 'active',
+          source_epoch: 'epoch-1',
+          source_revision: 1,
+        },
+      };
+      const store = new ChatV2Store();
+      store.replaceFromSnapshot({ ...liveSnapshot, runtime });
+      const cached = JSON.parse(JSON.stringify(store.serializeState({
+        settleRuntimeOverlay: true,
+      }))) as ChatV2ClientState;
+      if (cacheKind !== 'new-cache') {
+        cached.runtime!.authority = {
+          ...runtime.authority!,
+          lifecycle: cacheKind === 'terminal-cache' ? 'terminal' : 'active',
+        };
+      }
+      const restored = new ChatV2Store();
+      restored.restoreState(cached);
+      expect(restored.snapshot.runtime?.has_active_turn).toBe(false);
+      expect(restored.applyRealtime({
+        type: 'chat_v2_frame',
+        schema_version: 2,
+        projection_version: liveSnapshot.projection_version,
+        conversation_id: 'conv-1',
+        cursor_before: liveSnapshot.cursor,
+        cursor_after: 'cursor-2',
+        ops: [],
+        runtime: {
+          ...runtime,
+          runtime_revision: 2,
+          authority: { ...runtime.authority!, source_revision: 2 },
+        },
+        server_time: liveSnapshot.server_time,
+      }).outcome).toBe('applied');
+      expect(restored.snapshot.runtime?.has_active_turn).toBe(cacheKind !== 'terminal-cache');
+      expect(store.snapshot.runtime?.has_active_turn).toBe(true);
+    },
+  );
 
   it('serializes and restores reactive-proxy attachments on local optimistic items', () => {
     const store = new ChatV2Store();

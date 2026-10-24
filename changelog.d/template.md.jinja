@@ -1,0 +1,6 @@
+{% for section, categories in sections.items() %}{% for category in definitions if category in categories %}
+### {{ definitions[category]["name"] }}
+
+{% for text in categories[category] %}- {{ text }}
+{% endfor %}
+{% endfor %}{% endfor %}

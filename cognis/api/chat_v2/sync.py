@@ -60,8 +60,8 @@ from cognis.models.config import GenerationPerformanceSnapshot
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-# v6: durable compaction starts and correlated legacy pressure-notice retirement.
-PROJECTION_VERSION = "chat-v2-projection-v6"
+# v9: coalesce handoff lifecycle events by request identity.
+PROJECTION_VERSION = "chat-v2-projection-v9"
 _projection_version = PROJECTION_VERSION
 SNAPSHOT_SESSION_EVENT_LIMIT = 5_000
 SNAPSHOT_WINDOW_EVENT_LIMIT = 800
@@ -530,6 +530,7 @@ def queue_state_from_messages(messages: Sequence[dict[str, Any]]) -> QueueState:
                 else "queued",
             ),
             cancel_requested=bool(item.get("cancel_requested")),
+            can_edit=bool(item.get("can_edit")),
         )
         for index, item in enumerate(messages, start=1)
         if item.get("queue_id")
@@ -1333,7 +1334,7 @@ async def _hydrate_window_pairings(
     lookback_limit: int = PAIRING_HYDRATION_LOOKBACK_LIMIT,
     session_cache: Any = None,
 ) -> list[RawSessionEvent]:
-    """Backfill tool_call events whose pairing fell outside the read window.
+    """Backfill paired tool calls and assistant continuation segments.
 
     Tool events are flushed incrementally per boundary, so a sync window can
     contain a ``tool_result``/``delegation``/``evaluation`` event whose
@@ -1353,8 +1354,19 @@ async def _hydrate_window_pairings(
         if event.type == "tool_call" and event.data.get("call_id")
     }
     orphan_call_ids: dict[tuple[str, str], set[str]] = {}
+    orphan_phases: dict[tuple[str, str], set[tuple[str, int]]] = {}
+    seen_phases: set[tuple[str, str, str, int]] = set()
+    phase_boundaries: dict[tuple[str, str], int] = {}
+    in_window_positions = {(event.store_id, event.session_id, event.seq) for event in raw_events}
     min_referencing_seq: dict[tuple[str, str], int] = {}
-    for event in raw_events:
+    for event in _sort_raw_events(raw_events):
+        phase = _continuation_phase_key(event)
+        key = (event.store_id, event.session_id)
+        if phase is not None and (*key, *phase) not in seen_phases:
+            seen_phases.add((*key, *phase))
+            if event.data.get("content_is_delta") is True:
+                orphan_phases.setdefault(key, set()).add(phase)
+                phase_boundaries[key] = max(phase_boundaries.get(key, event.seq), event.seq)
         call_id = _pairing_call_id(event)
         if not call_id or call_id in in_window_call_ids:
             continue
@@ -1363,7 +1375,7 @@ async def _hydrate_window_pairings(
         current_min = min_referencing_seq.get(key)
         if current_min is None or event.seq < current_min:
             min_referencing_seq[key] = event.seq
-    if not orphan_call_ids:
+    if not orphan_call_ids and not orphan_phases:
         return list(raw_events)
 
     refs_by_key = {(ref.store, ref.event_store_session_id): ref for ref in session_refs}
@@ -1371,46 +1383,83 @@ async def _hydrate_window_pairings(
 
     async def _hydrate_key(key: tuple[str, str], call_ids: set[str]) -> list[RawSessionEvent]:
         ref = refs_by_key.get(key)
-        boundary_seq = min_referencing_seq.get(key)
-        if ref is None or boundary_seq is None or boundary_seq <= 1:
-            return []
-        try:
-            page = await _read_session_events(
-                ref=ref,
-                event_store=event_store,
-                before_seq=boundary_seq,
-                limit=lookback_limit,
-                direction="backward",
-                session_cache=session_cache,
-            )
-        except Exception:
-            logger.warning(
-                "chat_v2: pairing hydration read failed",
-                extra={"extra_data": {"session_id": ref.session_id}},
-                exc_info=True,
-            )
+        boundary_seq = max(min_referencing_seq.get(key, 0), phase_boundaries.get(key, 0))
+        if ref is None or boundary_seq <= 1:
             return []
         remaining = set(call_ids)
+        remaining_phases = set(orphan_phases.get(key, set()))
         resolved: list[RawSessionEvent] = []
-        for candidate in page.events:
-            if not remaining:
+        while remaining or remaining_phases:
+            was_hydrating_phase = bool(remaining_phases)
+            try:
+                page = await _read_session_events(
+                    ref=ref,
+                    event_store=event_store,
+                    before_seq=boundary_seq,
+                    limit=lookback_limit,
+                    direction="backward",
+                    session_cache=session_cache,
+                )
+            except Exception:
+                logger.warning(
+                    "chat_v2: pairing hydration read failed",
+                    extra={"extra_data": {"session_id": ref.session_id}},
+                    exc_info=True,
+                )
                 break
-            if candidate.seq >= boundary_seq or candidate.type != "tool_call":
-                continue
-            candidate_call_id = str(candidate.data.get("call_id") or "").strip()
-            if candidate_call_id in remaining:
-                resolved.extend(_tag_events([candidate], ref))
-                remaining.discard(candidate_call_id)
+            completed_phases: set[tuple[str, int]] = set()
+            for candidate in page.events:
+                if candidate.seq >= boundary_seq:
+                    continue
+                phase = _continuation_phase_key(candidate)
+                if phase in remaining_phases:
+                    if (key[0], key[1], candidate.seq) not in in_window_positions:
+                        resolved.extend(_tag_events([candidate], ref))
+                    if candidate.data.get("content_is_delta") is not True:
+                        completed_phases.add(phase)
+                if candidate.type == "tool_call":
+                    candidate_call_id = str(candidate.data.get("call_id") or "").strip()
+                    if candidate_call_id in remaining:
+                        resolved.extend(_tag_events([candidate], ref))
+                        remaining.discard(candidate_call_id)
+            remaining_phases.difference_update(completed_phases)
+            if not page.events:
+                break
+            if not remaining_phases:
+                if remaining and was_hydrating_phase:
+                    boundary_seq = min(
+                        min_referencing_seq[key], min(event.seq for event in page.events)
+                    )
+                    if boundary_seq > 1:
+                        continue
+                break
+            previous_boundary = min(event.seq for event in page.events)
+            if previous_boundary >= boundary_seq or previous_boundary <= 1:
+                break
+            boundary_seq = previous_boundary
         return resolved
 
     hydrated_groups = await asyncio.gather(
-        *[_hydrate_key(key, call_ids) for key, call_ids in orphan_call_ids.items()]
+        *[
+            _hydrate_key(key, orphan_call_ids.get(key, set()))
+            for key in orphan_call_ids.keys() | orphan_phases.keys()
+        ]
     )
     for group in hydrated_groups:
         hydrated.extend(group)
     if not hydrated:
         return list(raw_events)
     return _sort_raw_events([*hydrated, *raw_events])
+
+
+def _continuation_phase_key(event: RawSessionEvent) -> tuple[str, int] | None:
+    if event.type != "assistant_message":
+        return None
+    turn_id = event.data.get("turn_id")
+    phase = event.data.get("assistant_phase_index")
+    if not isinstance(turn_id, str) or not isinstance(phase, int):
+        return None
+    return turn_id, phase
 
 
 def _encode_cursor(

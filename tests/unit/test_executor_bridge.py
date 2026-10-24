@@ -2330,6 +2330,7 @@ def test_bridge_server_propagates_accepted_unknown() -> None:
 async def test_proxy_refresh_updates_forwarded_capabilities() -> None:
     provider = WebSocketExecutorProvider()
     row = SimpleNamespace(
+        executor_id="exec-1",
         status="active",
         runtime_metadata={"capabilities": {"tools": ["read"]}},
         labels={},
@@ -2351,17 +2352,16 @@ async def test_proxy_refresh_updates_forwarded_capabilities() -> None:
             return None
 
         async def scalars(self, _query: Any) -> Any:
+            if _query.column_descriptions[0]["entity"].__name__ == "ExecutorRow":
+                return [row]
             return SimpleNamespace(all=lambda: [lease])
 
-        async def get(self, _model: Any, _executor_id: str, **_: Any) -> Any:
-            return row
-
-    async def _controller(_owner_id: str) -> SimpleNamespace:
-        return SimpleNamespace(internal_url="http://peer:8000")
+    async def _controller(owner_ids: set[str]) -> dict[str, Any]:
+        return {owner: SimpleNamespace(internal_url="http://peer:8000") for owner in owner_ids}
 
     provider._cluster_enabled = True
     provider._cluster_session_factory = lambda: _Session()
-    provider._cluster_directory = SimpleNamespace(get_ready=_controller)
+    provider._cluster_directory = SimpleNamespace(get_ready_many=_controller)
     provider._cluster_runtime = SimpleNamespace(owner_id="controller-a:boot-a")
     provider._cluster_auth = SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt")
 
@@ -2557,6 +2557,7 @@ async def test_cluster_directory_refresh_is_serialized(
 async def test_forwarded_refresh_invalidation_race_never_republishes_closed_proxy() -> None:
     provider = WebSocketExecutorProvider()
     row = SimpleNamespace(
+        executor_id="exec-1",
         status="active",
         runtime_metadata={"capabilities": {"tools": ["read"]}},
         labels={},
@@ -2578,17 +2579,16 @@ async def test_forwarded_refresh_invalidation_race_never_republishes_closed_prox
             return None
 
         async def scalars(self, _query: Any) -> Any:
+            if _query.column_descriptions[0]["entity"].__name__ == "ExecutorRow":
+                return [row]
             return SimpleNamespace(all=lambda: [lease])
 
-        async def get(self, _model: Any, _executor_id: str, **_: Any) -> Any:
-            return row
-
-    async def ready_controller(_owner_id: str) -> SimpleNamespace:
-        return SimpleNamespace(internal_url="http://peer:8000")
+    async def ready_controller(owner_ids: set[str]) -> dict[str, Any]:
+        return {owner: SimpleNamespace(internal_url="http://peer:8000") for owner in owner_ids}
 
     provider._cluster_enabled = True
     provider._cluster_session_factory = lambda: _Session()
-    provider._cluster_directory = SimpleNamespace(get_ready=ready_controller)
+    provider._cluster_directory = SimpleNamespace(get_ready_many=ready_controller)
     provider._cluster_runtime = SimpleNamespace(owner_id="controller-a:boot-a")
     provider._cluster_auth = SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt")
     await provider.refresh_cluster_directory()
@@ -2599,15 +2599,15 @@ async def test_forwarded_refresh_invalidation_race_never_republishes_closed_prox
     release_refresh = asyncio.Event()
     ready_calls = 0
 
-    async def delayed_ready_controller(_owner_id: str) -> SimpleNamespace:
+    async def delayed_ready_controller(owner_ids: set[str]) -> dict[str, Any]:
         nonlocal ready_calls
         ready_calls += 1
         if ready_calls == 1:
             refresh_entered.set()
             await release_refresh.wait()
-        return SimpleNamespace(internal_url="http://peer:8000")
+        return await ready_controller(owner_ids)
 
-    provider._cluster_directory = SimpleNamespace(get_ready=delayed_ready_controller)
+    provider._cluster_directory = SimpleNamespace(get_ready_many=delayed_ready_controller)
     refresh = asyncio.create_task(provider.refresh_cluster_directory())
     await refresh_entered.wait()
     invalidation = asyncio.create_task(provider.invalidate_forwarded_connection("exec-1", failed))

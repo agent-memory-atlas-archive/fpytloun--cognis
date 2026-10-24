@@ -365,6 +365,7 @@ async def test_task_helpers_reject_notification_for_an_old_pause() -> None:
     )
     pause_waiter = Mock()
     pause_waiter.find_pending.return_value = current_pause
+    pause_waiter.list_pending.return_value = [current_pause]
     notification_service = AsyncMock()
     task = TaskModel(
         task_id="task-1",
@@ -372,7 +373,15 @@ async def test_task_helpers_reject_notification_for_an_old_pause() -> None:
         created_by="owner@example.com",
         agent_id="agent-1",
         status=TaskStatus.PAUSED,
-        workflow_state=WorkflowState(),
+        workflow_state=WorkflowState(
+            status="paused",
+            pending_pause_type="gate",
+            pending_pause_payload={
+                "pause_id": "current-pause",
+                "step_name": "current",
+                "options": current_pause.options,
+            },
+        ),
     )
 
     with pytest.raises(ValueError, match="does not match the current task pause"):
@@ -414,6 +423,7 @@ async def test_task_question_helper_rejects_notification_for_an_old_pause() -> N
     )
     pause_waiter = Mock()
     pause_waiter.find_pending.return_value = current_pause
+    pause_waiter.list_pending.return_value = [current_pause]
     notification_service = AsyncMock()
     task = TaskModel(
         task_id="task-1",

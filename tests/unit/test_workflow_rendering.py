@@ -38,6 +38,72 @@ def test_expression_requires_strict_boolean(renderer: WorkflowRenderer) -> None:
         renderer.render_expression("{{ vars.count }}", {"vars": {"count": 1}})
 
 
+def test_evidence_filters_remain_bounded(renderer: WorkflowRenderer) -> None:
+    assert renderer.render_expression(
+        "'implemented' in (message | lower)",
+        {
+            "message": "IMPLEMENTED",
+        },
+    )
+    assert (
+        renderer.render_text("{{ files | join(', ') }}", {"files": ["a.py", "b.py"]})
+        == "a.py, b.py"
+    )
+    assert (
+        renderer.render_text("{{ output | tojson }}", {"output": {"id": "report"}})
+        == '{"id": "report"}'
+    )
+    with pytest.raises(WorkflowRenderError):
+        renderer.render_text(
+            "{{ items | join(separator) }}",
+            {
+                "items": [""] * 1000,
+                "separator": "x" * 1000,
+            },
+        )
+    with pytest.raises(WorkflowRenderError):
+        renderer.validate_template("{{ value | unknown_filter }}")
+
+
+@pytest.mark.parametrize("value", [None, "true", "false", 1, 0, [], {}])
+def test_default_preserves_invalid_condition_types(
+    renderer: WorkflowRenderer, value: object
+) -> None:
+    with pytest.raises(WorkflowRenderError, match="boolean"):
+        renderer.render_expression(
+            "{{ vars.notify | default(false) }}", {"vars": {"notify": value}}
+        )
+    assert (
+        renderer.render_native("{{ vars.notify | default(false) }}", {"vars": {"notify": value}})
+        == value
+    )
+
+
+def test_default_uses_jinja_missing_value_semantics(renderer: WorkflowRenderer) -> None:
+    assert renderer.render_expression("{{ vars.notify | default(false) }}", {"vars": {}}) is False
+    assert (
+        renderer.render_native("{{ vars.notify | default(true) }}", {"vars": {"notify": False}})
+        is False
+    )
+    assert renderer.render_text("{{ vars.missing | default('absent') }}", {"vars": {}}) == "absent"
+    with pytest.raises(WorkflowRenderError):
+        renderer.render_expression("{{ vars.missing }}", {"vars": {}})
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "{{ vars.missing | attr('__class__') | default(false) }}",
+        "{{ vars.items() | default(false) }}",
+        "{{ vars.__class__.__mro__() | default(false) }}",
+        "{{ vars.missing | default(now.__globals__) }}",
+    ],
+)
+def test_default_does_not_enable_object_access(renderer: WorkflowRenderer, expression: str) -> None:
+    with pytest.raises(WorkflowRenderError):
+        renderer.render_native(expression, {"vars": {}})
+
+
 def test_strict_undefined_is_redaction_safe(renderer: WorkflowRenderer) -> None:
     secret = "super-secret-value"
     with pytest.raises(WorkflowRenderError) as exc:

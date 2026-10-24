@@ -30,6 +30,8 @@ describe('standalone client', () => {
     template.id = 'cognis-deliverable-payload';
     template.dataset.mediaBase = '/api/media';
     template.dataset.pdfUrl = '/api/report.pdf';
+    template.dataset.htmlUrl = '/api/report.html';
+    template.dataset.markdownUrl = '/api/report.md';
     template.dataset.standaloneUrl = '/api/view';
     template.content.textContent = JSON.stringify({
       content: 'Fallback',
@@ -46,18 +48,20 @@ describe('standalone client', () => {
     expect(mount).toHaveBeenCalledOnce();
     expect(mount.mock.calls[0][1]).toMatchObject({
       target: root,
-      props: {
+      props: { viewerProps: {
         content: 'Fallback',
         instanceId: 'dlv_test',
         pdfUrl: '/api/report.pdf',
+        htmlUrl: '/api/report.html',
+        markdownUrl: '/api/report.md',
         surface: 'standalone',
         title: 'Report',
-      },
+      } },
     });
     // Never passed: "Open standalone page" from the standalone page itself
     // would just reopen this same page.
-    expect(mount.mock.calls[0][1].props.standaloneUrl).toBeUndefined();
-    expect(mount.mock.calls[0][1].props.mediaUrlFor('media_abc')).toBe('/api/media/media_abc');
+    expect(mount.mock.calls[0][1].props.viewerProps.standaloneUrl).toBeUndefined();
+    expect(mount.mock.calls[0][1].props.viewerProps.mediaUrlFor('media_abc')).toBe('/api/media/media_abc');
     // The viewer owns theme selection; bootstrap must not force dark over it.
     expect(document.documentElement.dataset.resolvedTheme).toBeUndefined();
     expect(document.documentElement.style.colorScheme).toBe('');

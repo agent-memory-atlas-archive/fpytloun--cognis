@@ -23,6 +23,182 @@ import {
 
 const safe = { x: 240, y: 64, width: 1200, height: 800 };
 
+describe('document workspace windows', () => {
+  it.each(['artifact', 'deliverable'] as const)('opens, focuses and persists exact %s revisions', async (kind) => {
+    const manager = new WorkspaceManager('desktop', safe);
+    const document = {
+      kind, entityId: `${kind}_exact:revision/2`, title: 'Document revision',
+      canonicalHref: `/library/${kind}/${encodeURIComponent(`${kind}_exact:revision/2`)}`,
+    };
+    const first = await manager.requestOpen(document);
+    expect(first.status).toBe('opened');
+    expect(await manager.requestOpen(document)).toEqual({ status: 'focused', key: `${kind}:${document.entityId}` });
+    expect(manager.snapshot()).toHaveLength(1);
+    const restored = parseWorkspaceWindows(serializeWorkspaceWindows(manager.snapshot()), safe);
+    expect(restored[0]).toMatchObject(document);
+    manager.minimize(restored[0].key);
+    expect(await manager.requestOpen(document)).toMatchObject({ status: 'focused' });
+    expect(manager.snapshot()[0].minimized).toBe(false);
+  });
+
+  it('applies close guards to direct close and Escape without clearing newer guards', async () => {
+    const manager = new WorkspaceManager('desktop', safe);
+    manager.open({ kind: 'artifact', entityId: 'art_edit', title: 'Editing', canonicalHref: '/library/artifact/art_edit' });
+    const key = manager.snapshot()[0].key;
+    const stopOld = manager.registerCloseGuard(key, () => true);
+    const guard = vi.fn(() => false);
+    const stop = manager.registerCloseGuard(key, guard);
+    stopOld();
+    await manager.close(key);
+    dispatchWorkspaceEscape(manager, {}, true, false);
+    expect(guard).toHaveBeenCalledTimes(2);
+    expect(manager.snapshot()).toHaveLength(1);
+    stop();
+    await manager.close(key);
+    expect(manager.snapshot()).toHaveLength(0);
+  });
+
+  it('reuses an already-open revision when the reader changes revisions', () => {
+    const manager = new WorkspaceManager('desktop', safe);
+    const old = { kind: 'artifact' as const, entityId: 'art_old', title: 'Old', canonicalHref: '/library/artifact/art_old' };
+    const next = { ...old, entityId: 'art_next', title: 'Next', canonicalHref: '/library/artifact/art_next' };
+    manager.open(old);
+    manager.open(next);
+    manager.minimize('artifact:art_next');
+    manager.navigateDocument('artifact:art_old', next);
+    expect(manager.snapshot()).toHaveLength(1);
+    expect(manager.snapshot()[0]).toMatchObject({ ...next, key: 'artifact:art_next', minimized: false });
+  });
+});
+
+describe('workspace geometry interaction sessions', () => {
+  function setup() {
+    const manager = new WorkspaceManager('desktop', safe);
+    manager.open(input('one'));
+    manager.open(input('two'));
+    const original = manager.snapshot()[0];
+    const token = manager.beginInteraction(original.key, 'move', 500, 250)!;
+    return { manager, original, token };
+  }
+
+  it('keeps previews unpublished and commits geometry once with unrelated identity intact', () => {
+    const { manager, original, token } = setup();
+    const other = get(manager)[1];
+    const publication = vi.fn();
+    const stop = manager.subscribe(publication);
+    publication.mockClear();
+    for (let index = 1; index <= 24; index++) {
+      manager.previewInteraction(token, 500 + index, 250 + index);
+    }
+    expect(publication).not.toHaveBeenCalled();
+    expect(get(manager)[0].rect).toEqual(original.rect);
+    manager.updateMetadata(original.key, { title: 'Updated title' });
+    manager.resize(other.key, 700, 500);
+    expect(manager.isInteractionActive(token)).toBe(true);
+    publication.mockClear();
+    manager.finishInteraction(token);
+    expect(publication).toHaveBeenCalledTimes(1);
+    expect(get(manager)[0].rect.x).toBe(original.rect.x + 24);
+    expect(get(manager)[0].title).toBe('Updated title');
+    const committedOther = get(manager)[1];
+    manager.finishInteraction(token);
+    expect(publication).toHaveBeenCalledTimes(1);
+    expect(get(manager)[1]).toBe(committedOther);
+    stop();
+  });
+
+  it.each(['minimize', 'close', 'geometry', 'projection', 'remove'] as const)(
+    'invalidates on %s and cannot resurrect stale geometry', async (action) => {
+      const { manager, original, token } = setup();
+      manager.previewInteraction(token, 550, 280);
+      if (action === 'minimize') manager.minimize(original.key);
+      if (action === 'close') await manager.close(original.key);
+      if (action === 'geometry') manager.move(original.key, safe.x, safe.y);
+      if (action === 'projection') {
+        manager.replaceProjection(manager.snapshot().map((window) => window.key === original.key
+          ? { ...window, rect: { ...window.rect, x: safe.x } } : window));
+      }
+      if (action === 'remove') manager.replaceProjection([]);
+      expect(manager.isInteractionActive(token)).toBe(false);
+      const snapshot = manager.snapshot();
+      const publication = vi.fn();
+      const stop = manager.subscribe(publication);
+      publication.mockClear();
+      manager.finishInteraction(token);
+      expect(manager.snapshot()).toEqual(snapshot);
+      expect(publication).not.toHaveBeenCalled();
+      stop();
+    },
+  );
+
+  it('accepts metadata-only projections and reconciles safe bounds at commit', () => {
+    const { manager, token } = setup();
+    manager.previewInteraction(token, 550, 280);
+    manager.replaceProjection(manager.snapshot().map((window) => ({ ...window, title: 'Projected metadata' })));
+    expect(manager.isInteractionActive(token)).toBe(true);
+    const smaller = { x: 300, y: 100, width: 600, height: 400 };
+    manager.setSafeRect(smaller);
+    expect(manager.isInteractionActive(token)).toBe(true);
+    manager.finishInteraction(token);
+    expect(get(manager)[0].rect).toEqual(smaller);
+  });
+
+  it('recomputes obsolete snap and unclamped geometry when safe bounds change before finish', () => {
+    const { manager, original, token } = setup();
+    const x = safe.x + safe.width - 10;
+    expect(manager.previewInteraction(token, x, 250)?.snapTarget).toBe('right');
+    const wider = { ...safe, width: safe.width + 600 };
+    manager.setSafeRect(wider);
+    const publication = vi.fn();
+    const stop = manager.subscribe(publication);
+    publication.mockClear();
+    manager.finishInteraction(token);
+    expect(publication).toHaveBeenCalledTimes(1);
+    expect(get(manager)[0].restoreRect).toBeNull();
+    expect(get(manager)[0].rect).toEqual(clampWorkspaceRect({
+      ...original.rect, x: original.rect.x + x - 500,
+    }, wider));
+    stop();
+  });
+
+  it('retains cancelled preview without snap and atomically saves snap restore geometry', () => {
+    const { manager, token } = setup();
+    const preview = manager.previewInteraction(token, safe.x + 10, 250)!;
+    manager.finishInteraction(token, true);
+    expect(get(manager)[0].rect).toEqual(preview.rect);
+    expect(get(manager)[0].restoreRect).toBeNull();
+    const next = manager.beginInteraction(token.key, 'move', 500, 250)!;
+    const snapped = manager.previewInteraction(next, safe.x + 10, 250)!;
+    manager.finishInteraction(next);
+    expect(get(manager)[0].rect).toEqual(workspacePresetRect('left', safe, 'desktop'));
+    expect(get(manager)[0].restoreRect).toEqual(snapped.rect);
+  });
+
+  it('preserves maximized detach threshold and pointer anchor without intermediate publication', () => {
+    const { manager, original } = setup();
+    manager.applyPreset(original.key, 'maximize');
+    const token = manager.beginInteraction(original.key, 'move', 840, 84)!;
+    expect(manager.previewInteraction(token, 845, 89)).toBeNull();
+    const preview = manager.previewInteraction(token, 880, 124)!;
+    expect(preview.rect).toEqual(clampWorkspaceRect({
+      ...original.rect, x: 880 - original.rect.width / 2, y: 104,
+    }, safe));
+    expect(get(manager)[0].rect).toEqual(safe);
+    manager.finishInteraction(token, true);
+    expect(get(manager)[0].rect).toEqual(preview.rect);
+    expect(get(manager)[0].restoreRect).toBeNull();
+  });
+
+  it('clamps resize minimums and abandons without publication', () => {
+    const { manager, original } = setup();
+    const token = manager.beginInteraction(original.key, 'resize', 500, 250)!;
+    expect(manager.previewInteraction(token, -1000, -1000)?.rect).toMatchObject({ width: 360, height: 320 });
+    manager.abandonInteraction(token);
+    manager.finishInteraction(token);
+    expect(get(manager)[0].rect).toEqual(original.rect);
+  });
+});
+
   function input(
   entityId: string,
   kind: 'conversation' | 'task' | 'agent' | 'schedule' | 'attention' = 'conversation',

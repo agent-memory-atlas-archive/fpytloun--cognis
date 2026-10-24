@@ -191,7 +191,7 @@ function conversationActivityValue(conversation: Pick<Conversation, 'last_messag
  */
 export function partitionConversationLanes(
   conversations: Conversation[] | null | undefined,
-  limits: { active?: number; recent?: number } = {}
+  limits: { active?: number; recent?: number; waiting?: number } = {}
 ): DashboardConversationLanes {
   const activeLimit = limits.active ?? DEFAULT_ACTIVE_CONVERSATION_LIMIT;
   const recentLimit = limits.recent ?? DEFAULT_RECENT_CONVERSATION_LIMIT;
@@ -214,7 +214,7 @@ export function partitionConversationLanes(
 
   return {
     active: activeAll.slice(0, activeLimit),
-    waiting: waitingAll.slice(0, 5),
+    waiting: waitingAll.slice(0, limits.waiting ?? 5),
     recent: recentAll.slice(0, recentLimit)
   };
 }

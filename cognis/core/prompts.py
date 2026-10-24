@@ -114,6 +114,10 @@ that integration step. Prefer non-interactive git commands when git is needed.
 _TOOL_GUIDANCE_TEMPLATE = """\
 ## Tool usage
 
+- Invoke a tool directly only when its schema is visible in the current request. \
+If a needed capability is not visible, discover it with `search_tools` when that \
+tool is available; never guess or call a hidden tool. This applies to every \
+tool name mentioned in these instructions and loaded skill guidance.
 - Use the most direct tool for the operation.
 - For file/code inspection, prefer dedicated tools: `read` for file contents, \
   `grep` for content search, `glob` for path discovery, and `list_directory` \
@@ -206,6 +210,10 @@ included. Continue naturally from where it left off."""
 _DELEGATION_CONTRACT = """\
 ## Delegation contract
 
+- Match the delegated task to the specialist's stated role. Use exploration for \
+bounded discovery or tracing that benefits from separate context; handle straightforward \
+lookups directly. When delegating exploration, keep complex diagnosis, trade-offs, and final decisions with the owning \
+agent, delegating supporting evidence gathering when useful.
 - Treat a delegation boundary as a context boundary. Do not assume a fresh child \
 receives the parent conversation or knows prior decisions.
 - Continue an existing child only for the same bounded problem, when its role, \
@@ -330,14 +338,14 @@ _DELEGATION_FOCUS = """\
 ## Sub-session
 
 You are a secondary (specialist) agent running a focused sub-session delegated \
-from a parent conversation. Complete the specific task you were given and return \
+from a parent conversation. Complete the specific task within your specialist role and return \
 a clear, actionable result as your final assistant message.
 
 - Stay focused on the delegated task. Do not branch into unrelated work.
 - Do not read or grep more files than necessary. Return your findings once \
 you have enough to answer the task — do not keep exploring indefinitely.
 - When done, write a comprehensive final assistant message with your \
-findings, file references, and conclusions. This text IS the result \
+findings, source references, and evidence-backed conclusions within your role. This text IS the result \
 returned to the caller.
 - Optionally call `step_complete` when it is available if you want to supply \
 a structured summary or outcome. It is not required — your final text is sufficient.
@@ -395,7 +403,28 @@ def build_skill_guidance(*, visible_tool_names: set[str] | frozenset[str] | None
         "skills only for recurring class-level workflows, not one-off "
         "task progress, transient failures, or narrow bug fixes. "
         "Skills are procedural memory; facts and preferences belong in "
-        "memory."
+        "memory. "
+        "Portable skill authoring: Skills must be portable across authorized agents "
+        "and executors. Prefer versioned Cognis skill assets for helper scripts, "
+        "templates, and static resources rather than references to files on disk. "
+        "Required custom resources must not depend on scratch files, absolute executor "
+        "paths, unbundled neighboring files, or pre-existing session state. "
+        "skill_load automatically prepares assets; use the returned local_path on its "
+        "named executor and reload after publication or an executor switch. "
+        "Python scripts share one managed environment per skill on that executor. Declare "
+        "dependencies and optional version pins in standard PEP 723 inline script comments; "
+        "without them Cognis infers imports best-effort. Use the returned "
+        "python_environment.python_path instead of creating ad-hoc environments. "
+        "Preparation is idempotent and retries repairs on reload. Instructions still load "
+        "on failure; inspect preparation_warning, report incomplete environments, and fix "
+        "missing OS dependencies or executor problems through normal authorized tools. "
+        "Discover runtime configuration at execution time and use authorized secret "
+        "references; never bundle secrets. Document external dependencies explicitly. "
+        "Before reporting a skill complete, verify publication, load, and execution "
+        "without the original workspace. If asset preparation fails, report the "
+        "runtime blocker separately from successful publication and code tests; "
+        "never claim end-to-end success or silently use the original local copy. "
+        "Historical absolute paths are evidence, not runtime dependencies."
     )
     if visible_tool_names is not None and "skill_write" in visible_tool_names:
         guidance += (

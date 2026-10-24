@@ -1,0 +1,106 @@
+@import './porcelain.css';
+@import './gruvbox.css';
+
+/* Final approved v4 Paper palettes. Classic's complete light/dark fallback
+   supplies the unchanged category colors, as in the approved presets. */
+[data-theme-family='paper'][data-resolved-theme='light'] {
+  --color-scrim: 32 32 31;
+  color-scheme: light;
+  /* Claude-like ivory content, a slightly deeper warm frame, hairlines. */
+  --app-chrome-bg: #efede6;
+  --color-canvas: 250 249 245;
+  --color-chrome: 239 237 230;
+  --color-surface: 255 255 255;
+  --color-inset: 243 241 236;
+  --color-elevated: 255 255 255;
+  --color-surface-hover: 233 231 224;
+  --color-foreground: 19 19 19;
+  --color-secondary: 56 56 53;
+  --color-muted: 102 100 94;
+  --color-separator: 230 227 218;
+  --color-control-border: 214 210 199;
+  --color-border-strong: 150 146 136;
+  --color-accent: 155 76 50;
+  --color-accent-hover: 120 57 35;
+  --color-on-accent: 255 255 255;
+  --color-accent-subtle: 238 236 230;
+  --color-success: 30 110 62;
+  --color-success-subtle: 233 241 235;
+  --color-warning: 140 88 8;
+  --color-warning-subtle: 245 238 223;
+  --color-danger: 176 52 44;
+  --color-danger-subtle: 239 235 229;
+  --color-info: 34 96 150;
+  --color-info-subtle: 235 234 229;
+  --color-violet-tone: 108 72 160;
+  --color-violet-subtle: 235 232 229;
+  --color-cyan-tone: 16 108 118;
+  --color-cyan-subtle: 233 234 229;
+  --shadow-card: none;
+  --shadow-overlay: 0 16px 48px -16px rgb(19 19 19 / .16);
+}
+
+[data-theme-family='paper'][data-resolved-theme='dark'] {
+  --color-scrim: 20 19 18;
+  color-scheme: dark;
+  --app-chrome-bg: #1f1e1d;
+  --color-canvas: 38 38 36;
+  --color-chrome: 31 30 29;
+  --color-surface: 48 48 46;
+  --color-inset: 20 20 19;
+  --color-elevated: 48 48 46;
+  --color-surface-hover: 62 62 57;
+  --color-foreground: 250 249 245;
+  --color-secondary: 194 191 182;
+  --color-muted: 178 174 162;
+  --color-separator: 65 65 59;
+  --color-control-border: 119 117 107;
+  --color-border-strong: 178 174 162;
+  --color-accent: 235 170 144;
+  --color-accent-hover: 242 194 173;
+  --color-on-accent: 41 33 29;
+  --color-accent-subtle: 57 57 51;
+  --color-success: 126 194 138;
+  --color-success-subtle: 38 60 48;
+  --color-warning: 226 178 92;
+  --color-warning-subtle: 62 53 38;
+  --color-danger: 236 128 114;
+  --color-danger-subtle: 49 46 43;
+  --color-info: 122 172 224;
+  --color-info-subtle: 48 48 45;
+  --color-violet-tone: 184 160 232;
+  --color-violet-subtle: 49 47 45;
+  --color-cyan-tone: 108 192 202;
+  --color-cyan-subtle: 47 49 45;
+  --shadow-card: none;
+  --shadow-overlay: 0 16px 48px -16px rgb(0 0 0 / .5);
+}
+
+/* Matte container edges are not status/chart foregrounds. Keep the latter
+   recognizable while preventing inherited neon category outlines. */
+[data-theme-family='paper'][data-resolved-theme] {
+  --color-info-border: var(--color-separator);
+  --color-success-border: var(--color-separator);
+  --color-warning-border: var(--color-control-border);
+  --color-danger-border: var(--color-control-border);
+  --color-violet-border: var(--color-separator);
+  --color-cyan-border: var(--color-separator);
+  --color-pink-border: var(--color-separator);
+  --color-orange-border: var(--color-separator);
+  --color-indigo-border: var(--color-separator);
+  --color-teal-border: var(--color-separator);
+  --color-lime-border: var(--color-separator);
+  --color-purple-border: var(--color-separator);
+  --color-blue-border: var(--color-separator);
+  --color-fuchsia-border: var(--color-separator);
+  --color-pink-subtle: var(--color-inset);
+  --color-orange-subtle: var(--color-inset);
+  --color-indigo-subtle: var(--color-inset);
+  --color-teal-subtle: var(--color-inset);
+  --color-lime-subtle: var(--color-inset);
+  --color-purple-subtle: var(--color-inset);
+  --color-blue-subtle: var(--color-inset);
+  --color-fuchsia-subtle: var(--color-inset);
+  --tool-group-border: 0px;
+  --tool-group-background: transparent;
+}

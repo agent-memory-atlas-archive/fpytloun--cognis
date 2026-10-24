@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { findTarget } from '$lib/find';
   import { onDestroy, untrack } from 'svelte';
   import ArrowLeft from 'lucide-svelte/icons/arrow-left';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
@@ -468,10 +469,10 @@
   }
 
   function statusClass(status: FileChangeStatus): string {
-    if (status === 'added') return 'text-lime-300';
-    if (status === 'deleted') return 'text-rose-300';
-    if (status === 'renamed') return 'text-violet-300';
-    return 'text-amber-300';
+    if (status === 'added') return 'text-lime-tone';
+    if (status === 'deleted') return 'text-danger';
+    if (status === 'renamed') return 'text-violet-tone';
+    return 'text-warning';
   }
 
   function statusLabel(status: FileChangeStatus): string {
@@ -551,37 +552,37 @@
 
 {#snippet stats(additions: number, deletions: number)}
   <span class="ml-auto shrink-0 font-mono text-[10px] tabular-nums">
-    {#if additions}<span class="text-lime-300">+{additions}</span>{/if}
-    {#if additions && deletions}<span class="text-slate-600">/</span>{/if}
-    {#if deletions}<span class="text-rose-300">-{deletions}</span>{/if}
+    {#if additions}<span class="text-lime-tone">+{additions}</span>{/if}
+    {#if additions && deletions}<span class="text-quiet">/</span>{/if}
+    {#if deletions}<span class="text-danger">-{deletions}</span>{/if}
   </span>
 {/snippet}
 
 {#snippet diffHistory(file: FileTreeFile)}
   <div class="space-y-3" data-testid="work-combined-diff">
     {#if sourceLabels(file).length}
-      <p class="text-[10px] text-slate-500">{sourceLabels(file).join(' · ')}</p>
+      <p class="text-[10px] text-quiet">{sourceLabels(file).join(' · ')}</p>
     {/if}
     {#if historyUnavailable}
-      <div class="rounded-xl border border-dashed border-amber-500/30 p-6 text-center" data-testid="work-file-history-unavailable">
-        <p class="text-sm text-amber-100">This file history is no longer retained.</p>
-        <p class="mt-1 text-xs text-slate-500">The available inline preview appears below.</p>
+      <div class="rounded-xl border border-dashed border-warning-border p-6 text-center" data-testid="work-file-history-unavailable">
+        <p class="text-sm text-warning">This file history is no longer retained.</p>
+        <p class="mt-1 text-xs text-quiet">The available inline preview appears below.</p>
       </div>
     {/if}
     {#if historyError}
-      <div class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100" data-testid="work-file-history-error">
+      <div class="rounded-lg border border-danger-border bg-danger-subtle px-3 py-2 text-xs text-danger" data-testid="work-file-history-error">
         <p>{historyError}</p>
         <button type="button" class="mt-1 underline" onclick={retryHistory}>Retry loading file history</button>
       </div>
     {/if}
     {#if combineFileDiffHistory(file)}
       {#if combineFileDiffHistory(file)?.truncated}
-        <p class="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-100">
+        <p class="rounded-lg border border-warning-border bg-warning-subtle px-3 py-2 text-xs text-warning">
           The combined diff contains content-truncated previews. The available partial history appears below.
         </p>
       {/if}
       {#if unavailablePreviewCount(file)}
-        <p class="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2 text-xs text-slate-400" data-testid="work-diff-partial-history">
+        <p class="rounded-lg border border-control-border bg-surface/60 px-3 py-2 text-xs text-muted" data-testid="work-diff-partial-history">
           {unavailablePreviewCount(file)} change{unavailablePreviewCount(file) === 1 ? '' : 's'} without a text preview {unavailablePreviewCount(file) === 1 ? 'is' : 'are'} not included in the combined diff.
         </p>
       {/if}
@@ -593,65 +594,65 @@
     {:else if identityRefreshLoading}
       <!-- The loading status below replaces stale missing-identity copy. -->
     {:else if omittedPreviewCount(file)}
-      <div class="rounded-xl border border-dashed border-amber-500/30 p-6 text-center" data-testid="work-diff-preview-omitted">
-        <p class="text-sm text-amber-100">{omittedPreviewMessage(file)}</p>
-        <p class="mt-1 text-xs text-slate-500">{file.path}</p>
+      <div class="rounded-xl border border-dashed border-warning-border p-6 text-center" data-testid="work-diff-preview-omitted">
+        <p class="text-sm text-warning">{omittedPreviewMessage(file)}</p>
+        <p class="mt-1 text-xs text-quiet">{file.path}</p>
       </div>
     {:else}
-      <div class="rounded-xl border border-dashed border-slate-700 p-6 text-center" data-testid="work-diff-no-preview">
-        <p class="text-sm text-slate-300">No text preview is available.</p>
-        <p class="mt-1 text-xs text-slate-500">{file.binary ? 'Binary file' : file.generated ? 'Generated file' : 'Text preview unavailable'} · {file.path}</p>
+      <div class="rounded-xl border border-dashed border-control-border p-6 text-center" data-testid="work-diff-no-preview">
+        <p class="text-sm text-secondary">No text preview is available.</p>
+        <p class="mt-1 text-xs text-quiet">{file.binary ? 'Binary file' : file.generated ? 'Generated file' : 'Text preview unavailable'} · {file.path}</p>
       </div>
     {/if}
     {#if historyLoading || identityRefreshLoading}
-      <p class="text-center text-xs text-slate-500" role="status" data-testid="work-file-history-loading">Loading file history…</p>
+      <p class="text-center text-xs text-quiet" role="status" data-testid="work-file-history-loading">Loading file history…</p>
     {:else if historyUsesLazyData && historyHasMore && historyBeforeCursor}
-      <button type="button" class="w-full rounded-lg border border-slate-700 px-3 py-2 text-xs text-sky-200 hover:bg-slate-800" onclick={() => void loadHistoryPage(historyGeneration, historyBeforeCursor)} data-testid="work-file-history-more">
+      <button type="button" class="w-full rounded-lg border border-control-border px-3 py-2 text-xs text-accent hover:bg-raised" onclick={() => void loadHistoryPage(historyGeneration, historyBeforeCursor)} data-testid="work-file-history-more">
         Load older file history
       </button>
     {/if}
   </div>
 {/snippet}
 
-<div bind:this={explorerElement} class="flex min-h-[28rem] min-w-0 overflow-hidden rounded-xl border border-slate-700/80 bg-slate-950/40" data-testid="work-file-explorer">
+<div data-find-scope bind:this={explorerElement} class="flex min-h-[28rem] min-w-0 overflow-hidden rounded-xl border border-control-border/80 bg-canvas/40" data-testid="work-file-explorer">
   {#if treeCollapsed}
     <button
       type="button"
-      class="work-tree-wide-only hidden w-11 shrink-0 items-start justify-center border-r border-slate-800 pt-3 text-slate-400 hover:text-slate-100"
+      class="work-tree-wide-only hidden w-11 shrink-0 items-start justify-center border-r border-separator pt-3 text-muted hover:text-foreground"
       aria-label="Show files tree"
       title="Show files tree"
       onclick={() => { treeCollapsed = false; }}
     ><PanelLeftOpen class="h-4 w-4" /></button>
   {:else}
     <aside
-      class={`${mobileDiffOpen ? 'hidden work-tree-pane-open' : 'flex'} work-tree-pane relative w-full shrink-0 flex-col border-r border-slate-800`}
+      class={`${mobileDiffOpen ? 'hidden work-tree-pane-open' : 'flex'} work-tree-pane relative w-full shrink-0 flex-col border-r border-separator`}
       style:width={explorerWidth >= 880 && !mobileDiffOpen ? `${treeWidth}px` : undefined}
       data-testid="work-files-tree-pane"
     >
-      <div class="sticky top-0 z-10 space-y-2 border-b border-slate-800 bg-slate-950/95 p-2">
+      <div class="sticky top-0 z-10 space-y-2 border-b border-separator bg-canvas/95 p-2">
         <div class="flex items-center gap-2">
           <label class="relative min-w-0 flex-1">
             <span class="sr-only">Filter changed files</span>
-            <Search class="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-500" />
-            <input bind:this={filterInput} bind:value={query} class="h-9 w-full rounded-lg border border-slate-700 bg-slate-900 pl-8 pr-2 text-xs text-slate-100 placeholder:text-slate-600" placeholder="Filter files…" />
+            <Search class="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-quiet" />
+            <input use:findTarget={{ scopeOnly: true }} bind:this={filterInput} bind:value={query} class="h-9 w-full rounded-lg border border-control-border bg-surface pl-8 pr-2 text-xs text-foreground placeholder:text-quiet" placeholder="Filter files…" />
           </label>
-          <button type="button" class="work-tree-wide-only hidden rounded p-2 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Hide files tree" title="Hide files tree" onclick={() => { treeCollapsed = true; }}><PanelLeftClose class="h-4 w-4" /></button>
+          <button type="button" class="work-tree-wide-only hidden rounded p-2 text-quiet hover:bg-raised hover:text-foreground" aria-label="Hide files tree" title="Hide files tree" onclick={() => { treeCollapsed = true; }}><PanelLeftClose class="h-4 w-4" /></button>
         </div>
         <div class="flex items-center gap-2">
-          <select bind:value={statusFilter} class="h-8 min-w-0 flex-1 rounded-lg border border-slate-800 bg-slate-900 px-2 text-xs text-slate-300" aria-label="Filter by file status">
+          <select bind:value={statusFilter} class="h-8 min-w-0 flex-1 rounded-lg border border-separator bg-surface px-2 text-xs text-secondary" aria-label="Filter by file status">
             <option value="all">All statuses</option>
             <option value="added">Added</option>
             <option value="modified">Modified</option>
             <option value="deleted">Deleted</option>
             <option value="renamed">Renamed</option>
           </select>
-          <span class="text-[10px] text-slate-500">{files.length} files</span>
+          <span class="text-[10px] text-quiet">{files.length} files</span>
           {@render stats(totals.additions, totals.deletions)}
         </div>
       </div>
        <div bind:this={treeElement} role="tree" tabindex="-1" aria-label="Changed files" class="min-h-0 flex-1 overflow-y-auto p-1" onkeydown={onTreeKeydown} onscroll={onTreeScroll} data-testid="work-files-tree" data-virtualized={virtualized ? 'true' : 'false'}>
         {#if commonRoot}
-          <p class="px-2 py-1 font-mono text-[10px] text-slate-500" data-testid="work-files-common-root">{commonRoot}</p>
+          <p class="px-2 py-1 font-mono text-[10px] text-quiet" data-testid="work-files-common-root">{commonRoot}</p>
         {/if}
         {#if virtualized && virtualWindow.paddingTop > 0}
           <div style:height={`${virtualWindow.paddingTop}px`} aria-hidden="true" data-testid="work-files-virtual-padding-top"></div>
@@ -666,22 +667,22 @@
             tabindex={focusedId === item.node.id ? 0 : -1}
             data-node-id={item.node.id}
             data-testid={item.node.kind === 'file' ? `work-file-${item.node.diff.path_id ?? item.node.path}` : undefined}
-            class={`flex min-h-9 w-full min-w-0 items-center gap-1.5 rounded px-1.5 text-left text-xs ${item.node.kind === 'file' && selected?.id === item.node.id ? 'bg-sky-500/15 text-sky-100' : 'text-slate-300 hover:bg-slate-800/80'}`}
+            class={`flex min-h-9 w-full min-w-0 items-center gap-1.5 rounded px-1.5 text-left text-xs ${item.node.kind === 'file' && selected?.id === item.node.id ? 'bg-accent-subtle text-accent' : 'text-secondary hover:bg-raised/80'}`}
             style:padding-left={`${Math.max(6, item.node.depth * 14)}px`}
             onclick={() => item.node.kind === 'folder' ? toggleFolder(item.node) : selectFile(item.node)}
              onfocus={() => { focusedId = item.node.id; }}
              data-initial-focus={item.node.kind === 'file' && item.node.diffs.some((diff) => diff.source_item_id === initialFocus?.workItemId) ? 'true' : undefined}
           >
             {#if item.node.kind === 'folder'}
-              {#if effectiveExpanded.has(item.node.id)}<ChevronDown class="h-3.5 w-3.5 shrink-0" /><FolderOpen class="h-3.5 w-3.5 shrink-0 text-sky-300" />{:else}<ChevronRight class="h-3.5 w-3.5 shrink-0" /><Folder class="h-3.5 w-3.5 shrink-0 text-sky-300" />{/if}
+              {#if effectiveExpanded.has(item.node.id)}<ChevronDown class="h-3.5 w-3.5 shrink-0" /><FolderOpen class="h-3.5 w-3.5 shrink-0 text-accent" />{:else}<ChevronRight class="h-3.5 w-3.5 shrink-0" /><Folder class="h-3.5 w-3.5 shrink-0 text-accent" />{/if}
               <span class="scrollbar-hidden-x min-w-0">{item.node.name}</span>
-              <span class="rounded bg-slate-800 px-1.5 text-[10px] text-slate-500">{item.node.counts.files}</span>
+              <span class="rounded bg-raised px-1.5 text-[10px] text-quiet">{item.node.counts.files}</span>
               {@render stats(item.node.counts.additions, item.node.counts.deletions)}
             {:else}
               <span class={`w-3 shrink-0 font-mono text-[10px] font-bold ${statusClass(item.node.status)}`}>{statusLabel(item.node.status)}</span>
-              <FileCode2 class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+              <FileCode2 class="h-3.5 w-3.5 shrink-0 text-quiet" />
               <span class="scrollbar-hidden-x min-w-0" title={item.node.path}>{item.node.name}</span>
-               {#if item.node.binary}<span class="text-[9px] text-violet-300">binary</span>{:else if item.node.generated}<span class="text-[9px] text-slate-500">generated</span>{/if}
+               {#if item.node.binary}<span class="text-[9px] text-violet-tone">binary</span>{:else if item.node.generated}<span class="text-[9px] text-quiet">generated</span>{/if}
               {@render stats(item.node.counts.additions, item.node.counts.deletions)}
             {/if}
           </button>
@@ -689,7 +690,7 @@
         {#if virtualized && virtualWindow.paddingBottom > 0}
           <div style:height={`${virtualWindow.paddingBottom}px`} aria-hidden="true" data-testid="work-files-virtual-padding-bottom"></div>
         {/if}
-        {#if visible.length === 0}<p class="p-4 text-center text-xs text-slate-500" data-testid="work-files-empty-filter">No changed files match this filter.</p>{/if}
+        {#if visible.length === 0}<p class="p-4 text-center text-xs text-quiet" data-testid="work-files-empty-filter">No changed files match this filter.</p>{/if}
       </div>
       <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
       <div
@@ -700,7 +701,7 @@
         aria-valuemin="200"
         aria-valuemax="480"
         aria-valuenow={treeWidth}
-        class="work-tree-wide-only absolute -right-1 top-0 z-20 hidden h-full w-2 cursor-col-resize touch-none focus-visible:bg-sky-400/40"
+        class="work-tree-wide-only absolute -right-1 top-0 z-20 hidden h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent-subtle"
         onpointerdown={startResize}
         onkeydown={resizeWithKeyboard}
         data-testid="work-files-resizer"
@@ -710,24 +711,24 @@
 
   <main bind:this={diffElement} class={`${mobileDiffOpen ? 'block' : 'hidden work-diff-wide'} min-w-0 max-w-full flex-1 overflow-auto p-2 sm:p-3`} data-testid="work-diff-pane">
     {#if selected}
-      <button type="button" class="work-tree-narrow-only mb-2 inline-flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm text-sky-200 hover:bg-slate-800" onclick={() => { mobileDiffOpen = false; }}><ArrowLeft class="h-4 w-4" />Back to files</button>
+      <button type="button" class="work-tree-narrow-only mb-2 inline-flex min-h-10 items-center gap-2 rounded-lg px-2 text-sm text-accent hover:bg-raised" onclick={() => { mobileDiffOpen = false; }}><ArrowLeft class="h-4 w-4" />Back to files</button>
       <div class="mb-2 flex min-w-0 items-center gap-2 text-xs">
         <span class={`font-mono font-bold ${statusClass(selected.status)}`}>{statusLabel(selected.status)}</span>
-        <span class="scrollbar-hidden-x min-w-0 font-mono text-slate-300">{selected.diff.old_path ? `${selected.diff.old_path} → ${selected.path}` : selected.path}</span>
+        <span class="scrollbar-hidden-x min-w-0 font-mono text-secondary">{selected.diff.old_path ? `${selected.diff.old_path} → ${selected.path}` : selected.path}</span>
         {@render stats(selected.counts.additions, selected.counts.deletions)}
       </div>
       {@render diffHistory(selectedHistoryFile ?? selected)}
     {:else}
-      <p class="p-8 text-center text-sm text-slate-500">Select a changed file.</p>
+      <p class="p-8 text-center text-sm text-quiet">Select a changed file.</p>
     {/if}
   </main>
 </div>
 
 {#if focusedDiffOpen && selectedHistoryFile && combineFileDiffHistory(selectedHistoryFile)}
-  <div class="fixed inset-0 z-50 flex flex-col bg-slate-950/95 backdrop-blur" role="dialog" aria-modal="true" aria-label={`Expanded diff for ${selected.path}`} data-testid="work-diff-overlay">
-    <header class="flex items-center gap-3 border-b border-slate-800 px-4 py-3">
-      <span class="scrollbar-hidden-x min-w-0 flex-1 font-mono text-xs text-slate-200">{selected.path}</span>
-      <button type="button" class="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200" onclick={() => { focusedDiffOpen = false; }} aria-label="Minimize diff">
+  <div class="fixed inset-0 z-50 flex flex-col bg-canvas/95 backdrop-blur" role="dialog" aria-modal="true" aria-label={`Expanded diff for ${selected.path}`} data-testid="work-diff-overlay">
+    <header class="flex items-center gap-3 border-b border-separator px-4 py-3">
+      <span class="scrollbar-hidden-x min-w-0 flex-1 font-mono text-xs text-foreground">{selected.path}</span>
+      <button type="button" class="inline-flex items-center gap-2 rounded-lg border border-control-border px-3 py-2 text-xs text-foreground" onclick={() => { focusedDiffOpen = false; }} aria-label="Minimize diff">
         <Minimize2 class="h-4 w-4" /> Minimize
       </button>
     </header>

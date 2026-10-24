@@ -7,7 +7,7 @@ import logging
 import os
 import secrets
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -27,6 +27,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.agent_direct import agent_direct_context_ref
 from cognis.models.deliverable import (
+    ArtifactRevisionError,
+    DeliverableRevisionError,
     RichPayloadValidationError,
     normalize_required_rich_payload,
     rich_export_metadata,
@@ -40,6 +42,7 @@ from cognis.store.deliverable_storage import (
 )
 from cognis.store.direct_turns import NONTERMINAL_STATUSES, DirectTurnAdmissionRejected
 from cognis.store.models import (
+    DELIVERABLE_LIVE_STATUSES,
     Agent,
     AgentGrantRow,
     AgentSecondaryBinding,
@@ -246,7 +249,60 @@ def _exclude_task_control_clause() -> sa.ColumnElement[bool]:
     )
 
 
-def _conversation_list_filters(
+def topic_conversation_clause() -> sa.ColumnElement[bool]:
+    """Ordinary web topics, matching the default Dashboard conversation scope."""
+    kind = sa.func.lower(
+        sa.func.trim(sa.func.coalesce(Conversation.context_data["kind"].as_string(), ""))
+    )
+    ref = sa.func.coalesce(Conversation.context_ref, "")
+    managed_target = sa.exists(
+        sa.select(ManagedConversationLink.link_id).where(
+            ManagedConversationLink.target_conversation_id == Conversation.conversation_id,
+            ManagedConversationLink.user_email == Conversation.user_email,
+        )
+    )
+    return sa.and_(
+        sa.func.lower(sa.func.trim(Conversation.context_type)) == "web",
+        kind.not_in(
+            (
+                "agent_direct",
+                "main",
+                "channel",
+                "external",
+                "task_control",
+                "agent_work",
+                "managed_agent_conversation",
+            )
+        ),
+        ~ref.startswith("web:agent_direct:"),
+        ~sa.and_(ref.startswith("web:user:"), ref.endswith(":default")),
+        ~managed_target,
+    )
+
+
+def conversation_waiting_candidate_clause(user_email: str) -> sa.ColumnElement[bool]:
+    """Select unread/actionable candidates before history pagination, not runtime eligibility."""
+    unread = sa.and_(
+        Conversation.last_message_at.is_not(None),
+        sa.or_(
+            Conversation.last_read_at.is_(None),
+            Conversation.last_message_at > Conversation.last_read_at,
+        ),
+    )
+    pending = sa.exists(
+        sa.select(NotificationRow.notification_id).where(
+            NotificationRow.user_email == user_email,
+            NotificationRow.conversation_id == Conversation.conversation_id,
+            NotificationRow.status == "pending",
+            NotificationRow.notification_type.in_(
+                ("escalation", "gate", "step_question", "credential_request", "auth_challenge")
+            ),
+        )
+    )
+    return sa.or_(unread, pending)
+
+
+def conversation_list_filters(
     user_email: str,
     *,
     context_type: str | None = None,
@@ -256,8 +312,15 @@ def _conversation_list_filters(
     status: str = "active",
     project_id: str | None = None,
     include_agent_direct: bool = True,
+    include_task_execution: bool = True,
 ) -> list[Any]:
-    filters: list[Any] = [Conversation.user_email == user_email]
+    """Build owner-scoped conversation eligibility shared by lists and summaries."""
+    from cognis.store.hook_visibility import internal_hook_conversation_clause
+
+    filters: list[Any] = [
+        Conversation.user_email == user_email,
+        ~internal_hook_conversation_clause(),
+    ]
     if status == "task":
         filters.extend([Conversation.status == "active", _task_control_clause()])
     elif status == "active":
@@ -277,6 +340,8 @@ def _conversation_list_filters(
         raise ValueError(f"Unsupported conversation status filter: {status}")
     if status != "task":
         filters.append(_exclude_task_control_clause())
+    if not include_task_execution:
+        filters.append(Conversation.context_type != "task")
     context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
     agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
     if len(context_values) == 1:
@@ -304,8 +369,13 @@ def _conversation_scope_filters(
     project_id: str | None = None,
     include_agent_direct: bool = True,
     status: str = "active",
+    include_internal: bool = False,
 ) -> list[Any]:
+    from cognis.store.hook_visibility import internal_hook_conversation_clause
+
     filters: list[Any] = [Conversation.user_email == user_email]
+    if not include_internal:
+        filters.append(~internal_hook_conversation_clause())
     filters.append(_task_control_clause() if status == "task" else _exclude_task_control_clause())
     context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
     agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
@@ -1160,7 +1230,11 @@ async def list_active_agents_summary(
 ) -> list[dict[str, str | None]]:
     """List safe agent metadata for tool responses."""
 
-    visible = await list_visible_agents(session, owner_email)
+    visible = await session.execute(
+        _visible_agents_statement(owner_email)
+        .with_only_columns(Agent.agent_id, Agent.name, Agent.description, Agent.status)
+        .where(Agent.status == "active")
+    )
     return [
         {
             "agent_id": row.agent_id,
@@ -1168,8 +1242,7 @@ async def list_active_agents_summary(
             "description": row.description,
             "status": row.status,
         }
-        for row, _grant in visible
-        if row.status == "active"
+        for row in visible.unique()
     ]
 
 
@@ -1187,6 +1260,37 @@ async def list_agents(session: AsyncSession, owner_email: str | None = None) -> 
         query = query.where(Agent.owner_email == owner_email)
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+@dataclass(frozen=True)
+class AgentReadinessSnapshot:
+    """Owner-scoped configuration inputs, never an editor/runtime definition."""
+
+    owner_email: str
+    name: str
+    status: str
+    agent_type: str
+    execution: dict[str, Any] | None
+    llm_config: dict[str, Any] | None
+
+
+async def list_agent_readiness_snapshots(
+    session: AsyncSession, owner_email: str
+) -> list[AgentReadinessSnapshot]:
+    """Load only the agent fields needed by diagnostics and configuration checks."""
+    result = await session.execute(
+        select(
+            Agent.owner_email,
+            Agent.name,
+            Agent.status,
+            Agent.agent_type,
+            Agent.execution,
+            Agent.llm_config,
+        )
+        .where(Agent.owner_email == owner_email)
+        .order_by(Agent.updated_at.desc(), Agent.agent_id.asc())
+    )
+    return [AgentReadinessSnapshot(*row) for row in result]
 
 
 async def list_visible_agents(
@@ -1212,6 +1316,34 @@ async def list_visible_agents(
         rows.append((agent_row, grant_row))
         seen.add(agent_row.agent_id)
     return rows
+
+
+def visible_agent_ids(user_email: str) -> Any:
+    """Select directly usable agents without hydrating their definitions."""
+    return _visible_agents_statement(user_email).with_only_columns(Agent.agent_id).order_by(None)
+
+
+def _visible_agents_statement(user_email: str) -> Any:
+    """One live visibility query, with owned agents first as in the public list."""
+    return (
+        select(Agent, AgentGrantRow)
+        .outerjoin(
+            AgentGrantRow,
+            sa.and_(
+                AgentGrantRow.agent_id == Agent.agent_id,
+                Agent.owner_email != user_email,
+                AgentGrantRow.grantee_type == "user",
+                AgentGrantRow.grantee_user_email == user_email,
+                AgentGrantRow.revoked_at.is_(None),
+            ),
+        )
+        .where(sa.or_(Agent.owner_email == user_email, AgentGrantRow.grant_id.is_not(None)))
+        .order_by(
+            sa.case((Agent.owner_email == user_email, 0), else_=1),
+            Agent.updated_at.desc(),
+            Agent.agent_id.asc(),
+        )
+    )
 
 
 async def get_active_agent_grant(
@@ -1463,16 +1595,20 @@ async def set_agent_status(session: AsyncSession, agent_id: str, status: str) ->
 
 
 async def get_system_agent_override(
-    session: AsyncSession, *, owner_email: str, agent_id: str
+    session: AsyncSession, *, owner_email: str, agent_id: str, for_update: bool = False
 ) -> SystemAgentOverride | None:
-    """Return the per-user override for a shipped system agent."""
+    """Return the per-user override for a shipped system agent.
 
-    result = await session.execute(
-        select(SystemAgentOverride).where(
-            SystemAgentOverride.owner_email == owner_email,
-            SystemAgentOverride.agent_id == agent_id,
-        )
+    ``for_update`` locks the row until the caller's transaction ends.
+    """
+
+    query = select(SystemAgentOverride).where(
+        SystemAgentOverride.owner_email == owner_email,
+        SystemAgentOverride.agent_id == agent_id,
     )
+    if for_update:
+        query = query.with_for_update()
+    result = await session.execute(query)
     return result.scalar_one_or_none()
 
 
@@ -1500,10 +1636,19 @@ async def upsert_system_agent_override(
     execution_override: dict[str, Any] | None = None,
     agent_profiles_override: dict[str, Any] | None = None,
     default_agent_profile_id_override: str | None = None,
+    create_only: bool = False,
 ) -> SystemAgentOverride:
-    """Create or update a per-user system-agent override row."""
+    """Create or update a per-user system-agent override row.
 
-    row = await get_system_agent_override(session, owner_email=owner_email, agent_id=agent_id)
+    ``create_only`` always inserts, so a concurrent first insert fails on the
+    owner/agent unique constraint instead of silently updating another row.
+    """
+
+    row = (
+        None
+        if create_only
+        else await get_system_agent_override(session, owner_email=owner_email, agent_id=agent_id)
+    )
     if row is None:
         row = SystemAgentOverride(
             override_id=f"sao_{uuid.uuid4().hex[:12]}",
@@ -1915,8 +2060,16 @@ async def create_conversation(
     memory_labels: dict[str, object] | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
+    visibility: str | None = None,
 ) -> Conversation:
-    """Create a new conversation row without trusted lineage."""
+    """Create a new conversation row without trusted lineage.
+
+    A chat created in a project is shared with it unless ``visibility`` says
+    otherwise.
+    """
+
+    if visibility is None:
+        visibility = "project" if project_id else "private"
 
     from cognis.channels.constants import CHANNEL_TOOL_CONVERSATION_PREFIX
 
@@ -1933,6 +2086,7 @@ async def create_conversation(
         context_type=context_type,
         context_ref=context_ref,
         project_id=project_id,
+        visibility=visibility,
         context_data=context_data,
         lineage_kind=None,
         fork_source_conversation_id=None,
@@ -1964,19 +2118,12 @@ async def create_lineage_conversation(
     memory_labels: dict[str, object] | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
+    visibility: str | None = None,
 ) -> Conversation:
     """Validate and create one canonical typed lineage edge in this transaction."""
 
-    source_session = (
-        await session.scalars(
-            select(Session)
-            .where(
-                Session.session_id == lineage.source_session_id,
-                Session.user_email == user_email,
-            )
-            .with_for_update()
-        )
-    ).one_or_none()
+    # Conversation precedes session, including implicit session FK locks in
+    # concurrent TODO persistence. Refresh any identity-map entries after waiting.
     source_conversation = (
         await session.scalars(
             select(Conversation)
@@ -1986,6 +2133,18 @@ async def create_lineage_conversation(
                 Conversation.status != "deleted",
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
+    source_session = (
+        await session.scalars(
+            select(Session)
+            .where(
+                Session.session_id == lineage.source_session_id,
+                Session.user_email == user_email,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).one_or_none()
     if (
@@ -2032,6 +2191,8 @@ async def create_lineage_conversation(
         context_type=context_type,
         context_ref=context_ref,
         project_id=project_id,
+        # Forks keep the source's sharing choice unless the caller overrides it.
+        visibility=visibility or source_conversation.visibility,
         context_data=context_data,
         lineage_kind=lineage.kind,
         fork_source_conversation_id=(
@@ -2218,7 +2379,7 @@ async def list_recent_web_recap_candidates(
             Conversation.last_message_at,
             recap_enablement.updated_at,
         )
-        .join(
+        .outerjoin(
             UserUiState,
             (Conversation.user_email == UserUiState.user_email)
             & (UserUiState.key == "ui.preferences"),
@@ -2234,7 +2395,7 @@ async def list_recent_web_recap_candidates(
             Conversation.active_session_id.is_not(None),
             Conversation.last_message_at >= since,
             Conversation.last_message_at <= until,
-            UserUiState.value["chat"]["auto_recap"].as_boolean().is_(True),
+            func.coalesce(UserUiState.value["chat"]["auto_recap"].as_boolean(), True).is_(True),
         )
         .order_by(Conversation.last_message_at.desc(), Conversation.conversation_id.desc())
         .limit(limit)
@@ -2260,6 +2421,9 @@ async def list_conversations(
     cursor_id: str | None = None,
     changed_since: datetime | None = None,
     title_query: str | None = None,
+    waiting_candidates: bool = False,
+    topic_only: bool = False,
+    include_shared: bool = False,
     limit: int | None = None,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
@@ -2269,8 +2433,12 @@ async def list_conversations(
     When ``cursor_id`` and ``limit`` are provided, pagination is applied in SQL
     before hydration so callers can avoid loading the full conversation set.
     """
-    ordering_activity = Conversation.last_message_at
-    filters = _conversation_list_filters(
+    ordering_activity = (
+        sa.func.coalesce(Conversation.last_message_at, Conversation.created_at)
+        if waiting_candidates
+        else Conversation.last_message_at
+    )
+    filters = conversation_list_filters(
         user_email,
         context_type=context_type,
         context_types=context_types,
@@ -2279,7 +2447,18 @@ async def list_conversations(
         status=status,
         project_id=project_id,
         include_agent_direct=include_agent_direct,
+        include_task_execution=not waiting_candidates,
     )
+    if waiting_candidates:
+        filters.append(conversation_waiting_candidate_clause(user_email))
+    if include_shared and not waiting_candidates and status not in ("starred", "task"):
+        from cognis.store.project_queries import shared_conversation_clause
+
+        filters[0] = sa.or_(
+            Conversation.user_email == user_email, shared_conversation_clause(user_email)
+        )
+    if topic_only:
+        filters.append(topic_conversation_clause())
     query = (
         select(Conversation)
         .where(*filters)
@@ -2314,6 +2493,9 @@ async def list_conversations(
             ).where(*filters, Conversation.conversation_id == cursor_id)
         )
         cursor_row = cursor_result.one_or_none()
+        if include_shared and cursor_row is None:
+            # Do not restart at page one after membership/visibility revocation.
+            return []
         if cursor_row is not None:
             _cursor_id, cursor_activity, cursor_created_at = cursor_row
             query = query.where(
@@ -2352,6 +2534,7 @@ async def list_sidebar_tombstone_conversation_ids(
     include_agent_direct: bool = False,
 ) -> list[str]:
     """Return conversations changed since a sidebar cursor but no longer visible."""
+    from cognis.store.hook_visibility import internal_hook_conversation_clause
 
     filters = _conversation_scope_filters(
         user_email,
@@ -2362,13 +2545,18 @@ async def list_sidebar_tombstone_conversation_ids(
         project_id=project_id,
         include_agent_direct=include_agent_direct,
         status=status,
+        include_internal=True,
     )
     visible_clause = _conversation_status_clause(status)
     result = await session.execute(
         select(Conversation.conversation_id)
         .where(*filters)
-        .where(Conversation.updated_at > changed_since)
-        .where(sa.not_(visible_clause))
+        .where(
+            sa.or_(
+                sa.and_(Conversation.updated_at > changed_since, sa.not_(visible_clause)),
+                internal_hook_conversation_clause(),
+            )
+        )
         .order_by(Conversation.updated_at.asc(), Conversation.conversation_id.asc())
     )
     return [str(conversation_id) for conversation_id in result.scalars().all()]
@@ -2383,7 +2571,7 @@ async def list_conversation_context_types(
 ) -> list[str]:
     """Return distinct conversation context types for sidebar filter projection."""
 
-    filters = _conversation_list_filters(
+    filters = conversation_list_filters(
         user_email,
         status=status,
         include_agent_direct=include_agent_direct,
@@ -2426,15 +2614,22 @@ async def list_pending_notification_types_by_conversation(
     if not ids:
         return {}
     result = await session.execute(
-        select(NotificationRow.conversation_id, NotificationRow.notification_type)
+        select(NotificationRow)
         .where(NotificationRow.user_email == user_email)
         .where(NotificationRow.conversation_id.in_(ids))
         .where(NotificationRow.status == "pending")
+        .where(NotificationRow.notification_type != "agent_question")
         .order_by(NotificationRow.created_at.asc(), NotificationRow.notification_id.asc())
     )
     pending: dict[str, list[str]] = {}
     seen: dict[str, set[str]] = {}
-    for conversation_id, notification_type in result.all():
+    from cognis.store.notification_expiry import notification_is_expired
+
+    now = datetime.now(UTC)
+    for row in result.scalars():
+        if notification_is_expired(row, now=now):
+            continue
+        conversation_id, notification_type = row.conversation_id, row.notification_type
         type_seen = seen.setdefault(conversation_id, set())
         if notification_type in type_seen:
             continue
@@ -2663,6 +2858,7 @@ async def sidebar_background_work_changed_since(
             Session.user_email == user_email,
             Session.parent_session_id.is_not(None),
             Session.updated_at > changed_since,
+            Session.delegation_mode.is_distinct_from("hook"),
         ),
         select(sa.literal(1))
         .select_from(Conversation)
@@ -2740,7 +2936,7 @@ async def sidebar_metadata_changed_since(
             UserUiState.updated_at > changed_since,
         ),
         select(sa.literal(1)).where(
-            *_conversation_list_filters(
+            *conversation_list_filters(
                 user_email,
                 status=status,
                 include_agent_direct=False,
@@ -3618,6 +3814,7 @@ async def list_open_managed_conversation_links(
     *,
     user_email: str,
     limit: int = 201,
+    controller_conversation_id: str | None = None,
 ) -> list[ManagedConversationLink]:
     """Return bounded, currently open managed conversations for one user."""
 
@@ -3637,6 +3834,11 @@ async def list_open_managed_conversation_links(
         .where(
             ManagedConversationLink.user_email == user_email,
             ManagedConversationLink.conversation_state == "open",
+            *(
+                [ManagedConversationLink.controller_conversation_id == controller_conversation_id]
+                if controller_conversation_id is not None
+                else []
+            ),
             origin_session.activity_scope_id == active_session.activity_scope_id,
         )
         .order_by(
@@ -5353,10 +5555,13 @@ async def list_conversation_sessions(
     statuses: list[str] | None = None,
     order: str = "asc",
     limit: int | None = None,
+    include_internal: bool = False,
 ) -> list[Session]:
     """List sessions for a conversation with optional bounded filters."""
 
     stmt = select(Session).where(Session.conversation_id == conversation_id)
+    if not include_internal:
+        stmt = stmt.where(Session.delegation_mode.is_distinct_from("hook"))
     if parent_session_id is not None:
         stmt = stmt.where(Session.parent_session_id == parent_session_id)
     elif parent_only is True:
@@ -5391,6 +5596,7 @@ async def get_child_session_continuation_chain(
         session,
         first.conversation_id,
         parent_session_id=first.parent_session_id,
+        include_internal=True,
     )
     lane_rows = {
         row.session_id: row
@@ -5473,6 +5679,7 @@ async def list_active_delegation_sessions(
     *,
     user_email: str,
     limit: int = 201,
+    controller_conversation_id: str | None = None,
 ) -> list[Session]:
     """Return bounded active child sessions across the user's conversations."""
 
@@ -5485,6 +5692,12 @@ async def list_active_delegation_sessions(
             Session.user_email == user_email,
             Session.parent_session_id.is_not(None),
             Session.status == "active",
+            Session.delegation_mode.is_distinct_from("hook"),
+            *(
+                [Session.conversation_id == controller_conversation_id]
+                if controller_conversation_id is not None
+                else []
+            ),
             Session.activity_scope_id == active_session.activity_scope_id,
         )
         .order_by(Session.updated_at.desc(), Session.started_at.desc())
@@ -5518,6 +5731,7 @@ async def list_delegation_sessions_in_active_scope(
             Session.conversation_id == controller_conversation_id,
             Session.parent_session_id.is_not(None),
             Session.activity_scope_id == active_session.activity_scope_id,
+            Session.delegation_mode.is_distinct_from("hook"),
         )
         .order_by(Session.updated_at.desc(), Session.started_at.desc())
         .limit(max(1, min(limit, 100)))
@@ -5679,8 +5893,20 @@ async def create_session(
     """Create a new session row."""
 
     resolved_session_id = session_id or f"sess_{uuid.uuid4().hex}"
+    artifact_scope_id = resolved_session_id
+    if previous_session_id:
+        previous = await session.get(Session, previous_session_id)
+        if (
+            previous is not None
+            and previous.user_email == user_email
+            and previous.agent_id == agent_id
+            and previous.conversation_id == conversation_id
+            and previous.parent_session_id == parent_session_id
+        ):
+            artifact_scope_id = previous.artifact_scope_id or previous.session_id
     session_row = Session(
         session_id=resolved_session_id,
+        artifact_scope_id=artifact_scope_id,
         activity_scope_id=activity_scope_id or resolved_session_id,
         conversation_id=conversation_id,
         parent_session_id=parent_session_id,
@@ -5703,6 +5929,10 @@ async def create_session(
     )
     session.add(session_row)
     await session.flush()
+    if source_session_id:
+        from cognis.core.artifact_entitlements import inherit_session_content
+
+        await session.run_sync(inherit_session_content, session_row)
     if session_row.intaris_session_id:
         from cognis.api.chat_v2.work_projection_eager import (
             initialize_session_work_projection,
@@ -5758,6 +5988,7 @@ async def get_latest_active_session_for_conversation(
         .where(
             Session.conversation_id == conversation_id,
             Session.status.in_(["active", "idle"]),
+            Session.parent_session_id.is_(None),
         )
         .order_by(Session.started_at.desc(), Session.session_id.desc())
         .limit(1)
@@ -6194,6 +6425,7 @@ async def list_child_sessions(session: AsyncSession, parent_session_id: str) -> 
     result = await session.execute(
         select(Session)
         .where(Session.parent_session_id == parent_session_id)
+        .where(Session.delegation_mode.is_distinct_from("hook"))
         .order_by(Session.started_at, Session.session_id)
     )
     return list(result.scalars().all())
@@ -6279,6 +6511,30 @@ async def list_credential_rows(session: AsyncSession, user_email: str) -> list[C
 # ---------------------------------------------------------------------------
 
 
+async def _initial_task_visibility(
+    session: AsyncSession, project_id: str | None, source_session_id: str | None
+) -> str:
+    """Project tasks are project-visible unless spawned from a private conversation.
+
+    A task created from a private conversation stays private so project
+    sharing never widens what the author chose to keep private.
+    """
+
+    if not project_id:
+        return "private"
+    if source_session_id:
+        result = await session.execute(
+            select(Conversation.visibility)
+            .join(Session, Session.conversation_id == Conversation.conversation_id)
+            .where(Session.session_id == source_session_id)
+            .limit(1)
+        )
+        source_visibility = result.scalar_one_or_none()
+        if source_visibility == "private":
+            return "private"
+    return "project"
+
+
 async def create_task(
     session: AsyncSession,
     *,
@@ -6291,6 +6547,7 @@ async def create_task(
     status: str = "draft",
     priority: int = 0,
     created_by_agent_id: str | None = None,
+    creation_origin: str | None = None,
     source_type: str = "api",
     source_ref: str | None = None,
     source_session_id: str | None = None,
@@ -6327,6 +6584,7 @@ async def create_task(
         agent_id=agent_id,
         agent_profile_id=agent_profile_id,
         created_by_agent_id=created_by_agent_id,
+        creation_origin=creation_origin,
         source_type=source_type,
         source_ref=source_ref,
         source_session_id=source_session_id,
@@ -6339,6 +6597,7 @@ async def create_task(
         session_policy=session_policy,
         workflow_id=workflow_id,
         project_id=project_id,
+        visibility=await _initial_task_visibility(session, project_id, source_session_id),
         workspace_root=workspace_root,
         working_directory=working_directory,
         workflow_state=workflow_state,
@@ -6790,6 +7049,8 @@ async def update_task_status(
     applied_completion_reason: str | None = None,
     delivery_mode: str | None = None,
     expected_attempt: int | None = None,
+    expected_status: str | None = None,
+    expected_pause_id: str | None = None,
 ) -> bool:
     """Update task status and optional lifecycle fields.
 
@@ -6824,6 +7085,13 @@ async def update_task_status(
         values["delivery_mode"] = delivery_mode
 
     predicates = [Task.task_id == task_id, Task.status.in_(allowed_from)]
+    if expected_status is not None:
+        predicates.append(Task.status == expected_status)
+    if expected_pause_id is not None:
+        predicates.append(
+            Task.workflow_state["pending_pause_payload"]["pause_id"].as_string()
+            == expected_pause_id
+        )
     if expected_attempt is not None:
         predicates.append(Task.attempt_number == expected_attempt)
     stmt = update(Task).where(*predicates).values(**values)
@@ -6898,21 +7166,16 @@ async def update_task_workflow_state(
     """Persist workflow state after a step transition.
 
     When *expected_version* is provided, the update uses optimistic
-    concurrency: it reads the current row, checks the stored version,
-    and only writes if it matches.  Returns ``False`` if the version
+    concurrency in the UPDATE predicate, not a read-then-write check.
+    Returns ``False`` if the version
     has been changed by another writer (stale write detected).
     """
+    predicates = [Task.task_id == task_id]
     if expected_version is not None:
-        # Read current state to check version (within the same session/tx)
-        row = await session.execute(select(Task.workflow_state).where(Task.task_id == task_id))
-        current_ws = row.scalar_one_or_none()
-        if current_ws is not None and isinstance(current_ws, dict):
-            db_version = current_ws.get("version", 0)
-            if db_version >= expected_version:
-                # Another writer already advanced the version — stale write
-                return False
-
-    stmt = update(Task).where(Task.task_id == task_id).values(workflow_state=workflow_state)
+        predicates.append(
+            func.coalesce(Task.workflow_state["version"].as_integer(), 0) == expected_version - 1
+        )
+    stmt = update(Task).where(*predicates).values(workflow_state=workflow_state)
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
@@ -7026,6 +7289,7 @@ async def list_active_tasks_by_source_conversation(
     *,
     created_by: str,
     limit: int = 100,
+    controller_conversation_id: str | None = None,
 ) -> list[Task]:
     """List non-terminal tasks that originated from a conversation."""
 
@@ -7037,6 +7301,11 @@ async def list_active_tasks_by_source_conversation(
             Task.source_ref.is_not(None),
             Task.source_session_id.is_not(None),
             Task.status.in_(["draft", "queued", "ready", "running", "paused"]),
+            *(
+                [Task.source_ref == controller_conversation_id]
+                if controller_conversation_id is not None
+                else []
+            ),
         )
         .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.task_id.desc())
         .limit(limit)
@@ -7244,6 +7513,232 @@ async def get_dependent_tasks(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _NewDeliverableLineage:
+    lineage_id: str
+    revision: int
+    supersedes_deliverable_id: str | None
+    target_title: str | None = None
+    # A revision keeps its lineage's project; ``None`` means "decide by context".
+    inherit_project: bool = False
+    project_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeliverableLineageSummary:
+    """Live-revision facts for one deliverable lineage."""
+
+    lineage_id: str
+    latest_deliverable_id: str
+    latest_revision: int
+    revision_count: int
+
+
+def deliverable_lineage_key(row: DeliverableRow) -> str:
+    """Return the lineage key, treating an unset lineage as the row itself."""
+
+    return row.lineage_id or row.deliverable_id
+
+
+def _is_live_supersedes_conflict(exc: IntegrityError) -> bool:
+    message = str(getattr(exc, "orig", exc))
+    return (
+        "uq_deliverables_live_supersedes" in message
+        or "deliverables.supersedes_deliverable_id" in message
+    )
+
+
+async def _resolve_new_deliverable_lineage(
+    session: AsyncSession,
+    *,
+    deliverable_id: str,
+    supersedes_deliverable_id: str | None,
+    replaced_drafts: list[DeliverableRow],
+) -> _NewDeliverableLineage:
+    """Decide lineage fields for a new deliverable row.
+
+    Replacing a draft of the same step output is not a new revision: the new
+    draft inherits the replaced draft's lineage position. An explicit target in
+    another scope must be the live head of its lineage.
+    """
+
+    replaced_ids = {draft.deliverable_id for draft in replaced_drafts}
+    if supersedes_deliverable_id is not None and supersedes_deliverable_id not in replaced_ids:
+        target = await session.scalar(
+            select(DeliverableRow)
+            .where(DeliverableRow.deliverable_id == supersedes_deliverable_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if target is None:
+            raise DeliverableRevisionError(
+                "supersedes_not_found",
+                "The deliverable to supersede was not found or is not accessible.",
+            )
+        lineage_id = deliverable_lineage_key(target)
+        if target.status not in DELIVERABLE_LIVE_STATUSES:
+            head = await get_deliverable_lineage_head(session, lineage_id)
+            raise DeliverableRevisionError(
+                "supersedes_not_active",
+                "The deliverable to supersede is a rejected or replaced draft. "
+                "Supersede the latest revision instead.",
+                latest_deliverable_id=head.deliverable_id if head is not None else None,
+                latest_revision=head.revision if head is not None else None,
+            )
+        successor = await session.scalar(
+            select(DeliverableRow.deliverable_id)
+            .where(
+                DeliverableRow.supersedes_deliverable_id == target.deliverable_id,
+                DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+                DeliverableRow.deliverable_id.not_in(replaced_ids or {""}),
+            )
+            .limit(1)
+        )
+        head = await get_deliverable_lineage_head(session, lineage_id)
+        if successor is not None or (
+            head is not None
+            and head.deliverable_id != target.deliverable_id
+            and head.deliverable_id not in replaced_ids
+        ):
+            raise DeliverableRevisionError(
+                "supersedes_not_latest",
+                "The deliverable to supersede already has a newer revision. "
+                "Supersede the latest revision instead.",
+                latest_deliverable_id=head.deliverable_id if head is not None else None,
+                latest_revision=head.revision if head is not None else None,
+            )
+        return _NewDeliverableLineage(
+            lineage_id=lineage_id,
+            revision=int(target.revision or 1) + 1,
+            supersedes_deliverable_id=target.deliverable_id,
+            target_title=target.title,
+            inherit_project=True,
+            project_id=target.project_id,
+        )
+    if replaced_drafts:
+        draft = max(replaced_drafts, key=lambda item: item.version)
+        return _NewDeliverableLineage(
+            lineage_id=deliverable_lineage_key(draft),
+            revision=int(draft.revision or 1),
+            supersedes_deliverable_id=draft.supersedes_deliverable_id,
+            inherit_project=True,
+            project_id=draft.project_id,
+        )
+    return _NewDeliverableLineage(
+        lineage_id=deliverable_id,
+        revision=1,
+        supersedes_deliverable_id=None,
+    )
+
+
+async def complete_revision_conflict(
+    session: AsyncSession,
+    error: DeliverableRevisionError,
+) -> DeliverableRevisionError:
+    """Roll back a lost revision race and attach the committed lineage head."""
+
+    if error.latest_deliverable_id is not None or error.lineage_id is None:
+        return error
+    await session.rollback()
+    head = await get_deliverable_lineage_head(session, error.lineage_id)
+    if head is not None:
+        error.latest_deliverable_id = head.deliverable_id
+        error.latest_revision = head.revision
+    return error
+
+
+async def _drafts_with_live_successor(
+    session: AsyncSession,
+    drafts: list[DeliverableRow],
+) -> dict[str, str]:
+    """Map replaceable drafts that have a live successor to their lineage IDs."""
+
+    if not drafts:
+        return {}
+    draft_ids = [draft.deliverable_id for draft in drafts]
+    rows = await session.scalars(
+        select(DeliverableRow.supersedes_deliverable_id).where(
+            DeliverableRow.supersedes_deliverable_id.in_(draft_ids),
+            DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+            DeliverableRow.deliverable_id.not_in(draft_ids),
+        )
+    )
+    successors = {str(item) for item in rows.all()}
+    return {
+        draft.deliverable_id: deliverable_lineage_key(draft)
+        for draft in drafts
+        if draft.deliverable_id in successors
+    }
+
+
+async def get_deliverable_lineage_head(
+    session: AsyncSession,
+    lineage_id: str,
+) -> DeliverableRow | None:
+    """Return the live revision with the highest revision number in a lineage."""
+
+    return cast(
+        DeliverableRow | None,
+        await session.scalar(
+            select(DeliverableRow)
+            .where(
+                DeliverableRow.lineage_id == lineage_id,
+                DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+            )
+            .order_by(DeliverableRow.revision.desc(), DeliverableRow.created_at.desc())
+            .limit(1)
+        ),
+    )
+
+
+async def list_deliverable_lineage(
+    session: AsyncSession,
+    lineage_id: str,
+) -> list[DeliverableRow]:
+    """List live revisions of a lineage, newest revision first."""
+
+    result = await session.scalars(
+        select(DeliverableRow)
+        .where(
+            DeliverableRow.lineage_id == lineage_id,
+            DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+        )
+        .order_by(DeliverableRow.revision.desc(), DeliverableRow.created_at.desc())
+    )
+    return list(result.all())
+
+
+async def get_deliverable_lineage_summary(
+    session: AsyncSession,
+    row: DeliverableRow,
+) -> DeliverableLineageSummary:
+    """Summarize the live revisions of the lineage that contains ``row``."""
+
+    lineage_id = deliverable_lineage_key(row)
+    count, latest_revision = (
+        await session.execute(
+            select(func.count(), func.max(DeliverableRow.revision)).where(
+                DeliverableRow.lineage_id == lineage_id,
+                DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+            )
+        )
+    ).one()
+    head = await get_deliverable_lineage_head(session, lineage_id) if count else None
+    if head is None:
+        return DeliverableLineageSummary(
+            lineage_id=lineage_id,
+            latest_deliverable_id=row.deliverable_id,
+            latest_revision=int(row.revision or 1),
+            revision_count=1,
+        )
+    return DeliverableLineageSummary(
+        lineage_id=lineage_id,
+        latest_deliverable_id=head.deliverable_id,
+        latest_revision=int(latest_revision or head.revision or 1),
+        revision_count=int(count),
+    )
+
+
 async def create_deliverable(
     session: AsyncSession,
     *,
@@ -7264,8 +7759,15 @@ async def create_deliverable(
     media_accessor_conversation_id: str | None = None,
     media_accessor_agent_id: str | None = None,
     published_owner_email: str | None = None,
+    supersedes_deliverable_id: str | None = None,
+    project_id: str | None = None,
 ) -> DeliverableRow:
-    """Create a new versioned deliverable for a step or conversation scope."""
+    """Create a new versioned deliverable for a step or conversation scope.
+
+    ``supersedes_deliverable_id`` makes the new row the next revision of that
+    deliverable's lineage. Callers own access authorization for the target;
+    this function enforces linear history and keeps the target payload.
+    """
 
     if bool(step_run_id) == bool(conversation_id):
         raise ValueError("deliverable must have exactly one owner scope")
@@ -7330,15 +7832,65 @@ async def create_deliverable(
     # Workflow writes revise one step output; direct-chat writes create
     # independent outputs whose returned references must remain readable.
     supersession_where = sa.and_(version_where, sa.literal(step_run_id is not None))
+    # Sharing changes and all revision writers serialize on immutable lineage
+    # roots, before draft/target row locks, so revocation includes new revisions.
+    from cognis.store.document_locks import lock_document_lineages
+
+    roots = list(
+        await session.scalars(
+            select(
+                sa.func.coalesce(DeliverableRow.lineage_id, DeliverableRow.deliverable_id)
+            ).where(
+                sa.or_(
+                    DeliverableRow.deliverable_id == supersedes_deliverable_id,
+                    sa.and_(
+                        supersession_where, DeliverableRow.status.in_(["buffered", "approved"])
+                    ),
+                )
+            )
+        )
+    )
+    await lock_document_lineages(session, DeliverableRow, roots)
+    # Row locks serialize draft replacement with a revision that targets the
+    # same draft (see _resolve_new_deliverable_lineage); both re-check after
+    # acquiring the lock. SQLite serializes writers and ignores FOR UPDATE.
     superseded_result = await session.execute(
-        select(DeliverableRow).where(
+        select(DeliverableRow)
+        .where(
             supersession_where,
             DeliverableRow.status.in_(["buffered", "approved"]),
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     superseded_rows = list(superseded_result.scalars().all())
+    # A draft that already has a live revision elsewhere is part of revision
+    # history: it must not be replaced, and its payload must survive.
+    protected_ids = await _drafts_with_live_successor(session, superseded_rows)
+    if protected_ids:
+        superseded_rows = [
+            row for row in superseded_rows if row.deliverable_id not in protected_ids
+        ]
+        if supersedes_deliverable_id is None:
+            protected = next(iter(protected_ids))
+            head = await get_deliverable_lineage_head(session, protected_ids[protected])
+            raise DeliverableRevisionError(
+                "supersedes_not_latest",
+                "This output already has a newer revision. Pass supersedes with the "
+                "latest revision to revise it.",
+                latest_deliverable_id=head.deliverable_id if head is not None else None,
+                latest_revision=head.revision if head is not None else None,
+            )
 
     row_deliverable_id = deliverable_id or f"dlv_{uuid.uuid4().hex}"
+    lineage = await _resolve_new_deliverable_lineage(
+        session,
+        deliverable_id=row_deliverable_id,
+        supersedes_deliverable_id=supersedes_deliverable_id,
+        replaced_drafts=superseded_rows,
+    )
+    if lineage.target_title is not None and not title:
+        title = lineage.target_title
     stored = await store_deliverable_payload(
         artifact_store,
         deliverable_id=row_deliverable_id,
@@ -7355,14 +7907,17 @@ async def create_deliverable(
         when="rollback",
     )
 
-    await session.execute(
-        update(DeliverableRow)
-        .where(
-            supersession_where,
-            DeliverableRow.status.in_(["buffered", "approved"]),
+    if superseded_rows:
+        await session.execute(
+            update(DeliverableRow)
+            .where(
+                DeliverableRow.deliverable_id.in_(
+                    [old_row.deliverable_id for old_row in superseded_rows]
+                ),
+                DeliverableRow.status.in_(["buffered", "approved"]),
+            )
+            .values(status="superseded", updated_at=_utcnow())
         )
-        .values(status="superseded", updated_at=_utcnow())
-    )
     if published_owner_email is not None and superseded_rows:
         await session.execute(
             update(ArtifactRecordRow)
@@ -7375,14 +7930,40 @@ async def create_deliverable(
             .values(status="deleted", deleted_at=_utcnow())
         )
 
+    content_owner_email = published_owner_email
+    content_owner_agent_id = None
+    if step_run_id is not None:
+        from cognis.core.content_refs import task_for_step_run
+
+        owning_task = await task_for_step_run(session, step_run_id)
+        if owning_task is not None:
+            content_owner_email = owning_task.created_by
+            content_owner_agent_id = owning_task.agent_id
+    elif conversation_id is not None:
+        creator = await get_conversation(session, conversation_id)
+        if creator is not None:
+            content_owner_email = creator.user_email
+            content_owner_agent_id = creator.agent_id
+        if session_id is not None:
+            creator_session = await session.get(Session, session_id)
+            if creator_session is not None and creator_session.user_email == content_owner_email:
+                content_owner_agent_id = creator_session.agent_id
     row = DeliverableRow(
         deliverable_id=row_deliverable_id,
+        owner_email=content_owner_email,
+        owner_agent_id=content_owner_agent_id,
         step_run_id=step_run_id,
         conversation_id=conversation_id,
         session_id=session_id,
         turn_id=turn_id,
         version=next_version,
         attempt_number=attempt_number,
+        lineage_id=lineage.lineage_id,
+        revision=lineage.revision,
+        supersedes_deliverable_id=lineage.supersedes_deliverable_id,
+        # Revisions and draft replacements keep the lineage project; a new
+        # lineage takes the project resolved by the caller.
+        project_id=lineage.project_id if lineage.inherit_project else project_id,
         storage_namespace=stored.namespace,
         storage_object_id=stored.object_id,
         content_key=stored.content.key,
@@ -7411,7 +7992,23 @@ async def create_deliverable(
         outputs=outputs,
     )
     session.add(row)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        if lineage.supersedes_deliverable_id is not None and _is_live_supersedes_conflict(exc):
+            # The failed transaction cannot be queried, and a savepoint would
+            # fire the payload-cleanup commit hooks early. The transaction owner
+            # completes the error with complete_revision_conflict().
+            raise DeliverableRevisionError(
+                "supersedes_not_latest",
+                "Another revision superseded this deliverable concurrently. "
+                "Supersede the latest revision instead.",
+                lineage_id=lineage.lineage_id,
+            ) from exc
+        raise
+    from cognis.core.artifact_entitlements import register_content_entitlements
+
+    await session.run_sync(register_content_entitlements, row)
     if published_owner_email is not None:
         extension = {
             "markdown": ".md",
@@ -7432,15 +8029,17 @@ async def create_deliverable(
             object_id=row.storage_object_id,
             filename=filename,
             owner_email=published_owner_email,
+            owner_agent_id=content_owner_agent_id,
             purpose="conversation_deliverable",
             kind="file",
             mime_type=row.content_mime,
             size_bytes=row.content_size,
             status="attached",
             expires_at=None,
-            conversation_id=None,
-            session_id=None,
+            conversation_id=conversation_id,
+            session_id=session_id,
             message_role="assistant",
+            project_id=row.project_id,
         )
     for old_row in superseded_rows:
         _queue_deliverable_payload_delete(
@@ -8346,6 +8945,7 @@ async def create_schedule(
     interaction_mode_override: str | None = "none",
     next_fire_at: datetime | None = None,
     created_by: str,
+    creation_origin: str | None = None,
 ) -> Schedule:
     """Create a schedule record."""
     row = Schedule(
@@ -8373,6 +8973,7 @@ async def create_schedule(
         interaction_mode_override=interaction_mode_override,
         next_fire_at=next_fire_at,
         created_by=created_by,
+        creation_origin=creation_origin,
     )
     session.add(row)
     await session.flush()
@@ -8444,6 +9045,7 @@ async def update_schedule(
         "next_fire_at",
         "disabled_reason",
         "consecutive_errors",
+        "creation_origin",
     }
     for key, value in fields.items():
         if key in allowed:
@@ -8946,6 +9548,7 @@ async def list_executors(
     include_shared: bool = False,
     for_update: bool = False,
     defer_observed_tools: bool = False,
+    executor_ids: list[str] | None = None,
 ) -> list[ExecutorRow]:
     """List all executor configurations.
 
@@ -8954,6 +9557,8 @@ async def list_executors(
     ``await session.refresh(row, attribute_names=["observed_tools"])``.
     """
     stmt = select(ExecutorRow).order_by(ExecutorRow.name)
+    if executor_ids is not None:
+        stmt = stmt.where(ExecutorRow.executor_id.in_(executor_ids))
     if defer_observed_tools:
         stmt = stmt.options(executor_observed_tools_deferred())
     if owner_email is not None:
@@ -10485,13 +11090,27 @@ async def create_artifact_record(
     content_hash: str | None = None,
     source_tool_call_id: str | None = None,
     source_anchor: str | None = None,
+    owner_agent_id: str | None = None,
+    lineage_id: str | None = None,
+    revision: int = 1,
+    supersedes_artifact_id: str | None = None,
+    project_id: str | None = None,
 ) -> ArtifactRecordRow:
+    if owner_agent_id is None and session_id is not None:
+        creator_session = await session.get(Session, session_id)
+        if creator_session is not None and creator_session.user_email == owner_email:
+            owner_agent_id = creator_session.agent_id
+    if owner_agent_id is None and conversation_id is not None:
+        creator = await get_conversation(session, conversation_id)
+        if creator is not None and creator.user_email == owner_email:
+            owner_agent_id = creator.agent_id
     row = ArtifactRecordRow(
         artifact_id=artifact_id,
         namespace=namespace,
         object_id=object_id,
         filename=filename,
         owner_email=owner_email,
+        owner_agent_id=owner_agent_id,
         conversation_id=conversation_id,
         session_id=session_id,
         message_role=message_role,
@@ -10504,10 +11123,187 @@ async def create_artifact_record(
         content_hash=content_hash,
         source_tool_call_id=source_tool_call_id,
         source_anchor=source_anchor,
+        lineage_id=lineage_id or artifact_id,
+        revision=revision,
+        supersedes_artifact_id=supersedes_artifact_id,
+        project_id=project_id,
     )
     session.add(row)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        if supersedes_artifact_id is not None and "supersedes_artifact_id" in (
+            str(getattr(exc, "orig", "")) + str(exc)
+        ):
+            # The transaction owner rolls back and reports the committed head
+            # with complete_artifact_revision_conflict().
+            raise ArtifactRevisionError(
+                "supersedes_not_latest",
+                "Another revision superseded this artifact concurrently. "
+                "Supersede the latest revision instead.",
+                lineage_id=row.lineage_id,
+            ) from exc
+        raise
+    from cognis.core.artifact_entitlements import register_content_entitlements
+
+    await session.run_sync(register_content_entitlements, row)
     return row
+
+
+def artifact_live_clause(model: Any = ArtifactRecordRow) -> Any:
+    """Artifacts that still count as a revision of their lineage."""
+
+    return sa.and_(model.status != "deleted", model.deleted_at.is_(None))
+
+
+async def get_artifact_lineage_head(
+    session: AsyncSession, lineage_id: str
+) -> ArtifactRecordRow | None:
+    """Return the live revision with the highest revision number in a lineage."""
+
+    return cast(
+        ArtifactRecordRow | None,
+        await session.scalar(
+            select(ArtifactRecordRow)
+            .where(ArtifactRecordRow.lineage_id == lineage_id, artifact_live_clause())
+            .order_by(ArtifactRecordRow.revision.desc(), ArtifactRecordRow.created_at.desc())
+            .limit(1)
+        ),
+    )
+
+
+async def list_artifact_lineage(
+    session: AsyncSession, lineage_id: str, *, access_predicate: Any = None
+) -> list[ArtifactRecordRow]:
+    """List live revisions of an artifact lineage, newest first."""
+
+    stmt = select(ArtifactRecordRow).where(
+        ArtifactRecordRow.lineage_id == lineage_id, artifact_live_clause()
+    )
+    if access_predicate is not None:
+        stmt = stmt.where(access_predicate)
+    result = await session.scalars(
+        stmt.order_by(ArtifactRecordRow.revision.desc(), ArtifactRecordRow.created_at.desc())
+    )
+    return list(result.all())
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactLineageSummary:
+    """Live-revision facts for one artifact lineage."""
+
+    lineage_id: str
+    latest_artifact_id: str
+    latest_revision: int
+    revision_count: int
+
+
+async def get_artifact_lineage_summary(
+    session: AsyncSession, row: ArtifactRecordRow
+) -> ArtifactLineageSummary:
+    """Summarize the live revisions of the lineage that contains ``row``."""
+
+    lineage_id = row.lineage_id or row.artifact_id
+    count = await session.scalar(
+        select(func.count()).where(
+            ArtifactRecordRow.lineage_id == lineage_id, artifact_live_clause()
+        )
+    )
+    head = await get_artifact_lineage_head(session, lineage_id) if count else None
+    if head is None:
+        return ArtifactLineageSummary(lineage_id, row.artifact_id, int(row.revision or 1), 1)
+    return ArtifactLineageSummary(
+        lineage_id, head.artifact_id, int(head.revision or 1), int(count or 1)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class NewArtifactLineage:
+    """Lineage fields for the next revision of an artifact."""
+
+    lineage_id: str
+    revision: int
+    supersedes_artifact_id: str
+    project_id: str | None
+
+
+async def lock_artifact_revision_target(
+    session: AsyncSession, supersedes_artifact_id: str
+) -> NewArtifactLineage:
+    """Lock a revision target and require it to be the live head of its lineage.
+
+    The row lock serializes revision writers on PostgreSQL; the partial unique
+    index ``uq_artifacts_live_supersedes`` is the backstop. Callers own access
+    authorization for the target.
+    """
+
+    from cognis.store.document_locks import lock_document_lineages
+
+    root = await session.scalar(
+        select(sa.func.coalesce(ArtifactRecordRow.lineage_id, ArtifactRecordRow.artifact_id)).where(
+            ArtifactRecordRow.artifact_id == supersedes_artifact_id
+        )
+    )
+    await lock_document_lineages(session, ArtifactRecordRow, [root] if root else [])
+    target = await session.scalar(
+        select(ArtifactRecordRow)
+        .where(ArtifactRecordRow.artifact_id == supersedes_artifact_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if target is None:
+        raise ArtifactRevisionError(
+            "supersedes_not_found",
+            "The artifact to supersede was not found or is not accessible.",
+        )
+    lineage_id = target.lineage_id or target.artifact_id
+    head = await get_artifact_lineage_head(session, lineage_id)
+    if target.status == "deleted" or target.deleted_at is not None:
+        raise ArtifactRevisionError(
+            "supersedes_not_active",
+            "The artifact to supersede was deleted. Supersede the latest revision instead.",
+            latest_artifact_id=head.artifact_id if head is not None else None,
+            latest_revision=head.revision if head is not None else None,
+        )
+    successor = await session.scalar(
+        select(ArtifactRecordRow.artifact_id)
+        .where(
+            ArtifactRecordRow.supersedes_artifact_id == target.artifact_id,
+            artifact_live_clause(),
+        )
+        .limit(1)
+    )
+    # A deleted intermediate revision must not reopen an older revision: the
+    # target has to be the live head itself.
+    if successor is not None or (head is not None and head.artifact_id != target.artifact_id):
+        raise ArtifactRevisionError(
+            "supersedes_not_latest",
+            "The artifact to supersede already has a newer revision. "
+            "Supersede the latest revision instead.",
+            latest_artifact_id=head.artifact_id if head is not None else None,
+            latest_revision=head.revision if head is not None else None,
+        )
+    return NewArtifactLineage(
+        lineage_id=lineage_id,
+        revision=int(target.revision or 1) + 1,
+        supersedes_artifact_id=target.artifact_id,
+        project_id=target.project_id,
+    )
+
+
+async def complete_artifact_revision_conflict(
+    session: AsyncSession, error: ArtifactRevisionError
+) -> ArtifactRevisionError:
+    """Roll back a lost revision race and attach the committed lineage head."""
+
+    if error.latest_deliverable_id is not None or error.lineage_id is None:
+        return error
+    await session.rollback()
+    head = await get_artifact_lineage_head(session, error.lineage_id)
+    if head is not None:
+        error.latest_deliverable_id = head.artifact_id
+        error.latest_revision = head.revision
+    return error
 
 
 async def get_artifact_record(session: AsyncSession, artifact_id: str) -> ArtifactRecordRow | None:
@@ -10538,12 +11334,32 @@ def _artifact_discovery_stmt(
     session_id: str | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
+    project_ids: Sequence[str] = (),
+    project_id: str | None = None,
 ) -> sa.Select[tuple[ArtifactRecordRow]]:
+    successor = aliased(ArtifactRecordRow)
+    # Own records, plus documents of projects the caller may access. The
+    # caller's access predicate still decides each row.
+    scope = ArtifactRecordRow.owner_email == owner_email
+    if project_ids:
+        scope = sa.or_(scope, ArtifactRecordRow.project_id.in_(list(project_ids)))
     stmt = select(ArtifactRecordRow).where(
-        ArtifactRecordRow.owner_email == owner_email,
+        scope,
         ArtifactRecordRow.status != "deleted",
         sa.or_(ArtifactRecordRow.expires_at.is_(None), ArtifactRecordRow.expires_at > _utcnow()),
+        # Discovery shows only the latest revision of a lineage; older
+        # revisions stay readable by exact art_/dlv_ reference.
+        ~sa.exists().where(
+            DeliverableRow.supersedes_deliverable_id == ArtifactRecordRow.artifact_id,
+            DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+        ),
+        ~sa.exists().where(
+            successor.supersedes_artifact_id == ArtifactRecordRow.artifact_id,
+            artifact_live_clause(successor),
+        ),
     )
+    if project_id is not None:
+        stmt = stmt.where(ArtifactRecordRow.project_id == project_id)
     if kind is not None:
         stmt = stmt.where(ArtifactRecordRow.kind == kind)
     if purpose is not None:
@@ -10568,6 +11384,9 @@ async def list_recent_artifact_records(
     purpose: str | None = None,
     conversation_id: str | None = None,
     session_id: str | None = None,
+    access_predicate: Any = None,
+    project_ids: Sequence[str] = (),
+    project_id: str | None = None,
 ) -> list[ArtifactRecordRow]:
     result = await session.execute(
         _artifact_discovery_stmt(
@@ -10576,7 +11395,10 @@ async def list_recent_artifact_records(
             purpose=purpose,
             conversation_id=conversation_id,
             session_id=session_id,
+            project_ids=project_ids,
+            project_id=project_id,
         )
+        .where(access_predicate if access_predicate is not None else sa.true())
         .order_by(ArtifactRecordRow.created_at.desc(), ArtifactRecordRow.artifact_id.desc())
         .limit(limit)
     )
@@ -10595,6 +11417,9 @@ async def search_artifact_records(
     session_id: str | None = None,
     created_after: datetime | None = None,
     created_before: datetime | None = None,
+    access_predicate: Any = None,
+    project_ids: Sequence[str] = (),
+    project_id: str | None = None,
 ) -> list[ArtifactRecordRow]:
     stmt = _artifact_discovery_stmt(
         owner_email=owner_email,
@@ -10602,10 +11427,14 @@ async def search_artifact_records(
         purpose=purpose,
         conversation_id=conversation_id,
         session_id=session_id,
+        project_ids=project_ids,
+        project_id=project_id,
         created_after=created_after,
         created_before=created_before,
     )
     normalized_query = " ".join((query or "").strip().lower().split())
+    if access_predicate is not None:
+        stmt = stmt.where(access_predicate)
     if normalized_query:
         for token in normalized_query.split():
             pattern = f"%{token}%"
@@ -10622,6 +11451,59 @@ async def search_artifact_records(
         ).limit(limit)
     )
     return list(result.scalars().all())
+
+
+async def discover_task_deliverables(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    access_predicate: Any,
+    project_ids: Sequence[str] = (),
+    project_id: str | None = None,
+    query: str | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    limit: int = 10,
+) -> list[DeliverableRow]:
+    """Discover the latest revision of readable task deliverables.
+
+    Conversation deliverables are discovered through their artifact records.
+    """
+
+    successor = aliased(DeliverableRow)
+    scope = DeliverableRow.owner_email == owner_email
+    if project_ids:
+        scope = sa.or_(scope, DeliverableRow.project_id.in_(list(project_ids)))
+    stmt = select(DeliverableRow).where(
+        scope,
+        access_predicate,
+        DeliverableRow.step_run_id.is_not(None),
+        DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+        ~sa.exists().where(
+            successor.supersedes_deliverable_id == DeliverableRow.deliverable_id,
+            successor.status.in_(DELIVERABLE_LIVE_STATUSES),
+        ),
+    )
+    if project_id is not None:
+        stmt = stmt.where(DeliverableRow.project_id == project_id)
+    if created_after is not None:
+        stmt = stmt.where(DeliverableRow.created_at >= created_after)
+    if created_before is not None:
+        stmt = stmt.where(DeliverableRow.created_at <= created_before)
+    for token in " ".join((query or "").strip().lower().split()).split():
+        pattern = f"%{token}%"
+        stmt = stmt.where(
+            sa.or_(
+                sa.func.lower(sa.func.coalesce(DeliverableRow.title, "")).like(pattern),
+                sa.func.lower(DeliverableRow.deliverable_id).like(pattern),
+            )
+        )
+    result = await session.scalars(
+        stmt.order_by(DeliverableRow.created_at.desc(), DeliverableRow.deliverable_id.desc()).limit(
+            limit
+        )
+    )
+    return list(result.all())
 
 
 async def find_tool_artifact_record(
@@ -10692,6 +11574,29 @@ async def mark_artifacts_attached(
 ) -> int:
     if not artifact_ids:
         return 0
+    creator = await get_conversation(session, conversation_id)
+    if creator is None or (owner_email is not None and creator.user_email != owner_email):
+        return 0
+    from cognis.store.models import ArtifactGrantRow
+
+    # Reusing content must not move its ownership or erase its original provenance.
+    rows = await get_artifact_records(session, artifact_ids)
+    for row in rows:
+        if row.owner_email != creator.user_email or row.status == "deleted":
+            continue
+        if row.owner_agent_id is None and row.status == "temporary":
+            row.owner_agent_id = creator.agent_id
+            row.conversation_id = conversation_id
+            row.session_id = session_id
+        elif row.owner_agent_id != creator.agent_id and message_role == "user":
+            key = dict(
+                owner_email=creator.user_email,
+                content_ref=row.artifact_id,
+                agent_id=creator.agent_id,
+                source="input",
+            )
+            if await session.get(ArtifactGrantRow, key) is None:
+                session.add(ArtifactGrantRow(**key))
     stmt = update(ArtifactRecordRow).where(
         ArtifactRecordRow.artifact_id.in_(artifact_ids),
         ArtifactRecordRow.status != "deleted",
@@ -10701,8 +11606,6 @@ async def mark_artifacts_attached(
     result = await session.execute(
         stmt.values(
             status="attached",
-            conversation_id=conversation_id,
-            session_id=session_id,
             message_role=message_role,
             expires_at=None,
         )
@@ -10755,6 +11658,7 @@ async def claim_artifact_cleanup(
                     ),
                 ),
                 sa.and_(
+                    ArtifactRecordRow.owner_agent_id.is_(None),
                     ArtifactRecordRow.conversation_id.is_not(None),
                     ~sa.exists(
                         select(Conversation.conversation_id).where(
@@ -10794,6 +11698,7 @@ async def list_orphaned_attached_artifacts(
                     ),
                 ),
                 sa.and_(
+                    ArtifactRecordRow.owner_agent_id.is_(None),
                     ArtifactRecordRow.conversation_id.is_not(None),
                     sa.not_(
                         sa.exists(
@@ -10889,6 +11794,34 @@ async def _lock_active_knowledgebase(session: AsyncSession, *, knowledgebase_id:
         .values(updated_at=KnowledgebaseRow.updated_at)
     )
     return _rowcount(result) == 1
+
+
+async def lock_knowledgebase_share_transition(
+    session: AsyncSession, *, knowledgebase_id: str
+) -> bool:
+    """Serialize a share's prior-state read, grant mutation, and inbox entry."""
+    return await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id)
+
+
+async def lock_resource_share_transition(
+    session: AsyncSession, *, resource_type: Literal["agent", "project"], resource_id: str
+) -> bool:
+    """Lock before reading grants, including absent grants, until caller commit.
+
+    A no-op parent write serializes on both PostgreSQL and SQLite. All sharing
+    transports use this before deciding whether a transition needs a notice.
+    """
+    if resource_type == "agent":
+        statement = (
+            update(Agent).where(Agent.agent_id == resource_id).values(updated_at=Agent.updated_at)
+        )
+    else:
+        statement = (
+            update(ProjectRow)
+            .where(ProjectRow.project_id == resource_id)
+            .values(updated_at=ProjectRow.updated_at)
+        )
+    return _rowcount(await session.execute(statement)) == 1
 
 
 async def _advance_attachment_generation(
@@ -11121,6 +12054,8 @@ async def get_active_knowledgebase_grant(
 async def list_knowledgebases_for_user(
     session: AsyncSession, user_email: str
 ) -> list[KnowledgebaseRow]:
+    from cognis.store.project_knowledge import readable_project_knowledge_ids
+
     granted = select(KnowledgebaseGrantRow.knowledgebase_id).where(
         KnowledgebaseGrantRow.grantee_user_email == user_email,
         KnowledgebaseGrantRow.revoked_at.is_(None),
@@ -11132,6 +12067,7 @@ async def list_knowledgebases_for_user(
             sa.or_(
                 KnowledgebaseRow.owner_email == user_email,
                 KnowledgebaseRow.knowledgebase_id.in_(granted),
+                KnowledgebaseRow.knowledgebase_id.in_(readable_project_knowledge_ids(user_email)),
             ),
         )
         .order_by(KnowledgebaseRow.name.asc(), KnowledgebaseRow.knowledgebase_id.asc())
@@ -12149,9 +13085,13 @@ async def insert_knowledgebase_chunks(
 
 
 async def list_knowledgebase_chunks(
-    session: AsyncSession, *, knowledgebase_id: str
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    kb_artifact_id: str | None = None,
+    generation: int | None = None,
 ) -> list[KnowledgebaseChunkRow]:
-    result = await session.execute(
+    query = (
         select(KnowledgebaseChunkRow)
         .join(
             KnowledgebaseArtifactRow,
@@ -12163,6 +13103,11 @@ async def list_knowledgebase_chunks(
             KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
+    if kb_artifact_id is not None:
+        query = query.where(KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id)
+    if generation is not None:
+        query = query.where(KnowledgebaseChunkRow.generation == generation)
+    result = await session.execute(query)
     return list(result.scalars().all())
 
 
@@ -12322,6 +13267,45 @@ async def create_or_get_channel_delivery_outbox(
         return existing, False
 
 
+async def reuse_direct_turn_terminal_delivery(
+    session: AsyncSession,
+    *,
+    grace_delivery_id: str,
+    conversation_id: str,
+    turn_id: str,
+) -> ChannelDeliveryOutboxRow | None:
+    """Keep completion and error events on the existing fenced terminal owner."""
+    grace_row = await get_channel_delivery_outbox(session, grace_delivery_id)
+    if grace_row is not None and grace_row.conversation_id != conversation_id:
+        raise ValueError("follow-up delivery conversation mismatch")
+    # A notification turn can adopt a participant's channel route mid-turn.
+    # Its fenced direct terminal row then owns the answer, including retries.
+    direct_terminal = await session.scalar(
+        select(ChannelDeliveryOutboxRow)
+        .join(
+            DirectTurnRequestRow,
+            DirectTurnRequestRow.request_id == ChannelDeliveryOutboxRow.direct_turn_request_id,
+        )
+        .where(
+            DirectTurnRequestRow.conversation_id == conversation_id,
+            DirectTurnRequestRow.turn_id == turn_id,
+            ChannelDeliveryOutboxRow.delivery_id.in_(
+                [
+                    "direct-turn:" + DirectTurnRequestRow.request_id + ":final",
+                    "direct-turn:" + DirectTurnRequestRow.request_id + ":error",
+                ]
+            ),
+        )
+    )
+    if direct_terminal is not None:
+        await suppress_unsent_channel_delivery_outbox(
+            session,
+            delivery_id=grace_delivery_id,
+            reason="fenced direct turn owns the terminal reply",
+        )
+    return direct_terminal
+
+
 async def ensure_follow_up_result_delivery(
     session: AsyncSession,
     *,
@@ -12334,7 +13318,14 @@ async def ensure_follow_up_result_delivery(
     deliverable_id: str | None,
 ) -> ChannelDeliveryOutboxRow | None:
     """Create the durable terminal phase for a channel-bound follow-up."""
-
+    direct_terminal = await reuse_direct_turn_terminal_delivery(
+        session,
+        grace_delivery_id=grace_delivery_id,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+    )
+    if direct_terminal is not None:
+        return direct_terminal
     source_type = "follow_up_result"
     stable_key = hashlib.sha256(f"{source_type}:{grace_delivery_id}".encode()).hexdigest()[:20]
     result_delivery_id = f"cdel_{stable_key}"

@@ -483,9 +483,8 @@ scope violations.
 
 ## Completion Record
 
-- Integration branch/worktree:
-  `feat/stage-39-workflow-task-cockpit` in
-  `/home/riker/src/cognis-stage39`.
+- Integration used a task-owned isolated checkout. Private branch and filesystem
+  locations are omitted from this public record.
 - Implementation stack:
   - `32ece3ab` — effective workflow snapshots and presentation phases;
   - `f4081df9` — deterministic definitions and secure rendering;

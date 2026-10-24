@@ -4,8 +4,6 @@ Executors are the part of Cognis that perform tool execution. The controller dec
 
 ![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)
 
-![Executor browser automation and tool configuration](../assets/screenshots/executor-browser-tools.webp)
-
 ## Why executors exist
 
 This separation lets Cognis:
@@ -88,6 +86,23 @@ Open `Settings` and use the executors section to inspect:
 - individually enabled tools
 - attached MCP servers
 
+The monitor shows one card per executor with its platform, health, CPU and
+memory utilization, optional GPU utilization, and reported capability indicators.
+Unknown measurements are shown as unavailable, not zero. Charts retain up to
+20 minutes of samples collected while this settings page is open; they are not
+durable monitoring history.
+
+Select a card to open its detail dialog. **Overview** contains resource details
+and runtime diagnostics; **Tools & MCP** contains observed capabilities and tool
+assignments; **Runtime** contains browser, LSP, Office, and channel settings;
+**Inference** configures local inference; **Settings** edits identity, labels,
+sharing, connection tokens, and removal.
+
+Resource updates use a page-scoped subscription on the existing authenticated
+WebSocket and the executor's existing resource reports. There is no periodic
+executor-list HTTP polling. Reconnection refreshes the current inventory once;
+stale labels continue to age locally when telemetry stops.
+
 If browser automation is enabled on an executor, the same settings area also
 lets you configure browser runtime behavior such as auto-install, engine,
 headed-mode allowance, persistent local profiles, Xvfb fallback for headed
@@ -106,7 +121,44 @@ WebSocket executors can report several runtime states:
 
 `desired` and `applied` are config generations, not simple reconnect counters. If they differ, the executor is behind the latest saved configuration.
 
+### Inspecting and retrying runtime failures
+
+On the dashboard, expand an executor issue with **Show details** to see MCP
+initialization phases, error categories, timeout messages, and runtime warnings.
+The same runtime diagnostics are available in Settings → Executors.
+
+**Refresh status** reads the latest reported status; it does not restart anything.
+Owners (or admins for shared executors) can use **Retry configuration** to request
+runtime initialization again without editing settings or rotating the token.
+This reinitializes all configured MCP servers and may briefly affect their tools.
+It does not restart the executor service. For an offline executor, the request is
+applied on reconnect. An outstanding configuration generation is reused rather
+than superseded by repeated retries.
+
+An `initialize` timeout includes launching a stdio server and completing its MCP
+handshake. It does not by itself prove that the service behind the MCP server is
+down. Check the server's startup dependencies and configured connection timeout
+if retries continue to fail.
+
+After the executor becomes usable, timed-out MCP servers get up to three
+background retries, waiting 5, 15, and 30 seconds between attempts. Healthy MCP
+servers and native tools remain available. Authorization failures are not retried.
+Recovery publishes the discovered tools and clears the corresponding failure.
+Retries stop on configuration changes or disconnection. Executors without the
+targeted-retry RPC require a manual configuration retry.
+
 ### Disconnect and replay semantics
+
+When active work enters executor recovery, the chat shows an unavailable notice
+instead of waiting silently. A successful recovery adds an available notice.
+Runtime admission waits up to 15 minutes for the same executor to become ready;
+reconnecting alone is not enough if its configuration or tool inventory is still
+unavailable. You can cancel while waiting.
+
+If recovery times out, that turn stops. Send a new message after the executor is
+ready. Each new conversation turn gets its own recovery budget; retries and
+controller takeovers of the same turn retain the original deadline. These
+notices describe active work, not background monitoring of idle executors.
 
 Cognis may retry a small allowlist of read-only unary executor RPCs after an
 ambiguous transport failure. Those retries reuse a stable logical call ID. The
@@ -277,6 +329,11 @@ operation and emits a durable system notice. Additional executors remain
 explicit-only; an expired additional assignment may return to an eligible
 primary.
 
+If runtime tool discovery loses the executor connection during a restart, active
+work waits for the same selected executor within the existing 900-second recovery
+window, then rebuilds its tool inventory. Repeated disconnects do not reset this
+deadline. Cancellation still stops the wait.
+
 For task workflows, the binding is persisted at the task level. All steps
 of a single task run on the same executor by default — even though each
 step creates its own conversation, the task pin carries forward and the
@@ -285,6 +342,11 @@ controller never re-picks between steps. `switch_executor` or
 inherited by every subsequent step.
 
 ### `switch_executor` tool
+
+Call this tool alone. Before changing the active binding, the controller rebuilds
+the target's authorized tool inventory. A failed or cancelled inventory read
+leaves the binding and current inventory unchanged. A successful switch replaces
+executor tools rather than combining inventories from different machines.
 
 Available to the LLM whenever the agent has more than one assigned
 executor. The schema is constrained to currently usable assigned

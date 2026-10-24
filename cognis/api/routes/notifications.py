@@ -26,6 +26,7 @@ from cognis.core.notification_resolution import (
 )
 from cognis.core.notifications import Notification, NotificationService
 from cognis.core.question_sets import plain_text_reply_for_questions, validate_reply_for_questions
+from cognis.providers.guardrails.resolution_errors import ResolutionRejected
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
 attention_router = APIRouter(prefix="/api/v1/attention-actions", tags=["attention-actions"])
@@ -132,7 +133,11 @@ async def get_notification(
     user = require_current_user(request)
     svc = _get_service(request)
     notification = await svc.get(notification_id)
-    if notification is None or notification.user_email != user.email:
+    if (
+        notification is None
+        or notification.user_email != user.email
+        or notification.notification_type == "agent_question"
+    ):
         raise HTTPException(status_code=404, detail="Notification not found")
     return _to_response(notification)
 
@@ -155,7 +160,11 @@ async def resolve_notification(
 
     # Verify ownership before resolving
     notification = await svc.get(notification_id)
-    if notification is None or notification.user_email != user.email:
+    if (
+        notification is None
+        or notification.user_email != user.email
+        or notification.notification_type == "agent_question"
+    ):
         raise HTTPException(status_code=404, detail="Notification not found")
     if (
         notification.notification_type == "auth_challenge"
@@ -277,8 +286,23 @@ async def resolve_notification(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    ok = await svc.resolve(notification_id, payload.decision, data, user_email=user.email)
+    try:
+        ok = await svc.resolve(
+            notification_id,
+            payload.decision,
+            data,
+            user_email=user.email,
+            human_answer=notification.notification_type == "step_question",
+        )
+    except ResolutionRejected as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.api_detail()) from None
     if not ok:
+        current = await svc.get(notification_id)
+        if current is not None and current.status in {"pending", "resolving"}:
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to confirm the approval with Intaris. Please try again.",
+            )
         raise HTTPException(
             status_code=409,
             detail="Notification already resolved or not found",
@@ -428,6 +452,7 @@ async def resolve_attention_action(
                     notification_id=action_id,
                     expected_revision=payload.expected_revision,
                     submission_id=payload.submission_id,
+                    human_answer=True,
                 )
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -505,7 +530,10 @@ async def resolve_attention_action(
                 user_email=user.email,
                 expected_revision=payload.expected_revision,
                 data_factory=data_factory,
+                human_answer=detail.kind == "step_question",
             )
+        except ResolutionRejected as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.api_detail()) from None
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not ok:

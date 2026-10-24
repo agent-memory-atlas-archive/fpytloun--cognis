@@ -12,14 +12,14 @@
    * for 44x44 icon-only buttons where tap area is critical.
    */
   const buttonVariants = cva(
-    'inline-flex items-center justify-center rounded-xl text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 disabled:pointer-events-none disabled:opacity-60 select-none',
+    'primitive-button inline-flex items-center justify-center rounded-xl text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:pointer-events-none disabled:opacity-60 select-none',
     {
       variants: {
         variant: {
-          primary: 'bg-sky-500 text-slate-950 hover:bg-sky-400',
-          secondary: 'border border-slate-700 bg-slate-900 text-slate-100 hover:border-slate-500 hover:bg-slate-800',
-          ghost: 'text-slate-300 hover:bg-slate-800 hover:text-white',
-          danger: 'bg-rose-500 text-white hover:bg-rose-400'
+          primary: 'bg-accent text-on-accent hover:bg-accent-hover',
+          secondary: 'primitive-secondary border border-control-border bg-surface text-foreground hover:border-border-strong',
+          ghost: 'primitive-ghost text-secondary',
+          danger: 'primitive-danger'
         },
         size: {
           // default: 40px min-height mobile; 36px at md+ (preserves desktop density)

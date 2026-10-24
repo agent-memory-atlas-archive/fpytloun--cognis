@@ -1,8 +1,12 @@
 import type {
   ContextUsage,
   GenerationPerformanceSnapshot,
+  IntarisSessionDetail,
+  TokenUsage,
   RuntimeSelection
 } from '$lib/types/api';
+import { mergeContextUsage } from '$lib/sessionDiagnostics';
+import { mergeLatestPerformance } from '$lib/generation-performance';
 
 const MAX_ENTRIES = 16;
 const MAX_PER_CONVERSATION = 8;
@@ -22,6 +26,8 @@ export interface SessionInfoData {
   context_usage?: ContextUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;
   runtime_selection?: RuntimeSelection | null;
+  inference_target?: IntarisSessionDetail['inference_target'];
+  token_usage?: TokenUsage | null;
 }
 
 export function mergeRuntimeSelection(
@@ -40,6 +46,45 @@ export function newestRuntimeSelection(
   incoming: RuntimeSelection
 ): RuntimeSelection {
   return current && current.revision > incoming.revision ? current : incoming;
+}
+
+export function sessionInfoFromDetail(detail: IntarisSessionDetail): SessionInfoData {
+  return { ...detail };
+}
+
+export function mergeSessionContextUsage(
+  current: SessionInfoData,
+  incoming: ContextUsage | null,
+): SessionInfoData {
+  const context = mergeContextUsage(current.context_usage ?? null, incoming);
+  const target = current.inference_target;
+  const targetIsStale = incoming && context === incoming && target && (
+    (incoming.provider_id && incoming.provider_id !== target.provider_id)
+    || (incoming.model && incoming.model !== target.model)
+  );
+  return { ...current, context_usage: context, inference_target: targetIsStale ? null : target };
+}
+
+/** Selection revisions and measured runtime revisions are separate clocks. */
+export function mergeSessionInfo(
+  current: SessionInfoData | null,
+  incoming: SessionInfoData,
+): SessionInfoData {
+  if (!current || current.intaris_session_id !== incoming.intaris_session_id) return incoming;
+  const context = mergeContextUsage(current.context_usage ?? null, incoming.context_usage ?? null);
+  const incomingIsOlder = context === current.context_usage && context !== incoming.context_usage;
+  return {
+    ...current,
+    ...incoming,
+    context_usage: context,
+    last_generation: mergeLatestPerformance(current.last_generation ?? null, incoming.last_generation ?? null),
+    runtime_selection: incoming.runtime_selection
+      ? newestRuntimeSelection(current.runtime_selection, incoming.runtime_selection)
+      : current.runtime_selection,
+    inference_target: incomingIsOlder
+      ? current.inference_target
+      : incoming.inference_target ?? current.inference_target,
+  };
 }
 
 type Entry = {

@@ -1,4 +1,8 @@
 <script lang="ts">
+  import { findTarget } from '$lib/find';
+  import { agentModelCapabilities, type AgentModelCapabilities } from '$lib/agent-model-capabilities';
+  import type { Snippet } from 'svelte';
+  import type { InferenceRoute } from '$lib/inference-routes';
   import Sparkles from 'lucide-svelte/icons/sparkles';
 import Loader2 from 'lucide-svelte/icons/loader-2';
   import Eye from 'lucide-svelte/icons/eye';
@@ -11,6 +15,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
+  import { INSTANCE_MANAGEMENT_TOOLS } from '$lib/instance-management';
   import { thinkingEffortLabel } from '$lib/thinking';
   import {
     buildSystemPromptPreview,
@@ -34,7 +39,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   let {
     mode,
-    form,
+    form = $bindable(),
     tools,
     workflows,
     providers,
@@ -55,6 +60,16 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     editableFields = [],
     onSave,
     onBindingsChange,
+    activeSection = $bindable('identity'),
+    identityActions,
+    accessActions,
+    extraSections = [],
+    dirty = true,
+    bindingsSaving = false,
+    toolsLoading = false,
+    toolsError = '',
+    onRetryTools,
+    toolsKnown = true,
   } = $props<{
     mode: 'create' | 'edit';
     form: AgentFormState;
@@ -78,26 +93,40 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     editableFields?: string[];
     onSave: (payload: Record<string, unknown>) => void | Promise<void>;
     onBindingsChange?: ((bindings: string[]) => void | Promise<void>) | null;
+    activeSection?: string;
+    identityActions?: Snippet;
+    accessActions?: Snippet;
+    extraSections?: { id: string; label: string; content: Snippet }[];
+    dirty?: boolean;
+    bindingsSaving?: boolean;
+    toolsLoading?: boolean;
+    toolsError?: string;
+    onRetryTools?: () => void;
+    toolsKnown?: boolean;
   }>();
 
   let localBindings = $state<string[]>([]);
   const editorId = $props.id();
-  let activeSection = $state('identity');
+  let visitedSections = $state(new Set(['identity']));
   let toolSearch = $state('');
   const sections = $derived.by(() => [
     { id: 'identity', label: 'Identity', suffix: errors.name ? '!' : '' },
     { id: 'providers', label: 'Providers & models', suffix: errors.reasoningEffort ? '!' : '' },
-    { id: 'tools', label: 'Tools', count: tools.length },
+    { id: 'tools', label: 'Tools', count: tools.length || undefined },
     { id: 'access', label: 'Access & delegation' },
     ...(!isSystemAsset || editableFieldSet.has('agent_profiles')
       ? [{ id: 'profiles', label: 'Profiles', count: form.agentProfiles.length, suffix: errors.agentProfiles ? '!' : '' }]
       : []),
     ...(form.agentType === 'primary'
       ? [{ id: 'workflows', label: 'Workflows', suffix: errors.stepAgentOverridesJson ? '!' : '' }]
-      : [])
+      : []),
+    ...extraSections
   ]);
   $effect(() => {
     if (!sections.some((section) => section.id === activeSection)) activeSection = 'identity';
+    if (!visitedSections.has(activeSection)) {
+      visitedSections = new Set([...visitedSections, activeSection]);
+    }
   });
 
   function matchesTool(tool: AgentToolOption): boolean {
@@ -200,12 +229,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   }
 
   function toggleBinding(agentId: string): void {
-    if (localBindings.includes(agentId)) {
-      localBindings = localBindings.filter((id) => id !== agentId);
-    } else {
-      localBindings = [...localBindings, agentId];
-    }
-    onBindingsChange?.(localBindings);
+    const next = localBindings.includes(agentId)
+      ? localBindings.filter((id) => id !== agentId)
+      : [...localBindings, agentId];
+    onBindingsChange?.(next);
   }
 
   function toggleAllowedAgent(agentId: string): void {
@@ -238,6 +265,41 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   );
 
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
+  function setToolPermission(toolId: string, value: string): void {
+    if (value) form.toolPermissions[toolId] = value;
+    else delete form.toolPermissions[toolId];
+  }
+  let inferenceRoutes = $state<InferenceRoute[]>([]);
+  let routeLoadState = $state<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  const selectedRouteModels = $derived([
+    form.model,
+    ...form.agentProfiles.map((profile: AgentRuntimeProfileFormState) => profile.model || form.model)
+  ].filter(model => model.trim().startsWith('cognis/')));
+  const routeMetadataIssue = $derived(
+    selectedRouteModels.length === 0 ? null
+      : routeLoadState === 'error' ? 'Could not load route capabilities. Retry before saving.'
+      : routeLoadState !== 'loaded' ? 'Loading route capabilities…'
+      : selectedRouteModels.some(model =>
+        !agentModelCapabilities(providers, inferenceRoutes, 'cognis', model))
+        ? 'Selected route or target model metadata is unavailable. Check the route and providers, then retry.'
+        : null
+  );
+  async function loadInferenceRoutes(): Promise<void> {
+    if (routeLoadState === 'loading') return;
+    routeLoadState = 'loading';
+    try {
+      inferenceRoutes = (await api.inferenceRoutes.list()).routes;
+      routeLoadState = 'loaded';
+    } catch {
+      routeLoadState = 'error';
+    }
+  }
+  $effect(() => {
+    if (routeLoadState !== 'idle') return;
+    if (selectedRouteModels.length || ['providers', 'profiles'].includes(activeSection)) {
+      void loadInferenceRoutes();
+    }
+  });
 
   const toolCategories = $derived<string[]>(
     [...new Set(tools.filter((tool: AgentToolOption) => !isMcpTool(tool)).map((tool: AgentToolOption) => tool.category))].sort() as string[]
@@ -351,13 +413,16 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       errors.name = 'Name is required.';
     }
     if (canEditField('llm_config.reasoning_effort') &&
+        !(form.model.trim().startsWith('cognis/') && routeMetadataIssue) &&
         invalidThinking(form.reasoningEffort, availableThinkingEfforts())) {
       errors.reasoningEffort = 'Thinking effort is unavailable for this model. Select an available value.';
     }
     const seenProfileIds = new Set<string>();
     for (const profile of form.agentProfiles) {
       const profileId = profile.profileId.trim();
-      if (canEditProfiles() && invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))) {
+      if (canEditProfiles() &&
+          !((profile.model || form.model).trim().startsWith('cognis/') && routeMetadataIssue) &&
+          invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))) {
         errors.agentProfiles = `Thinking effort for profile "${profileId}" is unavailable. Select an available value.`;
         break;
       }
@@ -378,6 +443,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           `Runtime profile "${profileId}" needs description routing guidance before agents can switch to it.`;
         break;
       }
+      if (!Number.isSafeInteger(profile.quickSwitchIndex) || profile.quickSwitchIndex < 0) {
+        errors.agentProfiles = `Runtime profile "${profileId}" needs a non-negative integer quick-switch position.`;
+        break;
+      }
       seenProfileIds.add(profileId);
     }
     const stepJsonError = validateJson(form.stepAgentOverridesJson, 'Step agent overrides');
@@ -388,7 +457,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   }
 
   const errors = $derived(validationErrors());
-  const canSubmit = $derived(Object.keys(errors).length === 0 && Boolean(form.name.trim()));
+  const canSubmit = $derived(!routeMetadataIssue && Object.keys(errors).length === 0 && Boolean(form.name.trim()));
 
   // Keep agentId in sync with name until user manually edits the ID field
   $effect(() => {
@@ -458,7 +527,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   const globallyAttachedSkills = $derived(skills.filter((s: Skill) => attachedToAllAgents(s) && !form.selectedSkillIds.includes(s.skill_id)));
   const selectableSkills = $derived(skills.filter((s: Skill) => !attachedToAllAgents(s)));
-  const optionalBuiltinTools = [{ id: 'manage_agents', label: 'Manage agents', description: 'Create, edit, archive, bind, and share your other agents from chat.' }];
+  const optionalBuiltinTools = INSTANCE_MANAGEMENT_TOOLS;
 
   function toggleOptInBuiltinTool(toolId: string): void {
     if (form.optInBuiltinTools.includes(toolId)) {
@@ -470,7 +539,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (!canSubmit) {
+    if (!canSubmit || saving || !dirty || (readonly && !isSystemAsset)) {
       return;
     }
     await onSave(isSystemAsset ? formStateToSystemOverridePayload(form) : formStateToPayload(form));
@@ -481,8 +550,8 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   }
 
   function modelsForProvider(providerId: string): string[] {
-    if (!providerId) {
-      return [];
+    if (!providerId || providerId === 'cognis') {
+      return inferenceRoutes.map(route => route.reference);
     }
     const provider = providers.find((p: LLMProvider) => p.provider_id === providerId);
     if (!provider) {
@@ -507,24 +576,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     return modelsForProvider(form.providerId);
   }
 
-  function modelInfoForProvider(providerId: string, modelId: string): ModelEntry | null {
-    if (!providerId) {
-      return null;
-    }
-    const provider = providers.find((p: LLMProvider) => p.provider_id === providerId);
-    if (!provider) {
-      return null;
-    }
-    const explicitModel = modelId.trim();
-    const defaultModel = typeof provider.config?.default_model === 'string' ? provider.config.default_model : '';
-    const resolvedModel = explicitModel || defaultModel;
-    if (!resolvedModel) {
-      return null;
-    }
-    return provider.models.find((model: ModelEntry) => model.model_id === resolvedModel) ?? null;
+  function modelInfoForProvider(providerId: string, modelId: string): AgentModelCapabilities | null {
+    return agentModelCapabilities(providers, inferenceRoutes, providerId, modelId);
   }
 
-  function selectedProviderModelInfo(): ModelEntry | null {
+  function selectedProviderModelInfo(): AgentModelCapabilities | null {
     return modelInfoForProvider(form.providerId, form.model);
   }
 
@@ -587,7 +643,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       memoryMode: '',
       memoryBackendOptions: {},
       enabled: true,
-      agentSwitchable: false
+      agentSwitchable: false,
+      quickSwitch: false,
+      quickSwitchIndex: form.agentProfiles.length,
+      quickSwitchColor: 'neutral'
     };
     form.agentProfiles = [...form.agentProfiles, nextProfile];
     if (!form.defaultAgentProfileId) {
@@ -622,26 +681,29 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   }
 </script>
 
-<form class="space-y-5" onsubmit={handleSubmit}>
+<div class="space-y-5">
   <AccessibleTabs tabs={sections} activeId={activeSection} idPrefix={editorId}
-    ariaLabel="Agent configuration" onChange={(id) => { activeSection = id; }} />
+    ariaLabel="Agent configuration" sticky onChange={(id) => { activeSection = id; }} />
+<form id={`${editorId}-form`} class="space-y-5" onsubmit={handleSubmit}>
   <div class="min-w-0 space-y-5">
     <div class="min-w-0 space-y-5">
-      <div hidden={activeSection !== 'identity'} id={`${editorId}-panel-identity`} role="tabpanel" aria-labelledby={`${editorId}-tab-identity`} tabindex="0">
-      <div class="space-y-5">
+       <div hidden={activeSection !== 'identity'} id={`${editorId}-panel-identity`} role="tabpanel" aria-labelledby={`${editorId}-tab-identity`} tabindex="0">
+       {#if visitedSections.has('identity')}
+       <div class="space-y-5">
+       {@render identityActions?.()}
       <!-- Identity -->
       <Card class="p-5">
-        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Identity</p>
+        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-muted">Identity</p>
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>Name <span class="text-rose-300">*</span></span>
+          <label class="space-y-2 text-sm font-medium text-foreground">
+            <span>Name <span class="text-danger">*</span></span>
             <Input aria-invalid={errors.name ? 'true' : 'false'} bind:value={form.name} placeholder="Research Assistant" disabled={readonly} />
             {#if errors.name}
-              <span class="text-xs text-rose-300">{errors.name}</span>
+              <span class="text-xs text-danger">{errors.name}</span>
             {/if}
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
-            <span>ID <span class="text-slate-500">(optional)</span></span>
+          <label class="space-y-2 text-sm font-medium text-foreground">
+            <span>ID <span class="text-quiet">(optional)</span></span>
             <Input
               bind:value={form.agentId}
               disabled={mode === 'edit' || readonly}
@@ -649,22 +711,22 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               oninput={() => { if (mode === 'create') form.customId = true; }}
             />
             {#if mode === 'create' && !form.customId}
-              <span class="text-xs text-slate-400">Auto-generated from name. Type here to override.</span>
+              <span class="text-xs text-muted">Auto-generated from name. Type here to override.</span>
             {:else if mode === 'create' && form.customId}
-              <button type="button" class="text-xs text-sky-400 hover:text-sky-300" onclick={() => { form.customId = false; form.agentId = slugify(form.name); }}>Reset to auto</button>
+              <button type="button" class="text-xs text-accent hover:text-accent-hover" onclick={() => { form.customId = false; form.agentId = slugify(form.name); }}>Reset to auto</button>
             {/if}
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Type</span>
-            <select bind:value={form.agentType} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={mode === 'edit' || readonly}>
+            <select bind:value={form.agentType} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={mode === 'edit' || readonly}>
               <option value="primary">Primary</option>
               <option value="secondary">Secondary</option>
             </select>
-            <span class="block text-xs text-slate-400">
+            <span class="block text-xs text-muted">
               {form.agentType === 'primary' ? 'Interactive agent with personality and memory.' : 'Lightweight task executor for focused sub-tasks.'}
             </span>
           </label>
-          <div class="space-y-2 text-sm font-medium text-slate-200">
+          <div class="space-y-2 text-sm font-medium text-foreground">
             <span>Avatar</span>
             <div class="flex items-center gap-3">
               {#if form.avatarUrl}
@@ -686,7 +748,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     />
                     <button
                       type="button"
-                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-700 hover:text-slate-100 disabled:opacity-50"
+                      class="rounded-lg border border-control-border bg-raised/60 px-2.5 py-1 text-xs text-secondary hover:bg-inset hover:text-foreground disabled:opacity-50"
                       onclick={() => fileInput?.click()}
                       disabled={uploadingAvatar}
                     >
@@ -694,7 +756,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     </button>
                     <button
                       type="button"
-                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-sky-400 hover:bg-slate-700 hover:text-sky-300"
+                      class="rounded-lg border border-control-border bg-raised/60 px-2.5 py-1 text-xs text-accent hover:bg-inset hover:text-accent-hover"
                       onclick={() => { showAvatarModal = true; }}
                     >
                       Generate
@@ -702,7 +764,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     {#if form.avatarImageId || form.avatarUrl}
                       <button
                         type="button"
-                        class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-rose-400 hover:bg-slate-700 hover:text-rose-300"
+                        class="rounded-lg border border-control-border bg-raised/60 px-2.5 py-1 text-xs text-danger hover:bg-inset hover:text-danger"
                         onclick={removeAvatar}
                       >
                         Remove
@@ -714,13 +776,13 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             </div>
           </div>
         </div>
-        <div class="mt-4 space-y-2 text-sm font-medium text-slate-200">
+        <div class="mt-4 space-y-2 text-sm font-medium text-foreground">
           <div class="flex items-center justify-between">
             <span>Description</span>
             {#if !readonly}
               <button
                 type="button"
-                class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50"
+                class="flex items-center gap-1 text-xs text-accent hover:text-accent-hover disabled:opacity-50"
                 disabled={generatingField === 'description'}
                 onclick={() => generateField('description', () => form.description, (v) => { form.description = v; })}
                 title="Generate with AI"
@@ -729,44 +791,44 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               </button>
             {/if}
           </div>
-          <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" disabled={readonly}></textarea>
+          <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet" disabled={readonly}></textarea>
         </div>
       </Card>
 
       <!-- Personality (primary only) -->
       {#if form.agentType === 'primary'}
         <Card class="p-5">
-          <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Personality</p>
+          <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-muted">Personality</p>
           <div class="grid gap-4 md:grid-cols-3">
-            <div class="space-y-2 text-sm font-medium text-slate-200">
+            <div class="space-y-2 text-sm font-medium text-foreground">
               <div class="flex items-center justify-between">
                 <span>Tone</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
+                  <button type="button" class="text-accent hover:text-accent-hover disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
                     {#if generatingField === 'tone'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
               </div>
               <Input bind:value={form.tone} placeholder="e.g. formal, friendly, witty" disabled={readonly} />
-              <span class="block text-xs text-slate-500">How the agent communicates — voice and style.</span>
+              <span class="block text-xs text-quiet">How the agent communicates — voice and style.</span>
             </div>
-            <div class="space-y-2 text-sm font-medium text-slate-200">
+            <div class="space-y-2 text-sm font-medium text-foreground">
               <div class="flex items-center justify-between">
                 <span>Temperament</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
+                  <button type="button" class="text-accent hover:text-accent-hover disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
                     {#if generatingField === 'temperament'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
               </div>
               <Input bind:value={form.temperament} placeholder="e.g. patient, cautious, bold" disabled={readonly} />
-              <span class="block text-xs text-slate-500">How the agent behaves — disposition and reactions.</span>
+              <span class="block text-xs text-quiet">How the agent behaves — disposition and reactions.</span>
             </div>
-            <div class="space-y-2 text-sm font-medium text-slate-200">
+            <div class="space-y-2 text-sm font-medium text-foreground">
               <div class="flex items-center justify-between">
                 <span>Purpose</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
+                  <button type="button" class="text-accent hover:text-accent-hover disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
                     {#if generatingField === 'purpose'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
@@ -774,16 +836,16 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <Input bind:value={form.purpose} placeholder="research specialist" disabled={readonly} />
             </div>
           </div>
-          <div class="mt-4 space-y-2 text-sm font-medium text-slate-200">
+          <div class="mt-4 space-y-2 text-sm font-medium text-foreground">
             <div class="flex items-center justify-between">
               <span>Behavioral rules (one per line)</span>
               {#if !readonly && !isSystemAsset}
-                <button type="button" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
+                <button type="button" class="flex items-center gap-1 text-xs text-accent hover:text-accent-hover disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
                   {#if generatingField === 'behavioral_rules'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                 </button>
               {/if}
             </div>
-            <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Always cite sources&#10;Prefer concise answers" disabled={readonly}></textarea>
+            <textarea bind:value={form.behavioralRules} class="min-h-[110px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet" placeholder="Always cite sources&#10;Prefer concise answers" disabled={readonly}></textarea>
           </div>
         </Card>
       {/if}
@@ -791,61 +853,62 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       <!-- Editable identity instructions -->
       <Card class="p-5">
         <div class="mb-3 flex items-center justify-between gap-3">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Agent instructions</p>
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Agent instructions</p>
           {#if !readonly && !isSystemAsset}
             <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
           {:else if isSystemAsset}
-            <span class="text-xs text-slate-500">Managed by the shipped system agent definition.</span>
+            <span class="text-xs text-quiet">Managed by the shipped system agent definition.</span>
           {:else}
-            <span class="text-xs text-slate-500">Read-only because this agent is shared with you.</span>
+            <span class="text-xs text-quiet">Read-only because this agent is shared with you.</span>
           {/if}
         </div>
-        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}, a capable general-purpose AI assistant.&#10;&#10;Optimize for correctness, usefulness, and actionability over verbosity." disabled={readonly}></textarea>
-        <p class="mt-2 text-xs text-slate-400">Defines this agent's identity, communication style, and domain-specific behavior. Cognis runtime rules, tool policy, memory context, workflow instructions, and safety constraints are injected separately and cannot be overridden here.</p>
+        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet" placeholder="You are {'{'}name{'}'}, a capable general-purpose AI assistant.&#10;&#10;Optimize for correctness, usefulness, and actionability over verbosity." disabled={readonly}></textarea>
+        <p class="mt-2 text-xs text-muted">Defines this agent's identity, communication style, and domain-specific behavior. Cognis runtime rules, tool policy, memory context, workflow instructions, and safety constraints are injected separately and cannot be overridden here.</p>
       </Card>
 
-      <!-- Tools & Permissions -->
-      </div>
+      <details class="rounded-2xl border border-separator p-5">
+        <summary class="cursor-pointer text-sm font-medium text-foreground">System prompt preview</summary>
+        <p class="mt-2 text-sm text-muted">Editable identity only. Runtime instructions, memory, tools, skills, and workflow context are added separately.</p>
+        <pre class="mt-4 whitespace-pre-wrap break-words rounded-xl bg-canvas/70 p-4 text-sm leading-6 text-foreground">{buildSystemPromptPreview(form)}</pre>
+      </details>
+       </div>
+       {/if}
       </div>
       {#snippet executorSettings()}
       <Card class="p-5">
-        <h2 class="mb-1 text-lg font-semibold text-white">Execution access</h2>
-        <p class="mb-5 text-sm text-slate-400">Choose where this agent works and which executors it can access.</p>
+        <h2 class="mb-1 text-lg font-semibold text-strong">Execution access</h2>
+        <p class="mb-5 text-sm text-muted">Choose where this agent works and which executors it can access.</p>
         <div class="mb-4 grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Executor</span>
-            <select bind:value={form.executorId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+            <select bind:value={form.executorId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
               <option value="">Use default executor</option>
               {#each executors as executor}
                 <option value={executor.executor_id}>{executor.name} ({executor.executor_type})</option>
               {/each}
             </select>
-            <span class="block text-xs text-slate-400">Choose a specific executor or leave empty to use executor label matching / default resolution.</span>
+            <span class="block text-xs text-muted">Choose a specific executor or leave empty to use executor label matching / default resolution.</span>
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Executor selector (optional, key=value)</span>
-            <textarea bind:value={form.executorSelector} class="min-h-[72px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="tier=standard&#10;location=local" disabled={readonly || !!form.executorId}></textarea>
-            <span class="block text-xs text-slate-400">Used when no explicit executor is selected. Matches executor labels like Kubernetes selectors.</span>
+            <textarea bind:value={form.executorSelector} class="min-h-[72px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 font-mono text-sm text-foreground" placeholder="tier=standard&#10;location=local" disabled={readonly || !!form.executorId}></textarea>
+            <span class="block text-xs text-muted">Used when no explicit executor is selected. Matches executor labels like Kubernetes selectors.</span>
           </label>
         </div>
 
       </Card>
       {/snippet}
         {#snippet backendSettings()}
-        <div class="rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
-          <div class="mb-3">
-            <p class="text-sm font-medium text-slate-200">Backend capabilities</p>
-            <p class="mt-1 text-xs text-slate-400">
-              Select the per-agent memory and guardrails providers. Defaults keep the standard Mnemory + Intaris runtime.
-            </p>
-          </div>
-          <div class="grid gap-4 md:grid-cols-3">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+        <div class="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+        <Card class="min-w-0 p-5">
+          <h2 class="mb-4 text-sm font-semibold text-foreground">Memory</h2>
+          <div class="grid gap-4">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Memory backend</span>
               <select
                 bind:value={form.memoryBackend}
                 onchange={selectMemoryBackend}
-                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                 disabled={readonly || isSystemAsset}
               >
                 {#if !selectedMemoryBackend}
@@ -855,15 +918,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                   <option value={backend.id}>{backend.display_name}</option>
                 {/each}
               </select>
-              <span class="block text-xs text-slate-400">
+              <span class="block text-xs text-muted">
                 {selectedMemoryBackend?.description ?? 'Provider-owned memory backend.'}
               </span>
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span title="Mode behavior and copy come from the selected backend.">Memory mode</span>
               <select
                 bind:value={form.memoryMode}
-                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                 disabled={readonly || isSystemAsset || form.memoryBackend === 'none' || !selectedMemoryBackend?.modes.length}
               >
                 {#if form.memoryMode && !selectedMemoryMode}
@@ -873,53 +936,89 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                   <option value={memoryMode.id}>{memoryMode.label}</option>
                 {/each}
               </select>
-              <span class="block text-xs text-slate-400" title={selectedMemoryMode?.tooltip}>
+              <span class="block text-xs text-muted" title={selectedMemoryMode?.tooltip}>
                 {selectedMemoryMode?.description ?? 'No memory mode applies.'}
               </span>
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+          </div>
+          {#if selectedMemoryMode}
+            <details class="mt-4 text-xs text-muted">
+              <summary class="cursor-pointer text-secondary">Memory mode details</summary>
+              <p class="mt-3">{selectedMemoryMode.recommended_for}</p>
+              <dl class="mt-3 grid grid-cols-2 gap-2">
+                <dt>Core bootstrap</dt><dd>{selectedMemoryMode.behavior.core_bootstrap ? 'On' : 'Off'}</dd>
+                <dt>Auto recall</dt><dd>{selectedMemoryMode.behavior.auto_recall ? 'On' : 'Off'}</dd>
+                <dt>Auto remember</dt><dd>{selectedMemoryMode.behavior.auto_remember ? 'On' : 'Off'}</dd>
+                <dt>Memory tools</dt><dd>{selectedMemoryMode.behavior.tools ? 'On' : 'Off'}</dd>
+              </dl>
+            </details>
+          {/if}
+          {#if toolsKnown && form.memoryBackend !== 'none' && selectedMemoryMode?.behavior.tools && !memoryToolsAvailable}
+            <p class="mt-4 rounded-xl border border-warning-border bg-warning-subtle px-4 py-3 text-xs text-warning">
+              This mode expects memory tools, but the current tool allowlist excludes them.
+            </p>
+          {/if}
+        </Card>
+        <Card class="min-w-0 p-5">
+          <h2 class="mb-4 text-sm font-semibold text-foreground">Guardrails</h2>
+          <div class="grid gap-4 md:grid-cols-2">
+            <label class="space-y-2 text-sm font-medium text-foreground md:col-span-2">
               <span>Guardrails backend</span>
               <select
                 bind:value={form.guardrailsBackend}
-                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                 disabled={readonly || isSystemAsset}
               >
                 <option value="intaris">Intaris</option>
                 <option value="none">None</option>
               </select>
-              <span class="block text-xs text-slate-400">
-                None disables Intaris tool-call evaluation while keeping the Intaris event store.
+              <span class="block text-xs text-muted">
+                {form.guardrailsBackend === 'none' ? 'Tool-call evaluation is disabled. The event store remains active.' : 'Evaluates tool calls before execution.'}
               </span>
             </label>
+            <label class="space-y-2 text-sm font-medium text-foreground">
+              <span>Intaris evaluation</span>
+              <select bind:value={form.intarisEvaluation} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+                <option value="legacy">Legacy</option>
+                <option value="bounded_autonomy">Bounded autonomy</option>
+                <option value="balanced">Balanced</option>
+                <option value="strict">Strict</option>
+              </select>
+              <span class="block text-xs text-muted">Tasks inherit this evaluation unless overridden.</span>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-foreground">
+              <span>Approvals</span>
+              <select bind:value={form.approvalMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+                <option value="ask">Ask me</option>
+                <option value="unattended">Unattended (escalations are denied)</option>
+              </select>
+              <span class="block text-xs text-muted">{form.approvalMode === 'unattended' ? 'The Judge approves or denies; escalations are denied without waiting for you.' : 'Escalated calls wait for your approval.'}</span>
+            </label>
           </div>
-          <div class="mt-4 grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+          <details class="mt-4 border-t border-separator pt-4" open={!!(form.minimumOutcome || form.maximumOutcome || form.escalationTimeoutSeconds)}>
+            <summary class="cursor-pointer text-sm font-medium text-secondary">Advanced evaluation controls</summary>
+            <div class="mt-4 grid gap-4 md:grid-cols-2">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Minimum evaluation outcome</span>
-              <select bind:value={form.minimumOutcome} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.minimumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
                 <option value="">None (standard evaluation)</option>
                 <option value="deny">Deny all evaluated calls</option>
                 <option value="escalate">Require human approval</option>
                 <option value="approve">No additional restriction</option>
               </select>
-              <span class="block text-xs text-slate-400">Selects the stricter outcome after evaluation. Explicit Cognis access denials still apply.</span>
+              <span class="block text-xs text-muted">Selects the stricter outcome after evaluation. Explicit Cognis access denials still apply.</span>
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Maximum evaluation outcome</span>
-              <select bind:value={form.maximumOutcome} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.maximumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
                 <option value="">None (standard evaluation)</option>
                 <option value="deny">Do not upgrade denials</option>
                 <option value="escalate">Escalate evaluated denials</option>
                 <option value="approve">Allow evaluated denials (yolo)</option>
               </select>
-              <span class="block text-xs text-slate-400">Selects the more permissive outcome; a minimum restriction takes precedence.</span>
+              <span class="block text-xs text-muted">Selects the more permissive outcome; a minimum restriction takes precedence.</span>
             </label>
-          </div>
-          {#if form.guardrailsBackend === 'intaris' && form.maximumOutcome === 'approve'}
-            <div role="alert" class="mt-4 rounded-xl border border-red-500/70 bg-red-950/50 px-4 py-3 text-sm text-red-100">
-              <strong>DANGEROUS — Yolo mode:</strong> Intaris still evaluates and audits every evaluated call, but critical and denied calls may execute. This does not override explicit tool permissions or session lifecycle blocks.
-            </div>
-          {/if}
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <label class="block space-y-2 text-sm font-medium text-foreground md:col-span-2">
             <span>Escalation timeout (seconds)</span>
             <input
               type="number"
@@ -929,54 +1028,48 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               bind:value={form.escalationTimeoutSeconds}
               disabled={readonly || isSystemAsset}
               placeholder="Inherit global default (300 seconds)"
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
             />
-            <span class="block text-xs text-slate-400">Pending tool approvals are denied after this wait. Tasks can override it; empty inherits the global setting.</span>
+            <span class="block text-xs text-muted">Pending tool approvals are denied after this wait. Tasks can override it; empty inherits the global setting.</span>
           </label>
-          {#if selectedMemoryMode}
-            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-              <p class="text-xs text-slate-300"><strong>Recommended for:</strong> {selectedMemoryMode.recommended_for}</p>
-              <div class="mt-2 grid gap-2 text-xs text-slate-400 sm:grid-cols-4">
-                <span>Core bootstrap: {selectedMemoryMode.behavior.core_bootstrap ? 'On' : 'Off'}</span>
-                <span>Auto recall: {selectedMemoryMode.behavior.auto_recall ? 'On' : 'Off'}</span>
-                <span>Auto remember: {selectedMemoryMode.behavior.auto_remember ? 'On' : 'Off'}</span>
-                <span>Tools: {selectedMemoryMode.behavior.tools ? 'On' : 'Off'}</span>
-              </div>
             </div>
-          {/if}
-          {#if form.memoryBackend !== 'none' && selectedMemoryMode?.behavior.tools && !memoryToolsAvailable}
-            <div class="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
-              This mode expects memory tools, but the current tool allowlist excludes them.
+          </details>
+          {#if form.guardrailsBackend === 'intaris' && form.maximumOutcome === 'approve'}
+            <div role="alert" class="mt-4 rounded-xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">
+              <strong>DANGEROUS — Yolo mode:</strong> Intaris still evaluates and audits every evaluated call, but critical and denied calls may execute. This does not override explicit tool permissions or session lifecycle blocks.
             </div>
           {/if}
           {#if mode === 'edit' && form.guardrailsBackend === 'none'}
-            <div class="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <div class="mt-4 rounded-xl border border-warning-border bg-warning-subtle px-4 py-3 text-sm text-warning">
               <p class="font-medium">Guardrails are disabled for this agent.</p>
-              <p class="mt-1 text-xs text-amber-100/80">
+              <p class="mt-1 text-xs text-warning/80">
                 Tool calls will be auto-approved, including non-bypassable tools. Use this only for trusted agents and controlled environments.
               </p>
             </div>
           {/if}
+        </Card>
         </div>
 
         {/snippet}
 
-      <div hidden={activeSection !== 'access'} id={`${editorId}-panel-access`} role="tabpanel" aria-labelledby={`${editorId}-tab-access`} tabindex="0" class="space-y-5">
+       <div hidden={activeSection !== 'access'} id={`${editorId}-panel-access`} role="tabpanel" aria-labelledby={`${editorId}-tab-access`} tabindex="0" class="space-y-5">
+       {#if visitedSections.has('access')}
+       {@render accessActions?.()}
       {@render executorSettings()}
       <Card class="p-5">
         <!-- Stage 36: Additional executors (multi-executor agents) -->
-        <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
+        <div class="mb-4 rounded-2xl border border-control-border bg-canvas/40 p-4">
           <div class="mb-2 flex items-center justify-between">
             <div>
-              <p class="text-sm font-medium text-slate-200">Additional executors (optional)</p>
-              <p class="mt-1 text-xs text-slate-400">
-                Extra executors the agent can target via <code class="text-slate-300">target_executor</code>
-                or <code class="text-slate-300">switch_executor</code>. Never auto-selected by the controller.
+              <p class="text-sm font-medium text-foreground">Additional executors (optional)</p>
+              <p class="mt-1 text-xs text-muted">
+                Extra executors the agent can target via <code class="text-secondary">target_executor</code>
+                or <code class="text-secondary">switch_executor</code>. Never auto-selected by the controller.
               </p>
             </div>
             <button
               type="button"
-              class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-200 hover:bg-slate-800"
+              class="rounded-lg border border-control-border bg-surface px-3 py-1 text-xs text-foreground hover:bg-raised"
               disabled={readonly}
               onclick={() => {
                 form.additionalExecutors = [
@@ -989,15 +1082,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             </button>
           </div>
           {#if form.additionalExecutors.length === 0}
-            <p class="text-xs text-slate-500">No additional executors configured.</p>
+            <p class="text-xs text-quiet">No additional executors configured.</p>
           {/if}
           {#each form.additionalExecutors as additional, idx (idx)}
-            <div class="mt-3 grid gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3 md:grid-cols-2">
-              <label class="space-y-1 text-xs font-medium text-slate-200">
+            <div class="mt-3 grid gap-3 rounded-xl border border-separator bg-canvas/60 p-3 md:grid-cols-2">
+              <label class="space-y-1 text-xs font-medium text-foreground">
                 <span>Executor</span>
                 <select
                   bind:value={additional.executorId}
-                  class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-sm text-slate-100"
+                  class="w-full rounded-lg border border-control-border bg-canvas/80 px-2 py-1 text-sm text-foreground"
                   disabled={readonly || !!additional.executorSelector.trim()}
                 >
                   <option value="">— or use selector below —</option>
@@ -1006,20 +1099,20 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                   {/each}
                 </select>
               </label>
-              <label class="space-y-1 text-xs font-medium text-slate-200">
+              <label class="space-y-1 text-xs font-medium text-foreground">
                 <span>Selector (key=value, one per line)</span>
                 <textarea
                   bind:value={additional.executorSelector}
-                  class="min-h-[60px] w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 font-mono text-xs text-slate-100"
+                  class="min-h-[60px] w-full rounded-lg border border-control-border bg-canvas/80 px-2 py-1 font-mono text-xs text-foreground"
                   placeholder="role=browser&#10;loc=local"
                   disabled={readonly || !!additional.executorId.trim()}
                 ></textarea>
               </label>
-              <label class="space-y-1 text-xs font-medium text-slate-200 md:col-span-2">
+              <label class="space-y-1 text-xs font-medium text-foreground md:col-span-2">
                 <span>Description (optional)</span>
                 <input
                   bind:value={additional.description}
-                  class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-sm text-slate-100"
+                  class="w-full rounded-lg border border-control-border bg-canvas/80 px-2 py-1 text-sm text-foreground"
                   placeholder="e.g. personal Mac for coding"
                   disabled={readonly}
                 />
@@ -1027,7 +1120,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <div class="md:col-span-2">
                 <button
                   type="button"
-                  class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-xs text-rose-200 hover:bg-rose-500/20"
+                  class="rounded-lg border border-danger-border bg-danger-subtle px-3 py-1 text-xs text-danger hover:bg-danger-subtle"
                   disabled={readonly}
                   onclick={() => {
                     form.additionalExecutors = form.additionalExecutors.filter(
@@ -1042,33 +1135,33 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           {/each}
         </div>
 
-        <div class="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+        <div class="space-y-4 rounded-2xl border border-separator bg-canvas/60 p-4">
           <div>
-            <p class="text-sm font-medium text-slate-100">Delegation</p>
-            <p class="mt-1 text-xs text-slate-400">
+            <p class="text-sm font-medium text-foreground">Delegation</p>
+            <p class="mt-1 text-xs text-muted">
               Primary agents receive managed conversations or tasks. System specialists receive
               bounded synchronous delegate calls and cannot delegate further.
             </p>
           </div>
-          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-            <input bind:checked={form.delegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
+          <label class="flex items-center gap-3 text-sm font-medium text-foreground">
+            <input bind:checked={form.delegationEnabled} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" disabled={readonly} />
             Allow this agent to assign work to other agents
           </label>
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-              <input bind:checked={form.primaryDelegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+            <label class="flex items-center gap-3 text-sm font-medium text-foreground">
+              <input bind:checked={form.primaryDelegationEnabled} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" disabled={readonly || !form.delegationEnabled} />
               Primary-agent managed work and tasks
             </label>
-            <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-              <input bind:checked={form.systemDelegationEnabled} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+            <label class="flex items-center gap-3 text-sm font-medium text-foreground">
+              <input bind:checked={form.systemDelegationEnabled} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" disabled={readonly || !form.delegationEnabled} />
               Bounded system-specialist delegation
             </label>
           </div>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
+          <label class="block space-y-2 text-sm font-medium text-foreground">
             <span>Maximum managed depth</span>
             <select
               bind:value={form.maxManagedDepth}
-              class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              class="w-full rounded-lg border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
               disabled={readonly || !form.delegationEnabled || !form.primaryDelegationEnabled}
             >
               <option value={0}>0 — disabled</option>
@@ -1076,42 +1169,42 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <option value={2}>2 — coordinator and worker</option>
             </select>
           </label>
-          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-            <input bind:checked={form.restrictDelegationTargets} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly || !form.delegationEnabled} />
+          <label class="flex items-center gap-3 text-sm font-medium text-foreground">
+            <input bind:checked={form.restrictDelegationTargets} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" disabled={readonly || !form.delegationEnabled} />
             Restrict allowed target agents
           </label>
           {#if form.restrictDelegationTargets}
             <div class="space-y-3">
-              <p class="text-sm font-medium text-slate-200">Allowed target agents</p>
-              <p class="text-xs text-slate-400">This agent can always assign work to itself. An empty selection disables every other target.</p>
+              <p class="text-sm font-medium text-foreground">Allowed target agents</p>
+              <p class="text-xs text-muted">This agent can always assign work to itself. An empty selection disables every other target.</p>
               {#if form.agentId}
-                <div class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100">
+                <div class="rounded-xl border border-success-border bg-success-subtle px-3 py-2 text-sm text-success">
                   <span class="font-medium">Self</span>
-                  <span class="ml-2 font-mono text-xs text-emerald-200/80">{form.agentId}</span>
-                  <span class="ml-2 text-xs text-emerald-200/70">always allowed</span>
+                  <span class="ml-2 font-mono text-xs text-success/80">{form.agentId}</span>
+                  <span class="ml-2 text-xs text-success/70">always allowed</span>
                 </div>
               {/if}
               <div class="grid gap-2 md:grid-cols-2">
                 {#each primaryAgentOptions.filter((agent: Agent) => agent.agent_id !== form.agentId) as agent}
-                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
-                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id} · primary</span></span>
+                  <label class="flex items-start gap-3 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
+                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-quiet">{agent.agent_id} · primary</span></span>
                   </label>
                 {/each}
                 {#each systemSpecialistOptions as agent}
-                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
-                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id} · system specialist</span></span>
+                  <label class="flex items-start gap-3 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
+                    <input checked={form.allowedAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleAllowedAgent(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-quiet">{agent.agent_id} · system specialist</span></span>
                   </label>
                 {/each}
               </div>
               {#if unavailableAllowedAgentIds.length > 0}
-                <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
-                  <p class="text-xs font-medium text-amber-100">Unavailable configured targets</p>
+                <div class="rounded-xl border border-warning-border bg-warning-subtle p-3">
+                  <p class="text-xs font-medium text-warning">Unavailable configured targets</p>
                   <div class="mt-2 flex flex-wrap gap-2">
                     {#each unavailableAllowedAgentIds as agentId}
-                      <label class="flex items-center gap-2 rounded-lg border border-amber-500/20 px-2 py-1 font-mono text-xs text-amber-100">
-                        <input checked class="h-3.5 w-3.5 rounded border-amber-400" type="checkbox" onchange={() => toggleAllowedAgent(agentId)} disabled={readonly} />
+                      <label class="flex items-center gap-2 rounded-lg border border-warning-border px-2 py-1 font-mono text-xs text-warning">
+                        <input checked class="h-3.5 w-3.5 rounded border-warning-border" type="checkbox" onchange={() => toggleAllowedAgent(agentId)} disabled={readonly} />
                         {agentId}
                       </label>
                     {/each}
@@ -1120,29 +1213,29 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               {/if}
             </div>
           {/if}
-          <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-            <input bind:checked={form.restrictControllers} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
+          <label class="flex items-center gap-3 text-sm font-medium text-foreground">
+            <input bind:checked={form.restrictControllers} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" disabled={readonly} />
             Restrict agents allowed to target this primary agent
           </label>
           {#if form.restrictControllers}
             <div class="space-y-3">
-              <p class="text-sm font-medium text-slate-200">Allowed controller agents</p>
-              <p class="text-xs text-slate-400">Self is always allowed. An empty selection prevents every other agent from targeting this agent.</p>
+              <p class="text-sm font-medium text-foreground">Allowed controller agents</p>
+              <p class="text-xs text-muted">Self is always allowed. An empty selection prevents every other agent from targeting this agent.</p>
               <div class="grid gap-2 md:grid-cols-2">
                 {#each primaryAgentOptions.filter((agent: Agent) => agent.agent_id !== form.agentId) as agent}
-                  <label class="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                    <input checked={form.allowedControllerAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleAllowedController(agent.agent_id)} disabled={readonly} />
-                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-slate-500">{agent.agent_id}</span></span>
+                  <label class="flex items-start gap-3 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
+                    <input checked={form.allowedControllerAgentIds.includes(agent.agent_id)} class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleAllowedController(agent.agent_id)} disabled={readonly} />
+                    <span><span class="block">{agent.display_name ?? agent.name}</span><span class="block font-mono text-xs text-quiet">{agent.agent_id}</span></span>
                   </label>
                 {/each}
               </div>
               {#if unavailableControllerAgentIds.length > 0}
-                <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
-                  <p class="text-xs font-medium text-amber-100">Unavailable configured controllers</p>
+                <div class="rounded-xl border border-warning-border bg-warning-subtle p-3">
+                  <p class="text-xs font-medium text-warning">Unavailable configured controllers</p>
                   <div class="mt-2 flex flex-wrap gap-2">
                     {#each unavailableControllerAgentIds as agentId}
-                      <label class="flex items-center gap-2 rounded-lg border border-amber-500/20 px-2 py-1 font-mono text-xs text-amber-100">
-                        <input checked class="h-3.5 w-3.5 rounded border-amber-400" type="checkbox" onchange={() => toggleAllowedController(agentId)} disabled={readonly} />
+                      <label class="flex items-center gap-2 rounded-lg border border-warning-border px-2 py-1 font-mono text-xs text-warning">
+                        <input checked class="h-3.5 w-3.5 rounded border-warning-border" type="checkbox" onchange={() => toggleAllowedController(agentId)} disabled={readonly} />
                         {agentId}
                       </label>
                     {/each}
@@ -1155,12 +1248,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         {#if credentials.length > 0}
           <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed credentials</p>
+            <p class="mb-2 text-sm font-medium text-foreground">Allowed credentials</p>
             <div class="grid gap-2 md:grid-cols-2">
               {#each credentials as credential}
-                <label class="flex items-center gap-2 text-sm text-slate-200">
-                  <input checked={form.allowedCredentials.includes(credential.credential_id)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleCredential(credential.credential_id)} disabled={readonly} />
-                  {credential.label}<span class="text-xs text-slate-400">({credential.kind})</span>
+                <label class="flex items-center gap-2 text-sm text-foreground">
+                  <input checked={form.allowedCredentials.includes(credential.credential_id)} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleCredential(credential.credential_id)} disabled={readonly} />
+                  {credential.label}<span class="text-xs text-muted">({credential.kind})</span>
                 </label>
               {/each}
             </div>
@@ -1169,12 +1262,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         {#if knowledgebases.length > 0}
           <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed knowledgebases</p>
+            <p class="mb-2 text-sm font-medium text-foreground">Allowed knowledgebases</p>
             <div class="grid gap-2 md:grid-cols-2">
               {#each knowledgebases as kb}
-                <label class="flex items-start gap-2 text-sm text-slate-200">
-                  <input checked={form.allowedKnowledgebases.includes(kb.knowledgebase_id)} class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleKnowledgebase(kb.knowledgebase_id)} disabled={readonly} />
-                  <span><span>{kb.name}</span><span class="block font-mono text-xs text-slate-500">{kb.knowledgebase_id}</span></span>
+                <label class="flex items-start gap-2 text-sm text-foreground">
+                  <input checked={form.allowedKnowledgebases.includes(kb.knowledgebase_id)} class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleKnowledgebase(kb.knowledgebase_id)} disabled={readonly} />
+                  <span><span>{kb.name}</span><span class="block font-mono text-xs text-quiet">{kb.knowledgebase_id}</span></span>
                 </label>
               {/each}
             </div>
@@ -1183,38 +1276,45 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         {#if secrets.length > 0}
           <div class="mt-4">
-            <p class="mb-2 text-sm font-medium text-slate-200">Allowed secrets</p>
+            <p class="mb-2 text-sm font-medium text-foreground">Allowed secrets</p>
             <div class="grid gap-2 md:grid-cols-2">
               {#each secrets as secret}
-                <label class="flex items-center gap-2 text-sm text-slate-200">
-                  <input checked={form.allowedSecrets.includes(secret.name)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleSecret(secret.name)} disabled={readonly} />
-                  {secret.name}<span class="text-xs text-slate-400">({secret.scope})</span>
+                <label class="flex items-center gap-2 text-sm text-foreground">
+                  <input checked={form.allowedSecrets.includes(secret.name)} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleSecret(secret.name)} disabled={readonly} />
+                  {secret.name}<span class="text-xs text-muted">({secret.scope})</span>
                 </label>
               {/each}
             </div>
           </div>
         {/if}
       </Card>
+      {/if}
       </div>
 
       <div hidden={activeSection !== 'tools'} id={`${editorId}-panel-tools`} role="tabpanel" aria-labelledby={`${editorId}-tab-tools`} tabindex="0" class="space-y-5">
+       {#if visitedSections.has('tools')}
+       {#if toolsLoading}
+         <p role="status" class="p-5 text-sm text-muted">Loading tool catalog…</p>
+       {:else if toolsError}
+         <p role="alert" class="p-5 text-sm text-danger">{toolsError} <button type="button" class="underline" onclick={onRetryTools}>Retry loading tools</button></p>
+       {:else}
       <Card class="p-5">
-        <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
-          <p class="text-sm font-medium text-amber-100">Optional built-in tools</p>
-          <p class="mt-1 text-xs text-amber-100/70">These privileged controller tools are off by default and are not enabled by wildcard tool access.</p>
+        <div class="mt-4 rounded-2xl border border-warning-border bg-warning-subtle p-4">
+          <p class="text-sm font-medium text-warning">Optional built-in tools</p>
+          <p class="mt-1 text-xs text-warning/70">These privileged controller tools are off by default and are not enabled by wildcard tool access.</p>
           <div class="mt-3 space-y-2">
             {#each optionalBuiltinTools as tool}
-              <label class="flex items-start gap-3 text-sm text-slate-200">
+              <label class="flex items-start gap-3 text-sm text-foreground">
                 <input
                   checked={form.optInBuiltinTools.includes(tool.id)}
-                  class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas"
                   type="checkbox"
                   onchange={() => toggleOptInBuiltinTool(tool.id)}
                   disabled={readonly || form.agentType === 'secondary'}
                 />
                 <span>
                   <span class="font-medium">{tool.label}</span>
-                  <span class="block text-xs text-slate-400">{tool.description}</span>
+                  <span class="block text-xs text-muted">{tool.description}</span>
                 </span>
               </label>
             {/each}
@@ -1222,19 +1322,19 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         </div>
 
         {#if tools.length > 0}
-          <div class="mt-4 space-y-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-            <label class="block space-y-2 text-sm text-slate-200">
+          <div class="mt-4 space-y-3 rounded-2xl border border-separator bg-canvas/60 p-4">
+            <label class="block space-y-2 text-sm text-foreground">
               <span>Find a tool</span>
-              <input type="search" bind:value={toolSearch} placeholder="Search names, descriptions, or categories"
+              <input use:findTarget type="search" bind:value={toolSearch} placeholder="Search names, descriptions, or categories"
                 onkeydown={(event) => { if (event.key === 'Enter') event.preventDefault(); }}
-                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100" />
+                class="w-full rounded-xl border border-control-border bg-canvas px-3 py-2 text-sm text-foreground" />
             </label>
             {#if toolSearch.trim() && !tools.some(matchesTool)}
-              <p role="status" class="text-sm text-slate-400">No tools match “{toolSearch}”.</p>
+              <p role="status" class="text-sm text-muted">No tools match “{toolSearch}”.</p>
             {/if}
             <div>
-              <p class="text-sm font-medium text-slate-200">Tool categories</p>
-              <p class="mt-1 text-xs text-slate-400">Agents inherit all tools from their executor by default. Disable categories or individual tools here, then use permissions to require evaluation or deny access.</p>
+              <p class="text-sm font-medium text-foreground">Tool categories</p>
+              <p class="mt-1 text-xs text-muted">Agents inherit all tools from their executor by default. Disable categories or individual tools here, then use permissions to require evaluation or deny access.</p>
             </div>
 
             <div class="flex flex-wrap gap-2">
@@ -1242,7 +1342,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 {@const disabled = categoryDisabled(category)}
                 <button
                   type="button"
-                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {disabled ? 'bg-slate-900 border-slate-700 text-slate-400' : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'}"
+                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {disabled ? 'bg-surface border-control-border text-muted' : 'bg-success-subtle border-success-border text-success'}"
                   onclick={() => toggleCategory(category)}
                   disabled={!canEditTools()}
                 >
@@ -1256,27 +1356,27 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <div class="space-y-2">
               {#each toolCategories.filter((category) => toolsForCategory(category).some(matchesTool)) as category}
                 {@const categoryTools = toolsForCategory(category).filter(matchesTool)}
-                <details open={!!toolSearch.trim()} class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
-                  <summary class="cursor-pointer text-sm font-medium text-slate-200">
+                <details open={!!toolSearch.trim()} class="rounded-xl border border-separator bg-canvas/50 p-3">
+                  <summary class="cursor-pointer text-sm font-medium text-foreground">
                     {category}
-                    <span class="ml-2 text-xs text-slate-500">{categoryDisabled(category) ? 'disabled' : 'enabled'}</span>
+                    <span class="ml-2 text-xs text-quiet">{categoryDisabled(category) ? 'disabled' : 'enabled'}</span>
                   </summary>
                   <div class="mt-3 space-y-2">
                     {#each categoryTools as tool}
                       <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm">
-                        <label class="flex items-center gap-3 text-slate-200">
-                          <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={!canEditTools() || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
+                        <label class="flex items-center gap-3 text-foreground">
+                          <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={!canEditTools() || categoryDisabled(category)} class="h-4 w-4 rounded border-control-border bg-canvas" />
                           <span class="font-mono">{tool.source?.type === 'skill' && tool.source?.raw_tool_name ? tool.source.raw_tool_name : tool.name}</span>
                         </label>
-                        <span class="text-xs text-slate-500">
+                        <span class="text-xs text-quiet">
                           {tool.description}
                           {#if (tool as EffectiveToolItem).available_on && ((tool as EffectiveToolItem).available_on?.length ?? 0) > 1}
-                            <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-300" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
+                            <span class="ml-2 rounded-full bg-raised px-2 py-0.5 font-mono text-[10px] text-secondary" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
                               on: {((tool as EffectiveToolItem).available_on ?? []).join(', ')}
                             </span>
                           {/if}
                         </span>
-                        <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={!canEditPermissions() || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
+                        <select aria-label={`Permission for ${tool.name}`} value={form.toolPermissions[toolKey(tool)] ?? ''} onchange={(event) => setToolPermission(toolKey(tool), event.currentTarget.value)} class="w-32 rounded-lg border border-control-border bg-canvas/80 px-2 py-1 text-xs text-foreground" disabled={!canEditPermissions() || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
                           {#each permissionOptions as option}
                             <option value={option}>{option || 'inherit'}</option>
                           {/each}
@@ -1289,56 +1389,56 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             </div>
 
             {#if mcpServerGroups.some((group) => group.tools.some(matchesTool))}
-              <div class="mt-4 space-y-2 rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
+              <div class="mt-4 space-y-2 rounded-xl border border-accent/20 bg-accent-subtle p-3">
                 <div>
-                  <p class="text-sm font-medium text-sky-100">MCP servers</p>
-                  <p class="mt-1 text-xs text-slate-400">Disable a whole MCP server group, or keep the server enabled and disable individual tools below.</p>
+                  <p class="text-sm font-medium text-accent">MCP servers</p>
+                  <p class="mt-1 text-xs text-muted">Disable a whole MCP server group, or keep the server enabled and disable individual tools below.</p>
                 </div>
                 <div class="space-y-2">
                   {#each mcpServerGroups.filter((group) => group.tools.some(matchesTool)) as group}
                     {@const serverDisabled = mcpServerDisabled(group.key)}
-                    <details open={!!toolSearch.trim()} class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
-                      <summary class="cursor-pointer text-sm font-medium text-slate-200">
+                    <details open={!!toolSearch.trim()} class="rounded-lg border border-separator bg-canvas/60 p-3">
+                      <summary class="cursor-pointer text-sm font-medium text-foreground">
                         <span>{group.label}</span>
-                        <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">{mcpSourceLabel(group.sourceType)}</span>
-                        <span class="ml-2 text-xs text-slate-500">{serverDisabled ? 'disabled' : 'enabled'} · {group.tools.length} tools</span>
+                        <span class="ml-2 rounded-full bg-raised px-2 py-0.5 text-[10px] text-muted">{mcpSourceLabel(group.sourceType)}</span>
+                        <span class="ml-2 text-xs text-quiet">{serverDisabled ? 'disabled' : 'enabled'} · {group.tools.length} tools</span>
                       </summary>
                       <div class="mt-3 space-y-3">
-                        <label class="flex items-start gap-3 text-sm text-slate-200">
+                        <label class="flex items-start gap-3 text-sm text-foreground">
                           <input
                             type="checkbox"
                             checked={!serverDisabled}
                             onchange={() => toggleMcpServer(group)}
                             disabled={!canEditTools()}
-                            class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                            class="mt-0.5 h-4 w-4 rounded border-control-border bg-canvas"
                           />
                           <span>
                             <span class="font-medium">Enable server group</span>
-                            <span class="block font-mono text-xs text-slate-500">{group.key}</span>
+                            <span class="block font-mono text-xs text-quiet">{group.key}</span>
                           </span>
                         </label>
-                        <div class="space-y-2 border-t border-slate-800 pt-3">
+                        <div class="space-y-2 border-t border-separator pt-3">
                           {#each group.tools.filter(matchesTool) as tool}
                             <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm {serverDisabled ? 'opacity-50' : ''}">
-                              <label class="flex items-center gap-3 text-slate-200">
+                              <label class="flex items-center gap-3 text-foreground">
                                 <input
                                   type="checkbox"
                                   checked={!toolDisabled(toolKey(tool))}
                                   onchange={() => toggleTool(toolKey(tool))}
                                   disabled={!canEditTools() || serverDisabled}
-                                  class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                  class="h-4 w-4 rounded border-control-border bg-canvas"
                                 />
                                 <span class="font-mono">{tool.source?.raw_tool_name || tool.name}</span>
                               </label>
-                              <span class="text-xs text-slate-500">
+                              <span class="text-xs text-quiet">
                                 {tool.description}
                                 {#if (tool as EffectiveToolItem).available_on && ((tool as EffectiveToolItem).available_on?.length ?? 0) > 1}
-                                  <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-300" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
+                                  <span class="ml-2 rounded-full bg-raised px-2 py-0.5 font-mono text-[10px] text-secondary" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
                                     on: {((tool as EffectiveToolItem).available_on ?? []).join(', ')}
                                   </span>
                                 {/if}
                               </span>
-                              <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={!canEditPermissions() || serverDisabled || toolDisabled(toolKey(tool))}>
+                              <select aria-label={`Permission for ${tool.name}`} value={form.toolPermissions[toolKey(tool)] ?? ''} onchange={(event) => setToolPermission(toolKey(tool), event.currentTarget.value)} class="w-32 rounded-lg border border-control-border bg-canvas/80 px-2 py-1 text-xs text-foreground" disabled={!canEditPermissions() || serverDisabled || toolDisabled(toolKey(tool))}>
                                 {#each permissionOptions as option}
                                   <option value={option}>{option || 'inherit'}</option>
                                 {/each}
@@ -1358,46 +1458,46 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         <!-- Skills -->
         {#if skills.length > 0}
           <div class="mt-4 space-y-3">
-            <p class="text-sm font-medium text-slate-200">Skills</p>
-            <p class="text-xs text-slate-400">Select skills to attach to this agent. Auto-load instructions only for core skills that should be injected at startup.</p>
+            <p class="text-sm font-medium text-foreground">Skills</p>
+            <p class="text-xs text-muted">Select skills to attach to this agent. Auto-load instructions only for core skills that should be injected at startup.</p>
             {#if selectableSkills.length > 0}
               <div class="grid gap-2 md:grid-cols-2">
                 {#each selectableSkills as skill}
                   {@const selected = form.selectedSkillIds.includes(skill.skill_id)}
-                  <div class="space-y-2 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-sm text-slate-200">
+                  <div class="space-y-2 rounded-lg border border-separator bg-canvas/70 px-3 py-2 text-sm text-foreground">
                     <div class="flex items-center justify-between gap-3">
                       <label class="flex min-w-0 items-center gap-2">
                         <input
                           checked={selected}
-                          class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                          class="h-4 w-4 rounded border-control-border bg-canvas"
                           type="checkbox"
                           onchange={() => toggleSkill(skill.skill_id)}
                           disabled={!canEditField('skills')}
                         />
                         <span class="truncate">{skill.name}</span>
                         {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
-                          <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
+                          <span class="text-xs text-quiet">({skill.current_version.tools.length} tools)</span>
                         {/if}
                         {#if skill.current_version?.asset_manifest && skill.current_version.asset_manifest.length > 0}
-                          <span class="text-xs text-slate-500">({skill.current_version.asset_manifest.length} assets)</span>
+                          <span class="text-xs text-quiet">({skill.current_version.asset_manifest.length} assets)</span>
                         {/if}
                       </label>
-                      <button type="button" class="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200" onclick={() => { skillDetailId = skill.skill_id; }}>
+                      <button type="button" class="inline-flex items-center gap-1 text-xs text-muted hover:text-foreground" onclick={() => { skillDetailId = skill.skill_id; }}>
                         <Eye class="h-3.5 w-3.5" /> View
                       </button>
                     </div>
                     {#if selected}
-                      <label class="ml-6 flex items-start gap-2 text-xs text-slate-400">
+                      <label class="ml-6 flex items-start gap-2 text-xs text-muted">
                         <input
                           checked={form.autoLoadSkillIds.includes(skill.skill_id)}
-                          class="mt-0.5 h-3.5 w-3.5 rounded border-slate-600 bg-slate-950"
+                          class="mt-0.5 h-3.5 w-3.5 rounded border-control-border bg-canvas"
                           type="checkbox"
                           onchange={() => toggleSkillAutoLoad(skill.skill_id)}
                           disabled={!canEditField('skills')}
                         />
                         <span>
                           Auto-load instructions
-                          <span class="block text-slate-500">Inject full skill instructions at startup; use sparingly because it increases prompt size.</span>
+                          <span class="block text-quiet">Inject full skill instructions at startup; use sparingly because it increases prompt size.</span>
                         </span>
                       </label>
                     {/if}
@@ -1407,10 +1507,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {/if}
             {#if globallyAttachedSkills.length > 0}
               <div class="mt-2">
-                <p class="mb-1 text-xs text-slate-500">Globally attached to every agent:</p>
+                <p class="mb-1 text-xs text-quiet">Globally attached to every agent:</p>
                 <div class="flex flex-wrap gap-1">
                   {#each globallyAttachedSkills as skill}
-                    <span class="rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-300">{skill.name}</span>
+                    <span class="rounded bg-inset px-2 py-0.5 text-xs text-secondary">{skill.name}</span>
                   {/each}
                 </div>
               </div>
@@ -1429,14 +1529,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         <!-- Intaris MCP Servers -->
         {#if intarisMcpServers.length > 0}
           <div class="mt-4 space-y-3">
-            <p class="text-sm font-medium text-slate-200">Intaris MCP servers</p>
-            <p class="text-xs text-slate-400">Remote MCP servers managed by Intaris. Select which servers this agent can use.</p>
+            <p class="text-sm font-medium text-foreground">Intaris MCP servers</p>
+            <p class="text-xs text-muted">Remote MCP servers managed by Intaris. Select which servers this agent can use.</p>
             <div class="flex flex-wrap gap-2">
               {#each intarisMcpServers as server}
                 {@const selected = (form.intarisMcpServers || []).includes(server.name)}
                 <button
                   type="button"
-                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-sky-500/20 border-sky-500/50 text-sky-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-accent-subtle border-accent/50 text-accent' : 'bg-surface border-control-border text-muted hover:border-control-border'}"
                   disabled={!canEditTools()}
                   onclick={() => {
                     if (!canEditTools()) return;
@@ -1459,34 +1559,41 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         {/if}
 
         {#if form.mcpServers.length > 0}
-          <div class="mt-4 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+          <div class="mt-4 rounded-2xl border border-accent/30 bg-accent-subtle px-4 py-3 text-sm text-accent">
             <p class="font-medium">This agent still has legacy inline MCP server definitions.</p>
-            <p class="mt-1 text-sky-50/90">Create these servers in Settings → Tools and assign them to an executor. Existing inline MCP config is preserved for backward compatibility.</p>
+            <p class="mt-1 text-accent/90">Create these servers in Settings → Tools and assign them to an executor. Existing inline MCP config is preserved for backward compatibility.</p>
           </div>
         {/if}
       </Card>
 
       <!-- Provider & Model -->
+      {/if}
+      {/if}
       </div>
       <div hidden={activeSection !== 'providers'} id={`${editorId}-panel-providers`} role="tabpanel" aria-labelledby={`${editorId}-tab-providers`} tabindex="0" class="space-y-5">
+      {#if visitedSections.has('providers')}
       {@render backendSettings()}
       <Card class="p-5">
-        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">LLM Configuration</p>
+        <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-muted">LLM Configuration</p>
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Provider</span>
-            <select bind:value={form.providerId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.provider_id')}>
+            <select bind:value={form.providerId} onchange={() => {
+              if (form.providerId === 'cognis' && !form.model.startsWith('cognis/')) form.model = '';
+              else if (form.providerId !== 'cognis' && form.model.startsWith('cognis/')) form.model = '';
+            }} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditField('llm_config.provider_id')}>
               <option value="">Use default provider</option>
+              <option value="cognis">Cognis (custom routes)</option>
               {#each providers as provider}
                 <option value={provider.provider_id}>{provider.display_name}{provider.is_default ? ' ⭐' : ''}</option>
               {/each}
             </select>
-            <span class="block text-xs text-slate-400">Leave empty to use the system default.</span>
+            <span class="block text-xs text-muted">Leave empty to use the system default.</span>
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Model</span>
             {#if selectedProviderModels().length > 0}
-               <select bind:value={form.model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.model')}>
+               <select bind:value={form.model} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditField('llm_config.model')}>
                 <option value="">Use provider default</option>
                 {#each selectedProviderModels() as modelId}
                   <option value={modelId}>{modelId}</option>
@@ -1495,19 +1602,19 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {:else}
                <Input bind:value={form.model} placeholder="Use provider default" disabled={!canEditField('llm_config.model')} />
             {/if}
-            <span class="block text-xs text-slate-400">Leave empty to use the provider's default model.</span>
+            <span class="block text-xs text-muted">Leave empty to use the provider's default model.</span>
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Temperature</span>
             <Input bind:value={form.temperature} type="number" placeholder="default" disabled={!canEditField('llm_config.temperature')} />
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Max tokens</span>
             <Input bind:value={form.maxTokens} type="number" placeholder="default" disabled={!canEditField('llm_config.max_tokens')} />
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Thinking effort</span>
-            <select bind:value={form.reasoningEffort} aria-describedby={`${editorId}-thinking-help`} aria-invalid={invalidThinking(form.reasoningEffort, availableThinkingEfforts())} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.reasoning_effort')}>
+            <select bind:value={form.reasoningEffort} aria-describedby={`${editorId}-thinking-help`} aria-invalid={invalidThinking(form.reasoningEffort, availableThinkingEfforts())} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditField('llm_config.reasoning_effort')}>
               <option value="">Inherit</option>
               {#if invalidThinking(form.reasoningEffort, availableThinkingEfforts())}
                 <option value={form.reasoningEffort}>{thinkingEffortLabel(form.reasoningEffort)} (unavailable)</option>
@@ -1516,43 +1623,45 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 <option value={value}>{thinkingEffortLabel(value)}</option>
               {/each}
             </select>
-            <span id={`${editorId}-thinking-help`} class="block text-xs text-slate-400">
+            <span id={`${editorId}-thinking-help`} class="block text-xs text-muted">
               Inherit uses routing/provider configuration. Provider default does not inherit an effort hint.
               {#if !selectedProviderModelInfo()}Capabilities unavailable; only inheritance and provider default can be selected.{/if}
               {#if invalidThinking(form.reasoningEffort, availableThinkingEfforts())}Select an available value before saving.{/if}
             </span>
           </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Fast mode</span>
-              <select bind:value={form.fastMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.fast_mode')}>
+              <select bind:value={form.fastMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditField('llm_config.fast_mode')}>
                 <option value="inherit">Inherit</option>
                 <option value="enabled" disabled={!supportsFastMode()}>Enabled{supportsFastMode() ? '' : ' (unavailable)'}</option>
                 <option value="disabled">Disabled</option>
               </select>
-              <span class="block text-xs text-slate-400">
+              <span class="block text-xs text-muted">
                 {#if supportsFastMode()}Requests accelerated execution; account eligibility is not confirmed and premium pricing can apply.
                 {:else if selectedProviderModelInfo()}Fast mode is not supported for this provider/model.
                 {:else}Fast-mode capabilities unavailable.{/if}
                 Inherit uses lower-layer configuration. Disabled suppresses inherited acceleration.
               </span>
             </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Voice</span>
             <Input bind:value={form.voice} placeholder="Use system default" disabled={!canEditField('llm_config.voice')} />
-            <span class="block text-xs text-slate-400">TTS voice for the speaker button and conversation mode (e.g. <code>alloy</code>, <code>nova</code>, an ElevenLabs voice ID). Leave empty to use the system default.</span>
+            <span class="block text-xs text-muted">TTS voice for the speaker button and conversation mode (e.g. <code>alloy</code>, <code>nova</code>, an ElevenLabs voice ID). Leave empty to use the system default.</span>
           </label>
         </div>
       </Card>
 
+      {/if}
       </div>
       {#if !isSystemAsset || editableFieldSet.has('agent_profiles')}
       <div hidden={activeSection !== 'profiles'} id={`${editorId}-panel-profiles`} role="tabpanel" aria-labelledby={`${editorId}-tab-profiles`} tabindex="0">
+      {#if visitedSections.has('profiles')}
       <Card class="p-5">
         <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Runtime profiles</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">Per-agent execution profiles</h2>
-            <p class="mt-1 text-sm text-slate-400">
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Runtime profiles</p>
+            <h2 class="mt-1 text-lg font-semibold text-strong">Per-agent execution profiles</h2>
+            <p class="mt-1 text-sm text-muted">
                Profiles tune provider, model, thinking effort, memory availability/mode, and an extra prompt snippet.
                The memory backend remains agent-wide. Profile memory changes apply on the next logical turn and cannot loosen the frozen policy mid-turn.
             </p>
@@ -1561,11 +1670,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         </div>
 
         {#if form.agentProfiles.length > 0}
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span>Default runtime profile</span>
             <select
               bind:value={form.defaultAgentProfileId}
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
               disabled={!canEditField('default_agent_profile_id')}
             >
               {#each form.agentProfiles as profile}
@@ -1574,32 +1683,32 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 {/if}
               {/each}
             </select>
-            <span class="block text-xs text-slate-400">Used when no explicit <code>agent_profile_id</code> is requested.</span>
+            <span class="block text-xs text-muted">Used when no explicit <code>agent_profile_id</code> is requested.</span>
           </label>
 
           <div class="mt-5 space-y-4">
             {#each form.agentProfiles as profile, index (index)}
-              <div class="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+              <div class="rounded-2xl border border-separator bg-canvas/50 p-4">
                 <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                   <div>
-                    <p class="text-sm font-semibold text-slate-100">{profile.profileId || 'New profile'}</p>
-                    <p class="mt-1 text-xs text-slate-500">Canonical audit keeps <code>agent_id</code> and <code>agent_profile_id</code> as separate fields.</p>
+                    <p class="text-sm font-semibold text-foreground">{profile.profileId || 'New profile'}</p>
+                    <p class="mt-1 text-xs text-quiet">Canonical audit keeps <code>agent_id</code> and <code>agent_profile_id</code> as separate fields.</p>
                   </div>
                   <div class="flex items-center gap-3">
-                    <label class="flex items-center gap-2 text-xs text-slate-300">
+                    <label class="flex items-center gap-2 text-xs text-secondary">
                       <input
                         type="checkbox"
                         bind:checked={profile.enabled}
-                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        class="h-4 w-4 rounded border-control-border bg-canvas"
                         disabled={!canEditProfiles()}
                       />
                       Enabled
                     </label>
-                    <label class="flex items-center gap-2 text-xs text-slate-300">
+                    <label class="flex items-center gap-2 text-xs text-secondary">
                       <input
                         type="checkbox"
                         bind:checked={profile.agentSwitchable}
-                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        class="h-4 w-4 rounded border-control-border bg-canvas"
                         disabled={!canEditProfiles()}
                       />
                       Agent can switch to this profile
@@ -1609,31 +1718,64 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 </div>
 
                 <div class="mt-4 grid gap-4 md:grid-cols-2">
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="flex min-h-11 items-center gap-2 text-sm text-foreground">
+                    <input
+                      type="checkbox"
+                      bind:checked={profile.quickSwitch}
+                      class="h-4 w-4 rounded border-control-border bg-canvas"
+                      disabled={!canEditProfiles()}
+                    />
+                    Show in chat quick switcher
+                  </label>
+                  <label class="space-y-2 text-sm font-medium text-foreground">
+                    <span>Quick-switch position</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      bind:value={profile.quickSwitchIndex}
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
+                      disabled={!canEditProfiles() || !profile.quickSwitch}
+                    />
+                    <span class="block text-xs text-muted">Lower positions appear first. The agent default is always available.</span>
+                  </label>
+                  <label class="space-y-2 text-sm font-medium text-foreground">
+                    <span>Quick-switch color</span>
+                    <select
+                      bind:value={profile.quickSwitchColor}
+                      disabled={!canEditProfiles()}
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
+                    >
+                      {#each ['neutral', 'blue', 'teal', 'amber', 'violet', 'rose'] as color}
+                        <option value={color}>{color}</option>
+                      {/each}
+                    </select>
+                  </label>
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Profile ID</span>
                     <Input bind:value={profile.profileId} placeholder="fast" disabled={!canEditProfiles()} />
-                    <span class="block text-xs text-slate-400">Agent-local ID used as <code>agent_profile_id</code>; do not include <code>/</code>.</span>
+                    <span class="block text-xs text-muted">Agent-local ID used as <code>agent_profile_id</code>; do not include <code>/</code>.</span>
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Memory availability</span>
                     <select
                       bind:value={profile.memoryAvailability}
-                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       disabled={!canEditProfiles() || form.memoryBackend === 'none'}
                     >
                       <option value="inherit">Inherit</option>
                       <option value="enabled">Enabled</option>
                       <option value="disabled">Disabled</option>
                     </select>
-                    <span class="block text-xs text-slate-400">Effective: {form.memoryBackend === 'none' || profile.memoryAvailability === 'disabled' ? 'Disabled' : 'Enabled'}</span>
+                    <span class="block text-xs text-muted">Effective: {form.memoryBackend === 'none' || profile.memoryAvailability === 'disabled' ? 'Disabled' : 'Enabled'}</span>
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Memory mode</span>
                     <select
                       bind:value={profile.memoryMode}
-                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       disabled={!canEditProfiles() || form.memoryBackend === 'none' || profile.memoryAvailability === 'disabled'}
                     >
                       <option value="">Inherit agent setting ({selectedMemoryMode?.label ?? form.memoryMode})</option>
@@ -1644,35 +1786,40 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         <option value={memoryMode.id}>{memoryMode.label}</option>
                       {/each}
                     </select>
-                    <span class="block text-xs text-slate-400">Backend is agent-wide; this override takes effect next logical turn.</span>
+                    <span class="block text-xs text-muted">Backend is agent-wide; this override takes effect next logical turn.</span>
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Description / routing guidance</span>
                     <Input bind:value={profile.description} placeholder="Low-latency responses for simple tasks" disabled={!canEditProfiles()} />
-                    <span class="block text-xs text-slate-400">Used later by automatic routing to choose this profile.</span>
+                    <span class="block text-xs text-muted">Used later by automatic routing to choose this profile.</span>
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Provider</span>
                     <select
                       bind:value={profile.providerId}
-                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      onchange={() => {
+                        if (profile.providerId === 'cognis' && !profile.model.startsWith('cognis/')) profile.model = '';
+                        else if (profile.providerId !== 'cognis' && profile.model.startsWith('cognis/')) profile.model = '';
+                      }}
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       disabled={!canEditProfiles()}
                     >
                       <option value="">Use agent/default provider</option>
+                      <option value="cognis">Cognis (custom routes)</option>
                       {#each providers as provider}
                         <option value={provider.provider_id}>{provider.display_name}{provider.is_default ? ' ⭐' : ''}</option>
                       {/each}
                     </select>
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Model</span>
                     {#if modelsForProvider(profile.providerId).length > 0}
                       <select
                         bind:value={profile.model}
-                        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                         disabled={!canEditProfiles()}
                       >
                         <option value="">Use provider/agent default</option>
@@ -1685,13 +1832,13 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     {/if}
                   </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Thinking effort</span>
                     <select
                       bind:value={profile.reasoningEffort}
                       aria-describedby={`${editorId}-profile-${profile.profileId}-thinking-help`}
                       aria-invalid={invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))}
-                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       disabled={!canEditProfiles()}
                     >
                       <option value="">Inherit</option>
@@ -1702,78 +1849,85 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         <option value={value}>{thinkingEffortLabel(value)}</option>
                       {/each}
                     </select>
-                    <span id={`${editorId}-profile-${profile.profileId}-thinking-help`} class="block text-xs text-slate-400">
+                    <span id={`${editorId}-profile-${profile.profileId}-thinking-help`} class="block text-xs text-muted">
                       Inherit uses the agent's thinking configuration. Provider default does not inherit an effort hint.
                       {#if invalidThinking(profile.reasoningEffort, availableThinkingEffortsForProfile(profile))}Select an available value before saving.{/if}
                     </span>
                   </label>
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span>Fast mode</span>
                       <select
                         bind:value={profile.fastMode}
-                        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                         disabled={!canEditProfiles()}
                       >
                         <option value="inherit">Inherit agent setting</option>
                         <option value="enabled" disabled={!supportsFastModeForProfile(profile)}>Enabled{supportsFastModeForProfile(profile) ? '' : ' (unavailable)'}</option>
                         <option value="disabled">Disabled</option>
                       </select>
-                      <span class="block text-xs text-slate-400">
+                      <span class="block text-xs text-muted">
                         {#if supportsFastModeForProfile(profile)}Account eligibility is not confirmed; premium pricing can apply.
                         {:else}Fast mode is unsupported or its capability metadata is unavailable.{/if}
                         Inherit uses the agent configuration. Disabled suppresses inherited acceleration.
                       </span>
                     </label>
 
-                  <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                  <label class="space-y-2 text-sm font-medium text-foreground md:col-span-2">
                     <span>System prompt extra</span>
                     <textarea
                       bind:value={profile.systemPromptExtra}
-                      class="min-h-28 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      class="min-h-28 w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       placeholder="Extra behavior tuning injected only when this profile is active."
                       disabled={!canEditProfiles()}
                     ></textarea>
-                    <span class="block text-xs text-slate-400">This snippet tunes runtime behavior only; it must not redefine identity, memory scope, ownership, permissions, or tool rights.</span>
+                    <span class="block text-xs text-muted">This snippet tunes runtime behavior only; it must not redefine identity, memory scope, ownership, permissions, or tool rights.</span>
                   </label>
                 </div>
               </div>
             {/each}
           </div>
         {:else}
-          <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-400">
+          <div class="mt-4 rounded-2xl border border-separator bg-canvas/50 px-4 py-3 text-sm text-muted">
             No explicit runtime profiles. The agent will use the safe default derived from its base LLM configuration.
           </div>
         {/if}
 
         {#if errors.agentProfiles}
-          <p class="mt-3 text-sm text-rose-300">{errors.agentProfiles}</p>
+          <p class="mt-3 text-sm text-danger">{errors.agentProfiles}</p>
         {/if}
       </Card>
+      {/if}
       </div>
       {/if}
 
       <!-- Secondary Agent Bindings (primary only) -->
+      {#if form.agentType === 'primary'}
       <div hidden={activeSection !== 'workflows'} id={`${editorId}-panel-workflows`} role="tabpanel" aria-labelledby={`${editorId}-tab-workflows`} tabindex="0" class="space-y-5">
-      {#if form.agentType === 'primary' && !readonly && secondaryAgents.length > 0}
+      {#if visitedSections.has('workflows')}
+      {#if mode === 'edit' && !readonly && secondaryAgents.length > 0}
         <Card class="p-5">
           <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Secondary agent bindings</p>
-            <p class="mt-1 text-sm text-slate-400">Select which user-created secondary agents this primary agent can delegate to. System secondary agents are always available.</p>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Secondary agent bindings</p>
+            <p class="mt-1 text-sm text-muted">Select which user-created secondary agents this primary agent can delegate to. System secondary agents are always available.</p>
           </div>
           <div class="mt-3 grid gap-2 md:grid-cols-2">
             {#each secondaryAgents.filter((a: Agent) => !a.is_system) as agent}
-              <label class="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
+              <label class="flex items-center gap-3 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
                 <input
                   checked={localBindings.includes(agent.agent_id)}
-                  class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  class="h-4 w-4 rounded border-control-border bg-canvas"
                   type="checkbox"
-                  onchange={() => toggleBinding(agent.agent_id)}
+                  onchange={(event) => {
+                    event.currentTarget.checked = localBindings.includes(agent.agent_id);
+                    toggleBinding(agent.agent_id);
+                  }}
+                  disabled={bindingsSaving || !onBindingsChange}
                 />
                 <span>{agent.display_name ?? agent.name}</span>
-                <span class="text-xs text-slate-400">({agent.agent_id})</span>
+                <span class="text-xs text-muted">({agent.agent_id})</span>
               </label>
             {:else}
-              <p class="text-sm text-slate-500">No user-created secondary agents. System agents are always available.</p>
+              <p class="text-sm text-quiet">No user-created secondary agents. System agents are always available.</p>
             {/each}
           </div>
         </Card>
@@ -1784,26 +1938,26 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       <Card class="p-5">
         <div class="space-y-4">
           <div>
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Workflow settings</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">Available workflows</h2>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Workflow settings</p>
+            <h2 class="mt-1 text-lg font-semibold text-strong">Available workflows</h2>
           </div>
 
           <div class="grid gap-3 md:grid-cols-2">
             {#each workflows as workflow}
-              <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
-                <input checked={form.availableWorkflowIds.includes(workflow.workflow_id)} class="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleWorkflow(workflow.workflow_id)} disabled={readonly} />
+              <label class="flex items-start gap-3 rounded-2xl border border-separator bg-canvas/60 px-4 py-3 text-sm text-foreground">
+                <input checked={form.availableWorkflowIds.includes(workflow.workflow_id)} class="mt-1 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleWorkflow(workflow.workflow_id)} disabled={readonly} />
                 <span>
-                  <span class="block font-medium text-white">{workflow.name}</span>
-                  <span class="mt-1 block text-xs text-slate-400">{workflow.workflow_id}</span>
+                  <span class="block font-medium text-strong">{workflow.name}</span>
+                  <span class="mt-1 block text-xs text-muted">{workflow.workflow_id}</span>
                 </span>
               </label>
             {/each}
           </div>
 
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Default workflow</span>
-              <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+              <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
                 <option value="">Automatic (decision engine)</option>
                 {#each workflows as workflow}
                   {#if form.availableWorkflowIds.includes(workflow.workflow_id)}
@@ -1813,77 +1967,82 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               </select>
             </label>
 
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Selection mode</span>
-              <select bind:value={form.workflowSelectionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+              <select bind:value={form.workflowSelectionMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
                 <option value="automatic">automatic</option>
                 <option value="always_ask">always_ask</option>
                 <option value="use_default">use_default</option>
               </select>
             </label>
 
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Default chat mode</span>
-              <select bind:value={form.defaultChatMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+              <select bind:value={form.defaultChatMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
                 <option value="default">default</option>
                 <option value="plan">plan</option>
                 <option value="build">build</option>
               </select>
-              <span class="block text-xs font-normal text-slate-500">Controls chat behavior before any conversation or one-shot slash override.</span>
+              <span class="block text-xs font-normal text-quiet">Controls chat behavior before any conversation or one-shot slash override.</span>
             </label>
           </div>
 
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
+          <details class="space-y-2">
+          <summary class="cursor-pointer text-sm font-medium text-foreground">Advanced workflow overrides</summary>
+          <label class="block space-y-2 text-sm font-medium text-foreground">
             <span>Step agent overrides (JSON)</span>
-            <textarea aria-invalid={errors.stepAgentOverridesJson ? 'true' : 'false'} bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500" disabled={readonly}></textarea>
+            <textarea aria-invalid={errors.stepAgentOverridesJson ? 'true' : 'false'} bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 font-mono text-sm text-foreground placeholder:text-quiet" disabled={readonly}></textarea>
             {#if errors.stepAgentOverridesJson}
-              <span class="text-xs text-rose-300">{errors.stepAgentOverridesJson}</span>
+              <span class="text-xs text-danger">{errors.stepAgentOverridesJson}</span>
             {/if}
           </label>
+          </details>
         </div>
       </Card>
       {/if}
 
+      {/if}
       </div>
+      {/if}
+    </div>
+  </div>
+</form>
+  {#each extraSections as section (section.id)}
+    <div hidden={activeSection !== section.id} id={`${editorId}-panel-${section.id}`} role="tabpanel" aria-labelledby={`${editorId}-tab-${section.id}`} tabindex="0" class="space-y-5">
+      {#if visitedSections.has(section.id)}
+        {@render section.content()}
+      {/if}
+    </div>
+  {/each}
       {#if error}
-        <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+        <p role="alert" class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">
           {error}
         </p>
       {/if}
 
       {#if !readonly || isSystemAsset}
-        <div class="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/95 p-4 backdrop-blur">
-          <div class="text-xs text-slate-400">
-            <p>Save applies to all sections.</p>
+        <div class="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-separator bg-canvas/95 p-4 backdrop-blur">
+          <div class="text-xs text-muted">
+            <p>{dirty ? 'Unsaved configuration changes' : 'Configuration saved'}</p>
+            {#if routeMetadataIssue}
+              <p role="status" class="mt-1 text-warning">{routeMetadataIssue}</p>
+            {/if}
+            {#if routeLoadState === 'error' || (routeLoadState === 'loaded' && routeMetadataIssue)}
+              <button type="button" class="mt-1 text-accent underline" onclick={loadInferenceRoutes}>
+                Retry route discovery
+              </button>
+            {/if}
             {#each Object.entries(errors) as [field, message]}
-              <button type="button" class="mt-1 block text-left text-rose-300 underline"
+              <button type="button" class="mt-1 block text-left text-danger underline"
                  onclick={() => { activeSection = field === 'name' ? 'identity' : field === 'reasoningEffort' ? 'providers' : field === 'agentProfiles' ? 'profiles' : 'workflows'; }}>
                 {message}
               </button>
             {/each}
           </div>
-          <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : isSystemAsset ? 'Save overrides' : 'Save changes'}</Button>
+          <Button form={`${editorId}-form`} type="submit" disabled={saving || !canSubmit || !dirty}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : isSystemAsset ? 'Save overrides' : 'Save changes'}</Button>
         </div>
       {/if}
-    </div>
-
-    <div hidden={activeSection !== 'identity'} class="space-y-5">
-      {#if form.agentType === 'primary'}
-        <Card class="p-5">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Editable identity preview</p>
-          <p class="mt-2 text-sm text-slate-300">This preview shows only the editable identity block. Runtime instructions, memory, tools, skills, and workflow context are added separately.</p>
-          <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildSystemPromptPreview(form)}</pre>
-        </Card>
-      {:else}
-        <Card class="p-5">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Secondary agent</p>
-          <p class="mt-2 text-sm text-slate-300">Secondary agents are lightweight task executors. They have no personality or memory integration — just a focused system prompt and scoped tools.</p>
-          <p class="mt-2 text-sm text-slate-300">They are invoked by primary agents via delegation or by the workflow engine via step agent overrides.</p>
-        </Card>
-      {/if}
-    </div>
-  </div>
-</form>
+</div>
 
 {#if showAvatarModal}
   <AvatarGenerateModal

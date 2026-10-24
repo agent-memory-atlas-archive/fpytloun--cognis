@@ -72,9 +72,9 @@ class _ReplayAuthoringAgent:
         valid_agenda = [
             item for item in agenda_items if item["timestamp"] != item["metadata"].get("end")
         ]
-        payload["blocks"][2]["date"] = "2026-07-14"
+        payload["blocks"][2]["date"] = "2030-04-16"
         payload["blocks"][2]["timezone"] = "Europe/Prague"
-        payload["blocks"][2]["now"] = "2026-07-14T08:00:00+02:00"
+        payload["blocks"][2]["now"] = "2030-04-16T08:00:00+02:00"
         payload["blocks"][2]["items"] = [
             {
                 "title": item["title"],
@@ -129,7 +129,7 @@ class _ReplayAuthoringAgent:
         chart = payload["blocks"][5]["blocks"][0]
         chart.update(
             {
-                "title": "Lovosice temperature",
+                "title": "Fictional town temperature",
                 "series": [
                     {
                         "id": "temperature",
@@ -208,8 +208,8 @@ def test_collector_json_acceptance_fixture_produces_valid_daily_payload() -> Non
 
 
 @pytest.mark.asyncio
-async def test_agent_authored_pulse_v2_accepts_production_collector_replay() -> None:
-    replay = _fixture("production_collector_replay.json")
+async def test_agent_authored_pulse_v2_accepts_synthetic_collector_replay() -> None:
+    replay = _fixture("synthetic_collector_replay.json")
     collectors = replay["collectors"]
     assert len(next(item for item in collectors if item["collector"] == "gmail")["items"]) == 15
     descriptor = describe_available_tool([WRITE_DELIVERABLE_TOOL], "write_deliverable")[
@@ -251,8 +251,9 @@ async def test_agent_authored_pulse_v2_accepts_production_collector_replay() -> 
     assert chart["source_ids"] == [weather["sources"][0]["id"]]
     assert chart["observed_at"] == weather["observed_at"]
     serialized = json.dumps(payload)
-    assert "Review unused OAuth clients" in serialized
-    assert "Summer promotion" not in serialized
+    inbox = next(item for item in collectors if item["collector"] == "gmail")
+    for item in inbox["items"]:
+        assert (item["title"] in serialized) is bool(item["metadata"]["actionable"])
     assert serialized.count("Unavailable") == 1
     quality = rich_render_metadata(payload)["pulse_quality"]
     assert quality["quality_gate_passed"] is True
@@ -485,6 +486,41 @@ async def test_daily_brief_v12_is_not_silently_upgraded_to_v13_contract() -> Non
     assert v12["valid"] is True
     assert v13["valid"] is False
     assert any(error["code"] == "invalid_daily_brief" for error in v13["errors"])
+
+
+@pytest.mark.asyncio
+async def test_daily_brief_source_failure_does_not_report_dependent_contract_errors() -> None:
+    result = await validate_available_tool_call_with_context(
+        [WRITE_DELIVERABLE_TOOL],
+        "write_deliverable",
+        {
+            "action": "rich:pulse",
+            "payload_artifact": {"artifact_id": "art_5ad3732fe5744381a7c841ca88af93f8"},
+        },
+        NativeValidationContext(task_description="Use daily_brief_v13."),
+    )
+    assert result["valid"] is False
+    assert [error["code"] for error in result["errors"]] == ["artifact_support_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_daily_brief_normalization_failure_reports_only_payload_errors() -> None:
+    arguments = {"action": "rich:pulse", "payload": deepcopy(PULSE_DAILY_SKELETON)}
+    arguments["payload"]["title"] = "Daily pulse"
+    arguments["payload"]["metadata"].pop("presentation")
+    arguments["payload"]["blocks"].pop()
+    ordinary = await validate_available_tool_call_with_context(
+        [WRITE_DELIVERABLE_TOOL], "write_deliverable", arguments, NativeValidationContext()
+    )
+    daily = await validate_available_tool_call_with_context(
+        [WRITE_DELIVERABLE_TOOL],
+        "write_deliverable",
+        arguments,
+        NativeValidationContext(task_description="Use daily_brief_v13."),
+    )
+    assert ordinary["valid"] is False
+    assert daily["errors"] == ordinary["errors"]
+    assert not any(error["code"] == "invalid_daily_brief" for error in daily["errors"])
 
 
 def test_standard_pulse_allows_optional_context_without_daily_slots() -> None:

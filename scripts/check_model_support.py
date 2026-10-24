@@ -140,7 +140,11 @@ def openai_model_details(markdown: str, model_id: str) -> dict[str, Any]:
         for label in ("Input", "Cached input", "Output")
         if (match := re.search(rf"^\| {label} \| ([\$\d.]+) \|", pricing, re.MULTILINE))
     }
-    efforts = re.search(r"^`reasoning\.effort` supports ([^\n]+)", markdown, re.MULTILINE)
+    efforts = re.search(
+        r"^`reasoning\.effort` supports (.*?)(?:\.|\n## |\Z)",
+        markdown,
+        re.MULTILINE | re.DOTALL,
+    )
     endpoints = section("Endpoints")
     responses = re.search(
         r"^\| Responses \| `v1/responses` \| (Supported|Not supported) \|",

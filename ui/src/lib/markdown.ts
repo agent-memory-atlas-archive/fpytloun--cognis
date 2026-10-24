@@ -1,6 +1,6 @@
 import DOMPurify from 'dompurify';
-import hljs from 'highlight.js/lib/common';
-import { marked, Renderer } from 'marked';
+import { HIGHLIGHT_ATTR } from '$lib/syntax/lazy-highlight';
+import { marked, Renderer, type Token } from 'marked';
 
 marked.setOptions({
   breaks: true,
@@ -9,7 +9,7 @@ marked.setOptions({
 
 const forbiddenAttributes = ['onerror', 'onclick', 'onload', 'onmouseover'];
 const forbiddenTags = ['iframe', 'script', 'style'];
-const markdownRenderPolicyVersion = 'markdown-policy-v2';
+const markdownRenderPolicyVersion = 'markdown-policy-v3';
 const youtubeVideoIdPattern = /^[A-Za-z0-9_-]{11}$/;
 const youtubePlaceholderPattern = /<span data-cognis-youtube-embed="(\d+)"><\/span>/g;
 const safeIframeAllow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
@@ -568,17 +568,9 @@ function createLinkRenderer(state?: MarkdownRenderState): Renderer {
 
   renderer.code = (token) => {
     const lang = languageClass(token.lang ?? '');
-    try {
-      if (lang && hljs.getLanguage(lang)) {
-        const highlighted = hljs.highlight(token.text, { language: lang, ignoreIllegals: true }).value;
-        return `<pre><code class="hljs language-${lang}">${highlighted}</code></pre>`;
-      }
-    } catch {
-      // Fall through to escaped plain text if highlight.js cannot parse it.
-    }
-
-    const className = lang ? ` class="language-${lang}"` : '';
-    return `<pre><code${className}>${escapeHtml(token.text)}</code></pre>`;
+    // Escaped plain text; highlighted lazily when visible (lazy-highlight.ts).
+    const attributes = lang ? ` class="language-${lang}" ${HIGHLIGHT_ATTR}="${lang}"` : '';
+    return `<pre><code${attributes}>${escapeHtml(token.text)}</code></pre>`;
   };
 
   renderer.link = (token) => {
@@ -791,10 +783,9 @@ export function renderDocsMarkdown(markdown: string, context?: MarkdownRenderCon
 /**
  * Streaming markdown renderer.
  *
- * Splits incoming content at block boundaries (blank lines and fenced code
- * blocks) and memoizes per-block HTML. Re-parsing during streaming only hits
- * the tail block. For a 2000-token assistant reply this turns an O(n^2)
- * parse+sanitize into O(n) at steady state.
+ * Uses the Markdown lexer for block boundaries and memoizes stable HTML.
+ * Blank lines alone are not boundaries: lists and quotes can span them.
+ * Reference definitions require document-wide resolution.
  *
  * Usage:
  *   const streamer = createMarkdownStreamer();
@@ -808,72 +799,108 @@ export interface MarkdownStreamer {
   reset(): void;
 }
 
+function balanceStreamingInline(text: string): string {
+  const protectedRanges: Array<[number, number]> = [];
+  const protect = (token: Token, start: number, block: boolean) => {
+    if (['code', 'codespan', 'link', 'image', 'html', 'escape', 'blockquote', 'list', 'table'].includes(token.type)) {
+      // Container tokens own their original prefixes. Nested code raw strings
+      // have stripped indentation/quotes and cannot be located by global search.
+      protectedRanges.push([start, start + token.raw.length]);
+      return;
+    }
+    if ('tokens' in token && Array.isArray(token.tokens) && token.tokens.length) {
+      const children = token.tokens as Token[];
+      const raw = children.map(child => child.raw).join('');
+      const childOffset = token.raw.indexOf(raw);
+      if (childOffset < 0) {
+        if (block) protectedRanges.push([start, start + token.raw.length]);
+        return;
+      }
+      let childStart = start + childOffset;
+      for (const child of children) {
+        protect(child, childStart, false);
+        childStart += child.raw.length;
+      }
+    }
+  };
+  let offset = 0;
+  for (const token of marked.lexer(text)) {
+    protect(token, offset, true);
+    offset += token.raw.length;
+  }
+  protectedRanges.sort((a, b) => a[0] - b[0]);
+  let rangeIndex = 0;
+  const pending: string[] = [];
+  const pattern = /(\*{1,3}|_{1,3}|~~|`+)/g;
+  let tail = text;
+  let partialCloser = '';
+  for (const match of text.matchAll(pattern)) {
+    const start = match.index;
+    while (rangeIndex < protectedRanges.length && protectedRanges[rangeIndex][1] <= start) rangeIndex++;
+    if (rangeIndex < protectedRanges.length && protectedRanges[rangeIndex][0] <= start) continue;
+    const marker = match[0];
+    const before = start > 1 && /[\uDC00-\uDFFF]/.test(text[start - 1])
+      ? text.slice(start - 2, start) : text[start - 1] ?? '';
+    const after = String.fromCodePoint(text.codePointAt(start + marker.length) ?? 0).replace('\0', '');
+    const previous = pending[pending.length - 1];
+    const canClose = before !== '' && !/\s/u.test(before)
+      && (after === '' || /[\s\p{P}]/u.test(after));
+    if (previous === marker && canClose) {
+      pending.pop();
+      continue;
+    }
+    // A token can end halfway through the closing run, e.g. **bold*.
+    if (previous && previous.startsWith(marker) && canClose && after === '') {
+      pending.pop();
+      partialCloser = previous.slice(marker.length);
+      continue;
+    }
+    const canOpen = (before === '' || /[\s\p{P}]/u.test(before))
+      && after !== '' && !/\s/u.test(after);
+    if (marker.startsWith('`') && canOpen) {
+      // An unfinished code span owns its remainder, including literal Markdown.
+      pending.push(marker);
+      break;
+    }
+    if (canOpen && /[\p{L}\p{N}]/u.test(after)) {
+      pending.push(marker);
+    } else if (after === '' && (before === '' || /\s/u.test(before))) {
+      // A delimiter without any text yet should not flash on screen.
+      tail = text.slice(0, start);
+    }
+  }
+  return tail + partialCloser + pending.reverse().join('');
+}
+
+function streamingTail(source: string): string {
+  const text = balanceStreamingInline(source);
+  // Withhold unfinished image syntax; show unfinished link labels as text.
+  // Never change the stored source, and finalize always renders it verbatim.
+  const match = /(?<![\\!])(!?)\[([^\]\n]*)(?:\](?:\([^)\n]*)?)?$/.exec(text);
+  if (!match) return text;
+  let protectedSyntax = false;
+  marked.walkTokens(marked.lexer(text), (token) => {
+    if (
+      (token.type === 'code' || token.type === 'codespan' || token.type === 'html'
+        || token.type === 'link' || token.type === 'image')
+      && token.raw.includes(match[0])
+    ) protectedSyntax = true;
+  });
+  if (protectedSyntax) return text;
+  return text.slice(0, match.index) + (match[1] ? '' : match[2]);
+}
+
 export function createMarkdownStreamer(context?: MarkdownRenderContext): MarkdownStreamer {
   // Map of block text -> rendered HTML fragment (stable blocks only).
   const cache = new Map<string, string>();
   const cacheEnabled = !((context?.resolveLink || context?.resolveImage) && !context.cacheKey);
-  let stableHtml = '';
-  let stableLen = 0;
 
   function splitBlocks(text: string): { stable: string[]; tail: string } {
-    // Walk chars and keep track of fenced code state so we don't split mid-fence.
-    const blocks: string[] = [];
-    let inFence = false;
-    let fenceChar: '`' | '~' = '`';
-    let fenceLength = 0;
-    let fenceAllowsNestedFallback = false;
-    let nestedFenceDepth = 0;
-
-    const lines = text.split('\n');
-    let charIdx = 0;
-    let blockStart = 0;
-
-    for (let li = 0; li < lines.length; li++) {
-      const line = lines[li];
-      if (!inFence) {
-        const opener = parseFenceOpener(line);
-        if (opener) {
-          inFence = true;
-          fenceChar = opener.char;
-          fenceLength = opener.length;
-          fenceAllowsNestedFallback = genericEnclosingFenceLanguages.has(fenceLanguage(opener));
-          nestedFenceDepth = 0;
-        }
-      } else if (parseClosingFence(line, fenceChar, fenceLength)) {
-        if (nestedFenceDepth > 0) {
-          nestedFenceDepth -= 1;
-        } else {
-          inFence = false;
-          fenceLength = 0;
-          fenceAllowsNestedFallback = false;
-        }
-      } else if (fenceAllowsNestedFallback) {
-        const nestedOpener = parseFenceOpener(line);
-        if (nestedOpener && nestedOpener.char === fenceChar && nestedOpener.length >= fenceLength) {
-          nestedFenceDepth += 1;
-        }
-      }
-      const isBlockBreak = !inFence && line.trim() === '';
-      if (isBlockBreak && blockStart < charIdx) {
-        const block = text.slice(blockStart, charIdx);
-        if (block.trim()) blocks.push(block);
-        blockStart = charIdx + line.length + 1;
-      }
-      charIdx += line.length + 1;
-    }
-
-    // Anything after the last block break is the tail. If we're not in a
-    // fence and the last char was a blank line, tail is empty.
-    let tail = blockStart < text.length ? text.slice(blockStart) : '';
-    const incompleteIframeIndex = blocks.findIndex(
-      (block) => /^ {0,3}<iframe\b/i.test(block) && !/<iframe\b[^>]*>\s*<\/iframe>/i.test(block),
-    );
-    if (incompleteIframeIndex !== -1) {
-      const deferred = blocks.splice(incompleteIframeIndex).join('\n\n');
-      tail = tail ? `${deferred}\n\n${tail}` : deferred;
-    }
-
-    return { stable: blocks, tail };
+    const normalized = normalizeMarkdownForRender(text);
+    const tokens = marked.lexer(normalized);
+    if (Object.keys(tokens.links).length > 0) return { stable: [], tail: normalized };
+    const blocks = tokens.filter((token) => token.type !== 'space').map((token) => token.raw);
+    return { stable: blocks.slice(0, -1), tail: blocks.at(-1) ?? '' };
   }
 
   function parseSanitize(chunk: string): string {
@@ -882,8 +909,6 @@ export function createMarkdownStreamer(context?: MarkdownRenderContext): Markdow
 
   function render(content: string): string {
     if (!content) {
-      stableHtml = '';
-      stableLen = 0;
       return '';
     }
 
@@ -899,26 +924,18 @@ export function createMarkdownStreamer(context?: MarkdownRenderContext): Markdow
       }
       pieces += html;
     }
-    stableHtml = pieces;
-    stableLen = stable.reduce((acc, b) => acc + b.length, 0);
-
-    const tailHtml = tail.trim() ? parseSanitize(tail) : '';
+    const tailHtml = tail.trim() ? parseSanitize(streamingTail(tail)) : '';
     return pieces + tailHtml;
   }
 
   function finalize(content: string): string {
     // A final full parse guarantees convergence for constructs that can span
     // streaming block boundaries, including raw HTML tokens.
-    const pieces = parseSanitize(content);
-    stableHtml = pieces;
-    stableLen = content.length;
-    return pieces;
+    return parseSanitize(content);
   }
 
   function reset(): void {
     cache.clear();
-    stableHtml = '';
-    stableLen = 0;
   }
 
   return { render, finalize, reset };

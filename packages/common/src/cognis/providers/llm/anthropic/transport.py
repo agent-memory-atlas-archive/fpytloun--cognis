@@ -23,6 +23,15 @@ from cognis.providers.llm.anthropic.contracts import (
     ResolvedAnthropicRequestContext,
     materialize_json,
 )
+from cognis.providers.llm.anthropic.model_policy import (
+    anthropic_model_policy,
+    validate_model_request,
+)
+from cognis.providers.llm.anthropic.thinking_replay import (
+    REPLAY_FINGERPRINTS,
+    prepare_thinking_replay,
+    seal_thinking_replay,
+)
 from cognis.providers.llm.errors import (
     LLMStreamProviderError,
     MidStreamErrorCategory,
@@ -96,6 +105,17 @@ class AnthropicTransportError(LLMStreamProviderError):
         super().__init__(message, payload=payload)
 
 
+def _validate_response_model(message: Mapping[str, Any], expected: str) -> None:
+    if (
+        anthropic_model_policy(expected).binds_thinking_to_prefix
+        and message.get("model") != expected
+    ):
+        raise AnthropicTransportError(
+            "Sonnet 5.5 response model differs from the requested model; "
+            "cannot establish signed thinking provenance"
+        )
+
+
 def build_anthropic_headers(
     context: ResolvedAnthropicRequestContext, credential: str
 ) -> dict[str, str]:
@@ -113,7 +133,14 @@ def build_anthropic_headers(
     else:
         # Claude Code identity and beta selection belong only to OAuth requests.
         headers["authorization"] = f"Bearer {credential}"
-        headers["anthropic-beta"] = ",".join(ANTHROPIC_REQUIRED_BETAS)
+        headers["anthropic-beta"] = ",".join(
+            beta
+            for beta in ANTHROPIC_REQUIRED_BETAS
+            if not (
+                anthropic_model_policy(context.model).binds_thinking_to_prefix
+                and beta == "interleaved-thinking-2025-05-14"
+            )
+        )
         headers["user-agent"] = CLAUDE_CODE_USER_AGENT
     return headers
 
@@ -195,6 +222,12 @@ def _payload(
     *,
     stream: bool,
 ) -> dict[str, Any]:
+    try:
+        validate_model_request(context.model, request)
+    except ValueError as exc:
+        raise AnthropicTransportError(
+            str(exc), category=MidStreamErrorCategory.INVALID_REQUEST
+        ) from exc
     payload = {
         key: value
         for key, value in request.items()
@@ -228,7 +261,10 @@ def _payload(
         ),
     )
     if tool_choice is None:
-        payload.pop("tools", None)
+        if anthropic_model_policy(context.model).binds_thinking_to_prefix:
+            payload["tool_choice"] = {"type": "none"}
+        else:
+            payload.pop("tools", None)
     elif payload["tools"]:
         thinking = request.get("thinking")
         thinking_enabled = isinstance(thinking, Mapping) and thinking.get("type") != "disabled"
@@ -245,6 +281,7 @@ def _payload(
         ) from exc
     if not isinstance(materialized, dict):
         raise AnthropicTransportError("Anthropic request payload must be a JSON object")
+    prepare_thinking_replay(context, materialized, request.get(REPLAY_FINGERPRINTS, ()))
     return materialized
 
 
@@ -285,7 +322,7 @@ def _anthropic_tool_choice(
         choice: dict[str, Any] = {"type": "auto"}
     elif isinstance(value, str) and value in {"required", "any"}:
         choice = {"type": "any"}
-    elif value == "none":
+    elif value == "none" or isinstance(value, Mapping) and value.get("type") == "none":
         return None
     elif isinstance(value, Mapping):
         choice_type = value.get("type")
@@ -467,6 +504,7 @@ class AnthropicStreamDecoder:
             message = event.get("message")
             if not isinstance(message, Mapping):
                 raise AnthropicTransportError("Anthropic message_start lacks message")
+            _validate_response_model(message, self.model_fingerprint)
             self.message_id = message.get("id") if isinstance(message.get("id"), str) else None
             self._merge_usage(message.get("usage"))
             return []
@@ -852,9 +890,10 @@ class AnthropicMessagesClient:
     ) -> dict[str, Any]:
         """Execute a non-streaming request and produce native-compatible chat data."""
 
+        payload = _payload(context, request, bundle, stream=False)
         response, owned_client = await self._request(
             context,
-            _payload(context, request, bundle, stream=False),
+            payload,
             request=request,
         )
         try:
@@ -875,6 +914,7 @@ class AnthropicMessagesClient:
             model_fingerprint=model_fingerprint,
             thinking_fingerprint=context.thinking_fingerprint,
         )
+        envelope = seal_thinking_replay(envelope, context, payload)
         return _chat_response(data, context.model, envelope, bundle)
 
     async def stream(
@@ -888,9 +928,10 @@ class AnthropicMessagesClient:
     ) -> AsyncIterator[dict[str, Any]]:
         """Execute a streaming request, closing response/client on cancellation."""
 
+        payload = _payload(context, request, bundle, stream=True)
         response, owned_client = await self._request(
             context,
-            _payload(context, request, bundle, stream=True),
+            payload,
             request=request,
         )
         decoder = AnthropicStreamDecoder(
@@ -903,7 +944,7 @@ class AnthropicMessagesClient:
             async for event in decode_sse(response.aiter_lines()):
                 for chunk in decoder.feed(event):
                     yield chunk
-            envelope = decoder.envelope()
+            envelope = seal_thinking_replay(decoder.envelope(), context, payload)
             yield {
                 "anthropic_native_envelope": envelope.to_dict(),
                 "anthropic_native_events": [{"type": "message_stop"}],
@@ -976,6 +1017,7 @@ def _envelope_from_message(
     model_fingerprint: str,
     thinking_fingerprint: str,
 ) -> AnthropicNativeEnvelope:
+    _validate_response_model(message, model_fingerprint)
     content = message.get("content")
     if not isinstance(content, list) or not all(isinstance(block, Mapping) for block in content):
         raise AnthropicTransportError("Anthropic response has invalid content blocks")

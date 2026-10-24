@@ -281,5 +281,11 @@ def artifact_preview_rich_payload(payload: dict[str, object]) -> dict[str, objec
             "rows": rows,
         }
     else:
-        block = {"type": "code", "content": content, "language": "plaintext"}
+        mime = str(payload.get("mime_type") or "").split(";", 1)[0].lower()
+        is_json = (
+            mime == "application/json"
+            or mime.endswith("+json")
+            or str(payload.get("filename") or "").lower().endswith(".json")
+        )
+        block = {"type": "code", "content": content, "language": "json" if is_json else "plaintext"}
     return {"metadata": {}, "blocks": [block]}

@@ -12,37 +12,41 @@
 </script>
 
 {#if !registry}
-  <p class="rounded-lg border border-amber-500/30 p-2 text-xs text-amber-200">
+  <p class="rounded-lg border border-warning-border p-2 text-xs text-warning">
     Not returned by this discovery snapshot. It can be partial; this model will not be removed.
   </p>
 {:else if fields.length}
-  <details class="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
-    <summary class="cursor-pointer text-sm text-amber-200">
+  <details class="rounded-lg border border-warning-border bg-warning-subtle p-3">
+    <summary class="cursor-pointer text-sm text-warning">
       Registry drift: {fields.length} differing {fields.length === 1 ? 'field' : 'fields'}
     </summary>
-    <p class="my-2 text-xs text-slate-400">
+    <p class="my-2 text-xs text-muted">
       Differences can be intentional overrides. Source: {registry.source || 'provider discovery / bundled registry'}.
       Resets change only the draft. Save the provider to apply them.
     </p>
     <ul class="space-y-2">
       {#each fields as field}
-        <li class="rounded border border-amber-500/20 p-2 text-xs">
-          <strong class="text-amber-100">{field}</strong>
-          <div class="break-words text-slate-300">Configured: {showValue(model[field])}</div>
-          <div class="break-words text-slate-300">Registry: {showValue(registry[field])}</div>
-          <button type="button" class="mt-1 text-sky-300 underline"
+        <li class="rounded border border-warning-border p-2 text-xs">
+          <strong class="text-warning">{field}</strong>
+          <div class="break-words text-secondary">Configured: {showValue(model[field])}</div>
+          <div class="break-words text-secondary">Registry: {showValue(registry[field])}</div>
+          <button type="button" class="mt-1 text-accent underline"
             onclick={() => registry && onreset(resetModelDrift(model, registry, field))}>
             Reset {field}
           </button>
         </li>
       {/each}
     </ul>
-    <button type="button" class="mt-3 rounded border border-amber-400/40 px-3 py-1 text-sm text-amber-100"
+    <button type="button" class="mt-3 rounded border border-warning-border px-3 py-1 text-sm text-warning"
       onclick={() => registry && onreset(resetModelDrift(model, registry))}>
       Reset all discovered fields for this model
     </button>
-    <p class="mt-1 text-xs text-slate-400">Fields absent from discovery are unknown and remain unchanged.</p>
+    <p class="mt-1 text-xs text-muted">Fields absent from discovery are unknown and remain unchanged.</p>
   </details>
 {:else}
-  <p class="text-xs text-emerald-300">Aligned with supplied registry fields.</p>
+  {#if registry.context_window == null || registry.max_output_tokens == null}
+    <p class="text-xs text-warning">Partial metadata; no differences in supplied registry fields.</p>
+  {:else}
+    <p class="text-xs text-success">Aligned with supplied registry fields. Unreported capabilities and prices remain unknown.</p>
+  {/if}
 {/if}

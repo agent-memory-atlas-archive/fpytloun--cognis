@@ -29,6 +29,7 @@ describe('Markdown document identity', () => {
       title: 'Audit report',
       payload: { blocks: [{ type: 'markdown', content: 'Summary.\n\n# Later heading' }] },
     });
-    expect(container.querySelector('.rich-toolbar h1')).toHaveTextContent('Audit report');
+    expect(container.querySelector('.rich-toolbar h1')).toBeNull();
+    expect(container.querySelector('.rich-body .document-title')).toHaveTextContent('Audit report');
   });
 });

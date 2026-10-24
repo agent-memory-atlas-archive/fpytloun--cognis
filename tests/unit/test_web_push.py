@@ -313,6 +313,82 @@ def test_send_one_clears_last_error_after_success(
     assert response.json()["last_error"] is None
 
 
+def test_gone_endpoint_is_not_silently_re_enabled(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
+
+    with TestClient(create_app()) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = {
+            "Authorization": f"Bearer {client.app.state.auth_provider.sign_access_token('user@example.com', 'User', 'user')}"
+        }
+
+        def register(endpoint: str) -> dict[str, object]:
+            response = client.post(
+                "/api/v1/push/subscriptions",
+                headers=headers,
+                json={"endpoint": endpoint, "keys": {"p256dh": "p256dh-key", "auth": "auth-key"}},
+            )
+            assert response.status_code == 200
+            return response.json()
+
+        dead = "https://web.push.apple.com/dead-endpoint"
+        first = register(dead)
+        assert first["enabled"] is True and first["gone"] is False
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            client.app.state.web_push_service,
+            "_send_sync",
+            lambda _row, _payload: ("gone", "Push failed: 410 Gone"),
+        )
+        client.post("/api/v1/push/subscriptions/test", headers=headers)
+
+        again = register(dead)
+        assert again == {
+            "subscription_id": first["subscription_id"],
+            "enabled": False,
+            "gone": True,
+        }
+        status = client.get("/api/v1/push/subscriptions/status", headers=headers).json()
+        assert status["enabled_subscriptions"] == 0
+
+        fresh = register("https://web.push.apple.com/fresh-endpoint")
+        assert fresh["enabled"] is True and fresh["gone"] is False
+
+        # A user-disabled (not gone) subscription re-registers normally.
+        client.post(
+            "/api/v1/push/subscriptions/unsubscribe",
+            headers=headers,
+            json={"endpoint": "https://web.push.apple.com/fresh-endpoint"},
+        )
+        assert register("https://web.push.apple.com/fresh-endpoint")["enabled"] is True
+
+
+def test_legacy_gone_errors_are_recognized() -> None:
+    from cognis.core.web_push import _is_gone_row
+
+    assert _is_gone_row(SimpleNamespace(enabled=False, last_error="Push failed: 410 Gone"))
+    assert _is_gone_row(SimpleNamespace(enabled=False, last_error="gone: Unregistered"))
+    assert not _is_gone_row(SimpleNamespace(enabled=True, last_error="Push failed: 410 Gone"))
+    assert not _is_gone_row(SimpleNamespace(enabled=False, last_error=None))
+    assert not _is_gone_row(SimpleNamespace(enabled=False, last_error="Push failed: 500"))
+
+
 def test_send_sync_passes_loaded_vapid_key_to_pywebpush(
     monkeypatch: object,
     tmp_path: Path,
@@ -387,6 +463,91 @@ def test_schedule_error_event_payload_does_not_require_conversation_id() -> None
     assert payload["kind"] == "schedule"
     assert payload["tag"] == "schedule:sched_1"
     assert payload["url"] == "/schedules/sched_1"
+    # System alerts keep Cognis branding.
+    assert payload["title"] == "Cognis"
+    assert "icon" not in payload
+
+
+def _branding_service(monkeypatch: object, agent: object) -> WebPushService:
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    conversation = SimpleNamespace(
+        conversation_id="conversation-a",
+        agent_id="agent-a",
+        context_type="web",
+        user_email="user@example.com",
+        title="Branding",
+    )
+
+    async def _get_conversation(_session: object, _conversation_id: str) -> object:
+        return conversation
+
+    async def _get_agent(_session: object, _agent_id: str) -> object:
+        return agent
+
+    monkeypatch.setattr("cognis.core.web_push.get_conversation", _get_conversation)  # type: ignore[attr-defined]
+    monkeypatch.setattr("cognis.core.web_push.get_agent", _get_agent)  # type: ignore[attr-defined]
+    return WebPushService(
+        session_factory=lambda: _Session(),  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject="mailto:test@example.com",
+            reason="disabled",
+        ),
+    )
+
+
+def test_agent_notifications_use_agent_branding_and_system_alerts_do_not(
+    monkeypatch: object,
+) -> None:
+    agent = SimpleNamespace(
+        display_name="Riker",
+        name="riker",
+        avatar_image_id=None,
+        avatar_url="/avatars/riker.png",
+        owner_email="user@example.com",
+    )
+    service = _branding_service(monkeypatch, agent)
+
+    reply = asyncio.run(
+        service._event_payload(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.TURN_COMPLETED,
+                data={"conversation_id": "conversation-a", "final_content": "Done."},
+            )
+        )
+    )
+    assert reply is not None
+    assert reply["title"] == "Riker"
+    assert reply["icon"] == "/avatars/riker.png"
+
+    schedule = asyncio.run(
+        service._event_payload(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.SCHEDULE_DISABLED,
+                data={
+                    "schedule_id": "sched_1",
+                    "schedule_name": "Daily check",
+                    "created_by": "user@example.com",
+                    "agent_id": "agent-a",
+                },
+            )
+        )
+    )
+    assert schedule is not None
+    assert schedule["title"] == "Cognis"
+    assert "icon" not in schedule
+    assert schedule["body"] == (
+        'Schedule "Daily check" (Riker) was disabled after repeated failures.'
+    )
 
 
 def test_turn_completed_payload_correlates_push_with_observed_completion(

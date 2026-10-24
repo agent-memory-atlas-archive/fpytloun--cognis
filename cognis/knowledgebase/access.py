@@ -7,10 +7,12 @@ from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis.core.project_access import resolve_agent_use_grant
 from cognis.models.agent import AgentPermissions
 from cognis.store.models import Agent, KnowledgebaseRow
+from cognis.store.project_knowledge import list_project_knowledgebases
+from cognis.store.project_queries import get_project_agent_use_assignment
 from cognis.store.queries import (
-    get_active_agent_grant,
     get_active_knowledgebase_grant,
     get_agent,
     get_knowledgebase_by_id,
@@ -25,6 +27,7 @@ class KnowledgebaseAccessContext:
     actor_email: str
     agent_id: str | None = None
     agent_owner_email: str | None = None
+    project_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +39,7 @@ class ResolvedKnowledgebaseAccess:
     is_owner: bool = False
     is_agent_grantee: bool = False
     is_direct_user_grantee: bool = False
+    is_project_grantee: bool = False
 
 
 async def resolve_knowledgebase_access(
@@ -72,12 +76,35 @@ async def resolve_knowledgebase_access(
             return None
         if context.agent_owner_email and context.agent_owner_email != agent.owner_email:
             return None
+        if context.project_id and await get_project_agent_use_assignment(
+            session,
+            agent_id=agent.agent_id,
+            user_email=context.actor_email,
+            project_id=context.project_id,
+        ):
+            rows = await list_project_knowledgebases(
+                session, user_email=context.actor_email, project_id=context.project_id
+            )
+            if any(row.knowledgebase_id == knowledgebase_id for row in rows):
+                return ResolvedKnowledgebaseAccess(
+                    knowledgebase=kb,
+                    actor_email=context.actor_email,
+                    owner_email=kb.owner_email,
+                    via_agent_id=agent.agent_id,
+                    is_project_grantee=True,
+                    is_owner=is_owner,
+                )
         if agent.owner_email != kb.owner_email:
             return None
         if knowledgebase_id not in _allowed_knowledgebases(agent):
             return None
         if context.actor_email != agent.owner_email:
-            agent_grant = await get_active_agent_grant(session, agent.agent_id, context.actor_email)
+            agent_grant = await resolve_agent_use_grant(
+                session,
+                agent_id=agent.agent_id,
+                user_email=context.actor_email,
+                project_id=context.project_id,
+            )
             if agent_grant is None:
                 return None
             return ResolvedKnowledgebaseAccess(
@@ -113,6 +140,16 @@ async def resolve_knowledgebase_access(
             owner_email=kb.owner_email,
             is_direct_user_grantee=True,
         )
+    if any(
+        row.knowledgebase_id == knowledgebase_id
+        for row in await list_project_knowledgebases(session, user_email=context.actor_email)
+    ):
+        return ResolvedKnowledgebaseAccess(
+            knowledgebase=kb,
+            actor_email=context.actor_email,
+            owner_email=kb.owner_email,
+            is_project_grantee=True,
+        )
     return None
 
 
@@ -131,19 +168,32 @@ async def list_available_knowledgebases(
     if context.agent_owner_email and context.agent_owner_email != agent.owner_email:
         return []
     if context.actor_email != agent.owner_email:
-        grant = await get_active_agent_grant(session, agent.agent_id, context.actor_email)
+        grant = await resolve_agent_use_grant(
+            session,
+            agent_id=agent.agent_id,
+            user_email=context.actor_email,
+            project_id=context.project_id,
+        )
         if grant is None:
             return []
     ids = _allowed_knowledgebases(agent)
-    if not ids:
-        return []
     from cognis.store.queries import list_knowledgebases_by_ids
 
-    return await list_knowledgebases_by_ids(
+    rows = await list_knowledgebases_by_ids(
         session,
         owner_email=agent.owner_email,
         knowledgebase_ids=ids,
     )
+    if context.project_id and await get_project_agent_use_assignment(
+        session,
+        agent_id=agent.agent_id,
+        user_email=context.actor_email,
+        project_id=context.project_id,
+    ):
+        rows += await list_project_knowledgebases(
+            session, user_email=context.actor_email, project_id=context.project_id
+        )
+    return list({row.knowledgebase_id: row for row in rows}.values())
 
 
 def _allowed_knowledgebases(agent: Agent) -> list[str]:

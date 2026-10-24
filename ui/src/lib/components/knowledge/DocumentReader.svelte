@@ -1,5 +1,6 @@
 <script lang="ts">
   import hljs from 'highlight.js/lib/common';
+  import { prettyPrintJson } from '$lib/syntax/json';
   import { parse as parseYaml } from 'yaml';
 
   import Download from 'lucide-svelte/icons/download';
@@ -46,11 +47,7 @@
     if (!content || (kind !== 'code' && kind !== 'json' && kind !== 'yaml' && kind !== 'xml')) return null;
     let text = content.text;
     if (kind === 'json') {
-      try {
-        text = JSON.stringify(JSON.parse(text), null, 2);
-      } catch {
-        // leave as-is if not valid JSON
-      }
+      text = prettyPrintJson(text);
     } else if (kind === 'yaml') {
       try {
         parseYaml(text);
@@ -112,10 +109,10 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col" data-testid="knowledge-document-reader">
-  <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800/80 px-4 py-3">
+  <div class="flex shrink-0 items-center justify-between gap-3 border-b border-separator/80 px-4 py-3">
     <div class="flex items-center gap-2 overflow-hidden">
-      <FileText class="h-4 w-4 shrink-0 text-slate-500" />
-      <h3 class="truncate text-sm font-semibold text-white">{doc.display_name}</h3>
+      <FileText class="h-4 w-4 shrink-0 text-quiet" />
+      <h3 class="truncate text-sm font-semibold text-strong">{doc.display_name}</h3>
     </div>
     {#if downloadUrl || onDownload}
       <Button size="sm" variant="secondary" onclick={handleDownload}>
@@ -131,9 +128,9 @@
       {#if loading}
         <LoadingState label="Loading document…" description="Fetching content for preview." />
       {:else if error}
-        <div class="rounded-2xl border border-rose-800/60 bg-rose-950/40 px-4 py-3 text-sm text-rose-300" role="alert">{error}</div>
+        <div class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger" role="alert">{error}</div>
       {:else if !content}
-        <div class="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-slate-800/80 px-6 py-12 text-center text-sm text-slate-400">
+        <div class="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-separator/80 px-6 py-12 text-center text-sm text-muted">
           <p>Preview isn't available for this file type yet.</p>
           {#if downloadUrl || onDownload}
             <p>Use Download to open it directly.</p>
@@ -141,31 +138,31 @@
         </div>
       {:else}
         {#if content.extractedText}
-          <p class="mb-3 rounded-lg border border-slate-800/80 bg-slate-900/60 px-3 py-2 text-xs text-slate-400">
+          <p class="mb-3 rounded-lg border border-separator/80 bg-surface/60 px-3 py-2 text-xs text-muted">
             Showing extracted text. Original formatting is not preserved.
           </p>
         {/if}
         {#if kind === 'markdown' && markdownDoc}
           <div class="prose prose-invert prose-sm max-w-none">{@html markdownDoc.html}</div>
         {:else if highlighted}
-          <pre class="overflow-x-auto rounded-xl bg-slate-950/80 p-4 text-xs leading-relaxed"><code>{@html highlighted}</code></pre>
+          <pre class="overflow-x-auto rounded-xl bg-canvas/80 p-4 text-xs leading-relaxed"><code>{@html highlighted}</code></pre>
         {:else}
-          <pre class="whitespace-pre-wrap break-words text-sm text-slate-200">{content.text}</pre>
+          <pre class="whitespace-pre-wrap break-words text-sm text-foreground">{content.text}</pre>
         {/if}
       {/if}
     </div>
 
-    <div class="hidden w-64 shrink-0 overflow-y-auto border-l border-slate-800/80 p-4 lg:block">
+    <div class="hidden w-64 shrink-0 overflow-y-auto border-l border-separator/80 p-4 lg:block">
       <DocumentMetadataCard {doc} {metadataSchema} />
     {#if kind === 'markdown' && markdownDoc && markdownDoc.headings.length > 1}
       <nav class="mt-4" aria-label="Table of contents">
-        <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Contents</p>
+        <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-quiet">Contents</p>
         <ul class="space-y-1 text-sm">
           {#each markdownDoc.headings as heading (heading.id)}
             <li style={`padding-left: ${(heading.level - 1) * 10}px`}>
               <button
                 type="button"
-                class={`text-left hover:text-sky-300 ${activeHeadingId === heading.id ? 'text-sky-300' : 'text-slate-400'}`}
+                class={`text-left hover:text-accent-hover ${activeHeadingId === heading.id ? 'text-accent' : 'text-muted'}`}
                 onclick={() => scrollToHeading(heading)}
               >
                 {heading.text}
@@ -177,5 +174,5 @@
     {/if}
     </div>
   </div>
-  <div class="border-t border-slate-800 p-3 lg:hidden"><details><summary class="cursor-pointer text-sm text-slate-300">Details</summary><div class="mt-2"><DocumentMetadataCard {doc} {metadataSchema} /></div></details></div>
+  <div class="border-t border-separator p-3 lg:hidden"><details><summary class="cursor-pointer text-sm text-secondary">Details</summary><div class="mt-2"><DocumentMetadataCard {doc} {metadataSchema} /></div></details></div>
 </div>

@@ -529,29 +529,29 @@
     <ChannelsPageHeader busy={busy} onRefresh={() => void loadData()} onAdd={beginCreateDefault} />
 
     {#if error}
-      <Card class="border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-200">{error}</Card>
+      <Card class="border border-danger-border bg-danger-subtle p-4 text-sm text-danger">{error}</Card>
     {/if}
 
     <ChannelsSummaryCards items={summaryCards} />
 
     {#if webhookInfo && !webhookInfoDismissed}
-      <Card class="border border-emerald-500/20 bg-emerald-500/10 p-5 text-sm text-emerald-100">
+      <Card class="border border-success-border bg-success-subtle p-5 text-sm text-success">
         <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <p class="font-medium">Webhook setup for {webhookInfo.channelType}</p>
-            <p class="mt-2 text-emerald-100/80">Use this callback URL in the external platform configuration:</p>
-            <code class="mt-3 block rounded-xl bg-slate-950/80 px-3 py-2 text-xs text-slate-100">{webhookInfo.url}</code>
+            <p class="mt-2 text-success/80">Use this callback URL in the external platform configuration:</p>
+            <code class="mt-3 block rounded-xl bg-canvas/80 px-3 py-2 text-xs text-foreground">{webhookInfo.url}</code>
             {#if webhookInfo.secret}
-              <p class="mt-3 text-emerald-100/80">Verification secret / token:</p>
-              <code class="mt-2 block rounded-xl bg-slate-950/80 px-3 py-2 text-xs text-slate-100">{webhookInfo.secret}</code>
+              <p class="mt-3 text-success/80">Verification secret / token:</p>
+              <code class="mt-2 block rounded-xl bg-canvas/80 px-3 py-2 text-xs text-foreground">{webhookInfo.secret}</code>
             {/if}
           </div>
           <div class="flex flex-col gap-2">
-            <button class="rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100" onclick={() => webhookInfo && void copyWebhookInfo(webhookInfo.url)} type="button">Copy URL</button>
+            <button class="rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground" onclick={() => webhookInfo && void copyWebhookInfo(webhookInfo.url)} type="button">Copy URL</button>
             {#if webhookInfo.secret}
-              <button class="rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100" onclick={() => webhookInfo?.secret && void copyWebhookInfo(webhookInfo.secret)} type="button">Copy secret</button>
+              <button class="rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground" onclick={() => webhookInfo?.secret && void copyWebhookInfo(webhookInfo.secret)} type="button">Copy secret</button>
             {/if}
-            <button class="rounded-xl px-3 py-2 text-sm text-slate-300" onclick={() => { webhookInfoDismissed = true; }} type="button">Dismiss</button>
+            <button class="rounded-xl px-3 py-2 text-sm text-secondary" onclick={() => { webhookInfoDismissed = true; }} type="button">Dismiss</button>
           </div>
         </div>
       </Card>
@@ -565,7 +565,7 @@
         { id: 'contacts', label: `Verified senders (${contacts.length})` },
       ] as tab}
         <button
-          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-sky-500 text-slate-950' : 'border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 hover:text-white'}`}
+          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-accent text-on-accent' : 'border border-control-border bg-surface text-secondary hover:border-border-strong hover:text-strong'}`}
           onclick={() => handleTabChange(tab.id as ChannelsTab)}
           type="button"
         >
@@ -586,10 +586,11 @@
         <Sheet
           open={mobileEditorOpen}
           onClose={closeEditor}
+          backdropDismissible={!isDirty && !Object.values(credentialOverrides).some(Boolean)}
+          dismissible={!busy}
           side="bottom"
           label={editorMode === 'create' ? 'Create channel account' : 'Edit channel account'}
           maxHeight="92dvh"
-          dismissible={!isDirty}
         >
           {#snippet children()}
             <ChannelAccountEditor
@@ -632,11 +633,11 @@
         <!-- Desktop-only inline editor -->
         <div class="hidden lg:block">
           {#if editorMode === 'closed'}
-            <Card class="p-6 text-sm text-slate-300">
-              <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Account editor</p>
-              <h2 class="mt-2 text-lg font-semibold text-white">Choose a platform or existing account</h2>
+            <Card class="p-6 text-sm text-secondary">
+              <p class="text-xs uppercase tracking-[0.24em] text-quiet">Account editor</p>
+              <h2 class="mt-2 text-lg font-semibold text-strong">Choose a platform or existing account</h2>
               <p class="mt-2">Select an account to edit, or start a new account setup to see platform-specific guidance here.</p>
-              <button class="mt-4 rounded-xl bg-sky-500 px-4 py-2 text-sm font-medium text-slate-950" onclick={beginCreateDefault} type="button">Add channel</button>
+              <button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-on-accent" onclick={beginCreateDefault} type="button">Add channel</button>
             </Card>
           {:else}
             <ChannelAccountEditor

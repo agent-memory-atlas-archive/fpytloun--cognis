@@ -2,8 +2,6 @@
 
 Tasks are how Cognis tracks durable work that should run through a workflow instead of a single immediate chat turn.
 
-![Cognis task workflow view on iOS PWA](../assets/screenshots/pwa-task.webp)
-
 ## What tasks are for
 
 Use `Tasks` when work should be:
@@ -28,6 +26,13 @@ The task board gives you a kanban-style view of work by status. From there you c
 - inspect queued or running work
 - open task details
 - understand which items are blocked, active, or completed
+
+Dashboard schedule-failure notifications also offer **Task details** for the
+latest recorded task, plus **Retry task** when that task is failed and you can
+mutate tasks. Retry asks for confirmation and starts a fresh run; completed
+actions can execute again. It opens the new task for debugging and does not
+change or re-enable the schedule. **View schedule** remains available.
+Deleted or inaccessible tasks do not expose task actions.
 
 Tasks created through the UI, API, or agent `create_task` tool can be saved as
 drafts. Draft tasks are durable but are not enqueued or executed until you submit
@@ -78,6 +83,15 @@ You can also steer a paused task from chat through the main agent. When you do t
 ## Delivery model
 
 Task results are delivered back into the target conversation instead of talking directly to external channels. This keeps user-facing communication inside the normal conversation model.
+
+For shared project tasks using preferred-channel delivery, final successful
+results also go to other project users through their own configured preferred
+channel for the task's agent. This includes scheduled task results. Recipients
+must still have access to both the task and the agent, and an active channel
+conversation; Cognis does not grant agent access or create channel routes.
+Failures, progress, questions, and approvals remain owner-only. Silent
+completion and other delivery modes do not fan out. These notifications do not
+start additional agent turns or grant permission to manage the task.
 
 Task follow-ups are not all phrased the same way:
 

@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis import json_codec as json
@@ -42,6 +43,7 @@ from cognis.core.artifact_inputs import (
     safe_attachment_metadata,
     validate_outbound_attachment_batch,
 )
+from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope, ClusterSignalService
 from cognis.core.deliverable_links import (
     DeliverableShareUnavailable,
     DeliverableViewLink,
@@ -94,6 +96,7 @@ class ChannelDeliveryStatus(StrEnum):
 
 
 _TASK_FINAL_SOURCE_TYPE = "task_final_result"
+_PROJECT_TASK_RESULT_SOURCE_TYPE = "project_task_result"
 _TASK_RESULT_FOLLOW_UP_SOURCE_TYPE = "task_result_follow_up"
 _FOLLOW_UP_RESULT_SOURCE_TYPE = "follow_up_result"
 _NOTIFICATION_SOURCE_TYPE = "notification"
@@ -286,12 +289,14 @@ class ChannelDeliveryService:
         channel_manager_ref: Any,  # Callable[[], ChannelManager]
         turn_scheduler: Any | None = None,  # TurnScheduler (for observer flush)
         public_base_url: str = "",
+        cluster_signals: ClusterSignalService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._event_bus = event_bus
         self._channel_manager_ref = channel_manager_ref
         self._turn_scheduler = turn_scheduler
         self._public_base_url = public_base_url.rstrip("/")
+        self._cluster_signals = cluster_signals
         self._retry_task: asyncio.Task[None] | None = None
         self._retry_wakeup = asyncio.Event()
         self._managed_channel_service: Any | None = None
@@ -307,6 +312,11 @@ class ChannelDeliveryService:
         event_bus.subscribe(EventType.TURN_ERROR, self._handle_turn_error_event)
         event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_schedule_event)
         event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_schedule_event)
+        event_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, self._handle_outbox_change)
+
+    async def _handle_outbox_change(self, event: Event) -> None:
+        if event.data.get("kind") == ClusterSignalKind.CHANNEL_OUTBOX_CHANGED:
+            self.wake_pending_deliveries()
 
     def set_managed_channel_service(self, service: Any) -> None:
         """Attach managed-final lifecycle settlement without a constructor cycle."""
@@ -390,6 +400,7 @@ class ChannelDeliveryService:
         content: str,
         attachments: list[dict[str, Any]] | None,
         error: bool = False,
+        progress_source: dict[str, Any] | None = None,
     ) -> ChannelDeliveryStatus:
         """Persist and signal a fenced direct-turn terminal delivery."""
         from cognis.store.direct_turns import DirectTurnStore
@@ -406,8 +417,14 @@ class ChannelDeliveryService:
                 user_email=request.user_id,
                 conversation_id=request.conversation_id,
             )
+        from cognis.channels.source_delivery import progress_delivery_id
+
         suffix = "error" if error else "final"
-        delivery_id = f"direct-turn:{request_id}:{suffix}"
+        delivery_id = (
+            progress_delivery_id(progress_source)
+            if progress_source is not None
+            else f"direct-turn:{request_id}:{suffix}"
+        )
         row = await store.create_fenced_channel_delivery(
             request_id=request_id,
             lease=lease,
@@ -418,6 +435,13 @@ class ChannelDeliveryService:
         )
         if row is None:
             return ChannelDeliveryStatus.UNAVAILABLE
+        self.wake_pending_deliveries()
+        if self._cluster_signals is not None:
+            await self._cluster_signals.publish(
+                ClusterSignalKind.CHANNEL_OUTBOX_CHANGED,
+                scope=ClusterSignalScope(direct_request_id=request_id),
+                revision=row.delivery_id,
+            )
         await self._deliver_outbox(
             delivery_id=row.delivery_id,
             final_content=None,
@@ -434,6 +458,15 @@ class ChannelDeliveryService:
         except ValueError:
             return ChannelDeliveryStatus.FAILED
 
+    async def source_is_queued(self, source: dict[str, Any]) -> bool:
+        """Exclude committed progress already owned by the durable outbox."""
+        from cognis.channels.source_delivery import progress_delivery_id
+        from cognis.store.queries import get_channel_delivery_outbox
+
+        async with self._session_factory() as session:
+            row = await get_channel_delivery_outbox(session, progress_delivery_id(source))
+        return row is not None
+
     async def deliver_task_to_conversation(
         self,
         conversation_id: str,
@@ -442,6 +475,7 @@ class ChannelDeliveryService:
         content: str,
         attachments: list[dict[str, Any]] | None = None,
         deliverable_id: str | None = None,
+        project_result: bool = False,
     ) -> ChannelDeliveryStatus:
         """Persist and immediately attempt a resumable direct task delivery."""
 
@@ -451,6 +485,9 @@ class ChannelDeliveryService:
             get_channel_delivery_outbox_for_source,
         )
 
+        source_type = (
+            _PROJECT_TASK_RESULT_SOURCE_TYPE if project_result else _TASK_FINAL_SOURCE_TYPE
+        )
         async with self._session_factory() as session:
             route = await get_conversation_channel_route(session, conversation_id)
             if route is None:
@@ -460,11 +497,24 @@ class ChannelDeliveryService:
                     if conversation is not None and conversation.context_type == "web"
                     else ChannelDeliveryStatus.FAILED
                 )
-            existing = await get_channel_delivery_outbox_for_source(
-                session,
-                conversation_id=conversation_id,
-                source_type=_TASK_FINAL_SOURCE_TYPE,
-                source_id=task_id,
+            if project_result:
+                from cognis.core.project_task_delivery import project_result_recipient_allowed
+
+                if not await project_result_recipient_allowed(session, task_id, route[4]):
+                    return ChannelDeliveryStatus.FAILED
+            identity = route[4] if project_result else conversation_id
+            stable_key = hashlib.sha256(f"{source_type}:{task_id}:{identity}".encode()).hexdigest()[
+                :20
+            ]
+            existing = (
+                await get_channel_delivery_outbox(session, f"cdel_{stable_key}")
+                if project_result
+                else await get_channel_delivery_outbox_for_source(
+                    session,
+                    conversation_id=conversation_id,
+                    source_type=source_type,
+                    source_id=task_id,
+                )
             )
             if existing is None:
                 channel_type, account_id, chat_id, thread_id, user_email = route
@@ -474,16 +524,13 @@ class ChannelDeliveryService:
                     user_email=user_email,
                     conversation_id=conversation_id,
                 )
-                stable_key = hashlib.sha256(
-                    f"{_TASK_FINAL_SOURCE_TYPE}:{task_id}:{conversation_id}".encode()
-                ).hexdigest()[:20]
                 existing = await create_channel_delivery_outbox(
                     session,
                     delivery_id=f"cdel_{stable_key}",
                     user_email=user_email,
                     conversation_id=conversation_id,
                     session_id=None,
-                    source_type=_TASK_FINAL_SOURCE_TYPE,
+                    source_type=source_type,
                     source_id=task_id,
                     channel_type=channel_type,
                     account_id=account_id,
@@ -497,6 +544,11 @@ class ChannelDeliveryService:
                 await session.commit()
                 attachments = authorized_attachments
             delivery_id = existing.delivery_id
+
+        if project_result:
+            # The durable retry worker sends informational copies independently
+            # of the owner's result delivery and terminal lifecycle propagation.
+            return ChannelDeliveryStatus(existing.status)
 
         await self._deliver_outbox(
             delivery_id=delivery_id,
@@ -1151,6 +1203,28 @@ class ChannelDeliveryService:
         if not isinstance(delivery_id, str) or not event.data.get("channel_deliverable"):
             return
 
+        from cognis.store.queries import reuse_direct_turn_terminal_delivery
+
+        conversation_id = event.data.get("conversation_id")
+        turn_id = event.data.get("turn_id")
+        if isinstance(conversation_id, str) and isinstance(turn_id, str):
+            async with self._session_factory() as session:
+                terminal = await reuse_direct_turn_terminal_delivery(
+                    session,
+                    grace_delivery_id=delivery_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                )
+                await session.commit()
+            if terminal is not None:
+                await self._deliver_outbox(
+                    delivery_id=terminal.delivery_id,
+                    final_content=None,
+                    fallback_text=None,
+                    ignore_next_attempt=True,
+                )
+                return
+
         fallback_text = event.data.get("delivery_fallback_text")
         if not isinstance(fallback_text, str):
             fallback_text = None
@@ -1173,14 +1247,10 @@ class ChannelDeliveryService:
         if channel_info is None:
             return
 
-        tool_name = event.data.get("tool_name", "unknown")
-        content = (
-            f'Escalation: The agent wants to use tool "{tool_name}" '
-            "but needs your approval. Reply /approve or /deny."
-        )
         notification_id = event.data.get("notification_id") or event.data.get("call_id")
         if not isinstance(notification_id, str) or not notification_id:
             return
+        content = self._render_escalation_notification(event.data, notification_id=notification_id)
         await self._enqueue_notification_delivery(
             notification_id=notification_id,
             conversation_id=conversation_id,
@@ -1212,7 +1282,13 @@ class ChannelDeliveryService:
             await self._flush_observer_buffers(conversation_id)
 
         if notification_type == "escalation" and isinstance(payload, dict):
-            content = self._render_escalation_notification(payload)
+            content = self._render_escalation_notification(
+                payload,
+                notification_id=str(
+                    event.data.get("notification_id") or payload.get("call_id") or ""
+                ),
+                expires_at=event.data.get("expires_at"),
+            )
         elif notification_type == "step_question" and isinstance(payload, dict):
             content = self._render_step_question_notification(payload)
         elif notification_type == "auth_challenge" and isinstance(payload, dict):
@@ -1379,7 +1455,13 @@ class ChannelDeliveryService:
         )
         return "\n\n".join(lines)
 
-    def _render_escalation_notification(self, payload: dict[str, Any]) -> str:
+    def _render_escalation_notification(
+        self,
+        payload: dict[str, Any],
+        *,
+        notification_id: str = "",
+        expires_at: Any = None,
+    ) -> str:
         """Render a rich escalation prompt for channel integrations."""
         tool_name = str(payload.get("tool_name") or "tool call")
         risk = payload.get("risk")
@@ -1388,6 +1470,9 @@ class ChannelDeliveryService:
         managed_agent = payload.get("managed_target_agent_id")
 
         lines = [f"*[escalation]* Approval required for tool `{tool_name}`."]
+        identifier = notification_id or str(payload.get("call_id") or "")
+        if identifier:
+            lines.append(f"**Approval ID:** `{identifier}`")
         if managed_title or managed_agent:
             origin = managed_title or managed_agent
             lines.append(f"_Requested by managed conversation: {origin}_")
@@ -1395,8 +1480,29 @@ class ChannelDeliveryService:
             lines.append(f"**Risk:** {risk}")
         if reasoning:
             lines.append(f"**Reason:** {reasoning}")
-        lines.append("_Reply /approve to allow it or /deny to block it._")
-        lines.append("_You can optionally add a note, for example: /approve safe to continue_")
+        arguments = payload.get("arguments_display")
+        if isinstance(arguments, dict):
+            from cognis.core.notifications import safe_display_arguments
+
+            # Only the controller's existing pre-redacted display projection.
+            rendered = json.dumps(safe_display_arguments(arguments), ensure_ascii=False, indent=2)
+            rendered = rendered.replace("```", "`\u200b``")
+            if len(rendered) > 3000:
+                rendered = (
+                    rendered[:3000] + "\n… [preview shortened; inspect full action in Cognis]"
+                )
+            lines.append(f"**Action arguments:**\n```json\n{rendered}\n```")
+        expiry = expires_at or payload.get("expires_at")
+        lines.append(
+            f"**Expires:** {expiry}"
+            if expiry
+            else f"**Approval timeout:** {payload.get('timeout_seconds', 300)} seconds from creation."
+        )
+        if identifier:
+            lines.append(f"Reply `/approve --id {identifier}` or `/deny --id {identifier}`.")
+            lines.append("You can optionally add a note after the approval ID.")
+        else:
+            lines.append("Open Cognis to resolve this approval. No approval ID is available.")
         return "\n\n".join(lines)
 
     async def _flush_observer_buffers(self, conversation_id: str) -> None:
@@ -1583,6 +1689,21 @@ class ChannelDeliveryService:
                 owns_account = getattr(manager, "owns_account", None)
                 if callable(owns_account) and not owns_account(pending_row.account_id):
                     return
+                if pending_row.direct_turn_request_id is not None:
+                    earlier_progress = await session.scalar(
+                        select(ChannelDeliveryOutboxRow.delivery_id)
+                        .where(
+                            ChannelDeliveryOutboxRow.conversation_id == pending_row.conversation_id,
+                            ChannelDeliveryOutboxRow.delivery_id.startswith("channel-progress:"),
+                            ChannelDeliveryOutboxRow.created_at < pending_row.created_at,
+                            ChannelDeliveryOutboxRow.status.not_in(
+                                ["sent", "suppressed", "permanent", "uncertain"]
+                            ),
+                        )
+                        .limit(1)
+                    )
+                    if earlier_progress is not None:
+                        return
             if pending_row is not None and pending_row.source_type == "managed_channel_final":
                 from cognis.channels.managed import managed_delivery_fence_valid
 
@@ -1676,6 +1797,16 @@ class ChannelDeliveryService:
         ) -> bool:
             if lease_lost.is_set():
                 return False
+            if row.source_type == _PROJECT_TASK_RESULT_SOURCE_TYPE:
+                from cognis.core.project_task_delivery import project_result_route_allowed
+
+                async with self._session_factory() as session:
+                    if not await project_result_route_allowed(session, row):
+                        await suppress_channel_delivery_outbox(
+                            session, delivery_ids=[delivery_id], reason=None
+                        )
+                        await session.commit()
+                        return False
             if row.source_type in {
                 "delegation",
                 "task_gate_follow_up",

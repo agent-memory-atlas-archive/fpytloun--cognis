@@ -86,7 +86,8 @@ describe('Control Center route contract', () => {
     expect(dashboard).not.toContain('control-center-agents-footer');
     expect(dashboard).not.toContain('data-testid="control-center-agents"');
     expect(conversations).toContain('dashboard-conversations-agents');
-    expect(tasks).toContain('WorkstreamTodoProgress');
+    expect(tasks).toContain('DashboardRowIndicators');
+    expect(source('../components/dashboard/DashboardRowIndicators.svelte')).toContain('WorkstreamTodoProgress');
     expect(tasks).toContain('WorkstreamExecutionStatus');
     expect(tasks).toContain('DiffStat');
     expect(dashboard).toContain('api.agents.listAll({ include_system: false })');

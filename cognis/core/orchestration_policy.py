@@ -187,6 +187,9 @@ def build_orchestration_capability_guidance(
     if has_delegate or has_managed:
         lines.extend(
             [
+                "- Keep inter-agent messages human-readable: use normal grammar and "
+                "spaces between words and numbers; preserve identifiers and quoted "
+                "text exactly.",
                 "- Create a fresh isolated child for a materially different role, "
                 "responsibility, tool or authority scope, or independent workstream. "
                 "Use a compact contract with exact references; never pass the parent "

@@ -88,6 +88,42 @@ def test_public_health_route_bypasses_auth(monkeypatch: object, tmp_path: Path) 
         assert response.status_code == 200
 
 
+@pytest.mark.parametrize(
+    "role,scopes,expected",
+    [("admin", {}, 200), ("user", {}, 403), ("admin", {"inference_only": True}, 403)],
+)
+def test_profiling_uses_real_admin_api_key_auth(
+    monkeypatch: object, tmp_path: Path, role: str, scopes: dict, expected: int
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def seed() -> str:
+            key_id, key = generate_api_key_material()
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="profiling@example.com",
+                    name="Profiling",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role=role,
+                )
+                await create_api_key(
+                    session,
+                    user_email="profiling@example.com",
+                    key_hash=app.state.password_hasher.hash(key),
+                    name="Diagnostics",
+                    key_id=key_id,
+                    scopes=scopes,
+                )
+                await session.commit()
+            return key
+
+        key = asyncio.run(seed())
+        response = client.get("/api/v1/system/profiling", headers={"X-API-Key": key})
+        assert response.status_code == expected
+
+
 def test_signed_artifact_content_route_bypasses_auth(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.get(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from cognis.bootstrap import run_schema_bootstrap
 from cognis.store.database import create_session_factory
 from cognis.store.migrations.versioning import ALEMBIC_VERSION_NUM_LENGTH
 from cognis.store.queries import (
@@ -21,12 +23,40 @@ from cognis.store.queries import (
     list_secondary_bindings,
     set_secondary_bindings,
 )
+from tests.bootstrap_preservation import read_bootstrap_data, seed_bootstrap_data
 from tests.schema_parity import assert_schema_matches_metadata
 
 MIGRATIONS = Path("cognis/store/migrations/versions")
 MODELS = Path("cognis/store/models.py")
 POSTGRES_INTEGRATION_TESTS = Path("tests/integration")
 NUMERIC_BOOLEAN_LITERALS = {"0", "1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_tables", [False, True])
+async def test_bootstrap_at_129_then_upgrade_preserves_release_schema(
+    tmp_path: Path, partial_tables: bool
+) -> None:
+    database_path = tmp_path / "bootstrapped-upgrade.db"
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    config.config_file_name = None
+    await asyncio.to_thread(command.upgrade, config, "129_work_record_file_metadata")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    try:
+        await run_schema_bootstrap(engine)
+        async with engine.begin() as connection:
+            preserved = await connection.run_sync(seed_bootstrap_data)
+        if partial_tables:
+            async with engine.begin() as connection:
+                await connection.execute(sa.text("DROP TABLE inference_bindings"))
+                await connection.execute(sa.text("DROP TABLE agent_hook_turns"))
+        await asyncio.to_thread(command.upgrade, config, "head")
+        async with engine.connect() as connection:
+            await connection.run_sync(assert_schema_matches_metadata)
+            assert await connection.run_sync(read_bootstrap_data) == preserved
+    finally:
+        await engine.dispose()
 
 
 def _is_sa_attribute(node: ast.AST, name: str) -> bool:

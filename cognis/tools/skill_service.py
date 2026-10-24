@@ -364,20 +364,31 @@ async def prepare_skill_assets(
             version_row = await get_skill_version(session, asset_row.skill_version_id)
             if version_row is None or version_row.skill_id != skill_id:
                 raise ValueError("existing_asset_id must belong to the same skill")
-            prepared.append(
-                PreparedSkillAsset(
-                    filename=filename,
-                    asset_id=artifact_store.generate_id("sa"),
-                    artifact_namespace=asset_row.artifact_namespace,
-                    artifact_object_id=asset_row.artifact_object_id,
-                    content_hash=asset_row.content_hash,
-                    size_bytes=asset_row.size_bytes,
-                    content_type=asset_row.content_type,
+            if filename == asset_row.filename:
+                prepared.append(
+                    PreparedSkillAsset(
+                        filename=filename,
+                        asset_id=artifact_store.generate_id("sa"),
+                        artifact_namespace=asset_row.artifact_namespace,
+                        artifact_object_id=asset_row.artifact_object_id,
+                        content_hash=asset_row.content_hash,
+                        size_bytes=asset_row.size_bytes,
+                        content_type=asset_row.content_type,
+                    )
                 )
+                continue
+            # Storage keys include the filename. A rename needs a new immutable
+            # object, not a reference to the old object under a missing key.
+            content, _ = await artifact_store.async_load(
+                asset_row.artifact_namespace, asset_row.artifact_object_id, asset_row.filename
             )
-            continue
-
-        if source_artifact_id:
+            if (
+                len(content) != asset_row.size_bytes
+                or hashlib.sha256(content).hexdigest() != asset_row.content_hash
+            ):
+                raise ValueError("Existing skill asset content does not match its manifest")
+            content_type = asset_row.content_type
+        elif source_artifact_id:
             record = await get_artifact_record(session, source_artifact_id)
             if record is None:
                 raise ValueError(f"Artifact '{source_artifact_id}' not found")

@@ -739,7 +739,9 @@ def test_agent_management_list_includes_available_profiles(tmp_path: Path) -> No
                 "description": None,
                 "agent_type": "primary",
                 "status": "active",
+                "is_system": False,
                 "manageable": True,
+                "management_mode": "full",
                 "default_agent_profile_id": "quality",
                 "agent_profiles": [
                     {

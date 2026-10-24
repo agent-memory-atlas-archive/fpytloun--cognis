@@ -58,6 +58,8 @@ async def run_synthesize_local(
                 api_key=request_kwargs.get("api_key"),
                 api_base=request_kwargs.get("api_base") or request_kwargs.get("base_url"),
                 timeout=request_kwargs.get("timeout", 120),
+                num_retries=0,
+                max_retries=0,
             )
             audio_bytes = await _extract_tts_bytes(result)
             if audio_bytes:
@@ -68,8 +70,10 @@ async def run_synthesize_local(
                     voice=voice,
                     duration_seconds=None,
                 )
+            raise RuntimeError("Text-to-speech returned an empty audio payload")
         except Exception:
-            logger.debug("litellm.aspeech failed; falling back to direct HTTP", exc_info=True)
+            # Recovery belongs to the controller; one RPC is one upstream call.
+            raise
 
     api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
     if not isinstance(api_base, str) or not api_base:

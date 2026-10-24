@@ -3216,6 +3216,80 @@ class DeliverableStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class DeliverableRevisionError(ValueError):
+    """A caller-correctable ``supersedes`` failure for write_deliverable."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        latest_deliverable_id: str | None = None,
+        latest_revision: int | None = None,
+        lineage_id: str | None = None,
+        path: str = "$.supersedes",
+    ) -> None:
+        super().__init__(message)
+        self.path = path
+        self.code = code
+        self.message = message
+        self.latest_deliverable_id = latest_deliverable_id
+        self.latest_revision = latest_revision
+        # Set when the latest revision must still be resolved after rollback.
+        self.lineage_id = lineage_id
+
+    def to_tool_result(self) -> dict[str, Any]:
+        """Return the model-facing rejection payload."""
+
+        payload: dict[str, Any] = {
+            "status": "rejected",
+            "reason": self.code,
+            "path": self.path,
+            "message": self.message,
+        }
+        if self.latest_deliverable_id is not None:
+            payload[self.latest_field] = self.latest_deliverable_id
+            payload["latest_revision"] = self.latest_revision
+        return payload
+
+    latest_field = "latest_deliverable_id"
+
+
+class ArtifactRevisionError(DeliverableRevisionError):
+    """A caller-correctable ``supersedes`` failure for artifact writes.
+
+    Shares the deliverable revision contract; ``latest_artifact_id`` names the
+    head of the lineage.
+    """
+
+    latest_field = "latest_artifact_id"
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        latest_artifact_id: str | None = None,
+        latest_revision: int | None = None,
+        lineage_id: str | None = None,
+        path: str = "$.supersedes",
+    ) -> None:
+        super().__init__(
+            code,
+            message,
+            latest_deliverable_id=latest_artifact_id,
+            latest_revision=latest_revision,
+            lineage_id=lineage_id,
+            path=path,
+        )
+
+    @property
+    def latest_artifact_id(self) -> str | None:
+        """Head of the artifact lineage, when known."""
+
+        return self.latest_deliverable_id
+
+
 class Deliverable(BaseModel):
     """Typed, versioned artifact authored by a workflow step."""
 
@@ -3226,6 +3300,9 @@ class Deliverable(BaseModel):
     turn_id: str | None = None
     version: int
     attempt_number: int = 1
+    lineage_id: str | None = None
+    revision: int = 1
+    supersedes_deliverable_id: str | None = None
     content: str
     format: Literal["markdown", "plain", "html", "rich"] = "markdown"
     title: str | None = None

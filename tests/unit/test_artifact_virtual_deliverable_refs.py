@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -248,6 +247,7 @@ async def test_artifact_tools_read_and_metadata_owned_deliverable(
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
     read = await handle_artifact_tool(
         "artifact_read",
@@ -256,6 +256,7 @@ async def test_artifact_tools_read_and_metadata_owned_deliverable(
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
 
     assert metadata.is_error is False
@@ -339,7 +340,7 @@ async def test_artifact_tools_deny_cross_user_deliverable(task_continuation_db) 
 
 
 @pytest.mark.asyncio
-async def test_unrelated_owner_conversation_can_use_published_chat_deliverable(
+async def test_unrelated_agent_cannot_use_published_chat_deliverable(
     task_continuation_db,
 ) -> None:
     await _seed_managed_deliverables(task_continuation_db)
@@ -371,14 +372,12 @@ async def test_unrelated_owner_conversation_can_use_published_chat_deliverable(
         runtime_metadata=_managed_metadata("conv-unrelated", "agent-unrelated"),
     )
 
-    assert metadata.is_error is False
-    assert metadata.metadata is not None
-    assert metadata.metadata["filename"] == "Published-report.md"
+    assert metadata.is_error is True
+    assert metadata.metadata is None
     assert search.is_error is False
     assert search.metadata is not None
-    assert search.metadata["items"][0]["artifact_id"] == "dlv_published"
-    assert read.is_error is False
-    assert read.output == "1: Published deliverable"
+    assert search.metadata["items"] == []
+    assert read.is_error is True
 
 
 @pytest.mark.asyncio
@@ -409,6 +408,7 @@ async def test_rich_deliverable_virtual_artifact_serves_fallback_text_metadata(
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
     read = await handle_artifact_tool(
         "artifact_read",
@@ -417,6 +417,7 @@ async def test_rich_deliverable_virtual_artifact_serves_fallback_text_metadata(
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
 
     assert metadata.is_error is False
@@ -482,6 +483,7 @@ async def test_artifact_get_url_returns_virtual_deliverable_url(task_continuatio
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
 
     assert result.is_error is False
@@ -506,6 +508,7 @@ async def test_artifact_get_url_supports_virtual_markdown_deliverable_view(
         artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
         user_email="owner@example.com",
+        runtime_metadata={"agent_id": "agent-owner", "conversation_id": "conv-owner"},
     )
 
     assert result.is_error is False
@@ -568,7 +571,7 @@ async def test_controller_can_read_direct_child_deliverable_and_records_audit(
         ("conv-grandchild", "agent-grandchild"),
     ],
 )
-async def test_managed_descendant_can_access_ancestor_artifact(
+async def test_managed_descendant_requires_explicit_ancestor_input(
     task_continuation_db,
     conversation_id: str,
     agent_id: str,
@@ -576,16 +579,47 @@ async def test_managed_descendant_can_access_ancestor_artifact(
     await _seed_managed_deliverables(task_continuation_db)
 
     async with task_continuation_db() as session:
-        assert await artifact_authorized_for_conversation(
+        artifact = await _persist_test_artifact(session, "att-controller-input", "conv-controller")
+        assert not await artifact_authorized_for_conversation(
             session,
-            artifact=SimpleNamespace(
-                owner_email="owner@example.com",
-                conversation_id="conv-controller",
-            ),
+            artifact=artifact,
             owner_email="owner@example.com",
             conversation_id=conversation_id,
             agent_id=agent_id,
         )
+        from cognis.core.artifact_sharing import grant_artifact_inputs
+
+        await grant_artifact_inputs(
+            session,
+            owner_email="owner@example.com",
+            agent_id=agent_id,
+            content_refs=[artifact.artifact_id],
+        )
+        await session.flush()
+        assert await artifact_authorized_for_conversation(
+            session,
+            artifact=artifact,
+            owner_email="owner@example.com",
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+        )
+
+
+async def _persist_test_artifact(session, ref, conversation):
+    return await create_artifact_record(
+        session,
+        artifact_id=ref,
+        namespace="attachments",
+        object_id=ref,
+        filename="context.txt",
+        owner_email="owner@example.com",
+        conversation_id=conversation,
+        purpose="test",
+        kind="file",
+        mime_type="text/plain",
+        size_bytes=10,
+        status="attached",
+    )
 
 
 @pytest.mark.asyncio
@@ -593,12 +627,8 @@ async def test_managed_artifact_access_preserves_ancestor_and_sibling_boundaries
     task_continuation_db,
 ) -> None:
     await _seed_managed_deliverables(task_continuation_db)
-    child_artifact = SimpleNamespace(
-        owner_email="owner@example.com",
-        conversation_id="conv-child",
-    )
-
     async with task_continuation_db() as session:
+        child_artifact = await _persist_test_artifact(session, "att-child-output", "conv-child")
         assert await artifact_authorized_for_conversation(
             session,
             artifact=child_artifact,
@@ -629,6 +659,15 @@ async def test_nested_ancestor_grant_binds_to_accessor_link(task_continuation_db
     async with task_continuation_db() as session:
         artifact = await get_artifact_record(session, "att-child-context")
         assert artifact is not None
+        from cognis.core.artifact_sharing import grant_artifact_inputs
+
+        await grant_artifact_inputs(
+            session,
+            owner_email="owner@example.com",
+            agent_id="agent-grandchild",
+            content_refs=[artifact.artifact_id],
+        )
+        await session.flush()
         authorized = await authorize_outbound_artifact_refs_in_session(
             session,
             [
@@ -651,8 +690,8 @@ async def test_nested_ancestor_grant_binds_to_accessor_link(task_continuation_db
             user_email="owner@example.com",
         )
         assert grandchild_link is not None
-        assert grant["scope"] == "ancestor"
-        assert grant["descendant_link_id"] == grandchild_link.link_id
+        assert grant["scope"] == "agent"
+        assert grant["accessor_link_id"] == grandchild_link.link_id
         assert await outbound_artifact_grant_is_valid(
             session,
             attachment=authorized[0],
@@ -745,6 +784,15 @@ async def test_nested_deliverable_denies_malformed_lineage_edge(
                 else next(item.link_id for item in links if item.link_id != link.link_id)
             )
         setattr(link, field, value)
+        # No entitlement was issued while this malformed lineage was valid.
+        # Previously issued output grants intentionally survive source deletion.
+        from sqlalchemy import delete
+
+        from cognis.store.models import ArtifactGrantRow
+
+        await session.execute(
+            delete(ArtifactGrantRow).where(ArtifactGrantRow.content_ref == "dlv_grandchild")
+        )
         await session.commit()
 
     result = await handle_artifact_tool(

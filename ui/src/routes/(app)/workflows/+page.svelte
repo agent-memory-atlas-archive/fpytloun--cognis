@@ -42,6 +42,8 @@ import X from 'lucide-svelte/icons/x';
   import type { Agent, StepProfileDefinition, Workflow } from '$lib/types/api';
 
   let loading = true;
+  let profilesLoading = true;
+  let profilesError = '';
   let saving = false;
   let error = '';
   let importText = '';
@@ -127,11 +129,18 @@ import X from 'lucide-svelte/icons/x';
     loading = true;
     error = '';
     try {
-      [workflows, secondaryAgents, stepProfiles] = await Promise.all([
-        api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral }),
-        api.agents.listAll({ agent_type: 'secondary' }),
-        api.workflows.stepProfiles()
-      ]);
+      workflows = await api.workflows.listAll({ include_disabled: true, include_ephemeral: showEphemeral });
+      loading = false;
+      profilesLoading = true;
+      profilesError = '';
+      try {
+        stepProfiles = await api.workflows.stepProfiles();
+      } catch (caughtError) {
+        profilesError = asApiError(caughtError).message;
+        return;
+      } finally {
+        profilesLoading = false;
+      }
       stepProfileMap = buildStepProfileMap(stepProfiles);
       stepProfileOptions = [
         { id: '', label: 'Unrestricted' },
@@ -156,6 +165,11 @@ import X from 'lucide-svelte/icons/x';
     } finally {
       loading = false;
     }
+  }
+
+  async function retryWorkflowProfiles(): Promise<void> {
+    await loadWorkflows(selectedWorkflow?.workflow_id);
+    if (!profilesError) await loadDraftFromQuery();
   }
 
   async function selectWorkflow(workflow: Workflow): Promise<void> {
@@ -309,6 +323,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function saveWorkflow(): Promise<void> {
+    if (profilesLoading || profilesError) return;
     if (!selectedWorkflow?.is_system && !editingSkillId && isDirty()) {
       form.presentationEdited = true;
     }
@@ -642,8 +657,11 @@ import X from 'lucide-svelte/icons/x';
   }
 
   onMount(() => {
+    void api.agents.listAll({ agent_type: 'secondary' }).then((items) => {
+      secondaryAgents = items;
+    }).catch((e) => addToast(asApiError(e).message, 'error'));
     const cleanup = installBeforeUnloadGuard(isDirty);
-    void loadWorkflows().then(() => loadDraftFromQuery());
+    void loadWorkflows().then(() => { if (!profilesError) return loadDraftFromQuery(); });
     return cleanup;
   });
 </script>
@@ -660,23 +678,27 @@ import X from 'lucide-svelte/icons/x';
   <section class="min-h-0 min-w-0 w-full max-w-full space-y-5 overflow-x-hidden pb-24 lg:pb-0">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div class="min-w-0">
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow registry</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">Workflows</h1>
+        <p class="text-sm uppercase tracking-[0.25em] text-muted">Workflow registry</p>
+        <h1 class="mt-1 text-2xl font-semibold text-strong">Workflows</h1>
       </div>
       <!-- Desktop action bar. Mobile gets a fixed sticky bar at the bottom
            of the viewport so Save is always one tap away even at the end of
            a long step editor. -->
-      <div class="hidden lg:flex flex-wrap gap-2">
+      {#if !profilesLoading && !profilesError}<div class="hidden lg:flex flex-wrap gap-2">
         <Button variant="secondary" onclick={newWorkflow}>New workflow</Button>
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
         <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
         <Button onclick={saveWorkflow} disabled={saving || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}</Button>
-      </div>
+      </div>{/if}
     </div>
 
     {#if error}
-      <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+      <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
+    {/if}
+    {#if profilesError}
+      <p role="alert">{profilesError}</p>
+      <Button onclick={retryWorkflowProfiles}>Retry workflow profiles</Button>
     {/if}
 
     <!--
@@ -690,39 +712,44 @@ import X from 'lucide-svelte/icons/x';
       <!-- Registry column: hidden on mobile when editor is open -->
       <aside class={`min-w-0 space-y-5 ${mobileShowEditor ? 'hidden xl:block' : 'block'}`} data-testid="workflow-registry">
         <Card class="p-4">
-          <label class="flex items-center justify-between gap-3 text-sm text-slate-200">
+          <label class="flex items-center justify-between gap-3 text-sm text-foreground">
             <span>Show ephemeral workflows</span>
-            <input checked={showEphemeral} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={toggleShowEphemeral} />
+            <input checked={showEphemeral} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={toggleShowEphemeral} />
           </label>
-          <p class="mt-2 text-xs text-slate-500">Debug view for archived and historical composed workflows.</p>
+          <p class="mt-2 text-xs text-quiet">Debug view for archived and historical composed workflows.</p>
         </Card>
         <Card class="p-4">
           <div class="space-y-2">
             {#each workflows as workflow}
-              <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-sky-400/40 bg-sky-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
+              <button disabled={profilesLoading || !!profilesError} class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-accent/40 bg-accent-subtle text-strong' : 'border-separator bg-canvas/70 text-foreground hover:border-control-border'}`} onclick={() => selectWorkflow(workflow)}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <span class="min-w-0 flex-1 truncate font-medium">{workflow.name}</span>
-                  <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.disabled ? 'disabled' : workflow.lifecycle === 'ephemeral' ? 'ephemeral' : workflow.is_system ? 'system' : 'user'}</span>
+                  <span class="shrink-0 rounded-full border border-control-border px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-muted">{workflow.disabled ? 'disabled' : workflow.lifecycle === 'ephemeral' ? 'ephemeral' : workflow.is_system ? 'system' : 'user'}</span>
                 </div>
-                <p class="mt-2 break-all text-xs leading-5 text-slate-400">{workflow.workflow_id}</p>
+                <p class="mt-2 break-all text-xs leading-5 text-muted">{workflow.workflow_id}</p>
               </button>
             {/each}
           </div>
         </Card>
 
         <Card class="p-4">
-          <label class="text-xs uppercase tracking-[0.25em] text-slate-400" for="import-yaml-input">Import YAML</label>
-          <textarea id="import-yaml-input" bind:value={importText} class="mt-3 min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
-          <Button class="mt-3 w-full justify-center" variant="secondary" onclick={importYaml}>Import into editor</Button>
+          <label class="text-xs uppercase tracking-[0.25em] text-muted" for="import-yaml-input">Import YAML</label>
+          <textarea id="import-yaml-input" bind:value={importText} class="mt-3 min-h-[180px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 font-mono text-sm text-foreground placeholder:text-quiet"></textarea>
+          <Button disabled={profilesLoading || !!profilesError} class="mt-3 w-full justify-center" variant="secondary" onclick={importYaml}>Import into editor</Button>
         </Card>
       </aside>
 
       <!-- Editor column: hidden on mobile when registry is the active screen -->
       <div class={`min-w-0 space-y-5 ${mobileShowEditor ? 'block' : 'hidden xl:block'}`}>
+        {#if profilesLoading}
+          <LoadingState label="Loading workflow profiles" />
+        {:else if profilesError}
+          <p>Workflow editing requires configuration profiles.</p>
+        {:else}
         <!-- Mobile back breadcrumb -->
         {#if mobileShowEditor}
           <button
-            class="flex items-center gap-2 text-sm text-slate-400 transition hover:text-white xl:hidden"
+            class="flex items-center gap-2 text-sm text-muted transition hover:text-strong xl:hidden"
             onclick={() => void showMobileRegistry()}
             type="button"
           >
@@ -731,11 +758,11 @@ import X from 'lucide-svelte/icons/x';
           </button>
         {/if}
         {#if selectedWorkflow?.is_system}
-          <Card class="border border-sky-500/30 bg-sky-500/10 p-4 text-sm text-sky-100">
+          <Card class="border border-accent/30 bg-accent-subtle p-4 text-sm text-accent">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium">System workflow</p>
-                <p class="mt-1 text-sky-100/80">This bundled workflow is immutable. You can tune selected step runtime fields here or duplicate it for full customization.</p>
+                <p class="mt-1 text-accent/80">This bundled workflow is immutable. You can tune selected step runtime fields here or duplicate it for full customization.</p>
               </div>
               <div class="flex flex-wrap gap-2">
                 <Button variant="secondary" onclick={duplicateSelectedWorkflow}>Duplicate to edit</Button>
@@ -746,125 +773,125 @@ import X from 'lucide-svelte/icons/x';
               </div>
             </div>
             {#if selectedWorkflow.override_warnings.length > 0}
-              <p class="mt-3 text-xs text-sky-50/90">{selectedWorkflow.override_warnings.join(' ')}</p>
+              <p class="mt-3 text-xs text-accent/90">{selectedWorkflow.override_warnings.join(' ')}</p>
             {/if}
           </Card>
         {:else if selectedWorkflow?.lifecycle === 'ephemeral'}
-          <Card class="border border-cyan-500/30 bg-cyan-500/10 p-4 text-sm text-cyan-100">
+          <Card class="border border-cyan-border bg-cyan-subtle p-4 text-sm text-cyan-tone">
             <p class="font-medium">Ephemeral workflow</p>
-            <p class="mt-1 text-cyan-100/80">This workflow is a historical composed artifact. It is read-only. Promote it into a new persistent workflow to edit or reuse it.</p>
+            <p class="mt-1 text-cyan-tone/80">This workflow is a historical composed artifact. It is read-only. Promote it into a new persistent workflow to edit or reuse it.</p>
           </Card>
         {:else if editingSkillId}
-          <Card class="border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+          <Card class="border border-success-border bg-success-subtle p-4 text-sm text-success">
             <p class="font-medium">Skill decomposition editor</p>
-            <p class="mt-1 text-emerald-100/80">This editor is reusing workflow step controls for the latest saved decomposition of skill <code>{editingSkillId}</code>. Saving here updates the skill version rather than creating a workflow.</p>
+            <p class="mt-1 text-success/80">This editor is reusing workflow step controls for the latest saved decomposition of skill <code>{editingSkillId}</code>. Saving here updates the skill version rather than creating a workflow.</p>
           </Card>
         {/if}
 
         <!-- Workflow metadata -->
-        <details class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-          <summary class="cursor-pointer text-xs uppercase tracking-[0.25em] text-slate-400">Workflow settings</summary>
+        <details class="rounded-2xl border border-separator bg-surface/50 p-5">
+          <summary class="cursor-pointer text-xs uppercase tracking-[0.25em] text-muted">Workflow settings</summary>
           <div class="mt-5 space-y-5">
         <Card class="p-5">
-          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Metadata</p>
+          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-muted">Metadata</p>
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Workflow ID</span>
               <Input bind:value={form.workflowId} disabled={!!selectedWorkflow || !!editingSkillId} placeholder="wf_review_loop" />
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Name</span>
               <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} />
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Version</span>
               <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="number" />
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Tags</span>
               <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} placeholder="code, review" />
             </label>
           </div>
 
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span>Description</span>
-            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
+            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
           </label>
 
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span class="inline-flex items-center gap-2">
               Selection criteria
               <Tooltip text="Natural language description of when this workflow should be auto-selected by the classifier. Used by the Decision Engine to match incoming tasks to workflows.">
-                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
-            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
+            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
           </label>
         </Card>
 
         <!-- Workflow defaults -->
         <Card class="p-5">
-          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Workflow defaults</p>
+          <p class="mb-3 text-xs uppercase tracking-[0.25em] text-muted">Workflow defaults</p>
           <div class="grid gap-4 md:grid-cols-3">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span class="inline-flex items-center gap-2">
                 Interaction mode
                 <Tooltip text="Controls when the workflow can pause for human input. 'Autonomous' never pauses. 'Gates only' pauses at defined gate steps. 'Steps can ask' also allows run steps to request input mid-execution.">
-                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
-              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
+              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="none">Autonomous</option>
                 <option value="explicit_gates">Gates only</option>
                 <option value="step_requests">Steps can ask</option>
               </select>
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span class="inline-flex items-center gap-2">
                 Default max attempts
                 <Tooltip text="How many times a step can retry after evaluation rejection before triggering the 'on exhausted' action. Applies to all steps unless overridden per step.">
-                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
               <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="number" />
             </label>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span class="inline-flex items-center gap-2">
                 On exhausted
                 <Tooltip text="What happens when a step exhausts all retry attempts. 'Continue anyway' advances to the next step. 'Fail task' marks the entire task as failed. 'Ask human' pauses and notifies the user for a decision.">
-                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                  <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
-              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
+              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="continue">Continue anyway</option>
                 <option value="fail">Fail task</option>
                 <option value="gate">Ask human</option>
               </select>
             </label>
           </div>
-          <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
+          <label class="mt-4 flex items-center gap-3 text-sm text-foreground">
+            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
             <span class="inline-flex items-center gap-2">
               Evaluate steps by default
               <Tooltip text="When enabled, an evaluator LLM checks whether each step's objective was met before advancing to the next step. Disable for simple or fire-and-forget steps.">
-                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
           </label>
-          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span class="inline-flex items-center gap-2">
               Completion notification behavior
               <Tooltip text="Default delivery sends results through the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel. Allow silent completion lets the agent finish without notifying when nothing user-actionable happened.">
-                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
             <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-              <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
+              <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="default">Default delivery</option>
                 <option value="direct">Direct channel delivery</option>
               </select>
-              <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
+              <label class="inline-flex items-center gap-2 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
+                <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
                 <span>Allow silent completion</span>
               </label>
             </div>
@@ -888,32 +915,32 @@ import X from 'lucide-svelte/icons/x';
           <div data-testid="workflow-phase-builder">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Phase builder</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Workflow phases</h2>
-              <p class="mt-1 text-sm text-slate-400">Phases organize contiguous steps for people. Execution remains step-based.</p>
+              <p class="text-xs uppercase tracking-[0.25em] text-muted">Phase builder</p>
+              <h2 class="mt-1 text-lg font-semibold text-strong">Workflow phases</h2>
+              <p class="mt-1 text-sm text-muted">Phases organize contiguous steps for people. Execution remains step-based.</p>
             </div>
             <Button size="sm" variant="secondary" onclick={addPhase} disabled={!!selectedWorkflow?.is_system}>Add phase</Button>
           </div>
           <div class="mt-4 space-y-3">
             {#each form.phases as phase, phaseIndex}
-              <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4" data-testid={`workflow-phase-${phase.id}`}>
+              <article class="rounded-2xl border border-separator bg-canvas/60 p-4" data-testid={`workflow-phase-${phase.id}`}>
                 <div class="grid gap-3 md:grid-cols-[minmax(8rem,0.8fr)_minmax(12rem,1fr)_auto]">
-                  <label class="space-y-1 text-xs text-slate-400">Phase ID
+                  <label class="space-y-1 text-xs text-muted">Phase ID
                     <Input value={phase.id} disabled title="Phase IDs remain stable; rename the phase title instead." />
                   </label>
-                  <label class="space-y-1 text-xs text-slate-400">Title
+                  <label class="space-y-1 text-xs text-muted">Title
                     <Input bind:value={phase.title} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
                   </label>
                   <div class="flex items-end gap-1">
-                    <button type="button" aria-label="Move phase up" class="h-10 w-10 rounded-xl border border-slate-700 text-slate-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === 0} onclick={() => movePhase(phaseIndex, -1)}><ArrowUp class="mx-auto h-4 w-4" /></button>
-                    <button type="button" aria-label="Move phase down" class="h-10 w-10 rounded-xl border border-slate-700 text-slate-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === form.phases.length - 1} onclick={() => movePhase(phaseIndex, 1)}><ArrowDown class="mx-auto h-4 w-4" /></button>
-                    <button type="button" aria-label="Remove phase" class="h-10 rounded-xl border border-rose-500/30 px-3 text-xs text-rose-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || form.phases.length === 1} onclick={() => void removePhase(phaseIndex)}>Remove</button>
+                    <button type="button" aria-label="Move phase up" class="h-10 w-10 rounded-xl border border-control-border text-secondary disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === 0} onclick={() => movePhase(phaseIndex, -1)}><ArrowUp class="mx-auto h-4 w-4" /></button>
+                    <button type="button" aria-label="Move phase down" class="h-10 w-10 rounded-xl border border-control-border text-secondary disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === form.phases.length - 1} onclick={() => movePhase(phaseIndex, 1)}><ArrowDown class="mx-auto h-4 w-4" /></button>
+                    <button type="button" aria-label="Remove phase" class="h-10 rounded-xl border border-danger-border px-3 text-xs text-danger disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || form.phases.length === 1} onclick={() => void removePhase(phaseIndex)}>Remove</button>
                   </div>
                 </div>
-                <label class="mt-3 block space-y-1 text-xs text-slate-400">Description
+                <label class="mt-3 block space-y-1 text-xs text-muted">Description
                   <Input bind:value={phase.description} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
                 </label>
-                <p class="mt-3 text-xs text-slate-500">{form.steps.filter((step) => step.phaseId === phase.id).length} steps</p>
+                <p class="mt-3 text-xs text-quiet">{form.steps.filter((step) => step.phaseId === phase.id).length} steps</p>
               </article>
             {/each}
           </div>
@@ -923,8 +950,8 @@ import X from 'lucide-svelte/icons/x';
         <Card class="p-4">
           <div class="mb-4 flex items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Canvas</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Phases and steps</h2>
+              <p class="text-xs uppercase tracking-[0.25em] text-muted">Canvas</p>
+              <h2 class="mt-1 text-lg font-semibold text-strong">Phases and steps</h2>
             </div>
             <Button size="sm" variant="secondary" onclick={addStep} disabled={!!selectedWorkflow?.is_system}>Add step</Button>
           </div>
@@ -941,28 +968,28 @@ import X from 'lucide-svelte/icons/x';
           </div>
 
         <!-- Step editor -->
-        <div class={`min-w-0 ${mobileInspectorOpen ? 'fixed inset-0 z-50 overflow-y-auto bg-slate-950 lg:static lg:z-auto lg:block lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto' : 'hidden lg:block'}`} data-testid="workflow-step-inspector" aria-label="Selected step inspector">
+        <div class={`min-w-0 ${mobileInspectorOpen ? 'fixed inset-0 z-50 overflow-y-auto bg-canvas lg:static lg:z-auto lg:block lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto' : 'hidden lg:block'}`} data-testid="workflow-step-inspector" aria-label="Selected step inspector">
         <Card class="min-w-0 rounded-none p-5 lg:rounded-2xl">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Inspector</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">{form.steps[selectedStepIndex]?.name || `Step ${selectedStepIndex + 1}`}</h2>
+              <p class="text-xs uppercase tracking-[0.25em] text-muted">Inspector</p>
+              <h2 class="mt-1 text-lg font-semibold text-strong">{form.steps[selectedStepIndex]?.name || `Step ${selectedStepIndex + 1}`}</h2>
             </div>
-            <button class="h-11 w-11 rounded-xl text-slate-300 hover:bg-slate-800 lg:hidden" type="button" aria-label="Back to workflow canvas" onclick={() => (mobileInspectorOpen = false)}><X class="mx-auto h-5 w-5" /></button>
+            <button class="h-11 w-11 rounded-xl text-secondary hover:bg-raised lg:hidden" type="button" aria-label="Back to workflow canvas" onclick={() => (mobileInspectorOpen = false)}><X class="mx-auto h-5 w-5" /></button>
           </div>
 
           <div class="mt-4 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3" aria-label="Inspector groups">
             {#each inspectorGroups as group}
               <button
                 type="button"
-                class={`min-h-10 rounded-xl border px-2 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400 ${openInspectorGroup === group[0] ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-800 text-slate-400'}`}
+                class={`min-h-10 rounded-xl border px-2 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent ${openInspectorGroup === group[0] ? 'border-accent/60 bg-accent-subtle text-accent' : 'border-separator text-muted'}`}
                 data-inspector-group={group[0]}
                 aria-expanded={openInspectorGroup === group[0]}
                 onclick={() => (openInspectorGroup = group[0])}
               >{group[1]}</button>
             {/each}
           </div>
-          <p class="mt-3 text-xs text-slate-500" aria-live="polite">
+          <p class="mt-3 text-xs text-quiet" aria-live="polite">
             {openInspectorGroup === 'basics' ? 'Name, type, phase, and primary instructions.'
               : openInspectorGroup === 'agent-runtime' ? 'Agent selection, runtime profile, reasoning, and tool profile.'
               : openInspectorGroup === 'context-session' ? 'Inputs, prior-step context, and session continuation.'
@@ -975,20 +1002,20 @@ import X from 'lucide-svelte/icons/x';
           <div class="mt-4 space-y-4">
             {#each form.steps as step, index}
               {#if index === selectedStepIndex}
-              <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
+              <article class="rounded-2xl border border-separator bg-canvas/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
                 <!-- Step header: name, type, step number badge, reorder
                      buttons. The up/down buttons are the touch-friendly
                      counterpart to HTML5 `draggable` (which is a no-op on
                      iOS Safari and flaky on Android Chrome). -->
                 <div class="mb-3 flex flex-wrap items-center gap-3">
-                  <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
-                  <span class="min-w-0 flex-1 break-words text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
+                  <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-raised text-[11px] font-medium text-muted">{index + 1}</span>
+                  <span class="min-w-0 flex-1 break-words text-sm font-medium text-foreground">{step.name || `Step ${index + 1}`}</span>
                   <div class="flex shrink-0 items-center gap-1">
-                    <button type="button" aria-label="Duplicate step" class="inline-flex h-10 items-center rounded-xl px-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40 md:h-8" disabled={!!selectedWorkflow?.is_system} onclick={() => duplicateStep(index)}>Duplicate</button>
+                    <button type="button" aria-label="Duplicate step" class="inline-flex h-10 items-center rounded-xl px-2 text-xs text-secondary hover:bg-raised disabled:opacity-40 md:h-8" disabled={!!selectedWorkflow?.is_system} onclick={() => duplicateStep(index)}>Duplicate</button>
                     <button
                       type="button"
                       aria-label="Move step up"
-                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40 md:h-8 md:w-8"
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-secondary hover:bg-raised hover:text-strong disabled:opacity-40 md:h-8 md:w-8"
                       disabled={!!selectedWorkflow?.is_system || index === 0}
                       onclick={() => moveStepBy(index, -1)}
                     >
@@ -997,29 +1024,29 @@ import X from 'lucide-svelte/icons/x';
                     <button
                       type="button"
                       aria-label="Move step down"
-                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-40 md:h-8 md:w-8"
+                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-secondary hover:bg-raised hover:text-strong disabled:opacity-40 md:h-8 md:w-8"
                       disabled={!!selectedWorkflow?.is_system || index === form.steps.length - 1}
                       onclick={() => moveStepBy(index, 1)}
                     >
                       <ArrowDown class="h-4 w-4" />
                     </button>
                   </div>
-                  <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-sky-600/40 text-sky-400' : 'border-slate-700 text-slate-400'}">{step.type.replace('_', ' ')}</span>
+                  <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-accent/40 text-accent' : 'border-control-border text-muted'}">{step.type.replace('_', ' ')}</span>
                   {#if step.agentOverride && step.type === 'run'}
-                    <span class="break-all rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
+                    <span class="break-all rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[10px] text-accent">{step.agentOverride}</span>
                   {/if}
                 </div>
 
                 {#if openInspectorGroup === 'basics'}
                 <section data-inspector-panel="basics" aria-label="Basic step fields">
                 <div class="grid gap-4 md:grid-cols-2">
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Name</span>
                     <Input bind:value={step.name} disabled={!!selectedWorkflow?.is_system} />
                   </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Type</span>
-                    <select bind:value={step.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                    <select bind:value={step.type} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                       <option value="run">Run (agent executes)</option>
                       <option value="gate">Gate (pause for approval)</option>
                       <option value="tool_call">Tool call (deterministic)</option>
@@ -1027,16 +1054,16 @@ import X from 'lucide-svelte/icons/x';
                       <option value="complete">Complete (deterministic terminal)</option>
                     </select>
                   </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span>Phase</span>
-                    <select value={step.phaseId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} onchange={(event) => moveStepToPhase(index, event.currentTarget.value)}>
+                    <select value={step.phaseId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system} onchange={(event) => moveStepToPhase(index, event.currentTarget.value)}>
                       {#each form.phases as phase}<option value={phase.id}>{phase.title}</option>{/each}
                     </select>
                   </label>
                  </div>
-                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                 <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                    <span>Prompt</span>
-                   <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                   <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}></textarea>
                  </label>
                  </section>
                  {/if}
@@ -1044,16 +1071,16 @@ import X from 'lucide-svelte/icons/x';
                  {#if openInspectorGroup === 'agent-runtime'}
                  <section data-inspector-panel="agent-runtime" aria-label="Agent and runtime fields">
                  {#if step.type === 'run'}
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-2">
                       Agent override
                       <Tooltip text="Run this step with a different agent instead of the task's primary agent. Useful for specialized steps like code review or architecture review.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <select
                       bind:value={step.agentOverride}
-                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
                       disabled={!!selectedWorkflow?.is_system}
                       onchange={() => {
                         step.agentProfileId = normalizeSelectedAgentProfileId(
@@ -1063,6 +1090,9 @@ import X from 'lucide-svelte/icons/x';
                       }}
                     >
                       <option value="">Default (task agent)</option>
+                      {#if step.agentOverride && !secondaryAgents.some((agent) => agent.agent_id === step.agentOverride)}
+                        <option value={step.agentOverride}>{step.agentOverride}</option>
+                      {/if}
                       {#each secondaryAgents as agent}
                         <option value={agent.agent_id}>
                           {agent.name}{agent.is_system ? ' (system)' : ''}
@@ -1070,7 +1100,7 @@ import X from 'lucide-svelte/icons/x';
                       {/each}
                     </select>
                   </label>
-                  {#if step.agentOverride}
+                  {#if step.agentOverride && secondaryAgents.some((agent) => agent.agent_id === step.agentOverride)}
                     <div class="mt-4">
                       <AgentProfileSelect
                         agents={secondaryAgents}
@@ -1082,9 +1112,9 @@ import X from 'lucide-svelte/icons/x';
                       />
                     </div>
                   {/if}
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span>Thinking effort</span>
-                    <select bind:value={step.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemWorkflowField('stepReasoning')}>
+                    <select bind:value={step.reasoningEffort} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditSystemWorkflowField('stepReasoning')}>
                       <option value="">Default</option>
                       {#each workflowThinkingEfforts() as value}
                         <option value={value}>{value === 'xhigh' ? 'XHigh' : value.charAt(0).toUpperCase() + value.slice(1)}</option>
@@ -1093,49 +1123,49 @@ import X from 'lucide-svelte/icons/x';
                   </label>
 
                   <details class="mt-4" open={!!step.stepProfileId || step.stepProfileMatrix.length > 0 || !!step.stepProfileIncludeText || !!step.stepProfileExcludeText}>
-                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                    <summary class="cursor-pointer text-sm font-medium text-secondary hover:text-foreground">
                       Tool profile
                       <Tooltip text="Profiles narrow the tool surface for this step. Soft mode changes default exposure only. Hard mode also restricts which tools search can discover.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 space-y-4">
                       <div class="grid gap-4 md:grid-cols-3">
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Preset</span>
-                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => applyStepProfilePreset(index, event.currentTarget.value)}>
+                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditSystemProfileField()} onchange={(event) => applyStepProfilePreset(index, event.currentTarget.value)}>
                             {#each stepProfileOptions as option}
                               <option value={option.id}>{option.label}</option>
                             {/each}
                           </select>
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Mode</span>
-                          <select bind:value={step.stepProfileMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()}>
+                          <select bind:value={step.stepProfileMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditSystemProfileField()}>
                             <option value="soft">Soft</option>
                             <option value="hard">Hard</option>
                           </select>
                         </label>
-                        <label class="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                          <input bind:checked={step.stepProfileAllowToolSearch} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!canEditSystemProfileField()} type="checkbox" />
+                        <label class="flex items-center gap-3 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
+                          <input bind:checked={step.stepProfileAllowToolSearch} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!canEditSystemProfileField()} type="checkbox" />
                           <span>Allow tool search</span>
                         </label>
                       </div>
 
-                      <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                      <div class="rounded-2xl border border-separator bg-canvas/60 p-4">
                         <div class="flex flex-wrap items-center justify-between gap-3">
                           <div>
-                            <p class="text-sm font-medium text-slate-200">Capability matrix</p>
-                            <p class="mt-1 text-xs text-slate-400">Rows are tool groups. Columns decide which capabilities are exposed or allowed for this step.</p>
+                            <p class="text-sm font-medium text-foreground">Capability matrix</p>
+                            <p class="mt-1 text-xs text-muted">Rows are tool groups. Columns decide which capabilities are exposed or allowed for this step.</p>
                           </div>
                           <div class="flex flex-wrap items-center gap-2">
                             {#if stepProfileHasCustomizations(index)}
-                              <button type="button" class="rounded-xl border border-slate-700 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:text-white" disabled={!canEditSystemProfileField()} onclick={() => resetStepProfile(index)}>
+                              <button type="button" class="rounded-xl border border-control-border px-3 py-2 text-xs font-medium text-foreground hover:border-border-strong hover:text-strong" disabled={!canEditSystemProfileField()} onclick={() => resetStepProfile(index)}>
                                 {step.stepProfileId ? 'Reset to preset' : 'Clear custom profile'}
                               </button>
                             {/if}
                             {#if remainingProfileCategories(index).length > 0}
-                              <select class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => handleAddProfileCategory(index, event)}>
+                              <select class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!canEditSystemProfileField()} onchange={(event) => handleAddProfileCategory(index, event)}>
                                 <option value="">Add group…</option>
                                 {#each remainingProfileCategories(index) as category}
                                   <option value={category}>{category}</option>
@@ -1145,9 +1175,9 @@ import X from 'lucide-svelte/icons/x';
                           </div>
                         </div>
                         <div class="mt-3 overflow-x-auto">
-                          <table class="min-w-full border-separate border-spacing-y-2 text-sm text-slate-200">
+                          <table class="min-w-full border-separate border-spacing-y-2 text-sm text-foreground">
                             <thead>
-                              <tr class="text-left text-xs uppercase tracking-[0.2em] text-slate-500">
+                              <tr class="text-left text-xs uppercase tracking-[0.2em] text-quiet">
                                 <th class="px-3 py-2">Group</th>
                                 {#each STEP_PROFILE_CAPABILITIES as capability}
                                   <th class="px-3 py-2">{capability}</th>
@@ -1157,13 +1187,13 @@ import X from 'lucide-svelte/icons/x';
                             </thead>
                             <tbody>
                               {#each step.stepProfileMatrix as row}
-                                <tr class="rounded-xl border border-slate-800 bg-slate-950/70">
+                                <tr class="rounded-xl border border-separator bg-canvas/70">
                                   <td class="px-3 py-2 font-medium">{row.category}</td>
                                   {#each STEP_PROFILE_CAPABILITIES as capability}
                                     <td class="px-3 py-2">
                                       <input
                                         checked={row.capabilities.includes(capability)}
-                                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                        class="h-4 w-4 rounded border-control-border bg-canvas"
                                         disabled={!canEditSystemProfileField()}
                                         type="checkbox"
                                         onchange={() => toggleStepProfileCapability(index, row.category, capability)}
@@ -1171,7 +1201,7 @@ import X from 'lucide-svelte/icons/x';
                                     </td>
                                   {/each}
                                   <td class="px-3 py-2 text-right">
-                                    <button type="button" class="text-xs text-slate-400 hover:text-rose-300" onclick={() => removeProfileCategory(index, row.category)} disabled={!canEditSystemProfileField()}>Remove</button>
+                                    <button type="button" class="text-xs text-muted hover:text-danger" onclick={() => removeProfileCategory(index, row.category)} disabled={!canEditSystemProfileField()}>Remove</button>
                                   </td>
                                 </tr>
                               {/each}
@@ -1181,11 +1211,11 @@ import X from 'lucide-svelte/icons/x';
                       </div>
 
                       <div class="grid gap-4 md:grid-cols-2">
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Explicit include</span>
                           <Input bind:value={step.stepProfileIncludeText} disabled={!canEditSystemProfileField()} placeholder="tool_name, mcp_server__tool" />
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Explicit exclude</span>
                           <Input bind:value={step.stepProfileExcludeText} disabled={!canEditSystemProfileField()} placeholder="tool_name, mcp_server__tool" />
                         </label>
@@ -1193,7 +1223,7 @@ import X from 'lucide-svelte/icons/x';
                     </div>
                   </details>
                  {/if}
-                 {#if step.type !== 'run'}<p class="text-sm text-slate-500">This step type has no agent runtime fields.</p>{/if}
+                 {#if step.type !== 'run'}<p class="text-sm text-quiet">This step type has no agent runtime fields.</p>{/if}
                  </section>
                  {/if}
 
@@ -1201,14 +1231,14 @@ import X from 'lucide-svelte/icons/x';
                  {#if openInspectorGroup === 'context-session'}
                  <section data-inspector-panel="context-session" aria-label="Context and session fields">
                  <div class="mt-4 grid gap-4 md:grid-cols-2">
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-2">
                       Input from previous steps
                       <Tooltip text="What context from previous steps flows into this step. 'Step output' passes the completion summary (recommended). 'Summary' generates an LLM summary. 'Full history' passes the entire session (expensive, rarely needed). 'None' starts with fresh context.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
-                    <select bind:value={step.inputMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                    <select bind:value={step.inputMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                       <option value="auto">Auto (server default)</option>
                       <option value="null">None (fresh context)</option>
                       <option value="last">Step output (recommended)</option>
@@ -1216,20 +1246,20 @@ import X from 'lucide-svelte/icons/x';
                       <option value="full">Full history (expensive)</option>
                     </select>
                   </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-2">
                       Source steps
                       <Tooltip text="Comma-separated names of steps to pull input from. Leave empty to use the immediately preceding step. Use 'all' to aggregate all prior run-step deliverables. 'all' must be used alone and cannot be combined with 'Full history'. Only applies when input mode is not 'None'.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review or all'} />
                   </label>
-                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                  <label class="space-y-2 text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-2">
                       Continue session from
                       <Tooltip text="Optional earlier run step whose conversation and session continue. It must also be an input source and use the same agent and runtime profile.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
                     <Input bind:value={step.reuseSessionFrom} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null' || step.type !== 'run'} placeholder="plan" />
@@ -1243,23 +1273,23 @@ import X from 'lucide-svelte/icons/x';
                  <section data-inspector-panel="completion-evaluation" aria-label="Completion and evaluation fields">
                  {#if step.type === 'run'}
                   <div class="mt-4 grid gap-4 md:grid-cols-2">
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span class="inline-flex items-center gap-2">
                         Max attempts
                         <Tooltip text="How many times this step can retry after evaluation rejection before triggering the 'on exhausted' action.">
-                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                       <Input bind:value={step.maxAttempts} disabled={!canEditSystemWorkflowField('stepMaxAttempts')} type="number" />
                     </label>
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span class="inline-flex items-center gap-2">
                         On exhausted
                         <Tooltip text="What happens when this step exhausts all retry attempts.">
-                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
-                      <select bind:value={step.onExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                      <select bind:value={step.onExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                         <option value="continue">Continue anyway</option>
                         <option value="fail">Fail task</option>
                         <option value="gate">Ask human</option>
@@ -1268,31 +1298,31 @@ import X from 'lucide-svelte/icons/x';
                   </div>
 
                   <div class="mt-4 flex flex-wrap gap-x-8 gap-y-2">
-                    <label class="flex items-center gap-3 text-sm text-slate-200">
-                      <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                    <label class="flex items-center gap-3 text-sm text-foreground">
+                      <input bind:checked={step.evaluate} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
                       <span class="inline-flex items-center gap-2">
                         Evaluate completion
                         <Tooltip text="When enabled, an evaluator LLM checks if the step objective was met before advancing. Rejected steps are sent back for revision.">
-                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                     </label>
-                    <label class="flex items-center gap-3 text-sm text-slate-200">
-                      <input bind:checked={step.requireDeliverable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                    <label class="flex items-center gap-3 text-sm text-foreground">
+                      <input bind:checked={step.requireDeliverable} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
                       <span class="inline-flex items-center gap-2">
                         Require deliverable
                         <Tooltip text="When enabled, the agent must call write_deliverable before step_complete. Deliverables become the canonical artifact for evaluation, UI, and final workflow output.">
-                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                          <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                         </Tooltip>
                       </span>
                     </label>
                     {#if form.interactionMode === 'step_requests'}
-                      <label class="flex items-center gap-3 text-sm text-slate-200">
-                        <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                      <label class="flex items-center gap-3 text-sm text-foreground">
+                        <input bind:checked={step.allowQuestions} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
                         <span class="inline-flex items-center gap-2">
                           Allow questions
                           <Tooltip text="Let the agent ask clarifying questions mid-step. The workflow pauses until the user responds. Only available when interaction mode is 'Steps can ask'.">
-                            <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                            <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                           </Tooltip>
                         </span>
                       </label>
@@ -1302,67 +1332,67 @@ import X from 'lucide-svelte/icons/x';
 
                 <!-- Gate configuration -->
                  {#if step.type === 'gate'}
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span>Gate message</span>
-                    <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                    <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}></textarea>
                   </label>
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span class="inline-flex items-center gap-2">
                       Gate options
                       <Tooltip text="One option per line in 'Label|action|prompt' format. Set prompt to true when the option requires feedback.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
-                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue|false&#10;Request changes|revise(plan)|true"></textarea>
+                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 font-mono text-sm text-foreground" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue|false&#10;Request changes|revise(plan)|true"></textarea>
                   </label>
                   <div class="mt-4 grid gap-4 md:grid-cols-2">
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span>Gate input steps</span>
                       <Input bind:value={step.gateInputText} disabled={!!selectedWorkflow?.is_system} placeholder="plan, review" />
                     </label>
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span>Timeout seconds</span>
                       <Input bind:value={step.gateTimeoutSeconds} disabled={!!selectedWorkflow?.is_system} min="1" type="number" />
                     </label>
-                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <label class="space-y-2 text-sm font-medium text-foreground">
                       <span>Timeout action</span>
-                      <select bind:value={step.gateTimeoutAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                      <select bind:value={step.gateTimeoutAction} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                         <option value="fail">Fail</option>
                         <option value="continue">Continue</option>
                         <option value="cancel">Cancel</option>
                       </select>
                     </label>
                   </div>
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span>Conditions (JSON array)</span>
-                    <textarea bind:value={step.gateConditionsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                    <textarea bind:value={step.gateConditionsText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}></textarea>
                   </label>
-                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
                     <span>Thresholds (JSON object)</span>
-                    <textarea bind:value={step.gateThresholdsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                    <textarea bind:value={step.gateThresholdsText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}></textarea>
                   </label>
                  {/if}
                  {#if step.type === 'complete'}
-                   <div class="mt-4 space-y-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4" data-testid={`complete-editor-${index}`}>
+                   <div class="mt-4 space-y-4 rounded-2xl border border-success-border bg-success-subtle p-4" data-testid={`complete-editor-${index}`}>
                      <div class="grid gap-4 md:grid-cols-2">
-                       <label class="space-y-2 text-sm font-medium text-slate-200">Terminal status
-                         <select bind:value={step.completeStatus} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="completed">Completed</option><option value="failed">Failed</option></select>
+                       <label class="space-y-2 text-sm font-medium text-foreground">Terminal status
+                         <select bind:value={step.completeStatus} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="completed">Completed</option><option value="failed">Failed</option></select>
                        </label>
-                       <label class="space-y-2 text-sm font-medium text-slate-200">Delivery override
-                         <select bind:value={step.completeDeliveryMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Workflow default</option><option value="same_conversation">Same conversation</option><option value="preferred_channel">Preferred channel</option><option value="latest_active_for_agent">Latest active for agent</option><option value="specific_conversation">Specific conversation</option><option value="silent">Silent</option></select>
+                       <label class="space-y-2 text-sm font-medium text-foreground">Delivery override
+                         <select bind:value={step.completeDeliveryMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="">Workflow default</option><option value="same_conversation">Same conversation</option><option value="preferred_channel">Preferred channel</option><option value="latest_active_for_agent">Latest active for agent</option><option value="specific_conversation">Specific conversation</option><option value="silent">Silent</option></select>
                        </label>
                      </div>
-                     <label class="block space-y-2 text-sm font-medium text-slate-200">Summary template
-                       <textarea bind:value={step.completeSummary} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 text-sm"></textarea>
+                     <label class="block space-y-2 text-sm font-medium text-foreground">Summary template
+                       <textarea bind:value={step.completeSummary} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 text-sm"></textarea>
                      </label>
-                     <label class="block space-y-2 text-sm font-medium text-slate-200">Content template
-                       <textarea bind:value={step.completeContent} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 text-sm"></textarea>
+                     <label class="block space-y-2 text-sm font-medium text-foreground">Content template
+                       <textarea bind:value={step.completeContent} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 text-sm"></textarea>
                      </label>
-                     <label class="block space-y-2 text-sm font-medium text-slate-200">Outputs (JSON object)
-                       <textarea bind:value={step.completeOutputsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                     <label class="block space-y-2 text-sm font-medium text-foreground">Outputs (JSON object)
+                       <textarea bind:value={step.completeOutputsText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm"></textarea>
                      </label>
-                     <label class="block space-y-2 text-sm font-medium text-slate-200">Notification (optional JSON object)
-                       <textarea bind:value={step.completeNotificationText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" placeholder={'{"mode":"silent","reason":"No work found"}'}></textarea>
+                     <label class="block space-y-2 text-sm font-medium text-foreground">Notification (optional JSON object)
+                       <textarea bind:value={step.completeNotificationText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm" placeholder={'{"mode":"silent","reason":"No work found"}'}></textarea>
                      </label>
                    </div>
                  {/if}
@@ -1372,79 +1402,79 @@ import X from 'lucide-svelte/icons/x';
                  {#if openInspectorGroup === 'advanced'}
                  <section data-inspector-panel="advanced" aria-label="Advanced step fields">
                  {#if ['tool_call', 'condition', 'complete'].includes(step.type)}
-                  <details class="mt-4 rounded-2xl border border-slate-700/70 bg-slate-950/40 p-4">
-                    <summary class="cursor-pointer text-sm font-medium text-slate-200">Deterministic routing and recovery</summary>
+                  <details class="mt-4 rounded-2xl border border-control-border/70 bg-canvas/40 p-4">
+                    <summary class="cursor-pointer text-sm font-medium text-foreground">Deterministic routing and recovery</summary>
                     <div class="mt-4 grid gap-4 md:grid-cols-2">
-                      <label class="space-y-2 text-sm font-medium text-slate-200">Run when
+                      <label class="space-y-2 text-sm font-medium text-foreground">Run when
                         <Input bind:value={step.deterministicWhen} placeholder={'{{ vars.enabled }}'} />
                       </label>
                       {#if step.type === 'tool_call'}
-                        <label class="space-y-2 text-sm font-medium text-slate-200">Next step
-                          <select bind:value={step.deterministicNext} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Natural next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                        <label class="space-y-2 text-sm font-medium text-foreground">Next step
+                          <select bind:value={step.deterministicNext} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="">Natural next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
                         </label>
                       {/if}
-                      <label class="space-y-2 text-sm font-medium text-slate-200">On error
-                        <select bind:value={step.deterministicOnError} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Runtime default</option><option value="fail">Fail</option><option value="continue">Continue</option><option value="skip">Skip</option><option value="gate">Gate</option></select>
+                      <label class="space-y-2 text-sm font-medium text-foreground">On error
+                        <select bind:value={step.deterministicOnError} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="">Runtime default</option><option value="fail">Fail</option><option value="continue">Continue</option><option value="skip">Skip</option><option value="gate">Gate</option></select>
                       </label>
-                      <label class="space-y-2 text-sm font-medium text-slate-200">Skip output (optional JSON object)
-                        <textarea bind:value={step.deterministicOnSkipText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                      <label class="space-y-2 text-sm font-medium text-foreground">Skip output (optional JSON object)
+                        <textarea bind:value={step.deterministicOnSkipText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm"></textarea>
                       </label>
                     </div>
                   </details>
                  {/if}
-                 {#if !['tool_call', 'condition', 'complete'].includes(step.type)}<p class="text-sm text-slate-500">This step type has no advanced deterministic controls.</p>{/if}
+                 {#if !['tool_call', 'condition', 'complete'].includes(step.type)}<p class="text-sm text-quiet">This step type has no advanced deterministic controls.</p>{/if}
                  </section>
                  {/if}
 
                  {#if openInspectorGroup === 'tools'}
                  <section data-inspector-panel="tools" aria-label="Tool fields">
                  {#if step.type === 'tool_call'}
-                  <div class="mt-4 space-y-4 rounded-2xl border border-violet-500/20 bg-violet-500/5 p-4" data-testid={`tool-call-editor-${index}`}>
-                    <label class="block space-y-2 text-sm font-medium text-slate-200">Tool name
+                  <div class="mt-4 space-y-4 rounded-2xl border border-violet-border bg-violet-subtle p-4" data-testid={`tool-call-editor-${index}`}>
+                    <label class="block space-y-2 text-sm font-medium text-foreground">Tool name
                       <Input bind:value={step.toolName} disabled={!!selectedWorkflow?.is_system} placeholder="builtin:read" />
                     </label>
                     <div class="grid gap-4 md:grid-cols-2">
-                      <label class="space-y-2 text-sm font-medium text-slate-200">Arguments (JSON object)
-                        <textarea bind:value={step.toolArgsText} class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
+                      <label class="space-y-2 text-sm font-medium text-foreground">Arguments (JSON object)
+                        <textarea bind:value={step.toolArgsText} class="min-h-32 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
                       </label>
-                      <label class="space-y-2 text-sm font-medium text-slate-200">Output mapping (JSON object)
-                        <textarea bind:value={step.toolOutputsText} class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
+                      <label class="space-y-2 text-sm font-medium text-foreground">Output mapping (JSON object)
+                        <textarea bind:value={step.toolOutputsText} class="min-h-32 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
                       </label>
                     </div>
-                    <label class="block space-y-2 text-sm font-medium text-slate-200">Summary template
+                    <label class="block space-y-2 text-sm font-medium text-foreground">Summary template
                       <Input bind:value={step.toolSummary} disabled={!!selectedWorkflow?.is_system} />
                     </label>
                     <div class="grid gap-4 md:grid-cols-3">
-                      <label class="flex items-center gap-2 text-sm text-slate-200"><input type="checkbox" bind:checked={step.toolFailOnError} /> Fail on error</label>
-                      <label class="flex items-center gap-2 text-sm text-amber-200"><input type="checkbox" bind:checked={step.toolAllowSideEffects} /> Allow side effects</label>
-                      <label class="space-y-1 text-sm text-slate-200">Timeout seconds <Input type="number" bind:value={step.toolTimeoutSeconds} /></label>
+                      <label class="flex items-center gap-2 text-sm text-foreground"><input type="checkbox" bind:checked={step.toolFailOnError} /> Fail on error</label>
+                      <label class="flex items-center gap-2 text-sm text-warning"><input type="checkbox" bind:checked={step.toolAllowSideEffects} /> Allow side effects</label>
+                      <label class="space-y-1 text-sm text-foreground">Timeout seconds <Input type="number" bind:value={step.toolTimeoutSeconds} /></label>
                     </div>
-                    <label class="block space-y-2 text-sm font-medium text-slate-200">Redact argument names
+                    <label class="block space-y-2 text-sm font-medium text-foreground">Redact argument names
                       <Input bind:value={step.toolRedactArgsText} placeholder="token, password" />
                     </label>
                   </div>
                  {/if}
-                 {#if step.type !== 'tool_call'}<p class="text-sm text-slate-500">This step type has no deterministic tool fields.</p>{/if}
+                 {#if step.type !== 'tool_call'}<p class="text-sm text-quiet">This step type has no deterministic tool fields.</p>{/if}
                  </section>
                  {/if}
 
                  {#if openInspectorGroup === 'routing-review'}
                  <section data-inspector-panel="routing-review" aria-label="Routing and review fields">
                  {#if step.type === 'condition'}
-                  <div class="mt-4 space-y-4 rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4" data-testid={`condition-editor-${index}`}>
-                    <label class="block space-y-2 text-sm font-medium text-slate-200">Expression
-                      <textarea bind:value={step.conditionExpression} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" placeholder={'{{ steps.fetch.outputs.items | length > 0 }}'}></textarea>
+                  <div class="mt-4 space-y-4 rounded-2xl border border-warning-border bg-warning-subtle p-4" data-testid={`condition-editor-${index}`}>
+                    <label class="block space-y-2 text-sm font-medium text-foreground">Expression
+                      <textarea bind:value={step.conditionExpression} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm" placeholder={'{{ steps.fetch.outputs.items | length > 0 }}'}></textarea>
                     </label>
                     <div class="grid gap-4 md:grid-cols-2">
-                      <label class="space-y-2 text-sm font-medium text-slate-200">True branch
-                        <select bind:value={step.conditionThen} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                      <label class="space-y-2 text-sm font-medium text-foreground">True branch
+                        <select bind:value={step.conditionThen} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
                       </label>
-                      <label class="space-y-2 text-sm font-medium text-slate-200">False branch
-                        <select bind:value={step.conditionElse} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                      <label class="space-y-2 text-sm font-medium text-foreground">False branch
+                        <select bind:value={step.conditionElse} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
                       </label>
                     </div>
-                    <label class="block space-y-2 text-sm font-medium text-slate-200">Output mapping (optional JSON object)
-                      <textarea bind:value={step.conditionOutputText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                    <label class="block space-y-2 text-sm font-medium text-foreground">Output mapping (optional JSON object)
+                      <textarea bind:value={step.conditionOutputText} class="min-h-24 w-full rounded-xl border border-control-border bg-canvas/80 p-3 font-mono text-sm"></textarea>
                     </label>
                   </div>
                  {/if}
@@ -1452,29 +1482,29 @@ import X from 'lucide-svelte/icons/x';
                 <!-- Evaluator retry loop -->
                 {#if step.type === 'run' && (step.evaluate || step.evaluatorRejectTarget)}
                   <details class="mt-4" open={!!step.evaluatorRejectTarget}>
-                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                    <summary class="cursor-pointer text-sm font-medium text-secondary hover:text-foreground">
                       Evaluator retry loop
                       <Tooltip text="Configure what happens when the evaluator says the step output is incomplete. Without a target, the agent retries in place within the same step.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 grid gap-4 md:grid-cols-3">
-                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <label class="space-y-2 text-sm font-medium text-foreground">
                         <span>Evaluator reject target</span>
-                        <select bind:value={step.evaluatorRejectTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                        <select bind:value={step.evaluatorRejectTarget} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                           <option value="">None (retry in place)</option>
                           {#each previousStepNames(index) as prevName}
                             <option value={prevName}>{prevName}</option>
                           {/each}
                         </select>
                       </label>
-                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <label class="space-y-2 text-sm font-medium text-foreground">
                         <span>Max evaluator loops</span>
                         <Input bind:value={step.evaluatorRejectMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.evaluatorRejectTarget} type="number" />
                       </label>
-                      <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <label class="space-y-2 text-sm font-medium text-foreground">
                         <span>On evaluator loops exhausted</span>
-                        <select bind:value={step.evaluatorRejectOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.evaluatorRejectTarget}>
+                        <select bind:value={step.evaluatorRejectOnExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !step.evaluatorRejectTarget}>
                           <option value="continue">Continue anyway</option>
                           <option value="fail">Fail task</option>
                           <option value="gate">Ask human</option>
@@ -1487,17 +1517,17 @@ import X from 'lucide-svelte/icons/x';
                 <!-- Outcome routing -->
                  {#if step.type === 'run'}
                   <details class="mt-4" open={step.outcomeSuccessAction !== 'none' || step.outcomeRejectedAction !== 'none' || step.outcomeFailedAction !== 'none'}>
-                    <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
+                    <summary class="cursor-pointer text-sm font-medium text-secondary hover:text-foreground">
                       Outcome routing
                       <Tooltip text="Configure what happens after a valid step completion reports a business outcome. This is separate from evaluator retries: an approved review can still report outcome.status='rejected' and send work back.">
-                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </summary>
                     <div class="mt-3 space-y-4">
                       <div class="grid gap-4 md:grid-cols-4">
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On success</span>
-                          <select bind:value={step.outcomeSuccessAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                          <select bind:value={step.outcomeSuccessAction} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                             <option value="none">Default continue</option>
                             <option value="continue">Continue explicitly</option>
                             <option value="fail">Fail task</option>
@@ -1506,22 +1536,22 @@ import X from 'lucide-svelte/icons/x';
                             <option value="revise">Loop back to step</option>
                           </select>
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On success: target</span>
-                          <select bind:value={step.outcomeSuccessTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise'}>
+                          <select bind:value={step.outcomeSuccessTarget} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise'}>
                             <option value="">None</option>
                             {#each previousStepNames(index) as prevName}
                               <option value={prevName}>{prevName}</option>
                             {/each}
                           </select>
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Success max loops</span>
                           <Input bind:value={step.outcomeSuccessMaxLoops} disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise' || !step.outcomeSuccessTarget} type="number" />
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On success loops exhausted</span>
-                          <select bind:value={step.outcomeSuccessOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise' || !step.outcomeSuccessTarget}>
+                          <select bind:value={step.outcomeSuccessOnExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || step.outcomeSuccessAction !== 'revise' || !step.outcomeSuccessTarget}>
                             <option value="continue">Continue anyway</option>
                             <option value="fail">Fail task</option>
                             <option value="gate">Ask human</option>
@@ -1529,9 +1559,9 @@ import X from 'lucide-svelte/icons/x';
                         </label>
                       </div>
                       <div class="grid gap-4 md:grid-cols-4">
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On rejected</span>
-                          <select bind:value={step.outcomeRejectedAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                          <select bind:value={step.outcomeRejectedAction} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                             <option value="none">No special route</option>
                             <option value="fail">Fail task</option>
                             <option value="gate">Ask human</option>
@@ -1540,22 +1570,22 @@ import X from 'lucide-svelte/icons/x';
                             <option value="revise">Loop back to step</option>
                           </select>
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On rejected: target</span>
-                          <select bind:value={step.outcomeRejectedTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise'}>
+                          <select bind:value={step.outcomeRejectedTarget} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise'}>
                             <option value="">None</option>
                             {#each previousStepNames(index) as prevName}
                               <option value={prevName}>{prevName}</option>
                             {/each}
                           </select>
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>Rejected max loops</span>
                           <Input bind:value={step.outcomeRejectedMaxLoops} disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise' || !step.outcomeRejectedTarget} type="number" />
                         </label>
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On rejected loops exhausted</span>
-                          <select bind:value={step.outcomeRejectedOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise' || !step.outcomeRejectedTarget}>
+                          <select bind:value={step.outcomeRejectedOnExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || step.outcomeRejectedAction !== 'revise' || !step.outcomeRejectedTarget}>
                             <option value="continue">Continue anyway</option>
                             <option value="fail">Fail task</option>
                             <option value="gate">Ask human</option>
@@ -1563,9 +1593,9 @@ import X from 'lucide-svelte/icons/x';
                         </label>
                       </div>
                       <div class="grid gap-4 md:grid-cols-4">
-                        <label class="space-y-2 text-sm font-medium text-slate-200">
+                        <label class="space-y-2 text-sm font-medium text-foreground">
                           <span>On failed</span>
-                          <select bind:value={step.outcomeFailedAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                          <select bind:value={step.outcomeFailedAction} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                             <option value="none">Default fail</option>
                             <option value="fail">Fail task</option>
                             <option value="gate">Ask human</option>
@@ -1575,22 +1605,22 @@ import X from 'lucide-svelte/icons/x';
                           </select>
                         </label>
                         {#if step.outcomeFailedAction === 'revise'}
-                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <label class="space-y-2 text-sm font-medium text-foreground">
                             <span>Failed target</span>
-                            <select bind:value={step.outcomeFailedTarget} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                            <select bind:value={step.outcomeFailedTarget} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system}>
                               <option value="">Select earlier step</option>
                               {#each previousStepNames(index) as prevName}
                                 <option value={prevName}>{prevName}</option>
                               {/each}
                             </select>
                           </label>
-                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <label class="space-y-2 text-sm font-medium text-foreground">
                             <span>Failed max loops</span>
                             <Input bind:value={step.outcomeFailedMaxLoops} disabled={!!selectedWorkflow?.is_system || !step.outcomeFailedTarget} type="number" />
                           </label>
-                          <label class="space-y-2 text-sm font-medium text-slate-200">
+                          <label class="space-y-2 text-sm font-medium text-foreground">
                             <span>On failed loops exhausted</span>
-                            <select bind:value={step.outcomeFailedOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !step.outcomeFailedTarget}>
+                            <select bind:value={step.outcomeFailedOnExhausted} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !step.outcomeFailedTarget}>
                               <option value="continue">Continue anyway</option>
                               <option value="fail">Fail task</option>
                               <option value="gate">Ask human</option>
@@ -1601,7 +1631,7 @@ import X from 'lucide-svelte/icons/x';
                      </div>
                    </details>
                  {/if}
-                 {#if step.type !== 'run' && step.type !== 'condition'}<p class="text-sm text-slate-500">This step type has no routing or review fields.</p>{/if}
+                 {#if step.type !== 'run' && step.type !== 'condition'}<p class="text-sm text-quiet">This step type has no routing or review fields.</p>{/if}
                  </section>
                  {/if}
 
@@ -1615,14 +1645,15 @@ import X from 'lucide-svelte/icons/x';
         </Card>
         </div>
         </div>
+        {/if}
       </div>
     </div>
 
     <!-- Mobile-only sticky action bar. Anchored above the bottom tab bar
          via safe-area. Primary action is Save; secondary actions collapse
          behind an overflow menu in a Sheet. -->
-    <div
-      class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur lg:hidden"
+    {#if !profilesLoading && !profilesError}<div
+      class="fixed inset-x-0 z-30 border-t border-separator/80 bg-canvas/95 px-3 py-2 backdrop-blur lg:hidden"
       style="bottom: var(--app-shell-bottom-offset, 0px); padding-bottom: 6px;"
     >
       <div class="flex items-center gap-2">
@@ -1653,5 +1684,6 @@ import X from 'lucide-svelte/icons/x';
         <Button class="w-full justify-center" variant="danger" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
       </div>
     </Sheet>
+    {/if}
   </section>
 {/if}

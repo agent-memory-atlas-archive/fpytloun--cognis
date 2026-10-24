@@ -207,6 +207,12 @@ class _ProjectionBudget:
         return redacted
 
 
+def work_deliverable_lineage_key(deliverable: WorkDeliverable) -> str:
+    """Return the revision-lineage identity of a Work deliverable."""
+
+    return deliverable.lineage_id or deliverable.deliverable_id
+
+
 def is_work_evidence_item(
     item: TimelineItem,
     tool_definitions: Mapping[str, ToolDefinition],
@@ -311,9 +317,11 @@ def build_work_projection(
 
     for item in ordered:
         if isinstance(item, AssistantDeliverableTimelineItem):
-            if newest_first and item.deliverable_id in seen_deliverable_ids:
+            # Revisions of one lineage are one Work deliverable: keep the newest.
+            lineage_key = item.lineage_id or item.deliverable_id
+            if newest_first and lineage_key in seen_deliverable_ids:
                 continue
-            seen_deliverable_ids.add(item.deliverable_id)
+            seen_deliverable_ids.add(lineage_key)
             source_workstream = _source_workstream(item, workstream_by_stream)
             actionable = (
                 canonical_deliverable_ids is None
@@ -325,6 +333,8 @@ def build_work_projection(
             )
             deliverable = WorkDeliverable(
                 deliverable_id=item.deliverable_id,
+                lineage_id=item.lineage_id,
+                revision=item.revision,
                 sort_key=item.sort_key,
                 format=item.format,
                 title=item.title,
@@ -339,7 +349,7 @@ def build_work_projection(
             deliverables = [
                 existing
                 for existing in deliverables
-                if existing.deliverable_id != deliverable.deliverable_id
+                if work_deliverable_lineage_key(existing) != lineage_key
             ]
             deliverables.append(deliverable)
             if actionable and (final_deliverable is None or not newest_first):

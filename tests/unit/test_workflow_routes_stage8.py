@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_user, create_workflow
+from cognis.core.agent_loop import AgentLoop
+from cognis.core.workflow_management import get_workflow_for_user
+from cognis.models.tool import ToolCall
+from cognis.store.queries import (
+    attach_project_workflow,
+    create_project,
+    create_project_grant,
+    create_user,
+    create_workflow,
+    get_workflow,
+)
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -47,6 +61,190 @@ def test_workflow_list_includes_system_workflows(monkeypatch: object, tmp_path: 
         assert "system:direct" in workflow_ids
         assert "system:general-task" in workflow_ids
         assert "system:research" in workflow_ids
+
+
+async def _seed_bound_workflow(app: Any, permission: str | None = None) -> str:
+    async with app.state.session_factory() as session:
+        project = await create_project(session, owner_email="user@example.com", name="Bound")
+        for workflow_id in ("wf_bound_owner", "wf_unbound_owner"):
+            await create_workflow(
+                session,
+                workflow_id=workflow_id,
+                name=workflow_id,
+                owner_email="user@example.com",
+                definition={
+                    "workflow_id": workflow_id,
+                    "name": workflow_id,
+                    "owner_email": "user@example.com",
+                    "is_system": False,
+                    "steps": [{"name": "run", "type": "run", "prompt": "Work"}],
+                },
+            )
+        await attach_project_workflow(session, project.project_id, "wf_bound_owner")
+        if permission is not None:
+            await create_project_grant(
+                session,
+                project_id=project.project_id,
+                granted_by="user@example.com",
+                grantee_user_email="other@example.com",
+                permission=permission,
+            )
+        await session.commit()
+        return str(project.project_id)
+
+
+async def _native_workflow_read(
+    app: Any, actor: str, name: str, project_id: str | None = None
+) -> Any:
+    loop = SimpleNamespace(
+        session_manager=SimpleNamespace(session_factory=app.state.session_factory)
+    )
+    ctx = SimpleNamespace(
+        session=SimpleNamespace(user_email=actor, project_id=project_id),
+        agent=SimpleNamespace(manage_agents=True),
+    )
+    return await AgentLoop._handle_workflow_tool(
+        loop,
+        ToolCall(
+            call_id="workflow-read",
+            name=name,
+            arguments={"workflow_id": "wf_bound_owner"} if name == "get_workflow" else {},
+        ),
+        ctx=ctx,
+    )
+
+
+def test_owner_administrative_reads_do_not_grant_execution(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        project_id = asyncio.run(_seed_bound_workflow(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+        assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 200
+        listed = client.get("/api/v1/workflows", headers=headers).json()["items"]
+        assert sum(item["workflow_id"] == "wf_bound_owner" for item in listed) == 1
+        assert (
+            client.put(
+                "/api/v1/workflows/wf_bound_owner", headers=headers, json={"description": "Updated"}
+            ).status_code
+            == 200
+        )
+
+        async def check_native_and_execution() -> None:
+            for context_project in (None, project_id):
+                fetched = await _native_workflow_read(
+                    client.app, "user@example.com", "get_workflow", context_project
+                )
+                assert not fetched.is_error
+                assert json.loads(fetched.output)["description"] == "Updated"
+                listed = await _native_workflow_read(
+                    client.app, "user@example.com", "list_workflows", context_project
+                )
+                assert "wf_bound_owner" in {
+                    item["workflow_id"] for item in json.loads(listed.output)["workflows"]
+                }
+            registry = client.app.state.workflow_registry
+            assert await registry.get("wf_bound_owner", owner_email="user@example.com") is None
+            assert (
+                await get_workflow_for_user(
+                    workflow_registry=registry,
+                    workflow_id="wf_bound_owner",
+                    owner_email="user@example.com",
+                )
+                is None
+            )
+            assert (
+                await registry.get(
+                    "wf_bound_owner", owner_email="user@example.com", project_id=project_id
+                )
+                is not None
+            )
+            assert "wf_bound_owner" not in {
+                item.workflow_id for item in await registry.list_all(owner_email="user@example.com")
+            }
+            assert "wf_bound_owner" in {
+                item.workflow_id
+                for item in await registry.list_all(
+                    owner_email="user@example.com", project_id=project_id
+                )
+            }
+
+        asyncio.run(check_native_and_execution())
+
+
+@pytest.mark.parametrize("permission", [None, "viewer", "use", "manager"])
+@pytest.mark.parametrize("role", ["user", "admin"])
+def test_non_owner_management_reads_preserve_authorization(
+    monkeypatch: object, tmp_path: Path, permission: str | None, role: str
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        asyncio.run(_seed_user(client.app, email="other@example.com", role=role))
+        project_id = asyncio.run(_seed_bound_workflow(client.app, permission))
+        headers = _auth_headers(client.app, email="other@example.com", role=role)
+        assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 404
+        # Existing unbound admin exception is preserved, not extended to bound definitions.
+        assert client.get("/api/v1/workflows/wf_unbound_owner", headers=headers).status_code == (
+            200 if role == "admin" else 403
+        )
+        listed = client.get("/api/v1/workflows", headers=headers).json()["items"]
+        assert "wf_bound_owner" not in {item["workflow_id"] for item in listed}
+        assert (
+            client.put(
+                "/api/v1/workflows/wf_bound_owner", headers=headers, json={"description": "Denied"}
+            ).status_code
+            == 403
+        )
+
+        async def check_native() -> None:
+            for context_project in (None, project_id):
+                fetched = await _native_workflow_read(
+                    client.app, "other@example.com", "get_workflow", context_project
+                )
+                assert fetched.is_error
+                listed = await _native_workflow_read(
+                    client.app, "other@example.com", "list_workflows", context_project
+                )
+                assert "wf_bound_owner" not in {
+                    item["workflow_id"] for item in json.loads(listed.output)["workflows"]
+                }
+
+        asyncio.run(check_native())
+        scoped = client.get("/api/v1/workflows", headers=headers, params={"project_id": project_id})
+        if permission in {"use", "manager"}:
+            assert scoped.status_code == 200
+            assert "wf_bound_owner" not in {item["workflow_id"] for item in scoped.json()["items"]}
+        else:
+            assert scoped.status_code == 403
+
+
+def test_definition_owner_cannot_override_db_owner(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        asyncio.run(_seed_user(client.app, email="other@example.com"))
+        asyncio.run(_seed_bound_workflow(client.app))
+
+        async def forge_definition_and_check_native() -> None:
+            async with client.app.state.session_factory() as session:
+                row = await get_workflow(session, "wf_bound_owner")
+                assert row is not None
+                row.definition = {**row.definition, "owner_email": "other@example.com"}
+                await session.commit()
+            fetched = await _native_workflow_read(client.app, "other@example.com", "get_workflow")
+            assert fetched.is_error
+            listed = await _native_workflow_read(client.app, "other@example.com", "list_workflows")
+            assert "wf_bound_owner" not in {
+                item["workflow_id"] for item in json.loads(listed.output)["workflows"]
+            }
+
+        asyncio.run(forge_definition_and_check_native())
+        headers = _auth_headers(client.app, email="other@example.com")
+        assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 404
+        assert "wf_bound_owner" not in {
+            item["workflow_id"]
+            for item in client.get("/api/v1/workflows", headers=headers).json()["items"]
+        }
 
 
 def test_agent_list_includes_system_agents(monkeypatch: object, tmp_path: Path) -> None:

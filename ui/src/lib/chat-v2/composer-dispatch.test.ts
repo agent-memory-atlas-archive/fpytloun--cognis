@@ -1,11 +1,31 @@
-import { describe, expect, it, vi } from 'vitest';
-import { MemoryChatV2Outbox } from './outbox';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import 'fake-indexeddb/auto';
+import { MemoryChatV2Outbox as RawMemoryOutbox, CoordinatedOutbox } from './outbox';
+import { documentCoordination } from '$lib/document-coordination';
 import {
   dispatchChatComposerMessage,
   normalizeChatComposerInput,
 } from './composer-dispatch';
 
 describe('dispatchChatComposerMessage', () => {
+  it('routes a focused handoff through the command endpoint, never message admission', async () => {
+    const executeCommand = vi.fn().mockResolvedValue({ ok: true });
+    const result = await dispatchChatComposerMessage(
+      { conversationId: 'conv-1', content: '/handoff review the pending implementation', clientTxnId: 'txn-handoff' },
+      { executeCommand: executeCommand as never }
+    );
+    expect(result.kind).toBe('command');
+    expect(executeCommand).toHaveBeenCalledExactlyOnceWith(
+      'conv-1', 'txn-handoff', '/handoff review the pending implementation'
+    );
+  });
+  beforeEach(async () => {
+    await documentCoordination().beginLogin();
+    await documentCoordination().verified('composer-fixture@cognis.test');
+  });
+  function MemoryChatV2Outbox() {
+    return new CoordinatedOutbox(Object.assign(new RawMemoryOutbox(), { isDurable: () => true }), documentCoordination());
+  }
   it.each([
     ['/plan', { kind: 'command', content: '/plan', chatMode: undefined }],
     [' /build ', { kind: 'command', content: '/build', chatMode: undefined }],
@@ -45,8 +65,8 @@ describe('dispatchChatComposerMessage', () => {
     expect(executeCommand).toHaveBeenNthCalledWith(2, 'conv-1', 'txn-1', '/help');
   });
 
-  it('persists ordinary sends and clears an acknowledged outbox entry', async () => {
-    const outbox = new MemoryChatV2Outbox();
+  it('persists ordinary sends and retains a receipt for queued sibling windows', async () => {
+    const outbox = MemoryChatV2Outbox();
     const sendMessage = vi.fn().mockResolvedValue({ admission: 'queued', queue: { messages: [] } });
     const result = await dispatchChatComposerMessage(
       {
@@ -64,7 +84,8 @@ describe('dispatchChatComposerMessage', () => {
       client_message_id: 'msg-1',
       chat_mode: 'plan'
     }));
-    expect(await outbox.list()).toEqual([]);
+    expect(await outbox.get('txn-1')).toMatchObject({ status: 'acked',
+      admitted: { admission: 'queued', queue: { messages: [] } } });
   });
 
   it.each([
@@ -72,7 +93,7 @@ describe('dispatchChatComposerMessage', () => {
     ['/build\nimplement', 'implement', 'build'],
     ['/default continue', 'continue', 'default'],
   ] as const)('sends %s as normalized one-shot content and mode', async (input, content, chatMode) => {
-    const outbox = new MemoryChatV2Outbox();
+    const outbox = MemoryChatV2Outbox();
     const sendMessage = vi.fn().mockResolvedValue({ status: 'accepted' });
     await dispatchChatComposerMessage({
       conversationId: 'conv-1',
@@ -91,7 +112,8 @@ describe('dispatchChatComposerMessage', () => {
       client_message_id: 'msg-mode',
       chat_mode: chatMode
     });
-    expect(await outbox.list()).toEqual([]);
+    expect(await outbox.get('txn-mode')).toMatchObject({ status: 'acked',
+      admitted: { status: 'accepted' } });
   });
 
   it('routes bare mode directives to the command endpoint without sending a message', async () => {
@@ -136,7 +158,7 @@ describe('dispatchChatComposerMessage', () => {
   });
 
   it('retains a failed outbox entry with the error for retry', async () => {
-    const outbox = new MemoryChatV2Outbox();
+    const outbox = MemoryChatV2Outbox();
     await expect(dispatchChatComposerMessage(
       { conversationId: 'conv-1', content: 'hello', clientTxnId: 'txn-1', clientMessageId: 'msg-1' },
       { outbox, sendMessage: vi.fn().mockRejectedValue(new Error('offline')) as never }

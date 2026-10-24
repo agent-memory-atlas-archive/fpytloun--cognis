@@ -78,6 +78,22 @@ input with retry semantics. It does not append another `user_message`; Cognis
 records a `model_recovery` system notice (`Retrying turn…`) before the new
 assistant attempt. Retry is allowed only for failed, inactive turns.
 
+A recovery notice is owned by its recovery turn, not by an individual controller
+lease attempt. Its stable append key must reuse the original canonical payload:
+attempt number and retry reason are first-writer diagnostics. Before appending,
+the scheduler reads complete canonical history and reuses a matching notice;
+after an uncertain response or conflict it reconciles against that same durable
+owner. A 409 alone is not proof of success. Missing or mismatched canonical
+lineage fails closed. Event-store admission and cache-refresh failures are
+classified as `event_persistence_error:intaris`, never as an LLM-provider error.
+
+Session details distinguish prospective runtime selection from measured serving
+provenance. Cached details are rendered immediately but revalidated when opened.
+Context snapshots merge by runtime-metadata revision; a newer measured model
+invalidates an older serving target. Model and thinking badges change together,
+and quota monitoring follows the measured fallback provider once that selection
+has executed, without rewriting historical context/token measurements.
+
 Admission validation resolves the retry execution ID through the scheduler's
 canonical `system_notice` / `model_recovery` / `scope=turn` events and their
 `retry_source_turn_id` links until it finds the original user event. Every link
@@ -503,7 +519,9 @@ Two compaction paths:
   observes a completed/compacted root session without an already-rotated active
   child, ``_load_conversation_runtime()`` calls ``rotate_session()`` on the next
   turn and re-fetches preserved tail events from the old session's Intaris
-  stream via ``tail_start_seq`` stored in the ``compaction_summary`` event data.
+  stream via ``tail_start_seq`` stored in the ``compaction_summary`` event data,
+  plus any ``tail_pinned_seqs`` (see below). An incomplete pinned read seeds no
+  tail rather than a tail without the active instruction. The
   preserved tail is seeded from Intaris events, not from any model-facing
   projected transcript; controller-only provider metadata such as Anthropic
   signed thinking blocks is within-turn only and is not replayed across the
@@ -542,6 +560,23 @@ previous summary wrapper is reserved from the input budget before banding, and
 the preserved uncompacted tail is capped by walking user-turn boundaries
 backwards until it reaches roughly 30% of the active prompt budget, with
 ``session.compaction_preserve_turns`` as the maximum turn cap.
+
+**Long single turns.** System-started continuations extend one user turn
+without new user messages, so the latest turn alone can exceed the tail budget.
+When it does, the cut falls inside that turn at a tool-cycle boundary, sized by
+raw replay cost (compaction text truncates tool results and would understate
+it). The latest turn's admission anchors (its user messages and retry admission
+notices) are pinned verbatim at the front of the preserved tail, in order, and
+excluded from the summarized range; the summarizer still reads them for
+context. Continuation validation (``CanonicalContextSnapshot.require_turn``)
+therefore still finds the active instruction after rotation. The marker
+records ``tail_start_seq`` (contiguous tail start) and ``tail_pinned_seqs``.
+
+``turns_compacted`` counts whole user turns summarized and is informational;
+an intra-turn compaction reports ``0``. ``events_compacted`` decides success:
+the strategy returns ``noop`` before recording when the summarized range has
+no conversation content (for example, only context seeds), and rotation
+requires ``events_compacted > 0``.
 
 **LLM retry**: ``compact()`` retries transient errors (429, 5xx, timeout,
 connection) up to ``session.compaction_llm_max_attempts`` before falling back

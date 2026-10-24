@@ -1,0 +1,224 @@
+/* Original 07a413ce4 ToolCallBlock paint channels. These opt-in roles only
+   affect tagged, formerly distinct contexts; existing /opacity utilities are
+   never globally attenuated. Local palette boundaries reset every channel. */
+:where(:root, [data-theme-family][data-resolved-theme]) {
+  --legacy-rose-500: initial;
+  --legacy-rose-400: initial;
+  --legacy-rose-200: initial;
+  --legacy-rose-100: initial;
+  --legacy-sky-500: initial;
+  --legacy-sky-400: initial;
+  --legacy-sky-100: initial;
+  --legacy-sky-50: initial;
+  --legacy-emerald-500: initial;
+  --legacy-emerald-400: initial;
+  --legacy-emerald-300: initial;
+  --legacy-emerald-100: initial;
+  --legacy-emerald-50: initial;
+  --legacy-amber-500: initial;
+  --legacy-amber-400: initial;
+  --legacy-amber-300: initial;
+  --legacy-amber-100: initial;
+  --legacy-violet-500: initial;
+  --legacy-violet-400: initial;
+  --legacy-violet-300: initial;
+  --legacy-violet-100: initial;
+  --legacy-cyan-500: initial;
+  --legacy-cyan-400: initial;
+  --legacy-cyan-50: initial;
+  --legacy-slate-950: initial;
+  --legacy-slate-200: initial;
+  --legacy-quiet: initial;
+  --legacy-white: initial;
+  --legacy-sky-300: initial;
+  --legacy-sky-200: initial;
+  --legacy-rose-300: initial;
+  --legacy-rose-50: initial;
+  --legacy-violet-50: initial;
+  --legacy-cyan-300: initial;
+  --legacy-cyan-100: initial;
+  --legacy-text-75: initial;
+  --legacy-slate-50: initial;
+  --legacy-violet-200: initial;
+  --legacy-separator-ink: initial;
+  --legacy-yellow-400: initial;
+  --legacy-alpha-5: initial;
+  --legacy-alpha-10: initial;
+  --legacy-alpha-15: initial;
+  --legacy-alpha-20: initial;
+  --legacy-alpha-25: initial;
+  --legacy-alpha-30: initial;
+  --legacy-alpha-35: initial;
+  --legacy-alpha-40: initial;
+  --legacy-alpha-60: initial;
+  --legacy-alpha-70: initial;
+  --legacy-alpha-80: initial;
+}
+[data-theme-family='classic'][data-resolved-theme='dark'] {
+  --legacy-rose-500: 244 63 94;
+  --legacy-rose-400: 251 113 133;
+  --legacy-rose-200: 254 205 211;
+  --legacy-rose-100: 255 228 230;
+  --legacy-sky-500: 14 165 233;
+  --legacy-sky-400: 56 189 248;
+  --legacy-sky-100: 224 242 254;
+  --legacy-sky-50: 240 249 255;
+  --legacy-emerald-500: 16 185 129;
+  --legacy-emerald-400: 52 211 153;
+  --legacy-emerald-300: 110 231 183;
+  --legacy-emerald-100: 209 250 229;
+  --legacy-emerald-50: 236 253 245;
+  --legacy-amber-500: 245 158 11;
+  --legacy-amber-400: 251 191 36;
+  --legacy-amber-300: 252 211 77;
+  --legacy-amber-100: 254 243 199;
+  --legacy-violet-500: 139 92 246;
+  --legacy-violet-400: 167 139 250;
+  --legacy-violet-300: 196 181 253;
+  --legacy-violet-100: 237 233 254;
+  --legacy-cyan-500: 6 182 212;
+  --legacy-cyan-400: 34 211 238;
+  --legacy-cyan-50: 236 254 255;
+  --legacy-slate-950: 2 6 23;
+  --legacy-slate-200: 226 232 240;
+  --legacy-quiet: 100 116 139;
+  --legacy-white: 255 255 255;
+  --legacy-sky-300: 125 211 252;
+  --legacy-sky-200: 186 230 253;
+  --legacy-rose-300: 253 164 175;
+  --legacy-rose-50: 255 241 242;
+  --legacy-violet-50: 245 243 255;
+  --legacy-cyan-300: 103 232 249;
+  --legacy-cyan-100: 207 250 254;
+  --legacy-text-75: .75;
+  --legacy-slate-50: 248 250 252;
+  --legacy-violet-200: 221 214 254;
+  --legacy-separator-ink: 71 85 105;
+  --legacy-yellow-400: 250 204 21;
+  --legacy-alpha-5: .05;
+  --legacy-alpha-10: .1;
+  --legacy-alpha-15: .15;
+  --legacy-alpha-20: .2;
+  --legacy-alpha-25: .25;
+  --legacy-alpha-30: .3;
+  --legacy-alpha-35: .35;
+  --legacy-alpha-40: .4;
+  --legacy-alpha-60: .6;
+  --legacy-alpha-70: .7;
+  --legacy-alpha-80: .8;
+}
+/* Purpose-specific tags override only their corresponding opaque paint. */
+.tool-frame .legacy-tool.bg-error-5 { background: rgb(var(--legacy-rose-500, var(--color-danger-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-error-10 { background: rgb(var(--legacy-rose-500, var(--color-danger-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-info-5 { background: rgb(var(--legacy-sky-500, var(--color-info-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-native-5 { background: rgb(var(--legacy-sky-500, var(--color-blue-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-info-10 { background: rgb(var(--legacy-sky-500, var(--color-info-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-sky-option { background: rgb(var(--legacy-sky-400, var(--color-info-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-success-5 { background: rgb(var(--legacy-emerald-500, var(--color-success-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-success-10 { background: rgb(var(--legacy-emerald-500, var(--color-success-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-success-option { background: rgb(var(--legacy-emerald-400, var(--color-success-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-warning-5 { background: rgb(var(--legacy-amber-500, var(--color-orange-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-warning-10 { background: rgb(var(--legacy-amber-500, var(--color-warning-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-warning-option { background: rgb(var(--legacy-amber-400, var(--color-warning-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-violet-5 { background: rgb(var(--legacy-violet-500, var(--color-violet-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.bg-violet-10 { background: rgb(var(--legacy-violet-500, var(--color-violet-subtle)) / var(--legacy-alpha-10, 1)); }
+.tool-frame .legacy-tool.bg-cyan-5 { background: rgb(var(--legacy-cyan-500, var(--color-cyan-subtle)) / var(--legacy-alpha-5, 1)); }
+.tool-frame .legacy-tool.edge-error-30 { border-color: rgb(var(--legacy-rose-500, var(--color-danger-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-error-40 { border-color: rgb(var(--legacy-rose-500, var(--color-danger-border)) / var(--legacy-alpha-40, 1)); }
+.tool-frame .legacy-tool.edge-error-inner { border-color: rgb(var(--legacy-rose-400, var(--color-danger-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-error-15 { border-color: rgb(var(--legacy-rose-400, var(--color-danger-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-info-20 { border-color: rgb(var(--legacy-sky-500, var(--color-info-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-info-25 { border-color: rgb(var(--legacy-sky-500, var(--color-blue-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-info-35 { border-color: rgb(var(--legacy-sky-500, var(--color-info-border)) / var(--legacy-alpha-35, 1)); }
+.tool-frame .legacy-tool.edge-info-40 { border-color: rgb(var(--legacy-sky-500, var(--color-info-border)) / var(--legacy-alpha-40, 1)); }
+.tool-frame .legacy-tool.edge-sky-option { border-color: rgb(var(--legacy-sky-400, var(--color-info-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-success-20 { border-color: rgb(var(--legacy-emerald-500, var(--color-success-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-success-25 { border-color: rgb(var(--legacy-emerald-500, var(--color-success-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-success-30 { border-color: rgb(var(--legacy-emerald-500, var(--color-success-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-success-40 { border-color: rgb(var(--legacy-emerald-500, var(--color-success-border)) / var(--legacy-alpha-40, 1)); }
+.tool-frame .legacy-tool.edge-success-option { border-color: rgb(var(--legacy-emerald-400, var(--color-success-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-warning-35 { border-color: rgb(var(--legacy-amber-500, var(--color-warning-border)) / var(--legacy-alpha-35, 1)); }
+.tool-frame .legacy-tool.edge-warning-40 { border-color: rgb(var(--legacy-amber-500, var(--color-warning-border)) / var(--legacy-alpha-40, 1)); }
+.tool-frame .legacy-tool.edge-warning-inner { border-color: rgb(var(--legacy-amber-400, var(--color-warning-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-warning-option { border-color: rgb(var(--legacy-amber-400, var(--color-warning-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-warning-category { border-color: rgb(var(--legacy-amber-400, var(--color-orange-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-violet-25 { border-color: rgb(var(--legacy-violet-500, var(--color-violet-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-violet-20 { border-color: rgb(var(--legacy-violet-400, var(--color-violet-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-violet-result { border-color: rgb(var(--legacy-violet-300, var(--color-violet-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-cyan-25 { border-color: rgb(var(--legacy-cyan-500, var(--color-cyan-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.ink-error-100 { color: rgb(var(--legacy-rose-100, var(--color-danger))); }
+.tool-frame .legacy-tool.ink-error-200 { color: rgb(var(--legacy-rose-200, var(--color-danger))); }
+.tool-frame .legacy-tool.ink-success-100 { color: rgb(var(--legacy-emerald-100, var(--color-success))); }
+.tool-frame .legacy-tool.ink-answer-100 { color: rgb(var(--legacy-emerald-100, var(--color-foreground))); }
+.tool-frame .legacy-tool.ink-success-50 { color: rgb(var(--legacy-emerald-50, var(--color-foreground))); }
+.tool-frame .legacy-tool.ink-info-100 { color: rgb(var(--legacy-sky-100, var(--color-info))); }
+.tool-frame .legacy-tool.ink-info-50 { color: rgb(var(--legacy-sky-50, var(--color-foreground))); }
+.tool-frame .legacy-tool.ink-warning-100 { color: rgb(var(--legacy-amber-100, var(--color-warning))); }
+.tool-frame .legacy-tool.managed-result { background: rgb(var(--legacy-slate-950, var(--color-inset)) / .35); color: rgb(var(--legacy-slate-200, var(--color-foreground))); }
+.tool-frame .legacy-tool.edge-info-hint { border-color: rgb(var(--legacy-sky-400, var(--color-info-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-warning-25 { border-color: rgb(var(--legacy-amber-500, var(--color-warning-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.bg-violet-10:hover { background: rgb(var(--legacy-violet-500, var(--color-surface-hover)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-violet-30 { border-color: rgb(var(--legacy-violet-500, var(--color-violet-border)) / var(--legacy-alpha-30, 1)); }
+.tool-frame .legacy-tool.edge-todo-25 { border-color: rgb(var(--legacy-sky-500, var(--color-info-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-truncated { border-color: rgb(var(--legacy-amber-300, var(--color-warning-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-violet-15 { border-color: rgb(var(--legacy-violet-400, var(--color-violet-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-native-15 { border-color: rgb(var(--legacy-sky-400, var(--color-blue-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-cyan-15 { border-color: rgb(var(--legacy-cyan-400, var(--color-cyan-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-cyan-20 { border-color: rgb(var(--legacy-cyan-400, var(--color-cyan-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-success-inner { border-color: rgb(var(--legacy-emerald-400, var(--color-success-border)) / var(--legacy-alpha-20, 1)); }
+.tool-frame .legacy-tool.edge-answer-footer { border-color: rgb(var(--legacy-emerald-400, var(--color-success-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.ink-memory-artifact { color: rgb(var(--legacy-violet-100, var(--color-violet-tone))); }
+.tool-frame .legacy-tool.ink-memory-category { color: rgb(var(--legacy-amber-100, var(--color-orange-tone))); }
+.tool-frame .legacy-tool.ink-memory { color: rgb(var(--legacy-cyan-50, var(--color-cyan-tone))); }
+.tool-frame .legacy-tool.bg-question-inset { background: rgb(var(--legacy-slate-950, var(--color-surface)) / var(--legacy-alpha-35, 1)); }
+.tool-frame .legacy-tool.bg-answer-counter { background: rgb(var(--legacy-slate-950, var(--color-inset)) / var(--legacy-alpha-40, 1)); }
+.tool-frame .legacy-tool.bg-answer-note { background: rgb(var(--legacy-slate-950, var(--color-inset)) / var(--legacy-alpha-60, 1)); }
+.tool-frame .legacy-tool.bg-answer-footer { background: rgb(var(--legacy-slate-950, var(--color-inset)) / var(--legacy-alpha-80, 1)); }
+.tool-frame .legacy-tool.edge-question-inset { border-color: rgb(var(--legacy-sky-400, var(--color-info-border)) / var(--legacy-alpha-15, 1)); }
+.tool-frame .legacy-tool.edge-question-counter { border-color: rgb(var(--legacy-sky-400, var(--color-info-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.edge-answer-counter { border-color: rgb(var(--legacy-emerald-300, var(--color-success-border)) / var(--legacy-alpha-25, 1)); }
+.tool-frame .legacy-tool.bg-answer-selected { background: rgb(var(--legacy-emerald-300, var(--color-accent))); border-color: rgb(var(--legacy-emerald-300, var(--color-accent)) / var(--legacy-alpha-70, 1)); }
+.tool-frame .legacy-tool.bg-answer-unknown { background: rgb(var(--legacy-amber-300, var(--color-warning-subtle)) / var(--legacy-alpha-20, 1)); border-color: rgb(var(--legacy-amber-300, var(--color-warning-border)) / var(--legacy-alpha-60, 1)); }
+/* Foreground-only distinctions from original component owners. */
+.legacy-quiet.text-muted,
+/* Original ToolCallBlock raw disclosures and section captions all used Slate
+   500; descriptive metadata without this caption treatment used Slate 400. */
+.tool-frame :is(p, button).text-muted.font-medium.uppercase.tracking-widest {
+  color: rgb(var(--legacy-quiet, var(--color-muted)));
+}
+.legacy-quiet.hover\:text-secondary:hover { color: rgb(var(--color-secondary)); }
+.tool-frame button.text-muted.font-medium.uppercase.tracking-widest:hover { color: rgb(var(--color-secondary)); }
+.legacy-soft.text-secondary { color: rgb(var(--legacy-slate-200, var(--color-secondary))); }
+.legacy-white.text-foreground { color: rgb(var(--legacy-white, var(--color-foreground))); }
+.tool-frame .legacy-error-heading { color: rgb(var(--legacy-rose-300, var(--color-danger))); }
+.tool-frame .legacy-native-heading { color: rgb(var(--legacy-sky-300, var(--color-blue-tone))); }
+.tool-frame .legacy-error-title { color: rgb(var(--legacy-rose-50, var(--color-danger))); }
+.tool-frame .legacy-web-title { color: rgb(var(--legacy-violet-50, var(--color-accent))); }
+.tool-frame .legacy-web-title:hover { color: rgb(var(--legacy-violet-50, var(--color-accent-hover))); }
+.tool-frame .legacy-memory-title { color: rgb(var(--legacy-cyan-50, var(--color-foreground))); }
+.tool-frame .legacy-error-summary { color: rgb(var(--legacy-rose-100, var(--color-danger)) / var(--legacy-alpha-80, 1)); }
+.tool-frame .legacy-web-summary { color: rgb(var(--legacy-violet-100, var(--color-secondary)) / var(--legacy-alpha-80, 1)); }
+.tool-frame .legacy-memory-summary { color: rgb(var(--legacy-cyan-100, var(--color-secondary)) / var(--legacy-alpha-80, 1)); }
+.tool-frame .legacy-error-badges { color: rgb(var(--legacy-rose-100, var(--color-danger)) / var(--legacy-text-75, 1)); }
+.tool-frame .legacy-web-badges { color: rgb(var(--legacy-violet-100, var(--color-violet-tone)) / var(--legacy-text-75, 1)); }
+.tool-frame .legacy-memory-badges { color: rgb(var(--legacy-cyan-100, var(--color-cyan-tone)) / var(--legacy-text-75, 1)); }
+.legacy-recap-title.text-blue-tone { color: rgb(var(--legacy-sky-300, var(--color-blue-tone))); }
+.legacy-code-deletion.text-danger { color: rgb(var(--legacy-rose-300, var(--color-danger))); }
+.legacy-recap-control.text-foreground { color: rgb(var(--legacy-slate-200, var(--color-foreground))); }
+.legacy-additions.text-success { color: rgb(var(--legacy-emerald-300, var(--color-success))); }
+.tool-frame .legacy-tool-title { color: rgb(var(--legacy-slate-50, var(--color-foreground))); }
+.tool-frame .legacy-status-success { color: rgb(var(--legacy-emerald-300, var(--color-success))); }
+.tool-frame .legacy-status-info { color: rgb(var(--legacy-sky-300, var(--color-info))); }
+.tool-frame .legacy-status-active { color: rgb(var(--legacy-violet-200, var(--color-info))); }
+.tool-frame .legacy-status-error { color: rgb(var(--legacy-rose-300, var(--color-danger))); }
+.tool-frame .legacy-managed-heading { color: rgb(var(--legacy-violet-200, var(--color-violet-tone))); }
+.tool-frame .legacy-native-tool .text-blue-tone:not(.legacy-native-badges) { color: rgb(var(--legacy-sky-300, var(--color-blue-tone))); }
+.tool-frame .legacy-native-badges { color: rgb(var(--legacy-sky-100, var(--color-blue-tone)) / var(--legacy-text-75, 1)); }
+.legacy-hook-link.text-accent { color: rgb(var(--legacy-sky-300, var(--color-accent))); }
+.legacy-hook-link.text-accent:hover { color: rgb(var(--legacy-sky-200, var(--color-accent-hover))); }
+.legacy-recap-prose a { color: rgb(var(--legacy-sky-300, var(--color-accent))); }
+.legacy-recap-prose a:hover { color: rgb(var(--legacy-sky-300, var(--color-accent-hover))); }
+.tool-frame .legacy-separator.text-muted { color: rgb(var(--legacy-separator-ink, var(--color-muted))); }
+.tool-frame .legacy-risk-medium { color: rgb(var(--legacy-yellow-400, var(--color-warning))); }
+.tool-frame .legacy-native-tool .legacy-native-path.text-blue-tone { color: rgb(var(--legacy-sky-100, var(--color-blue-tone))); }
+.tool-frame .legacy-tool.ink-violet-100 { color: rgb(var(--legacy-violet-100, var(--color-violet-tone))); }

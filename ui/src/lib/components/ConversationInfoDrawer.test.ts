@@ -20,8 +20,8 @@ describe('ConversationInfoDrawer', () => {
     expect(screen.getByRole('heading', { name: 'Context' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Expand inspector' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Close conversation information' })).toBeNull();
-    expect(screen.getByTestId('conversation-info-drawer')).toHaveClass('bg-transparent', 'border-l', 'border-slate-800/60');
-    expect(screen.getByTestId('conversation-info-drawer')).not.toHaveClass('bg-slate-950');
+    expect(screen.getByTestId('conversation-info-drawer')).toHaveClass('bg-transparent', 'border-l', 'border-separator');
+    expect(screen.getByTestId('conversation-info-drawer')).not.toHaveClass('bg-elevated');
     expect(screen.getByRole('separator', { name: 'Resize conversation inspector' }))
       .toHaveClass('touch-resize-handle', 'touch-resize-handle--left');
   });
@@ -61,9 +61,9 @@ describe('ConversationInfoDrawer', () => {
     expect(screen.getByRole('button', { name: 'Close conversation information' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Expand inspector' })).toBeNull();
     expect(screen.getByTestId('conversation-info-header')).toHaveClass('min-w-0');
-    expect(document.querySelector('#conversation-info-drawer')).toHaveClass('bg-slate-950');
+    expect(document.querySelector('#conversation-info-drawer')).toHaveClass('bg-elevated');
     expect(document.querySelector('#conversation-info-drawer')).not.toHaveClass('bg-slate-900/95');
-    expect(screen.getByTestId('sheet-header-surface')).toHaveClass('bg-slate-950');
-    expect(screen.getByTestId('sheet-content-surface')).toHaveClass('bg-slate-950');
+    expect(screen.getByTestId('sheet-header-surface')).toHaveClass('bg-elevated');
+    expect(screen.getByTestId('sheet-content-surface')).toHaveClass('bg-elevated');
   });
 });

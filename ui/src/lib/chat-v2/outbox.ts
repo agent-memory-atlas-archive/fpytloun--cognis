@@ -1,9 +1,19 @@
 import type { AttachmentRef } from '$lib/types/api';
 import type { ChatMode } from './types';
+import type { SendMessageV2Response } from './types';
+import { documentCoordination, CoordinationUnavailableError, StaleDocumentError, type DocumentCoordination, type DocumentLease } from '$lib/document-coordination';
+import { scopedTransaction } from '$lib/offline/scoped-idb';
+import { snapshotPersistedMetadata } from './persisted-metadata';
+import { normalizeSubmissionInput, sameSubmissionInput, type SubmissionBinding } from './submission-input';
 
-export type OutboxStatus = 'pending' | 'sending' | 'acked' | 'failed';
+export type OutboxStatus = 'preparing' | 'pending' | 'sending' | 'acked' | 'failed';
 
 export interface OutboxEntry {
+  submission?: SubmissionBinding;
+  /** Older unowned entries are preserved, but never automatically sent by a new account. */
+  owner?: string;
+  /** Admission receipt lets another window settle the same txn without resending. */
+  admitted?: SendMessageV2Response;
   client_txn_id: string;
   client_message_id: string;
   conversation_id: string;
@@ -14,15 +24,21 @@ export interface OutboxEntry {
   created_at: string;
   updated_at: string;
   last_error?: string | null;
+  /** False after a permanent rejection; automatic retries skip the entry. */
+  retryable?: boolean;
 }
 
 export interface ChatV2Outbox {
+  reserve(entry: OutboxEntry, binding: SubmissionBinding): Promise<OutboxEntry>;
+  activate(clientTxnId: string, attachments: AttachmentRef[]): Promise<OutboxEntry>;
   put(entry: OutboxEntry): Promise<void>;
   get(clientTxnId: string): Promise<OutboxEntry | null>;
   list(conversationId?: string): Promise<OutboxEntry[]>;
   update(clientTxnId: string, patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>): Promise<void>;
   delete(clientTxnId: string): Promise<void>;
   clearAcked(): Promise<void>;
+  /** True only when entries survive a reload (not an in-memory fallback). */
+  isDurable(): boolean;
 }
 
 const DB_NAME = 'cognis-chat-v2';
@@ -43,11 +59,18 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
   private dbPromise: Promise<IDBDatabase> | null = null;
   private memoryFallback: MemoryChatV2Outbox | null = null;
 
-  constructor(indexedDBFactory: IDBFactory = indexedDB) {
+  constructor(indexedDBFactory: IDBFactory = indexedDB, private readonly name = DB_NAME,
+    private readonly lease?: DocumentLease) {
     this.indexedDB = indexedDBFactory;
   }
 
+  isDurable(): boolean {
+    return this.memoryFallback === null;
+  }
+
   async put(entry: OutboxEntry): Promise<void> {
+    entry = snapshotPersistedMetadata(entry);
+    if (entry.submission || entry.status === 'preparing') throw new Error('Submission bindings require reservation');
     await this.withFallback(
       () => this.putDb(entry),
       (outbox) => outbox.put(entry)
@@ -72,20 +95,77 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
     clientTxnId: string,
     patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>
   ): Promise<void> {
+    patch = snapshotPersistedMetadata(patch);
+    if ('submission' in patch || 'client_message_id' in patch || 'conversation_id' in patch
+      || 'content' in patch || 'chat_mode' in patch || patch.status === 'preparing') {
+      throw new Error('Immutable outbox input cannot be updated');
+    }
     await this.withFallback(
       async () => {
-        const existing = await this.getDb(clientTxnId);
-        if (!existing) return;
-        await this.putDb({
-          ...existing,
-          ...patch,
-          client_txn_id: existing.client_txn_id,
-          created_at: existing.created_at,
-          updated_at: new Date().toISOString()
+        const db = await this.db();
+        await this.lease?.validate();
+        const { store, done, guard } = scopedTransaction(db, STORE_NAME, 'readwrite', this.lease);
+        const request = store.get(clientTxnId) as IDBRequest<OutboxEntry | undefined>;
+        request.onsuccess = () => guard(() => {
+          const existing = request.result;
+          if (existing?.status === 'preparing') throw new Error('Submission preparation requires activation');
+          if (existing?.submission && existing.status === 'sending' && patch.status === 'pending') return;
+          if (existing && existing.status !== 'acked' && !existing.admitted) store.put({ ...existing, ...patch,
+            client_txn_id: existing.client_txn_id, owner: existing.owner,
+            created_at: existing.created_at, updated_at: new Date().toISOString() });
         });
+        await done;
       },
       (outbox) => outbox.update(clientTxnId, patch)
     );
+  }
+
+  async reserve(proposal: OutboxEntry, binding: SubmissionBinding): Promise<OutboxEntry> {
+    const entry = snapshotPersistedMetadata(proposal);
+    const captured = snapshotPersistedMetadata({ ...binding, input: normalizeSubmissionInput(binding.input) });
+    if (!captured.draft_key || !captured.input_revision || captured.version !== 1) throw new Error('Invalid submission input');
+    const db = await this.db();
+    await this.lease?.validate();
+    const { store, done, guard } = scopedTransaction(db, STORE_NAME, 'readwrite', this.lease);
+    let result!: OutboxEntry;
+    const request = store.index(CONVERSATION_INDEX).getAll(entry.conversation_id) as IDBRequest<OutboxEntry[]>;
+    request.onsuccess = () => guard(() => {
+      const matches = request.result.filter((row) => row.owner === entry.owner
+        && row.submission?.draft_key === captured.draft_key
+        && row.submission.input_revision === captured.input_revision);
+      if (matches.length > 1) throw new Error('Duplicate submission input binding');
+      const existing = matches[0];
+      if (existing) {
+        if (!sameSubmissionInput(existing.submission!.input, captured.input)) throw new Error('Submission input revision mismatch');
+        result = existing;
+      } else {
+        result = { ...entry, client_txn_id: crypto.randomUUID(), client_message_id: crypto.randomUUID(),
+          submission: captured, status: 'preparing', admitted: undefined };
+        store.add(result);
+      }
+    });
+    await done;
+    return result;
+  }
+
+  async activate(clientTxnId: string, attachments: AttachmentRef[]): Promise<OutboxEntry> {
+    attachments = snapshotPersistedMetadata(attachments);
+    const db = await this.db();
+    await this.lease?.validate();
+    const { store, done, guard } = scopedTransaction(db, STORE_NAME, 'readwrite', this.lease);
+    let result!: OutboxEntry;
+    const request = store.get(clientTxnId) as IDBRequest<OutboxEntry | undefined>;
+    request.onsuccess = () => guard(() => {
+      const existing = request.result;
+      if (!existing?.submission) throw new Error('Submission reservation unavailable');
+      result = existing;
+      if (existing.status === 'preparing' && !existing.admitted) {
+        result = { ...existing, attachments, status: 'pending', updated_at: new Date().toISOString() };
+        store.put(result);
+      }
+    });
+    await done;
+    return result;
   }
 
   async delete(clientTxnId: string): Promise<void> {
@@ -106,7 +186,8 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
   }
 
   private db(): Promise<IDBDatabase> {
-    this.dbPromise ??= openDatabase(this.indexedDB).catch((error) => {
+    this.lease?.assertCurrent();
+    this.dbPromise ??= openDatabase(this.indexedDB, this.name).catch((error) => {
       this.dbPromise = null;
       throw error;
     });
@@ -115,30 +196,41 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
 
   private async putDb(entry: OutboxEntry): Promise<void> {
     const db = await this.db();
-    await requestToPromise(transactionStore(db, 'readwrite').put(entry));
+    await this.lease?.validate();
+    const { store, done, guard } = scopedTransaction(db, STORE_NAME, 'readwrite', this.lease);
+    const request = store.get(entry.client_txn_id);
+    request.onsuccess = () => guard(() => { if (!request.result) store.put(entry); });
+    await done;
   }
 
   private async getDb(clientTxnId: string): Promise<OutboxEntry | null> {
     const db = await this.db();
-    const value = await requestToPromise<OutboxEntry | undefined>(
-      transactionStore(db, 'readonly').get(clientTxnId)
-    );
+    await this.lease?.validate();
+    const { store, done } = scopedTransaction(db, STORE_NAME, 'readonly', this.lease);
+    const value = await requestToPromise<OutboxEntry | undefined>(store.get(clientTxnId));
+    await done;
     return value ?? null;
   }
 
   private async listDb(conversationId?: string): Promise<OutboxEntry[]> {
     const db = await this.db();
-    const store = transactionStore(db, 'readonly');
+    await this.lease?.validate();
+    const { store, done } = scopedTransaction(db, STORE_NAME, 'readonly', this.lease);
     const source: IDBObjectStore | IDBIndex = conversationId
       ? store.index(CONVERSATION_INDEX)
       : store;
     const request = conversationId ? source.getAll(conversationId) : source.getAll();
-    return requestToPromise<OutboxEntry[]>(request);
+    const result = await requestToPromise<OutboxEntry[]>(request);
+    await done;
+    return result;
   }
 
   private async deleteDb(clientTxnId: string): Promise<void> {
     const db = await this.db();
-    await requestToPromise(transactionStore(db, 'readwrite').delete(clientTxnId));
+    await this.lease?.validate();
+    const { store, done } = scopedTransaction(db, STORE_NAME, 'readwrite', this.lease);
+    store.delete(clientTxnId);
+    await done;
   }
 
   private fallback(): MemoryChatV2Outbox {
@@ -155,8 +247,15 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
       return fallbackOperation(this.memoryFallback);
     }
     try {
-      return await operation();
+      await this.lease?.validate();
+      const result = await operation();
+      await this.lease?.validate();
+      return result;
     } catch (error) {
+      await this.lease?.validate();
+      // Production send receipts must remain visible to sibling documents.
+      // Per-document memory fallback cannot safely arbitrate admission.
+      if (this.lease) throw error;
       console.warn('Chat v2 IndexedDB outbox unavailable; using in-memory outbox', error);
       return fallbackOperation(this.fallback());
     }
@@ -164,10 +263,23 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
 }
 
 export class MemoryChatV2Outbox implements ChatV2Outbox {
+  async reserve(_entry: OutboxEntry, _binding: SubmissionBinding): Promise<OutboxEntry> {
+    throw new CoordinationUnavailableError();
+  }
+  async activate(_id: string, _attachments: AttachmentRef[]): Promise<OutboxEntry> {
+    throw new CoordinationUnavailableError();
+  }
   private readonly entries = new Map<string, OutboxEntry>();
 
+  isDurable(): boolean {
+    return false;
+  }
+
   async put(entry: OutboxEntry): Promise<void> {
-    this.entries.set(entry.client_txn_id, { ...entry, attachments: [...entry.attachments] });
+    if (this.entries.has(entry.client_txn_id)) return;
+    this.entries.set(entry.client_txn_id, {
+      ...entry, attachments: [...(entry.attachments ?? [])]
+    });
   }
 
   async get(clientTxnId: string): Promise<OutboxEntry | null> {
@@ -187,7 +299,7 @@ export class MemoryChatV2Outbox implements ChatV2Outbox {
     patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>
   ): Promise<void> {
     const existing = this.entries.get(clientTxnId);
-    if (!existing) return;
+    if (!existing || existing.status === 'acked' || existing.admitted) return;
     this.entries.set(clientTxnId, {
       ...existing,
       ...patch,
@@ -208,16 +320,56 @@ export class MemoryChatV2Outbox implements ChatV2Outbox {
   }
 }
 
-export function createIndexedDbChatV2Outbox(): IndexedDbChatV2Outbox {
+export class CoordinatedOutbox implements ChatV2Outbox {
+  readonly lease: DocumentLease;
+  constructor(private readonly inner: ChatV2Outbox, readonly coordination: DocumentCoordination) {
+    this.lease = coordination.capture();
+  }
+  private async access<T>(action: () => Promise<T>): Promise<T> {
+    await this.lease.validate();
+    const value = await action();
+    await this.lease.validate();
+    return value;
+  }
+  isDurable() { return this.inner.isDurable(); }
+  reserve(entry: OutboxEntry, binding: SubmissionBinding) {
+    if (entry.owner && entry.owner !== this.lease.owner) return Promise.reject(new StaleDocumentError());
+    return this.access(() => this.inner.reserve({ ...entry, owner: this.lease.owner! }, binding));
+  }
+  activate(id: string, attachments: AttachmentRef[]) {
+    return this.access(() => this.inner.activate(id, attachments));
+  }
+  put(entry: OutboxEntry) {
+    if (entry.owner && entry.owner !== this.lease.owner) return Promise.reject(new StaleDocumentError());
+    return this.access(() => this.inner.put({ ...entry, owner: this.lease.owner! }));
+  }
+  get(id: string) { return this.access(() => this.inner.get(id)); }
+  list(id?: string) { return this.access(() => this.inner.list(id)); }
+  update(id: string, patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>) {
+    return this.access(() => this.inner.update(id, { ...patch, owner: this.lease.owner! }));
+  }
+  // Per-view cleanup cannot prove that no sibling retains this transaction.
+  delete(_id: string) { this.lease.assertCurrent(); return Promise.resolve(); }
+  // Receipts must remain while another document may be waiting for admission.
+  clearAcked() { this.lease.assertCurrent(); return Promise.resolve(); }
+}
+
+export function createMemoryChatV2Outbox(): ChatV2Outbox {
+  throw new CoordinationUnavailableError();
+}
+
+export function createIndexedDbChatV2Outbox(coordination = documentCoordination()): ChatV2Outbox {
   if (typeof indexedDB === 'undefined') {
     throw new ChatV2OutboxUnavailableError();
   }
-  return new IndexedDbChatV2Outbox(indexedDB);
+  const lease = coordination.capture();
+  return new CoordinatedOutbox(
+    new IndexedDbChatV2Outbox(indexedDB, coordination.storageName(DB_NAME, lease), lease), coordination);
 }
 
-function openDatabase(indexedDBFactory: IDBFactory): Promise<IDBDatabase> {
+function openDatabase(indexedDBFactory: IDBFactory, name: string): Promise<IDBDatabase> {
   return withIdbTimeout(new Promise((resolve, reject) => {
-    const request = indexedDBFactory.open(DB_NAME, DB_VERSION);
+    const request = indexedDBFactory.open(name, DB_VERSION);
     request.onerror = () => reject(request.error ?? new Error('Failed to open Chat v2 IndexedDB outbox'));
     request.onsuccess = () => resolve(request.result);
     request.onupgradeneeded = () => {

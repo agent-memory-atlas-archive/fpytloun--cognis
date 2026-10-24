@@ -10,6 +10,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from cognis.logging import get_logger
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
+from cognis.models.intaris_policy import DEFAULT_INTARIS_EVALUATION, IntarisEvaluation
 from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
@@ -42,8 +43,12 @@ class AgentCapabilities(BaseModel):
     memory_backend: str = "mnemory"
     memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     guardrails_backend: str = "intaris"
+    intaris_evaluation: IntarisEvaluation = DEFAULT_INTARIS_EVALUATION
     minimum_outcome: Literal["deny", "escalate", "approve"] | None = None
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = None
+    # "unattended" applies interaction_mode "none" approval semantics to every
+    # session of this agent unless a task explicitly overrides interaction mode.
+    approval_mode: Literal["ask", "unattended"] = "ask"
     escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
 
     @model_validator(mode="after")
@@ -52,6 +57,8 @@ class AgentCapabilities(BaseModel):
             self.minimum_outcome is not None or self.maximum_outcome is not None
         ):
             raise ValueError("Evaluation outcome bounds require the Intaris guardrails backend")
+        if self.guardrails_backend == "none" and self.approval_mode != "ask":
+            raise ValueError("Unattended approvals require the Intaris guardrails backend")
         return self
 
     @field_validator("memory_backend")
@@ -152,6 +159,8 @@ class AgentDefinition(BaseModel):
     granted_permission: str | None = None
     executor_scope: str | None = None
     is_readonly_for_caller: bool = False
+    # Projects through which the caller may use this agent (project-scoped access).
+    shared_via_project_ids: list[str] = Field(default_factory=list)
     # Metadata
     status: str = "active"
     created_at: datetime | None = None
@@ -368,6 +377,9 @@ class AgentRuntimeProfile(BaseModel):
     memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     agent_switchable: bool = False
+    quick_switch: bool = False
+    quick_switch_index: int = Field(default=0, ge=0, strict=True)
+    quick_switch_color: Literal["neutral", "blue", "teal", "amber", "violet", "rose"] = "neutral"
 
     @model_validator(mode="before")
     @classmethod

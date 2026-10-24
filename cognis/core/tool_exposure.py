@@ -6,7 +6,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -250,16 +250,15 @@ def prepare_tool_exposure(
     - **hidden_searchable**: tools in the searchable inventory that are not
       currently policy-visible.  These are the candidates for ``search_tools``
       discovery.
-    - **promoted**: tools explicitly surfaced by ``search_tools`` or skill
-      activation (``promoted_tool_ids``).  They must become visible on the next
-      turn regardless of which hidden bucket they came from.
+    - **promoted**: bounded startup hints (``promoted_tool_ids``), not tools
+      found by discovery or skill activation.
 
     Provider packing then decides how to fit these sets into the model-facing
     tool list given any slot cap.  The invariant is:
 
     - critical helpers always win slots
     - promoted tools always win slots after critical helpers
-    - ``search_tools`` is included whenever hidden tools remain
+    - the controller discovery kernel remains present even with no hidden tools
     - remaining slots go to policy-visible non-MCP tools first, then MCP
     """
     validate_direct_schema_sizes(inventory_tools)
@@ -295,6 +294,12 @@ def prepare_tool_exposure(
     sorted_inventory = sorted(
         filter_edit_tools_for_model(inventory_tools, effective_model_id), key=_tool_sort_key
     )
+    if allow_tool_search and any(
+        tool.name == "skill_load" and tool.source.type == "builtin" for tool in sorted_inventory
+    ):
+        # Apply at the shared exposure boundary, including fallback candidates.
+        # A native deferred catalog would grow when a skill activates tools.
+        contract = replace(contract, discovery_mode=ToolDiscoveryMode.CONTROLLER_SEARCH)
 
     # Resolve policy-visible set.
     visible_defaults: set[str] = (
@@ -313,19 +318,6 @@ def prepare_tool_exposure(
     hidden_searchable_tools = [
         tool for tool in sorted_inventory if stable_tool_id(tool) not in visible_defaults
     ]
-    deferred_names = _deferred_integration_names(
-        [tool for tool in hidden_searchable_tools if stable_tool_id(tool) not in promoted_tool_ids]
-    )
-    if deferred_names:
-        for schema in controller_tool_schemas_with_search:
-            function = schema.get("function")
-            if not isinstance(function, dict) or function.get("name") != SEARCH_TOOLS_TOOL.name:
-                continue
-            function["description"] = (
-                f"{function.get('description', '').rstrip()} "
-                "Use search_tools to find other authorized operations in these deferred "
-                f"capabilities: {', '.join(deferred_names)}."
-            )
 
     # Promoted tools must be actually visible next turn regardless of policy
     # status.  A tool can be in ``visible_defaults`` (policy-visible) yet still
@@ -391,9 +383,9 @@ def prepare_tool_exposure(
         # deferred tool references invalid. Fall back before building payloads.
         discovery_enabled = allow_tool_search
     use_openai_controller_search_fallback = bool(
-        use_responses_api and discovery_enabled and search_tool_schema_present and has_hidden
+        use_responses_api and discovery_enabled and search_tool_schema_present
     )
-    if use_anthropic_defer or not allow_tool_search or not has_hidden:
+    if use_anthropic_defer or not allow_tool_search:
         filtered_controller_tool_schemas = controller_tool_schemas_without_discovery_kernel
     elif not use_responses_api or use_openai_controller_search_fallback:
         filtered_controller_tool_schemas = controller_tool_schemas_with_search

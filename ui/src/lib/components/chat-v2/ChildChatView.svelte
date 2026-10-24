@@ -59,16 +59,16 @@
   data-testid="child-chat-view"
 >
   <header
-    class="app-keyboard-stable-header chat-header-shell relative z-20 flex shrink-0 items-center gap-2 border-b border-slate-800/80 px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3"
+    class="app-keyboard-stable-header chat-header-shell relative z-20 flex shrink-0 items-center gap-2 border-b border-separator px-3 py-2.5 sm:gap-3 sm:px-4 sm:py-3"
     style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));"
     data-testid="child-header"
   >
-    <button class="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8" type="button" aria-label="Back to parent conversation" onclick={onBack}><ArrowLeft class="h-4 w-4" /></button>
+    <button class="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-muted hover:bg-surface-hover hover:text-strong sm:h-8 sm:w-8" type="button" aria-label="Back to parent conversation" onclick={onBack}><ArrowLeft class="h-4 w-4" /></button>
     <AgentAvatar name={displayName} {avatarUrl} class="h-8 w-8 shrink-0" />
     <div class="min-w-0 flex-1">
-      <h2 class="truncate text-sm font-semibold text-slate-100">{node.title}</h2>
-      <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-slate-400">
-        <span class="truncate text-slate-200">{displayName}</span>
+      <h2 class="truncate text-sm font-semibold text-foreground">{node.title}</h2>
+      <div class="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted">
+        <span class="truncate text-foreground">{displayName}</span>
         {#if node.agent_profile_id}<span class="hidden sm:inline">profile {node.agent_profile_id}</span>{/if}
         {#if node.model}<span class="hidden sm:inline">{node.model}</span>{/if}
         {#if node.reasoning_effort}<span class="hidden sm:inline">thinking {node.reasoning_effort}</span>{/if}
@@ -77,21 +77,21 @@
       </div>
     </div>
     <div class="flex shrink-0 items-center gap-0.5 sm:gap-1.5" data-testid="child-header-actions">
-      <button class="flex h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 font-mono text-[10px] text-slate-500 hover:bg-slate-800 hover:text-slate-200 sm:h-8 sm:min-w-0 sm:px-1.5 sm:py-1" type="button" aria-label="Copy canonical session ID" title="Copy canonical session ID" onclick={() => void copySessionId()}>
+      <button class="flex h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 font-mono text-[10px] text-quiet hover:bg-surface-hover hover:text-foreground sm:h-8 sm:min-w-0 sm:px-1.5 sm:py-1" type="button" aria-label="Copy canonical session ID" title="Copy canonical session ID" onclick={() => void copySessionId()}>
         <span class="hidden sm:inline">{view.sessionId.slice(0, 12)}</span>
-        {#if copied}<Check class="h-3.5 w-3.5 text-emerald-400 sm:h-3 sm:w-3" />{:else}<Copy class="h-3.5 w-3.5 sm:h-3 sm:w-3" />{/if}
+        {#if copied}<Check class="h-3.5 w-3.5 text-success sm:h-3 sm:w-3" />{:else}<Copy class="h-3.5 w-3.5 sm:h-3 sm:w-3" />{/if}
       </button>
       {#if view.kind === 'managed'}
         <a
-          class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-sky-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 sm:h-8 sm:w-8"
+          class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 sm:h-8 sm:w-8"
           href={`/chat/${encodeURIComponent(view.conversationId)}`}
           target="_blank"
           rel="noopener noreferrer"
           aria-label={`Open ${node.title} in new window`}
         ><ExternalLink class="h-4 w-4" /></a>
       {/if}
-      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8" type="button" aria-label={inspectorOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'} aria-expanded={inspectorOpen} aria-controls="conversation-info-drawer" data-testid="child-header-inspector" onclick={(event) => onToggleInspector(event.currentTarget as HTMLElement)}>{#if inspectorOpen}<ChevronsRight class="h-4 w-4" />{:else}<ChevronsLeft class="h-4 w-4" />{/if}</button>
-      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8" type="button" aria-label="Close child conversation" onclick={onClose}><X class="h-4 w-4" /></button>
+      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground sm:h-8 sm:w-8" type="button" aria-label={inspectorOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'} aria-expanded={inspectorOpen} aria-controls="conversation-info-drawer" data-testid="child-header-inspector" onclick={(event) => onToggleInspector(event.currentTarget as HTMLElement)}>{#if inspectorOpen}<ChevronsRight class="h-4 w-4" />{:else}<ChevronsLeft class="h-4 w-4" />{/if}</button>
+      <button class="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-muted hover:bg-surface-hover hover:text-strong sm:h-8 sm:w-8" type="button" aria-label="Close child conversation" onclick={onClose}><X class="h-4 w-4" /></button>
     </div>
   </header>
   {#if work.length || todos.length}

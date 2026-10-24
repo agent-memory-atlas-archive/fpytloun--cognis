@@ -79,6 +79,99 @@ def _session() -> SessionModel:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("idle_states", [[False], [True, False]])
+async def test_auto_defers_before_generation_or_publication_when_work_is_running(
+    idle_states,
+) -> None:
+    service, providers = _service(
+        {"choices": [{"message": {"content": '{"publish": true, "summary": "Completed."}'}}]},
+        [
+            {"seq": 1, "type": "user_message", "data": {"content": "Fix it"}},
+            {
+                "seq": 2,
+                "type": "tool_result",
+                "data": {"file_diffs": [{"path": "src/fix.py", "diff": "+fix\n"}]},
+            },
+            {"seq": 3, "type": "assistant_message", "data": {"content": "Fixed it."}},
+        ],
+    )
+    service._auto_still_idle = AsyncMock(side_effect=idle_states)
+    result = await service.generate(
+        _conversation(), _session(), auto=True, agent_owner_email="owner@example.org"
+    )
+    assert result in {
+        "Conversation is busy.",
+        "Conversation resumed before the recap was published.",
+    }
+    providers.guardrails.record_events.assert_not_awaited()
+    assert providers.llm.generate.await_count == len(idle_states) - 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "kind",
+    ["managed", "managed_live", "managed_queued", "delegated", "task", "shell", "unknown", "idle"],
+)
+async def test_ongoing_work_sources_block_automatic_recap(monkeypatch, kind) -> None:
+    service, providers = _service({}, [])
+    service._scheduler.durable_running_turn_state = AsyncMock(return_value=None)
+    service._scheduler.get_queued_messages = AsyncMock(return_value=[])
+    if kind == "managed_live":
+        service._scheduler.durable_running_turn_state.return_value = {"turn_id": "turn-child"}
+    if kind == "managed_queued":
+        service._scheduler.get_queued_messages.return_value = [{"queue_id": "queued-child"}]
+    monkeypatch.setattr(
+        "cognis.core.recap.list_active_delegation_sessions",
+        AsyncMock(return_value=[object()] if kind == "delegated" else []),
+    )
+    monkeypatch.setattr(
+        "cognis.core.recap.list_active_tasks_by_source_conversation",
+        AsyncMock(return_value=[object()] if kind == "task" else []),
+    )
+    monkeypatch.setattr(
+        "cognis.core.recap.list_open_managed_conversation_links",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    turn_state="running" if kind == "managed" else "idle",
+                    target_conversation_id="conv-child",
+                )
+            ]
+        ),
+    )
+    connection = SimpleNamespace(
+        background_shell_status=AsyncMock(
+            return_value={
+                "shells": [
+                    {
+                        "user_email": "someone@example.org",
+                        "conversation_id": "conv-recap",
+                        "status": "running",
+                    },
+                    {
+                        "user_email": "owner@example.org",
+                        "conversation_id": "conv-other",
+                        "status": "running",
+                    },
+                    {
+                        "user_email": "owner@example.org",
+                        "conversation_id": "conv-recap",
+                        "status": "running" if kind == "shell" else "completed",
+                    },
+                ]
+            }
+        )
+    )
+    if kind == "unknown":
+        connection.background_shell_status.side_effect = TimeoutError()
+    providers.executor = SimpleNamespace(
+        list_active=AsyncMock(return_value=[SimpleNamespace(executor_id="executor-test")]),
+        get_executor=AsyncMock(return_value=connection),
+    )
+    assert await service._has_ongoing_work(_conversation()) is (kind != "idle")
+
+
+@pytest.mark.anyio
 async def test_recap_is_classifier_side_call_with_no_turn_or_tools() -> None:
     service, providers = _service(
         {"choices": [{"message": {"content": "We researched caching. The next step is testing."}}]},

@@ -1,21 +1,44 @@
 import { writable, get } from 'svelte/store';
+import { metadataReadFlights } from '$lib/api/read-flights';
+import { dashboardRealtimeLoads } from '$lib/dashboard/realtime';
 
 import { getWebSocketUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
-import { conversationTimelineScope, type ChatRealtimeFrame, type TimelineScope } from '$lib/chat-v2/types';
+import {
+  conversationTimelineScope,
+  type ChatRealtimeFrame,
+  type ChatSyncResponse,
+  type TimelineScope,
+} from '$lib/chat-v2/types';
 import type { CognisWebSocketEvent } from '$lib/types/api';
 import { clamp } from '$lib/utils';
+
+const METADATA_REFRESH_ONLY_EVENTS = new Set([
+  'message_complete', 'turn_started', 'turn_settled', 'queued',
+  'queued_messages_updated', 'conversation_runtime_snapshot', 'conversation_state_delta',
+]);
+const METADATA_REFRESH_ONLY_SCOPES = new Set([
+  'executor_state_changed', 'notification_state_changed',
+  'task_progress_changed', 'schedule_action_changed',
+]);
+
+export function isMetadataRefreshOnlyScope(reason: unknown, metadataOnly?: unknown): boolean {
+  return typeof reason === 'string' && (METADATA_REFRESH_ONLY_SCOPES.has(reason)
+    || (metadataOnly === true && (reason === 'chat_scope_changed' || reason === 'sidebar_changed')));
+}
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'stalled';
 type CognisWebSocketClientEvent = CognisWebSocketEvent | ChatRealtimeFrame;
 type EventListener = (event: CognisWebSocketClientEvent) => void;
 type WebSocketAuth = Pick<typeof auth, 'getSnapshot' | 'clear'>;
 
-interface WebSocketState {
+export interface WebSocketState {
   status: ConnectionStatus;
   attempts: number;
   lastError: string | null;
+  /** True while the browser reports no network; reconnects wait for `online`. */
+  offline?: boolean;
 }
 
 interface ConversationSubscription {
@@ -40,6 +63,49 @@ const initialState: WebSocketState = {
   lastError: null
 };
 const CONVERSATION_SUBSCRIPTION_LIMIT = 12;
+const CATCH_UP_TIMEOUT_MS = 4_000;
+const CATCH_UP_RETAIN_MS = 10_000;
+const CHAT_FRAME_MAX_WAIT_MS = 100;
+
+interface CatchUpEntry {
+  cursor: string;
+  promise: Promise<ChatSyncResponse | null>;
+  resolve: (value: ChatSyncResponse | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+  consumed: boolean;
+  settled: boolean;
+}
+
+interface ChatV2CatchUpFrame {
+  type: 'chat_v2_catch_up';
+  scope_key: string;
+  sync?: ChatSyncResponse;
+  error?: string;
+}
+
+// Connection policy tuned for mobile links: sockets can silently die on
+// network handover or app suspension, so liveness is probed actively and a
+// wedged handshake is abandoned instead of waiting for the OS TCP timeout.
+export const WS_CONNECT_TIMEOUT_MS = 12_000;
+export const WS_HEARTBEAT_INTERVAL_MS = 25_000;
+export const WS_PONG_TIMEOUT_MS = 10_000;
+export const WS_PROBE_PONG_TIMEOUT_MS = 5_000;
+export const WS_RECONNECT_BASE_MS = 1_000;
+export const WS_RECONNECT_MAX_MS = 30_000;
+export const WS_STALLED_RETRY_MS = 60_000;
+export const WS_STALL_AFTER_ATTEMPTS = 10;
+/** Hidden longer than this means the socket may be dead; probe on return. */
+export const WS_RESUME_PROBE_AFTER_HIDDEN_MS = 10_000;
+
+/** Full-jitter exponential backoff (AWS style, floored at half the window). */
+export function reconnectDelayMs(attempt: number, random: () => number = Math.random): number {
+  const window = clamp(WS_RECONNECT_BASE_MS * 2 ** attempt, WS_RECONNECT_BASE_MS, WS_RECONNECT_MAX_MS);
+  return Math.round(window / 2 + random() * (window / 2));
+}
+
+function browserReportsOffline(): boolean {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
 
 export class CognisWebSocketClient {
   constructor(private readonly authProvider: WebSocketAuth = auth) {}
@@ -53,10 +119,17 @@ export class CognisWebSocketClient {
   private heartbeatTimer: number | null = null;
   private pongTimeout: number | null = null;
   private chatV2FrameFlushHandle: number | null = null;
+  private chatV2FrameFlushTimer: number | null = null;
   private pendingChatV2Frames: ChatRealtimeFrame[] = [];
+  private connectTimer: number | null = null;
+  private catchUps = new Map<string, CatchUpEntry>();
   private reconnectAttempts = 0;
   private authenticated = false;
+  private executorMonitorRefs = 0;
   private manualDisconnect = false;
+  private hasAuthenticatedBefore = false;
+  private lifecycleInstalled = false;
+  private hiddenAt: number | null = null;
 
   readonly state = writable<WebSocketState>(initialState);
 
@@ -64,6 +137,22 @@ export class CognisWebSocketClient {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  acquireExecutorMonitor(): () => void {
+    this.executorMonitorRefs += 1;
+    if (this.executorMonitorRefs === 1 && this.authenticated) {
+      this.sendRaw({ type: 'executor_monitor_subscribe' });
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.executorMonitorRefs -= 1;
+      if (this.executorMonitorRefs === 0 && this.authenticated) {
+        this.sendRaw({ type: 'executor_monitor_unsubscribe' });
+      }
     };
   }
 
@@ -89,16 +178,25 @@ export class CognisWebSocketClient {
       return;
     }
 
+    this.installLifecycleListeners();
     this.manualDisconnect = false;
     this.authenticated = false;
+    this.clearReconnectTimer();
     this.state.update(() => ({
       status: this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting',
       attempts: this.reconnectAttempts,
-      lastError: null
+      lastError: null,
+      offline: false
     }));
 
     const socket = new WebSocket(getWebSocketUrl());
     this.socket = socket;
+    this.clearConnectTimer();
+    this.connectTimer = window.setTimeout(() => {
+      this.connectTimer = null;
+      if (this.socket !== socket || this.authenticated) return;
+      this.abandonSocket(socket, 'Connection attempt timed out.');
+    }, WS_CONNECT_TIMEOUT_MS);
     socket.onopen = () => {
       if (this.socket !== socket) return;
     };
@@ -114,6 +212,7 @@ export class CognisWebSocketClient {
       if (this.socket !== socket) return;
       this.socket = null;
       this.authenticated = false;
+      this.clearConnectTimer();
       this.markChatV2WireDisconnected();
       if (this.manualDisconnect) {
         this.state.set({ status: 'idle', attempts: 0, lastError: null });
@@ -132,12 +231,112 @@ export class CognisWebSocketClient {
     };
   }
 
+  /**
+   * Detach a socket that is wedged (handshake or heartbeat timeout). A
+   * half-open TCP connection on mobile may never deliver `onclose`, so the
+   * client stops waiting for it and reconnects on a fresh socket.
+   */
+  private abandonSocket(socket: WebSocket, reason: string): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    this.authenticated = false;
+    this.clearConnectTimer();
+    this.markChatV2WireDisconnected();
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    try {
+      socket.close();
+    } catch {
+      // Closing a socket that never opened can throw in some engines.
+    }
+    this.state.update((state) => ({ ...state, lastError: reason }));
+    if (!this.manualDisconnect) this.scheduleReconnect();
+  }
+
+  /**
+   * Reconnect immediately (or verify an open socket with a fast probe). Used
+   * for user-initiated retries and browser lifecycle signals such as
+   * `online`, foregrounding, and BFCache restore.
+   */
+  reconnectNow(): void {
+    if (typeof window === 'undefined' || this.manualDisconnect) return;
+    if (this.authProvider.getSnapshot().status !== 'authenticated') return;
+    if (this.socket && this.socket.readyState === WebSocket.OPEN && this.authenticated) {
+      this.ping(WS_PROBE_PONG_TIMEOUT_MS);
+      return;
+    }
+    if (this.socket && this.socket.readyState === WebSocket.CONNECTING) return;
+    this.reconnectAttempts = 0;
+    this.connect();
+  }
+
+  private installLifecycleListeners(): void {
+    if (this.lifecycleInstalled || typeof window === 'undefined') return;
+    this.lifecycleInstalled = true;
+    window.addEventListener('online', () => {
+      this.state.update((state) => ({ ...state, offline: false }));
+      this.reconnectNow();
+    });
+    window.addEventListener('offline', () => {
+      if (this.manualDisconnect) return;
+      this.state.update((state) => ({ ...state, offline: true }));
+      if (!this.authenticated) this.waitForNetwork();
+    });
+    window.addEventListener('pageshow', (event) => {
+      if ((event as PageTransitionEvent).persisted) this.reconnectNow();
+    });
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          this.hiddenAt = Date.now();
+          return;
+        }
+        const hiddenFor = this.hiddenAt === null ? 0 : Date.now() - this.hiddenAt;
+        this.hiddenAt = null;
+        if (!this.authenticated || hiddenFor >= WS_RESUME_PROBE_AFTER_HIDDEN_MS) {
+          this.reconnectNow();
+        }
+      });
+    }
+  }
+
+  private waitForNetwork(): void {
+    this.clearReconnectTimer();
+    this.state.set({
+      status: 'reconnecting',
+      attempts: this.reconnectAttempts,
+      lastError: 'Offline. Waiting for network…',
+      offline: true
+    });
+    if (typeof window === 'undefined') return;
+    // `navigator.onLine` can be wrong (VPNs, captive portals), so keep a slow
+    // fallback probe that does not consume backoff attempts.
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, WS_STALLED_RETRY_MS);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.reconnectTimer);
+    }
+    this.reconnectTimer = null;
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.connectTimer);
+    }
+    this.connectTimer = null;
+  }
+
   disconnect(): void {
     this.manualDisconnect = true;
-    if (this.reconnectTimer !== null) {
-      window.clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    this.clearReconnectTimer();
+    this.clearConnectTimer();
     this.clearHeartbeat();
     this.clearPongTimeout();
     this.clearChatV2FrameFlush();
@@ -304,12 +503,19 @@ export class CognisWebSocketClient {
     });
   }
 
-  ping(): void {
+  ping(timeoutMs: number = WS_PONG_TIMEOUT_MS): void {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.authenticated) {
       return;
     }
-    this.socket.send(JSON.stringify({ type: 'ping' }));
-    this.startPongTimeout();
+    // Keep an already-running (shorter or equal) liveness deadline.
+    if (this.pongTimeout !== null && timeoutMs >= WS_PONG_TIMEOUT_MS) return;
+    try {
+      this.socket.send(JSON.stringify({ type: 'ping' }));
+    } catch {
+      this.abandonSocket(this.socket, 'Connection lost.');
+      return;
+    }
+    this.startPongTimeout(timeoutMs);
   }
 
   enableTts(voice: string | null = null): void {
@@ -344,6 +550,10 @@ export class CognisWebSocketClient {
   }
 
   private markChatV2WireDisconnected(): void {
+    // A catch-up requested on this socket can no longer arrive; fall back to
+    // REST now and never hand a previous socket's result to a later consumer.
+    for (const scopeKey of [...this.catchUps.keys()]) this.settleCatchUp(scopeKey, null);
+    this.catchUps.clear();
     for (const [scopeKey, subscription] of this.chatV2Subscriptions.entries()) {
       if (subscription.wireRegistered) {
         this.chatV2Subscriptions.set(scopeKey, { ...subscription, wireRegistered: false });
@@ -379,23 +589,101 @@ export class CognisWebSocketClient {
     }
   }
 
+  /**
+   * Take the server-sent reconnect catch-up delta for `scopeKey` if one was
+   * requested for exactly `cursor`. Resolves `null` (use REST sync) on
+   * timeout, server error, or cursor mismatch. Single use.
+   */
+  consumeCatchUp(scopeKey: string, cursor: string): Promise<ChatSyncResponse | null> | null {
+    const pending = this.catchUps.get(scopeKey);
+    if (!pending || pending.consumed || pending.cursor !== cursor) return null;
+    // Keep the entry until it settles so a frame arriving after the view
+    // asked still resolves this promise.
+    pending.consumed = true;
+    if (pending.settled) this.catchUps.delete(scopeKey);
+    return pending.promise;
+  }
+
+  private expectCatchUp(scopeKey: string, cursor: string): void {
+    this.settleCatchUp(scopeKey, null);
+    let resolvePromise!: (value: ChatSyncResponse | null) => void;
+    const promise = new Promise<ChatSyncResponse | null>((res) => { resolvePromise = res; });
+    const entry: CatchUpEntry = {
+      cursor,
+      promise,
+      consumed: false,
+      settled: false,
+      resolve: resolvePromise,
+      timer: setTimeout(() => this.settleCatchUp(scopeKey, null, entry), CATCH_UP_TIMEOUT_MS),
+    };
+    this.catchUps.set(scopeKey, entry);
+  }
+
+  private settleCatchUp(scopeKey: string, value: ChatSyncResponse | null, expected?: CatchUpEntry): void {
+    const entry = this.catchUps.get(scopeKey);
+    if (!entry || entry.settled || (expected && entry !== expected)) return;
+    clearTimeout(entry.timer);
+    entry.settled = true;
+    entry.resolve(value);
+    if (entry.consumed) {
+      this.catchUps.delete(scopeKey);
+      return;
+    }
+    // Unconsumed: retain briefly so a slightly late consumer gets the result.
+    setTimeout(() => {
+      if (this.catchUps.get(scopeKey) === entry) this.catchUps.delete(scopeKey);
+    }, CATCH_UP_RETAIN_MS);
+  }
+
+  private resolveCatchUp(frame: ChatV2CatchUpFrame): void {
+    const pending = this.catchUps.get(frame.scope_key);
+    if (!pending) return;
+    const sync = frame.sync;
+    this.settleCatchUp(
+      frame.scope_key,
+      sync && !frame.error && sync.cursor_before === pending.cursor ? sync : null,
+    );
+  }
+
   private handleMessage(raw: string): void {
     try {
       const payload = JSON.parse(raw) as CognisWebSocketClientEvent;
+      if ((payload as { type: string }).type === 'chat_v2_catch_up') {
+        this.resolveCatchUp(payload as unknown as ChatV2CatchUpFrame);
+        return;
+      }
       if (payload.type === 'authenticated') {
+        const isReconnect = this.hasAuthenticatedBefore;
+        this.hasAuthenticatedBefore = true;
         this.authenticated = true;
         this.reconnectAttempts = 0;
+        this.clearConnectTimer();
         this.clearPongTimeout();
-        this.state.set({ status: 'connected', attempts: 0, lastError: null });
+        this.state.set({ status: 'connected', attempts: 0, lastError: null, offline: false });
         this.startHeartbeat();
+        if (this.executorMonitorRefs > 0) {
+          this.sendRaw({ type: 'executor_monitor_subscribe' });
+        }
         for (const [scopeKey, subscription] of this.chatV2Subscriptions.entries()) {
           const { scope, cursor } = subscription;
           if (cursor) {
-            this.sendRaw({ type: 'chat_v2_subscribe', scope, cursor });
+            // On reconnect, ask the server to include the missed canonical
+            // delta so views can skip their follow-up REST sync.
+            const catchUp = isReconnect && scope.kind === 'conversation';
+            if (catchUp) this.expectCatchUp(scopeKey, cursor);
+            this.sendRaw(catchUp
+              ? { type: 'chat_v2_subscribe', scope, cursor, catch_up: true }
+              : { type: 'chat_v2_subscribe', scope, cursor });
             this.chatV2Subscriptions.set(scopeKey, { ...subscription, wireRegistered: true });
           }
         }
         this.flushQueue();
+        if (isReconnect) {
+          // The server registers resubscriptions without replaying canonical
+          // history missed while offline. Tell every mounted view to run its
+          // cursor-based REST sync so quiet conversations catch up too.
+          this.dispatch({ type: 'reconnected', missed_events_count: 0, client_resync: true });
+        }
         return;
       }
 
@@ -433,6 +721,25 @@ export class CognisWebSocketClient {
   }
 
   private dispatch(payload: CognisWebSocketClientEvent): void {
+    // Progress subscribers already serialize a trailing refresh. Aborting their
+    // shared transport here restarts expensive reads on every runtime update.
+    // Access/metadata invalidations still fence results before listeners run.
+    const refreshOnly = METADATA_REFRESH_ONLY_EVENTS.has(payload.type)
+      || (payload.type === 'scope_invalidated' && isMetadataRefreshOnlyScope(payload.reason, payload.metadata_only));
+    if (
+      !refreshOnly && (
+        dashboardRealtimeLoads(payload.type, 'reason' in payload ? payload.reason : undefined).length
+        || ['scope_invalidated', 'work_invalidated', 'inbox_changed'].includes(payload.type)
+      )
+    ) {
+      // The sidebar controller retains a trailing read for these hints. Restarting
+      // its current HTTP request as well can starve it under continuous child work.
+      // Other invalidations, including access changes, still cancel every flight.
+      metadataReadFlights.invalidate({
+        preserveRefreshOwned: payload.type === 'work_invalidated'
+          || (payload.type === 'scope_invalidated' && payload.reason === 'sidebar_changed'),
+      });
+    }
     for (const listener of this.listeners) {
       listener(payload);
     }
@@ -451,14 +758,17 @@ export class CognisWebSocketClient {
       this.chatV2FrameFlushHandle = null;
       this.flushChatV2Frames();
     });
+    // Painting can pause independently of the socket (notably on mobile).
+    // Do not make delivery depend solely on a rendering opportunity.
+    this.chatV2FrameFlushTimer = window.setTimeout(
+      () => this.flushChatV2Frames(),
+      CHAT_FRAME_MAX_WAIT_MS
+    );
   }
 
   private flushChatV2Frames(): void {
+    this.cancelChatV2FrameFlush();
     if (this.pendingChatV2Frames.length === 0) return;
-    if (this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
-      window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
-      this.chatV2FrameFlushHandle = null;
-    }
     const frames = this.pendingChatV2Frames;
     this.pendingChatV2Frames = [];
     try {
@@ -470,11 +780,19 @@ export class CognisWebSocketClient {
     }
   }
 
-  private clearChatV2FrameFlush(): void {
+  private cancelChatV2FrameFlush(): void {
     if (this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
       window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
     }
+    if (this.chatV2FrameFlushTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.chatV2FrameFlushTimer);
+    }
     this.chatV2FrameFlushHandle = null;
+    this.chatV2FrameFlushTimer = null;
+  }
+
+  private clearChatV2FrameFlush(): void {
+    this.cancelChatV2FrameFlush();
     this.pendingChatV2Frames = [];
   }
 
@@ -491,35 +809,40 @@ export class CognisWebSocketClient {
   private discardPendingChatV2Frames(keep: (frame: ChatRealtimeFrame) => boolean): void {
     if (this.pendingChatV2Frames.length === 0) return;
     this.pendingChatV2Frames = this.pendingChatV2Frames.filter(keep);
-    if (this.pendingChatV2Frames.length === 0 && this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
-      window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
-      this.chatV2FrameFlushHandle = null;
-    }
+    if (this.pendingChatV2Frames.length === 0) this.cancelChatV2FrameFlush();
   }
 
   private scheduleReconnect(): void {
     this.clearHeartbeat();
     this.clearPongTimeout();
+    this.clearReconnectTimer();
     if (typeof window === 'undefined') {
       return;
     }
 
-    if (this.reconnectAttempts >= 10) {
-      this.state.set({
-        status: 'stalled',
-        attempts: this.reconnectAttempts,
-        lastError: 'Connection lost. Use reconnect to try again.'
-      });
+    if (browserReportsOffline()) {
+      // Do not burn retry attempts while there is no network; `online`
+      // reconnects immediately.
+      this.waitForNetwork();
       return;
     }
 
-    const delay = clamp(1000 * 2 ** this.reconnectAttempts, 1000, 30_000);
+    const stalled = this.reconnectAttempts >= WS_STALL_AFTER_ATTEMPTS;
+    const delay = stalled ? WS_STALLED_RETRY_MS : reconnectDelayMs(this.reconnectAttempts);
     this.reconnectAttempts += 1;
-    this.state.set({
-      status: 'reconnecting',
-      attempts: this.reconnectAttempts,
-      lastError: 'Reconnecting to Cognis…'
-    });
+    this.state.set(stalled
+      ? {
+          status: 'stalled',
+          attempts: this.reconnectAttempts,
+          lastError: 'Connection lost. Retrying in the background.',
+          offline: false
+        }
+      : {
+          status: 'reconnecting',
+          attempts: this.reconnectAttempts,
+          lastError: 'Reconnecting to Cognis…',
+          offline: false
+        });
 
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
@@ -534,7 +857,7 @@ export class CognisWebSocketClient {
     this.clearHeartbeat();
     this.heartbeatTimer = window.setInterval(() => {
       this.ping();
-    }, 30_000);
+    }, WS_HEARTBEAT_INTERVAL_MS);
   }
 
   private clearHeartbeat(): void {
@@ -544,19 +867,17 @@ export class CognisWebSocketClient {
     this.heartbeatTimer = null;
   }
 
-  private startPongTimeout(): void {
+  private startPongTimeout(timeoutMs: number): void {
     if (typeof window === 'undefined') {
       return;
     }
     this.clearPongTimeout();
+    const socket = this.socket;
     this.pongTimeout = window.setTimeout(() => {
-      this.state.update((state) => ({
-        ...state,
-        status: 'stalled',
-        lastError: 'Heartbeat timed out. Reconnecting…'
-      }));
-      this.socket?.close();
-    }, 10_000);
+      this.pongTimeout = null;
+      if (!socket || this.socket !== socket) return;
+      this.abandonSocket(socket, 'Heartbeat timed out. Reconnecting…');
+    }, timeoutMs);
   }
 
   private clearPongTimeout(): void {

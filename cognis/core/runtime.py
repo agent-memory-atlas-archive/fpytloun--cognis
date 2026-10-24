@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 
+class ExecutorConfigurationError(RuntimeError):
+    """Executor configuration must be corrected before execution can start."""
+
+
 class TransientExecutorUnavailable(RuntimeError):
     """Selected executor is temporarily unavailable and may recover shortly."""
 
@@ -83,6 +87,7 @@ class ResolvedStepRuntime:
     runtime_info: dict[str, Any] | None = None
     executor_pool: Any = None  # Optional[ExecutorPool] (avoid forward ref)
     active_executor_id: str | None = None
+    rebuild_tool_registry: Callable[[Any], Awaitable[Any]] | None = None
 
 
 def build_local_executor_environment(

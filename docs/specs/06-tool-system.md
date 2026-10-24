@@ -12,6 +12,59 @@ rules.
 
 ## Tool Sources
 
+### Instance configuration management
+
+`manage_providers`, `manage_routes`, `manage_settings`, and `manage_executors`
+declare canonical action schemas in `cognis/tools/builtin/system_management.py`.
+Descriptions, validation, plan-mode classification, and policy metadata derive
+from those operation descriptors. The router accepts only registered builtin
+sources, requires explicit agent opt-in at execution, and always evaluates these
+non-bypassable operations. The handler checks root owner primary context and
+loads the trusted user's current role; arguments cannot supply actor identity.
+
+Transport-neutral management services own resource authorization, validation,
+persistence, and runtime effects. REST routes and tools share these services.
+Tool results are redacted and then pass the normal untrusted-result boundary.
+Provider and executor writes serialize with the existing database dispatch guard;
+timestamp preconditions are checked within that transaction. Named routes retain
+their store revision CAS. Task bindings and workflow profiles use locked aggregate
+snapshots and generation-bearing revision hashes to prevent absent-row ABA.
+
+Configuration previews execute validation and dependency checks but neither commit
+nor run runtime effects. Mutations preserve omitted fields, replace supplied config
+documents, and never cascade dependencies. Explicit create IDs support read-before-
+retry reconciliation; stale updates must be read and reviewed again. Provider cache
+invalidation and executor fencing/reconfiguration run after commit. Web mutations
+finish propagation cancellation-safely; hot settings conditionally recover only
+their own committed revision. The supported REST payload/response contracts remain
+unchanged. These are application configuration operations, not executor tool
+execution or arbitrary administrative shell access.
+
+Each domain has a bundled management skill. QuickStart explicitly enables all six
+instance-management opt-ins (including existing agent and MCP tools) and attaches
+available management skills, with an advanced opt-out. Existing agents retain
+their current permissions until explicitly configured.
+
+### Owner-scoped credential assignment
+
+`manage_agents` declares `credentials_get` (read) and `credentials_grant` /
+`credentials_revoke` (update) in its canonical native operation registry.
+All three require an exact `agent_id` and `credential_id`; mutations additionally
+require the agent's `expected_updated_at`. Only root owner primary chats can use
+this tool. Both resources are owner-checked, without administrator bypass.
+
+Credential metadata is read through the configured provider and projected onto
+identity/policy fields only. Assignment mutations use agent revision CAS in one
+transaction, changing only `permissions.allowed_credentials`. A stale write is
+rejected, including a concurrent no-op. Cancellation before commit rolls back;
+retry requires a fresh revision. There is no credential payload mutation,
+secret resolution, agent activation, or sharing side effect.
+
+Grant validates status, expiry and agent scope; revoke only removes an assignment.
+The credential provider continues to enforce current credential scope and status
+at resolution. Agent permissions follow the existing runtime-definition refresh
+lifecycle, so revoking an assignment is not cancellation of already-running work.
+
 Tools come from five sources, each with a priority for deduplication:
 
 | Source | Priority | Description |
@@ -79,6 +132,22 @@ class ToolSource(BaseModel):
 ```
 
 ### Authoritative operation descriptors
+
+Native tools (`builtin`, `controller`, and `executor`) are classified by their
+shared contract before registration or serialization. A declared category maps
+to an explicit profile group, unless the owner supplies a group directly.
+`read_only` supplies the baseline `read` or `write` capability; owners declare
+privileged and destructive capabilities explicitly. Declared `DELETE`
+operations also add `destructive`. Capability flags do not derive from tool
+names, descriptions, schema prose, or `non_bypassable`.
+
+Native classification is `ready`, `declared`, and confidence `1.0`.
+Registration audits and inventory resolution reject missing or inconsistent
+native classification instead of invoking a heuristic or an LLM. New native
+categories must extend the shared category mapping or supply an explicit group.
+Executor RPC payloads use the same normalization, including older payloads
+that omit classification fields. Dynamic classification and its persisted
+overrides remain limited to external MCP and executable skill sources.
 
 Native tools declare one or more `NativeToolOperation` objects. These
 declarations—not a shared schema, action-name heuristic, or annotation—are the
@@ -485,6 +554,22 @@ and `bash_kill` to stop them. For background commands, `timeout` only controls
 the initial preview wait and does not limit process lifetime. Prefer these
 managed controls over process-name polling such as `pgrep`, which can match
 wrappers or the polling command itself.
+
+A user can move a running foreground `bash` call into the background from the
+tool card ("Move to background"). The controller resolves the call's executor
+and executor instance from the active turn's durable dispatch record and sends a
+`tool.background` RPC (forwarded to the owning replica when needed). The bash
+handler stops its foreground stream readers without consuming buffered data,
+adopts the still-running process as a normal background shell session (seeded
+with the output captured so far, same conversation, call id, and completion
+callback), and returns the usual background-started result marked
+`moved_to_background: true` / `background_initiator: "user"`. The foreground
+timeout no longer applies. If the command exits first, the normal foreground
+result wins. For an executor-native backgroundable tool, the agent loop then
+injects a one-off system notice before the next model call telling the agent the
+user moved the command (with its `shell_id`) and persists it as a
+`system_notice` lifecycle event (`kind: tool_moved_to_background`). Completion
+follow-ups and status reminders behave exactly as for `run_in_background=true`.
 
 Agents should provide the optional `description` argument for background bash
 commands. The description is treated as the human-readable job identifier in
@@ -1646,9 +1731,26 @@ Skills are managed as Cognis records backed by the database and artifact store.
 System skills may be seeded from packaged application resources on bootstrap,
 but skills are not discovered from editable controller filesystem directories.
 
-At runtime, executors receive only temporary staged copies of the specific
-assets required by the selected skill tool recipe. The controller remains the
-source of truth for skill metadata, versions, and assets.
+`skill_load` resolves the current authorized version, releases its DB session,
+and sends that immutable bundle through `skill.assets.prepare` on the active
+authorized executor connection. This authenticated controller-only RPC does not
+trust configure-time `skill_manifests` and is not an LLM-callable tool. It returns
+version-pinned paths, hashes, and asset identities for the result and protected
+skill context. Preparation errors prevent successful loading/activation; no
+scratch fallback is allowed. `skill_asset_materialize` is retired.
+
+Executors cache verified assets under their Cognis data directory, isolated by
+actor, skill, and version. Relative bundle layout is preserved. Cache reads
+verify hashes; writes are atomic and use no-follow directory/file descriptors.
+Retrying preparation is idempotent. Cancellation belongs to the calling load;
+an interrupted cache fill can leave only verified version-scoped files, and a
+subsequent load safely repairs/reuses them. Auto-injected instructions without
+paths explicitly require a load before asset-only helper use.
+
+Executable recipes still stage the specific assets they need temporarily.
+The controller remains the source of truth for skill metadata, versions, and
+assets. General authoring guidance requires portable versioned resources and
+publication → load → clean execution evidence.
 
 ## Complete Tool Call Flow
 

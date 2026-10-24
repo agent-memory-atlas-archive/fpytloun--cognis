@@ -31,7 +31,7 @@
 <Popover text={details} placement="right">
   <button
     type="button"
-    class="rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+    class="rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
     aria-label={`Session identity: ${name}`}
     data-testid="activity-identity-control"
   >

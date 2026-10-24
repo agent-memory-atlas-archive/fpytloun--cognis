@@ -1,29 +1,75 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
+import { loginFixtureAccount } from '../../../test/verified-account';
+import { auth } from '$lib/stores/auth';
+import { documentCoordination } from '$lib/document-coordination';
+import { createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
+import { sendOutboxEntry } from '$lib/chat-v2/outbox-send';
 
 import CompactConversationChat from './CompactConversationChat.svelte';
 import { sessionTimelineScope } from '$lib/chat-v2/types';
+import { dispatchChatComposerMessage, normalizeChatComposerInput } from '$lib/chat-v2/composer-dispatch';
+import { chatV2Api } from '$lib/chat-v2/api';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   dispatch: vi.fn(),
-  sidebar: vi.fn(),
+  backgroundWork: vi.fn(),
+  cancel: vi.fn(),
 }));
 vi.mock('$lib/api/client', () => ({
   api: {
     artifacts: { upload: vi.fn() },
-    conversations: { sidebar: mocks.sidebar },
+    conversations: { backgroundWork: mocks.backgroundWork },
   },
 }));
-vi.mock('$lib/chat-v2/outbox', () => ({
-  MemoryChatV2Outbox: class { list = mocks.list; },
-  createIndexedDbChatV2Outbox: () => ({ list: mocks.list }),
-}));
+vi.mock('$lib/chat-v2/outbox', async (importOriginal) => {
+  const original = await importOriginal<typeof import('$lib/chat-v2/outbox')>();
+  const outbox = () => {
+    const rows = new Map<string, OutboxEntry>();
+    return {
+    list: async (...args: unknown[]) => {
+      const entries: OutboxEntry[] = await mocks.list(...args);
+      entries.forEach((entry) => {
+        if (!rows.has(entry.client_txn_id)) rows.set(entry.client_txn_id, entry);
+      });
+      return entries.map((entry) => rows.get(entry.client_txn_id)!);
+    },
+    get: async (id: string) => rows.get(id) ?? null,
+    update: vi.fn(async (id: string, changes: Partial<OutboxEntry>) => {
+      const entry = rows.get(id);
+      if (entry) rows.set(id, { ...entry, ...changes });
+    }),
+    delete: vi.fn(async () => undefined),
+    isDurable: () => true,
+  };
+  };
+  return {
+    ...original,
+    MemoryChatV2Outbox: class { constructor() { return outbox(); } },
+    createMemoryChatV2Outbox: outbox,
+    createIndexedDbChatV2Outbox: outbox,
+  };
+});
 vi.mock('$lib/chat-v2/composer-dispatch', () => ({
-  dispatchChatComposerMessage: mocks.dispatch,
+  dispatchChatComposerMessage: vi.fn(),
   normalizeChatComposerInput: vi.fn(),
 }));
+// Queued messages are sent by the outbox drain straight to the message API.
+vi.mock('$lib/chat-v2/api', async (importOriginal) => {
+  const original = await importOriginal<typeof import('$lib/chat-v2/api')>();
+  return {
+    ...original,
+    chatV2Api: {
+      ...original.chatV2Api,
+      cancelTurn: mocks.cancel,
+      sendMessage: (...args: unknown[]) => mocks.dispatch(...args).then(
+        (result: { response?: unknown } | undefined) => result?.response ?? {},
+      ),
+    },
+  };
+});
 
 vi.mock('$lib/components/chat-v2/ScopedChatV2Timeline.svelte', async () => (
   import('./CompactConversationChat.timeline-test-fixture.svelte')
@@ -40,10 +86,20 @@ vi.mock('$lib/components/chat-v2/ChatV2Composer.svelte', async () => (
 
 describe('CompactConversationChat auxiliary content', () => {
   afterEach(cleanup);
+  beforeEach(loginFixtureAccount);
+  afterEach(async () => { await auth.clear(); });
   beforeEach(() => {
+    vi.mocked(dispatchChatComposerMessage).mockReset();
+    // Composite autosave also calls normalization; unrelated UI tests need
+    // its real total function rather than an undefined-returning mock.
+    vi.mocked(normalizeChatComposerInput).mockReset().mockImplementation(({ content }) => ({
+      kind: 'message', content, chatMode: undefined,
+    }));
     mocks.list.mockReset().mockResolvedValue([]);
     mocks.dispatch.mockReset();
-    mocks.sidebar.mockReset().mockResolvedValue({
+    mocks.cancel.mockReset().mockResolvedValue({});
+    mocks.backgroundWork.mockReset().mockResolvedValue({
+      background_work_changed: true,
       background_work: {
         items: [{
           kind: 'task',
@@ -116,6 +172,59 @@ describe('CompactConversationChat auxiliary content', () => {
     });
   });
 
+  it('clears a completed command when changing timeline scope without changing conversation', async () => {
+    vi.mocked(normalizeChatComposerInput).mockReturnValue({ kind: 'command', content: '/status', chatMode: undefined });
+    vi.mocked(dispatchChatComposerMessage).mockResolvedValue({
+      kind: 'command',
+      response: { status: 'completed', text: 'Parent conversation status' },
+    } as Awaited<ReturnType<typeof dispatchChatComposerMessage>>);
+    const view = render(CompactConversationChat, { conversationId: 'conversation-one' });
+    await fireEvent.input(screen.getByLabelText('Composer text'), { target: { value: '/status' } });
+    await fireEvent.click(screen.getByTestId('compact-composer-fixture'));
+    expect(await screen.findByTestId('compact-command-result')).toHaveTextContent('Parent conversation status');
+    await view.rerender({
+      conversationId: 'conversation-one',
+      timelineScope: sessionTimelineScope('session-child', 'conversation-one'),
+    });
+    expect(screen.queryByTestId('compact-command-result')).not.toBeInTheDocument();
+  });
+
+  it('does not publish a pending parent command into a newly selected session view', async () => {
+    let resolveCommand!: (result: Awaited<ReturnType<typeof dispatchChatComposerMessage>>) => void;
+    vi.mocked(normalizeChatComposerInput).mockReturnValue({ kind: 'command', content: '/status', chatMode: undefined });
+    vi.mocked(dispatchChatComposerMessage).mockReturnValue(new Promise(resolve => { resolveCommand = resolve; }));
+    const onCommandResponse = vi.fn();
+    const view = render(CompactConversationChat, { conversationId: 'conversation-one', onCommandResponse });
+    await fireEvent.input(screen.getByLabelText('Composer text'), { target: { value: '/status' } });
+    await fireEvent.click(screen.getByTestId('compact-composer-fixture'));
+    await view.rerender({
+      conversationId: 'conversation-one',
+      timelineScope: sessionTimelineScope('session-child', 'conversation-one'),
+    });
+    resolveCommand({
+      kind: 'command',
+      response: { status: 'completed', text: 'Late parent conversation status' },
+    } as Awaited<ReturnType<typeof dispatchChatComposerMessage>>);
+    await tick();
+    expect(screen.queryByTestId('compact-command-result')).not.toBeInTheDocument();
+    expect(onCommandResponse).not.toHaveBeenCalled();
+  });
+
+  it('ignores a late stop error from a previous conversation and releases its busy state', async () => {
+    let rejectStop!: (error: Error) => void;
+    mocks.cancel.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectStop = reject; }));
+    const view = render(CompactConversationChat, { conversationId: 'conversation-one' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Activate fixture turn' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Stop fixture turn' }));
+    expect(screen.getByRole('button', { name: 'Stop fixture turn' })).toBeDisabled();
+    expect(chatV2Api.cancelTurn).toHaveBeenCalledWith('conversation-one', expect.any(Object));
+    await view.rerender({ conversationId: 'conversation-two' });
+    expect(screen.getByRole('button', { name: 'Stop fixture turn' })).not.toBeDisabled();
+    rejectStop(new Error('Previous conversation cancellation failed'));
+    await tick();
+    expect(screen.queryByText('Previous conversation cancellation failed')).not.toBeInTheDocument();
+  });
+
   it('renders one editable queue inside a bounded panel while preserving timeline and composer', async () => {
     render(CompactConversationChat, {
       conversationId: 'conversation-one',
@@ -156,6 +265,29 @@ describe('CompactConversationChat auxiliary content', () => {
     );
   });
 
+  it('does not rotate the replacement tab when a destroyed chat command completes late', async () => {
+    let resolve!: (result: Awaited<ReturnType<typeof dispatchChatComposerMessage>>) => void;
+    vi.mocked(normalizeChatComposerInput).mockReturnValue({ kind: 'command', content: '/new', chatMode: undefined });
+    vi.mocked(dispatchChatComposerMessage).mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    const onRotation = vi.fn();
+    const chatA = render(CompactConversationChat, { conversationId: 'conversation-a', onCommandResponse: onRotation });
+    await fireEvent.input(screen.getByLabelText('Composer text'), { target: { value: '/new' } });
+    await fireEvent.click(screen.getByTestId('compact-composer-fixture'));
+    await waitFor(() => expect(dispatchChatComposerMessage).toHaveBeenCalledOnce());
+    chatA.unmount();
+    render(CompactConversationChat, { conversationId: 'conversation-b', onCommandResponse: onRotation });
+    await fireEvent.input(screen.getByLabelText('Composer text'), { target: { value: 'Draft in B' } });
+    resolve({ kind: 'command', clientTxnId: 'txn-rotate-a', response: {
+      conversation_id: 'conversation-a', client_txn_id: 'txn-rotate-a', status: 'completed',
+      result_type: 'new_conversation', text: 'New conversation created',
+      data: { conversation_id: 'conversation-new' }, server_time: '2026-10-14T08:00:00Z',
+    } });
+    await tick();
+    await tick();
+    expect(onRotation).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Composer text')).toHaveValue('Draft in B');
+  });
+
   it('does not expose parent conversation controls while viewing a child session', async () => {
     render(CompactConversationChat, {
       conversationId: 'conversation-one',
@@ -176,6 +308,7 @@ describe('CompactConversationChat auxiliary content', () => {
   it.each(['list', 'dispatch'] as const)('isolates a scope switch during outbox %s', async (phase) => {
     const entries = [1, 2].map((id) => ({
       conversation_id: 'conversation-one',
+      owner: documentCoordination().capture().owner,
       content: `Pending ${id}`,
       status: 'pending',
       created_at: '2026-08-26T00:00:00Z',
@@ -211,7 +344,7 @@ describe('CompactConversationChat auxiliary content', () => {
     let release!: () => void;
     const pending = new Promise<void>((resolve) => { release = resolve; });
     const entry = {
-      conversation_id: 'conversation-one', content: 'Pending', status: 'pending',
+      conversation_id: 'conversation-one', owner: documentCoordination().capture().owner, content: 'Pending', status: 'pending',
       created_at: '2026-08-26T00:00:00Z', client_txn_id: 'txn-1', client_message_id: 'message-1',
     };
     mocks.list.mockImplementationOnce(async () => {
@@ -235,11 +368,30 @@ describe('CompactConversationChat auxiliary content', () => {
 
   it('reconciles pending messages in the editable conversation scope', async () => {
     mocks.list.mockResolvedValue([{
-      conversation_id: 'conversation-one', content: 'Pending', status: 'pending',
+      conversation_id: 'conversation-one', owner: documentCoordination().capture().owner, content: 'Pending', status: 'pending',
       created_at: '2026-08-26T00:00:00Z', client_txn_id: 'txn-1', client_message_id: 'message-1',
     }]);
     mocks.dispatch.mockResolvedValue({ kind: 'message', response: {} });
     render(CompactConversationChat, { conversationId: 'conversation-one' });
     await waitFor(() => expect(screen.getByTestId('compact-timeline-fixture')).toHaveAttribute('data-admissions', '1'));
+  });
+
+  it('retains admission receipts across repeated mock lists and sends only once', async () => {
+    const entry: OutboxEntry = {
+      conversation_id: 'conversation-one', owner: documentCoordination().capture().owner!,
+      content: 'Pending', status: 'pending', created_at: '2026-08-26T00:00:00Z',
+      updated_at: '2026-08-26T00:00:00Z', client_txn_id: 'txn-repeat',
+      client_message_id: 'message-repeat', attachments: [],
+    };
+    mocks.list.mockResolvedValue([entry]);
+    mocks.dispatch.mockResolvedValue({ response: {} });
+    const outbox = createIndexedDbChatV2Outbox();
+    await outbox.list('conversation-one');
+    await sendOutboxEntry(outbox, entry);
+    const [reloaded] = await outbox.list('conversation-one');
+    expect(reloaded.status).toBe('acked');
+    expect(reloaded.admitted).toBeDefined();
+    await sendOutboxEntry(outbox, reloaded);
+    expect(mocks.dispatch).toHaveBeenCalledOnce();
   });
 });

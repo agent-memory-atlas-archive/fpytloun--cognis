@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.config import CognisConfig
 from cognis.core import executor_availability
+from cognis.core.redis_service import RedisService
 from cognis.models.config import ProviderHealth
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.credentials.encrypted_db import EncryptedDBCredentialsProvider
@@ -64,6 +65,8 @@ def build_provider_registry(
     config: CognisConfig,
     session_factory: async_sessionmaker[Any],
     auth_provider: JWTAuthProvider,
+    *,
+    redis_service: RedisService | None = None,
 ) -> ProviderRegistry:
     # Executor implementations are optional for controller-only imports and
     # are loaded only when the application builds its runtime registry.
@@ -113,6 +116,7 @@ def build_provider_registry(
         secrets_provider=secrets_provider,
         inference_router=inference_router,
         credentials_provider=credentials_provider,
+        redis_service=redis_service,
     )
 
     registry = ProviderRegistry(

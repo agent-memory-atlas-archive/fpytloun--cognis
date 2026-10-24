@@ -149,6 +149,8 @@ describe('StepOutputModal', () => {
 
     expect(await screen.findByText('Persisted rich body')).toBeVisible();
     expect(screen.queryByText('Loading full deliverable…')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open full view' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: /^Theme:/ })).toBeNull();
     view.unmount();
   });
 

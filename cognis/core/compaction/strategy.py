@@ -11,12 +11,14 @@ from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
 from cognis.core.compaction.banding import build_compaction_input
 from cognis.core.compaction.fallback import build_sliding_window_summary
 from cognis.core.compaction.input_format import format_events_for_compaction
 from cognis.core.compaction.publication import compaction_publication_guard
 from cognis.core.compaction.recovery import append_recoverable_tool_output_handles
 from cognis.core.json_utils import extract_text_from_response
+from cognis.core.session_cache import is_retry_admission_notice
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, SessionModel, with_session_events_turn_id
 from cognis.runtime_context import scoped_runtime_context
@@ -98,6 +100,9 @@ class CompactionResult(BaseModel):
     summary: str | None = None
     compaction_seq: int | None = None
     turns_compacted: int = 0
+    # Summarized events. A cut inside one long user turn compacts history
+    # without summarizing a whole turn, so ``turns_compacted`` can be zero.
+    events_compacted: int = 0
     tokens_before: int = 0
     tokens_after: int = 0
     preserved_tail_events: list[Any] = []
@@ -121,18 +126,38 @@ def _split_events(
     count_tokens_fn: Any = None,
     model: str | None = None,
 ) -> tuple[list[Any], list[Any]]:
+    """Split events into summarized history and a verbatim preserved tail.
+
+    A turn is delimited by user messages, but system-started continuations can
+    extend one user turn far beyond the tail budget. In that case the cut falls
+    inside the latest turn at a tool-cycle boundary. The latest turn's
+    admission anchors (its user messages and retry admission notices) are then
+    pinned at the front of the preserved tail: they remain verbatim, keep their
+    relative order, and are excluded from ``older`` so continuation validation
+    still finds the active instruction after rotation.
+    """
     user_event_indices = [
         index for index, event in enumerate(events) if event.type == "user_message"
     ]
     max_preserved_turns = max(1, int(preserve_turns or 1))
+    latest_turn_start = user_event_indices[-1] if user_event_indices else None
 
     if (
         tail_token_budget is not None
         and tail_token_budget > 0
         and count_tokens_fn is not None
         and model is not None
-        and user_event_indices
+        and latest_turn_start is not None
     ):
+        intra_turn_cut = _oversized_latest_turn_cut(
+            events,
+            latest_turn_start,
+            tail_token_budget=tail_token_budget,
+            count_tokens_fn=count_tokens_fn,
+            model=model,
+        )
+        if intra_turn_cut is not None:
+            return _pin_latest_turn_admission(events, intra_turn_cut, latest_turn_start)
         keep_from = _token_budgeted_tail_start(
             events,
             user_event_indices,
@@ -143,7 +168,7 @@ def _split_events(
         )
         if keep_from is not None:
             keep_from = _snap_keep_from_to_cycle_boundary(events, keep_from)
-            return list(events[:keep_from]), list(events[keep_from:])
+            return _pin_latest_turn_admission(events, keep_from, latest_turn_start)
 
     if len(user_event_indices) <= max_preserved_turns:
         preserve_events = min(
@@ -154,9 +179,162 @@ def _split_events(
             return [], list(events)
         keep_from = len(events) - preserve_events
         keep_from = _snap_keep_from_to_cycle_boundary(events, keep_from)
-        return list(events[:keep_from]), list(events[keep_from:])
+        return _pin_latest_turn_admission(events, keep_from, latest_turn_start)
     keep_from = user_event_indices[-max_preserved_turns]
     return list(events[:keep_from]), list(events[keep_from:])
+
+
+def _is_turn_admission_event(event: Any) -> bool:
+    """Return whether continuation validation needs this event verbatim."""
+    return getattr(event, "type", None) == "user_message" or is_retry_admission_notice(event)
+
+
+def _pin_latest_turn_admission(
+    events: list[Any],
+    keep_from: int,
+    latest_turn_start: int | None,
+) -> tuple[list[Any], list[Any]]:
+    if latest_turn_start is None or keep_from <= latest_turn_start:
+        return list(events[:keep_from]), list(events[keep_from:])
+    pinned = [
+        event for event in events[latest_turn_start:keep_from] if _is_turn_admission_event(event)
+    ]
+    pinned_ids = {id(event) for event in pinned}
+    older = [event for event in events[:keep_from] if id(event) not in pinned_ids]
+    return older, pinned + list(events[keep_from:])
+
+
+def _event_prompt_text(event: Any) -> str:
+    """Return text approximating an event's model-prompt cost.
+
+    Compaction formatting truncates tool results, so it underestimates what the
+    preserved tail costs once replayed. Use the longer of the formatted line and
+    the raw payload.
+    """
+    formatted = format_events_for_compaction([event])
+    data = getattr(event, "data", None)
+    if not isinstance(data, dict):
+        return formatted
+    raw_parts: list[str] = []
+    for key in ("content", "result", "output", "arguments"):
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        raw_parts.append(value if isinstance(value, str) else json.dumps(value, default=str))
+    raw = "\n".join(raw_parts)
+    return raw if len(raw) > len(formatted) else formatted
+
+
+def _oversized_latest_turn_cut(
+    events: list[Any],
+    latest_turn_start: int,
+    *,
+    tail_token_budget: int,
+    count_tokens_fn: Any,
+    model: str,
+) -> int | None:
+    """Return a cut inside the latest turn when that turn exceeds the tail budget.
+
+    Walks backward from the end and stops once the budget is exceeded, so cost
+    is bounded by the budget rather than the size of the turn. Returns ``None``
+    when the whole latest turn fits (normal turn-boundary splitting applies) or
+    when no cycle boundary leaves anything to summarize.
+    """
+    anchors = [event for event in events[latest_turn_start:] if _is_turn_admission_event(event)]
+    try:
+        budget = tail_token_budget - int(
+            count_tokens_fn(format_events_for_compaction(anchors), model)
+        )
+        cost = 0
+        keep_from: int | None = None
+        for index in range(len(events) - 1, latest_turn_start, -1):
+            event = events[index]
+            if not _is_turn_admission_event(event):
+                cost += int(count_tokens_fn(_event_prompt_text(event), model))
+            if cost > budget:
+                break
+            # Only a stable boundary counts: a later call inside a parallel
+            # batch would snap back over earlier calls whose cost is unbudgeted.
+            if (
+                _is_compaction_tail_cycle_boundary(event)
+                and _snap_keep_from_to_cycle_boundary(events, index) == index
+            ):
+                keep_from = index
+        else:
+            return None
+    except Exception:
+        logger.warning("compaction: latest-turn token estimate failed", exc_info=True)
+        return None
+    # Even the latest complete cycle can exceed the budget alone; keep it verbatim.
+    if keep_from is None:
+        keep_from = _snap_keep_from_to_cycle_boundary(events, len(events) - 1)
+    if keep_from <= latest_turn_start + 1:
+        return None
+    return keep_from
+
+
+_SUMMARIZABLE_EVENT_TYPES = frozenset(
+    {
+        "user_message",
+        "assistant_message",
+        "assistant_thinking",
+        "tool_call",
+        "tool_result",
+        "delegation",
+    }
+)
+
+
+def _has_summarizable_history(older_events: list[Any]) -> bool:
+    """Return whether compaction would remove conversation content.
+
+    Context seeds and lifecycle notices alone do not justify recording a
+    summary or rotating the session.
+    """
+    return any(getattr(event, "type", None) in _SUMMARIZABLE_EVENT_TYPES for event in older_events)
+
+
+def _summary_input_events(older_events: list[Any], preserved_events: list[Any]) -> list[Any]:
+    """Return events the summarizer reads, including pinned admission anchors.
+
+    Pinned anchors stay verbatim in the tail, but the summarizer still needs the
+    instruction to describe progress on it.
+    """
+    if not older_events:
+        return []
+    last_older_seq = getattr(older_events[-1], "seq", None)
+    if not isinstance(last_older_seq, int):
+        return list(older_events)
+    pinned = [
+        event
+        for event in preserved_events
+        if isinstance(getattr(event, "seq", None), int) and event.seq < last_older_seq
+    ]
+    if not pinned:
+        return list(older_events)
+    return sorted([*older_events, *pinned], key=lambda event: event.seq)
+
+
+def _tail_layout(
+    preserved_events: list[Any], older_events: list[Any]
+) -> tuple[int | None, list[int]]:
+    """Return the contiguous tail start and seqs of pinned anchors before it."""
+    last_older_seq = (
+        older_events[-1].seq
+        if older_events and isinstance(getattr(older_events[-1], "seq", None), int)
+        else None
+    )
+    pinned_seqs: list[int] = []
+    tail_start_seq: int | None = None
+    for event in preserved_events:
+        seq = getattr(event, "seq", None)
+        if not isinstance(seq, int):
+            continue
+        if last_older_seq is not None and seq < last_older_seq:
+            pinned_seqs.append(seq)
+        elif tail_start_seq is None:
+            tail_start_seq = seq
+    return tail_start_seq, pinned_seqs
 
 
 def _token_budgeted_tail_start(
@@ -583,7 +761,7 @@ class CompactionStrategy:
             count_tokens_fn=count_tokens_fn,
             model=resolved_model,
         )
-        if not older_events:
+        if not _has_summarizable_history(older_events):
             return CompactionResult(compacted=False, method="noop")
 
         from cognis.core.agent_registry import SYSTEM_AGENTS
@@ -606,7 +784,7 @@ class CompactionStrategy:
             model=resolved_model,
         )
         compaction_input = build_compaction_input(
-            older_events,
+            _summary_input_events(older_events, preserved_events),
             max_input_tokens=history_input_tokens,
             count_tokens_fn=count_tokens_fn,
             model=resolved_model,
@@ -757,7 +935,7 @@ class CompactionStrategy:
             count_tokens_fn=count_tokens_fn,
             model=resolved_model,
         )
-        if not older_events:
+        if not _has_summarizable_history(older_events):
             return CompactionResult(compacted=False, method="noop")
 
         return await self._mechanical_fallback(
@@ -781,8 +959,9 @@ class CompactionStrategy:
         model_context: CompactionModelContext | None = None,
         record: bool = True,
     ) -> CompactionResult:
+        summary_input_events = _summary_input_events(older_events, preserved_events)
         summary = build_sliding_window_summary(
-            older_events,
+            summary_input_events,
             previous_summary=previous_summary,
         )
         try:
@@ -792,7 +971,7 @@ class CompactionStrategy:
             )
         except Exception:
             resolved_model = None
-        formatted_input = format_events_for_compaction(older_events)
+        formatted_input = format_events_for_compaction(summary_input_events)
         if not record:
             return self._build_compaction_result(
                 session=session,
@@ -842,6 +1021,7 @@ class CompactionStrategy:
         tokens_before = result.tokens_before
         tokens_after = result.tokens_after
         turns_compacted = result.turns_compacted
+        _, tail_pinned_seqs = _tail_layout(preserved_tail_events, older_events)
         compaction_event = SessionEvent(
             type="compaction_summary",
             data={
@@ -850,8 +1030,13 @@ class CompactionStrategy:
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
                 "turns_compacted": turns_compacted,
+                "events_compacted": result.events_compacted,
                 "method": method,
-                "tail_start_seq": (preserved_tail_events[0].seq if preserved_tail_events else None),
+                # The contiguous tail starts here; pinned admission anchors of
+                # the active turn precede the summarized range and are listed
+                # separately so deferred rotation can re-read both.
+                "tail_start_seq": result.tail_start_seq,
+                "tail_pinned_seqs": tail_pinned_seqs,
                 "tail_event_count": len(preserved_tail_events),
                 # This source-session checkpoint is a durable fallback if the
                 # subsequent rotation fails. The rotated marker shares its
@@ -911,14 +1096,16 @@ class CompactionStrategy:
             tokens_after = 0
 
         turns_compacted = sum(1 for event in older_events if event.type == "user_message")
+        tail_start_seq, _ = _tail_layout(preserved_tail_events, older_events)
         return CompactionResult(
             compacted=True,
             method=method,
             summary=summary,
             compaction_seq=compaction_seq,
             turns_compacted=turns_compacted,
+            events_compacted=len(older_events),
             tokens_before=tokens_before,
             tokens_after=tokens_after,
             preserved_tail_events=preserved_tail_events,
-            tail_start_seq=preserved_tail_events[0].seq if preserved_tail_events else None,
+            tail_start_seq=tail_start_seq,
         )

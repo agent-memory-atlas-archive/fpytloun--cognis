@@ -81,7 +81,7 @@ class _Guardrails:
             }
             for entry in self.source.prefix_entries
         ] + [
-            {"type": event.type, "data": event.data}
+            {"type": event.type, "data": event.data, "ts": event.ts}
             for event in self.source.events
             if event.type != "system_message"
         ]
@@ -97,6 +97,57 @@ class _Guardrails:
         self.recorded_batches.append(events)
         self.recorded_events.extend(events)
         return SimpleNamespace(ok=True, first_seq=first_seq, last_seq=len(self.recorded_events))
+
+
+@pytest.mark.asyncio
+async def test_bounded_fork_uses_prefix_snapshot_at_boundary_not_latest() -> None:
+    class Source(_Guardrails):
+        async def read_events(self, **kwargs: object) -> EventReadResult:
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "system_message",
+                        "data": {
+                            "role": "system",
+                            "source": "identity",
+                            "content": "original identity",
+                        },
+                    },
+                    {"seq": 2, "type": "context_snapshot", "data": {"entries": [{"seq": 1}]}},
+                    {"seq": 3, "type": "user_message", "data": {"content": "Original request"}},
+                    {
+                        "seq": 4,
+                        "type": "system_message",
+                        "data": {
+                            "role": "system",
+                            "source": "identity",
+                            "content": "later identity",
+                        },
+                    },
+                    {"seq": 5, "type": "context_snapshot", "data": {"entries": [{"seq": 4}]}},
+                    {"seq": 6, "type": "user_message", "data": {"content": "Later request"}},
+                ],
+                last_seq=6,
+                has_more=False,
+            )
+
+    cache, guardrails = _SessionCache(), Source()
+    assert await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source",
+        source_intaris_session_id="source",
+        target_session=SimpleNamespace(
+            session_id="bounded-target", intaris_session_id="bounded-target"
+        ),
+        source_label="hook",
+        max_source_seq=3,
+    )
+    assert [entry.content for entry in cache.stored_prefix] == ["original identity"]
+    contents = [event.data.get("content") for event in cache.seeded_events]
+    assert "Original request" in contents
+    assert "Later request" not in contents
 
 
 @pytest.mark.asyncio

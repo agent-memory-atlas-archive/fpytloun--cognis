@@ -236,10 +236,13 @@
       const rect = element.getBoundingClientRect();
       return rect.bottom > viewportRect.top && rect.top < viewportRect.bottom;
     });
+    // The message under the reading probe; otherwise (probe in a gap such as
+    // a tool row) the visible message whose start is closest to the probe,
+    // not simply the topmost one.
     activeContextElement = candidates.find((element) => {
       const rect = element.getBoundingClientRect();
       return rect.top <= probeY && rect.bottom >= probeY;
-    }) ?? candidates[0] ?? null;
+    }) ?? closestToProbe(candidates, probeY);
     if (!activeContextElement) {
       activeContextScrollable = false;
       return;
@@ -250,13 +253,33 @@
         && (activeContextElement.textContent?.length ?? 0) > 200);
   }
 
+  function closestToProbe(candidates: HTMLElement[], probeY: number): HTMLElement | null {
+    let best: HTMLElement | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const element of candidates) {
+      const distance = Math.abs(element.getBoundingClientRect().top - probeY);
+      if (distance < bestDistance) {
+        best = element;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  const ACTIVE_START_OFFSET = 8;
+
+  // One scroll write per tap. Rows render at their real size, so the target
+  // does not move afterwards; a follow-up correction would only fight iOS
+  // momentum scrolling.
   function jumpToActiveStart(): void {
     if (!viewportElement || !activeContextElement) return;
     const viewportTop = viewportElement.getBoundingClientRect().top;
     const elementTop = activeContextElement.getBoundingClientRect().top;
+    const offset = elementTop - viewportTop - ACTIVE_START_OFFSET;
+    if (Math.abs(offset) < 2) return;
     const row = activeContextElement.closest<HTMLElement>('[data-timeline-row-key]');
     const request = {
-      scrollTop: Math.max(0, viewportElement.scrollTop + elementTop - viewportTop - 8),
+      scrollTop: Math.max(0, viewportElement.scrollTop + offset),
       rowKey: row?.dataset.timelineRowKey ?? null,
     };
     if (onJumpToActiveStart) {
@@ -350,35 +373,35 @@
     {#if children}
       {@render children()}
     {:else if loadingOlder}
-      <p class="px-4 py-2 text-center text-xs text-slate-500">Loading older messages…</p>
+      <p class="px-4 py-2 text-center text-xs text-quiet">Loading older messages…</p>
     {/if}
 
     {#if !children && loading}
       <LoadingState />
     {:else if !children && error}
-      <p class="text-sm text-rose-400">{error}</p>
+      <p class="text-sm text-danger">{error}</p>
     {:else if !children && items.length === 0}
-      <p class="text-sm text-slate-500">{emptyLabel}</p>
+      <p class="text-sm text-quiet">{emptyLabel}</p>
     {/if}
   </div>
 
   {#if userScrolledUp || (contextNavigationRequested && activeContextScrollable)}
     <nav
-      class="sticky bottom-1 left-1/2 z-10 flex w-fit max-w-[calc(100%-env(safe-area-inset-left)-env(safe-area-inset-right)-1rem)] -translate-x-1/2 items-center gap-1 rounded-full border border-slate-700 bg-slate-900/95 p-1 shadow-lg backdrop-blur"
+      class="sticky bottom-1 left-1/2 z-10 flex w-fit max-w-[calc(100%-env(safe-area-inset-left)-env(safe-area-inset-right)-1rem)] -translate-x-1/2 items-center gap-1 rounded-full border border-control-border bg-elevated/95 p-1 shadow-lg backdrop-blur"
       aria-label="Message navigation"
       data-testid={testId ? `${testId}-navigation-cluster` : undefined}
     >
       {#if activeContextScrollable}
-        <button class="grid h-11 w-11 place-items-center rounded-full transition hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400" onclick={jumpToActiveStart} type="button" title="Jump to active message start" aria-label="Jump to active message start" data-testid={testId ? `${testId}-scroll-to-active-start` : undefined}>
-          <ArrowUp class="h-4 w-4 text-slate-300" />
+        <button class="grid h-11 w-11 place-items-center rounded-full transition hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" onclick={jumpToActiveStart} type="button" title="Jump to active message start" aria-label="Jump to active message start" data-testid={testId ? `${testId}-scroll-to-active-start` : undefined}>
+          <ArrowUp class="h-4 w-4 text-secondary" />
         </button>
       {/if}
-      <button class="grid h-11 w-11 place-items-center rounded-full transition hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400" onclick={jumpToBottom} type="button" title={followPausedLabel} aria-label={followPausedLabel} data-testid={testId ? `${testId}-scroll-to-bottom` : undefined}>
-        <ArrowDown class="h-4 w-4 text-slate-300" />
+      <button class="grid h-11 w-11 place-items-center rounded-full transition hover:bg-surface-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent" onclick={jumpToBottom} type="button" title={followPausedLabel} aria-label={followPausedLabel} data-testid={testId ? `${testId}-scroll-to-bottom` : undefined}>
+        <ArrowDown class="h-4 w-4 text-secondary" />
       </button>
     </nav>
   {:else if !loading && !error && live}
-    <nav class="sticky bottom-2 left-1/2 z-10 flex w-fit -translate-x-1/2 items-center gap-1 rounded-full border border-slate-700 bg-slate-900/95 p-1 shadow-lg backdrop-blur" aria-label="Live tail controls">
+    <nav class="sticky bottom-2 left-1/2 z-10 flex w-fit -translate-x-1/2 items-center gap-1 rounded-full border border-control-border bg-elevated/95 p-1 shadow-lg backdrop-blur" aria-label="Live tail controls">
       <LiveDots label={liveLabel} size="sm" />
     </nav>
   {/if}

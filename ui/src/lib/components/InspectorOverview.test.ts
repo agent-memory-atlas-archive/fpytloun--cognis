@@ -291,6 +291,6 @@ describe('InspectorOverview', () => {
     expect(
       screen.getByTestId('activity-node-logical-child').querySelector('.ring-1'),
     ).toBeNull();
-    expect(screen.getByTestId('activity-node-logical-child').firstElementChild).toHaveClass('border-sky-400/60');
+    expect(screen.getByTestId('activity-node-logical-child').firstElementChild).toHaveClass('border-accent');
   });
 });

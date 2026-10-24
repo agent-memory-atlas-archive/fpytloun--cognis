@@ -676,9 +676,21 @@ async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_mark
             "revision": expected_revision,
             "conversation_id": "conv-1",
             "session_id": "session-1",
+            "metadata_only": True,
         }
     )
     foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+def test_metadata_refresh_cannot_coalesce_away_access_invalidation() -> None:
+    payload = {
+        "type": "scope_invalidated",
+        "reason": "chat_scope_changed",
+        "conversation_id": "conv-1",
+    }
+    assert AuthenticatedWebSocket._scope_invalidation_key(payload) != (
+        AuthenticatedWebSocket._scope_invalidation_key({**payload, "metadata_only": True})
+    )
 
 
 @pytest.mark.asyncio
@@ -1751,6 +1763,10 @@ class _RecordingManager:
         self.chat_v2_last_generations: list[dict[str, Any] | None] = []
         self.chat_v2_runtime_lifecycles: list[str | None] = []
         self.app: Any = SimpleNamespace(state=SimpleNamespace())
+        self.admission_invalidations: list[str] = []
+
+    async def invalidate_chat_v2_admission(self, conversation_id: str) -> None:
+        self.admission_invalidations.append(conversation_id)
 
     async def send_error(self, _: object, **kwargs: object) -> None:
         self.errors.append(kwargs)
@@ -2245,6 +2261,85 @@ async def test_local_runtime_settlement_removes_only_transient_recovery_notices(
         "turn",
         "continuation",
     }
+
+
+@pytest.mark.asyncio
+async def test_user_admission_invalidates_independent_v2_clients_without_legacy_broadcast() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    sockets = []
+    for name, conversation_id in [
+        ("sender", "conv-1"),
+        ("recipient", "conv-1"),
+        ("unrelated", "conv-2"),
+    ]:
+        socket = _RecordingWebSocket()
+        sockets.append(socket)
+        connection = AuthenticatedWebSocket(
+            connection_id=name,
+            websocket=cast(Any, socket),
+            user_email="user@example.com",
+            role="user",
+        )
+        manager._connections[name] = connection  # noqa: SLF001
+        manager.subscribe_chat_v2(
+            connection,
+            TimelineScope(
+                key=f"conversation:{conversation_id}",
+                kind="conversation",
+                conversation_id=conversation_id,
+            ),
+            cursor="cursor-1",
+        )
+    await manager._handle_event(
+        Event(  # noqa: SLF001
+            type=EventType.USER_MESSAGE,
+            data={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "content": "Synthetic remote admission",
+                "client_message_id": "remote-admission",
+            },
+        )
+    )
+    for socket in sockets[:2]:
+        assert any(payload["type"] == "scope_invalidated" for payload in socket.payloads)
+        assert not any(payload["type"] == "user_message" for payload in socket.payloads)
+    assert sockets[2].payloads == []
+
+
+@pytest.mark.asyncio
+async def test_admission_invalidation_separates_queue_child_and_unsubscribed_scopes() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    socket = _RecordingWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="scoped-recipient",
+        websocket=cast(Any, socket),
+        user_email="recipient@example.com",
+        role="user",
+    )
+    manager._connections[connection.connection_id] = connection  # noqa: SLF001
+    for key, kind, session_id in [
+        ("conversation:conv-1", "conversation", None),
+        ("session:child", "session", "child"),
+        ("session:other", "session", "other"),
+    ]:
+        manager.subscribe_chat_v2(
+            connection,
+            TimelineScope(key=key, kind=kind, conversation_id="conv-1", session_id=session_id),
+            cursor="cursor-1",
+        )
+    await manager.invalidate_chat_v2_admission("conv-1")
+    assert [p["scope_key"] for p in socket.payloads] == ["conversation:conv-1"]
+    socket.payloads.clear()
+    await manager.invalidate_chat_v2_admission("conv-1", session_id="child")
+    assert {p["scope_key"] for p in socket.payloads} == {
+        "conversation:conv-1",
+        "session:child",
+    }
+    socket.payloads.clear()
+    manager.unsubscribe_chat_v2(connection, "session:child")
+    await manager.invalidate_chat_v2_admission("conv-1", session_id="child")
+    assert [p["scope_key"] for p in socket.payloads] == ["conversation:conv-1"]
 
 
 @pytest.mark.asyncio
@@ -3738,7 +3833,7 @@ def test_event_bus_system_notice_preserves_retry_metadata() -> None:
             "kind": "model_recovery",
             "scope": "retry",
             "reason_class": "rate_limit",
-            "provider_id": "anthropic-lumilens",
+            "provider_id": "anthropic-sample",
             "model": "claude-fable-5",
             "retry_after_seconds": 23,
             "provider_retry_after_seconds": 23,
@@ -3755,7 +3850,7 @@ def test_event_bus_system_notice_preserves_retry_metadata() -> None:
     assert payload is not None
     assert payload["type"] == "system_message"
     assert payload["reason_class"] == "rate_limit"
-    assert payload["provider_id"] == "anthropic-lumilens"
+    assert payload["provider_id"] == "anthropic-sample"
     assert payload["model"] == "claude-fable-5"
     assert payload["retry_after_seconds"] == 23
     assert payload["provider_retry_after_seconds"] == 23
@@ -4085,6 +4180,67 @@ def test_inbound_rate_limit_window_expires() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["work_invalidated", "scope_invalidated"])
+async def test_stream_pressure_preserves_latest_scope_invalidation(kind: str) -> None:
+    """A slow client must receive the hint that repairs its non-timeline views."""
+    socket = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="slow-work-view",
+        websocket=cast(Any, socket),
+        user_email="user@test.com",
+        role="user",
+    )
+    try:
+        await connection.send_json({"type": "message_start", "message_id": "head"})
+        await socket.started.wait()
+        for revision in range(1, 20):
+            assert connection.send_scope_invalidation_nowait(
+                {"type": kind, "reason": "sidebar_changed", "revision": str(revision)}
+            )
+        for index in range(DEFAULT_OUTBOUND_BUFFER + 1):
+            await connection.send_json(
+                {"type": "chunk", "message_id": f"msg_{index}", "content": str(index)}
+            )
+        socket.release.set()
+        await connection.wait_outbound_drained()
+        assert [frame for frame in socket.json_payloads if frame["type"] == kind] == [
+            {"type": kind, "reason": "sidebar_changed", "revision": "19"}
+        ]
+        assert socket.closed is None
+    finally:
+        socket.release.set()
+        await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_scope_invalidation_forces_reconnect_recovery() -> None:
+    """Do not leave a live-looking client permanently stale after a dropped hint."""
+    socket = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="saturated-work-view",
+        websocket=cast(Any, socket),
+        user_email="user@test.com",
+        role="user",
+    )
+    try:
+        await connection.send_json({"type": "message_start", "message_id": "head"})
+        await socket.started.wait()
+        for index in range(DEFAULT_OUTBOUND_BUFFER):
+            await connection.send_json(
+                {"type": "chat_v2_frame", "conversation_id": "conv-1", "index": index}
+            )
+        assert not connection.send_scope_invalidation_nowait(
+            {"type": "work_invalidated", "revision": "19"}
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert socket.closed == (1013, "WebSocket outbound buffer overflow")
+    finally:
+        socket.release.set()
+        await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_chunk_dropped_when_buffer_full() -> None:
     """Droppable chunks evict the oldest queued droppable frame when the queue is full."""
     blocked_ws = _BlockedWebSocket()
@@ -4316,6 +4472,7 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
                 "conversation_id": "conv-1",
                 "session_id": "sess-1",
                 "message_id": "msg-1",
+                "final_content": "**Done**\npassword: fixture-sensitive",
                 "turn_id": "turn-1",
                 "completed_at": completed_at,
             },
@@ -4344,6 +4501,7 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
             "conversation_id": "conv-1",
             "revision": ANY,
             "has_active_turn_override": False,
+            "completed_reply": {"message_id": "msg-1", "preview": ""},
             "active_turn_chat_mode": None,
             "active_turn_chat_mode_source": None,
         },
@@ -4410,6 +4568,7 @@ async def test_turn_completion_event_preserves_activity_for_pending_continuation
             "conversation_id": "conv-1",
             "revision": ANY,
             "has_active_turn_override": True,
+            "completed_reply": None,
             "active_turn_chat_mode": "build",
             "active_turn_chat_mode_source": "user_explicit",
         },
@@ -4475,6 +4634,7 @@ async def test_turn_started_event_emits_activity_correction() -> None:
             "conversation_id": "conv-1",
             "revision": ANY,
             "has_active_turn_override": True,
+            "completed_reply": None,
             "active_turn_chat_mode": "plan",
             "active_turn_chat_mode_source": "user",
         },
@@ -4540,6 +4700,7 @@ async def test_turn_error_event_fans_out_sidebar_correction_to_owner_window(
             "conversation_id": "conv-error",
             "revision": ANY,
             "has_active_turn_override": False,
+            "completed_reply": None,
             "active_turn_chat_mode": None,
             "active_turn_chat_mode_source": None,
         },
@@ -5092,13 +5253,19 @@ def test_terminal_payloads_include_turn_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_observer_clears_chat_v2_runtime_after_error() -> None:
+@pytest.mark.parametrize(
+    "code", ["cancelled", "turn_cancelled", "queued_turn_cancelled", "step_failed"]
+)
+@pytest.mark.parametrize("recoverable", [False, True])
+async def test_turn_observer_clears_chat_v2_runtime_after_error(
+    code: str, recoverable: bool
+) -> None:
     manager = _RecordingManager()
     observer = WebSocketTurnObserver(cast(Any, manager))
 
     await observer.on_turn_error(
         "conv-1",
-        TurnError("cancelled", "Cancelled", recoverable=False),
+        TurnError(code, "Turn ended", recoverable=recoverable),
     )
 
     assert ("conv-1", False, 0) in manager.chat_v2_runtime_payloads
@@ -5112,7 +5279,7 @@ async def test_turn_observer_relinquishes_runtime_after_recoverable_error() -> N
 
     await observer.on_turn_error(
         "conv-1",
-        TurnError("temporarily_unavailable", "Retry later", recoverable=True),
+        TurnError("temporarily_unavailable", "Retry later", recoverable=True, transient=True),
     )
 
     assert ("conv-1", False, 0) in manager.chat_v2_runtime_payloads
@@ -6128,3 +6295,198 @@ def test_ws_unknown_message_type_returns_error(monkeypatch: object, tmp_path: Pa
             error_resp = ws.receive_json()
             assert error_resp["type"] == "error"
             assert error_resp.get("code") == "validation_error"
+
+
+def _catch_up_conversation_scope() -> TimelineScope:
+    return TimelineScope(key="conversation:conv-1", kind="conversation", conversation_id="conv-1")
+
+
+class _AsyncNullContext:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("catch_up", [True, False])
+async def test_chat_v2_subscribe_catch_up_sends_sync_delta_after_registration(
+    monkeypatch: pytest.MonkeyPatch, catch_up: bool
+) -> None:
+    from cognis.api.chat_v2 import snapshot_coordinator
+    from cognis.api.chat_v2 import sync as sync_module
+
+    order: list[str] = []
+    manager = SimpleNamespace(
+        send_error=AsyncMock(),
+        subscribe_chat_v2=Mock(side_effect=lambda *a, **k: order.append("subscribe")),
+        send_chat_v2_scope_runtime_snapshot=AsyncMock(),
+    )
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(frame: dict[str, Any]) -> None:
+        order.append(frame["type"])
+        sent.append(frame)
+
+    connection = SimpleNamespace(
+        user_email="owner@example.com",
+        send_json=send_json,
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    scope = _catch_up_conversation_scope()
+    monkeypatch.setattr(websocket_module, "_authorize_chat_v2_scope", AsyncMock(return_value=True))
+    monkeypatch.setattr(websocket_module, "_rehydrate_chat_v2_scope", AsyncMock(return_value=scope))
+    monkeypatch.setattr(websocket_module, "validate_cursor", Mock())
+    monkeypatch.setattr(
+        websocket_module,
+        "get_conversation",
+        AsyncMock(return_value=SimpleNamespace(user_email="owner@example.com")),
+    )
+    context = SimpleNamespace(
+        scope=scope,
+        conversation=None,
+        session_refs=[],
+        # Real contexts carry readers on session_refs and no event store.
+        event_store=None,
+        cursor_secret="secret",
+        queue=None,
+        state=None,
+        runtime_input=None,
+        event_post_processor=None,
+        session_cache=None,
+    )
+    load_context = AsyncMock(return_value=context)
+    monkeypatch.setattr(snapshot_coordinator, "load_conversation_snapshot_context", load_context)
+    build = AsyncMock(
+        return_value=SimpleNamespace(model_dump=lambda mode: {"cursor_before": "c1", "ops": []})
+    )
+    monkeypatch.setattr(sync_module, "build_chat_sync_response", build)
+    app = SimpleNamespace(
+        state=SimpleNamespace(chat_v2_cursor_secret="secret", session_factory=_AsyncNullContext)
+    )
+    message: dict[str, Any] = {"scope": scope.model_dump(), "cursor": "c1"}
+    if catch_up:
+        message["catch_up"] = True
+
+    await _handle_chat_v2_subscribe(app, manager, connection, message)
+
+    if not catch_up:
+        assert sent == []
+        build.assert_not_awaited()
+        return
+    assert order == ["subscribe", "chat_v2_catch_up"]
+    assert sent == [
+        {
+            "type": "chat_v2_catch_up",
+            "scope_key": "conversation:conv-1",
+            "sync": {"cursor_before": "c1", "ops": []},
+        }
+    ]
+    assert build.await_args.kwargs["cursor"] == "c1"
+    assert load_context.await_args.kwargs["shared_reader"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_v2_catch_up_failure_reports_error_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.api.chat_v2 import snapshot_coordinator
+
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(frame: dict[str, Any]) -> None:
+        sent.append(frame)
+
+    connection = SimpleNamespace(user_email="owner@example.com", send_json=send_json)
+    monkeypatch.setattr(
+        websocket_module,
+        "get_conversation",
+        AsyncMock(return_value=SimpleNamespace(user_email="owner@example.com")),
+    )
+    monkeypatch.setattr(
+        snapshot_coordinator,
+        "load_conversation_snapshot_context",
+        AsyncMock(side_effect=RuntimeError("event store down")),
+    )
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=_AsyncNullContext))
+
+    await websocket_module._send_chat_v2_catch_up(
+        app, cast(Any, connection), _catch_up_conversation_scope(), "c1"
+    )
+
+    assert sent == [
+        {"type": "chat_v2_catch_up", "scope_key": "conversation:conv-1", "error": "catch_up_failed"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "can_read", "expected_error", "shared_reader"),
+    [
+        (
+            SimpleNamespace(user_email="author@example.com", status="active"),
+            False,
+            "not_found",
+            None,
+        ),
+        (
+            SimpleNamespace(user_email="owner@example.com", status="deleted"),
+            True,
+            "not_found",
+            None,
+        ),
+        (None, True, "not_found", None),
+        (SimpleNamespace(user_email="author@example.com", status="active"), True, None, True),
+    ],
+)
+async def test_chat_v2_catch_up_requires_rest_equivalent_read_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    row: Any,
+    can_read: bool,
+    expected_error: str | None,
+    shared_reader: bool | None,
+) -> None:
+    from cognis.api.chat_v2 import snapshot_coordinator
+    from cognis.api.chat_v2 import sync as sync_module
+    from cognis.core import project_access
+
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(frame: dict[str, Any]) -> None:
+        sent.append(frame)
+
+    connection = SimpleNamespace(user_email="owner@example.com", send_json=send_json)
+    monkeypatch.setattr(websocket_module, "get_conversation", AsyncMock(return_value=row))
+    monkeypatch.setattr(project_access, "can_read_conversation", AsyncMock(return_value=can_read))
+    scope = _catch_up_conversation_scope()
+    context = SimpleNamespace(
+        scope=scope,
+        conversation=None,
+        session_refs=[],
+        event_store=None,
+        cursor_secret="secret",
+        queue=None,
+        state=None,
+        runtime_input=None,
+        event_post_processor=None,
+        session_cache=None,
+    )
+    load_context = AsyncMock(return_value=context)
+    monkeypatch.setattr(snapshot_coordinator, "load_conversation_snapshot_context", load_context)
+    build = AsyncMock(return_value=SimpleNamespace(model_dump=lambda mode: {"ops": []}))
+    monkeypatch.setattr(sync_module, "build_chat_sync_response", build)
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=_AsyncNullContext))
+
+    await websocket_module._send_chat_v2_catch_up(app, cast(Any, connection), scope, "c1")
+
+    if expected_error:
+        assert sent == [
+            {"type": "chat_v2_catch_up", "scope_key": scope.key, "error": expected_error}
+        ]
+        load_context.assert_not_awaited()
+        build.assert_not_awaited()
+    else:
+        assert sent[0]["sync"] == {"ops": []}
+        assert load_context.await_args.kwargs["user_email"] == "author@example.com"
+        assert load_context.await_args.kwargs["shared_reader"] is shared_reader

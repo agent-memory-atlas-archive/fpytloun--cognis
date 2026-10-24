@@ -8,6 +8,8 @@ import datetime
 import html
 import math
 import re
+from collections.abc import Iterator
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
@@ -42,10 +44,14 @@ from cognis.core.context_projection import (
     PressureMode,
     ProjectionPolicy,
     ProjectionResult,
+    apply_projection_decisions,
     build_compacted_tool_result_placeholder,
     clear_large_tool_call_arguments,
     compacted_tool_group_anchors,
+    compaction_shrinks_tool_result,
     project_messages,
+    projection_decisions_from_diff,
+    projection_diagnostic_fields,
     projection_result_from_messages,
 )
 from cognis.core.cpu_offload import run_cpu_bound
@@ -65,7 +71,6 @@ from cognis.core.immutable_prefix import (
 from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES, is_web_main_chat_context
 from cognis.core.message_envelope import render_user_event_content, render_user_message
 from cognis.core.message_markers import (
-    ALL_INTERNAL_MARKERS,
     ANCHOR_NAMES,
     AUDIT_METADATA,
     AUDIT_ROLE,
@@ -76,6 +81,8 @@ from cognis.core.message_markers import (
     LATEST_MEMORY_RECALL_CONTEXT,
     PROJECT_CONTEXT,
     PROJECTED_COMPACTED,
+    PROJECTION_EVENT_SEQS,
+    PROTECTED_TOOL_OUTPUT,
     ROUTING_REMINDER,
     TOKEN_ESTIMATE,
     TURN_BOUNDARY,
@@ -89,6 +96,7 @@ from cognis.core.prompts import (
     build_system_instructions,
 )
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
+from cognis.core.session_cache import CachedEvent, CanonicalContextSnapshot
 from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
 from cognis.core.tool_output_presentation import (
     is_safe_lazy_artifact_ref,
@@ -103,6 +111,7 @@ from cognis.models.artifact import ArtifactKind
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
+    SessionEvent,
     SessionModel,
     with_session_events_turn_id,
 )
@@ -111,6 +120,7 @@ from cognis.providers.llm.anthropic.contracts import (
     AnthropicContinuationStatus,
     AnthropicNativeEnvelope,
 )
+from cognis.providers.llm.responses_bridge import RESPONSES_TOOL_CALL_TYPES
 from cognis.providers.memory.policy import MemoryRuntimePolicy, resolve_memory_policy
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
@@ -217,6 +227,8 @@ class ContextAssemblyResult(BaseModel):
     """Fully assembled LLM context and metadata."""
 
     messages: list[dict[str, Any]]
+    candidate_renderer: Any = Field(default=None, exclude=True)
+    canonical_messages: list[dict[str, Any]] | None = Field(default=None, exclude=True)
     audit_messages: list[dict[str, Any]] = Field(default_factory=list)
     degraded: bool = False
     degraded_sources: list[str] = Field(default_factory=list)
@@ -720,18 +732,17 @@ def _format_executor_pool_reminder(
     executor_pool: Any,
     *,
     active_executor_id: str | None = None,
+    include_single_executor: bool = False,
 ) -> str:
-    """Format the agent's full executor pool as a volatile tail reminder.
+    """Format assigned executors for an append-only context notice.
 
-    Returns an empty string when the pool is unavailable or when only a
-    single primary executor is assigned (degenerate case — no need to
-    list ourselves twice).
+    Omit initial singleton guidance unless it supersedes a previous pool.
     """
 
     if executor_pool is None:
         return ""
     targets = list(getattr(executor_pool, "all", None) or [])
-    if len(targets) <= 1:
+    if not targets or (len(targets) == 1 and not include_single_executor):
         return ""
     lines = ["Assigned executors (Stage 36 multi-executor agents):"]
     for target in targets:
@@ -768,17 +779,77 @@ def _format_executor_pool_reminder(
     return "\n".join(lines)
 
 
+def _append_routing_reminder(
+    messages: list[dict[str, Any]], content: str | None, *, turn_id: str | None
+) -> None:
+    """Keep delivered turn guidance at its canonical position on replay."""
+    if not content:
+        return
+    scoped_content = (
+        "Turn-local guidance: applies only to its associated user request. "
+        "On later requests this notice is historical context, not current instructions.\n\n"
+        + content
+    )
+    previous = next(
+        (
+            message
+            for message in reversed(messages)
+            if turn_id is not None
+            and message.get(AUDIT_SOURCE) == "routing_reminder"
+            and message.get(AUDIT_METADATA, {}).get("turn_id") == turn_id
+        ),
+        None,
+    )
+    if previous is not None and previous.get("content") == scoped_content:
+        return
+    messages.append(
+        {
+            "role": "system",
+            "content": scoped_content,
+            ROUTING_REMINDER: True,
+            AUDIT_SOURCE: "routing_reminder",
+            AUDIT_ROLE: "developer",
+            AUDIT_METADATA: {
+                "context_injection": True,
+                "replayable": True,
+                "replay_scope": "same_session",
+                "visibility": "agent_context",
+                "model_role": "system",
+                "canonical_role": "developer",
+                "turn_id": turn_id,
+            },
+        }
+    )
+
+
 def _append_executor_pool_reminder(
     messages: list[dict[str, Any]],
     *,
     executor_pool: Any,
     active_executor_id: str | None,
 ) -> None:
+    """Append changed assignments without rewriting canonical history."""
+    previous = next(
+        (
+            message
+            for message in reversed(messages)
+            if message.get(AUDIT_SOURCE) == "executor_pool_reminder"
+        ),
+        None,
+    )
     content = _format_executor_pool_reminder(
         executor_pool,
         active_executor_id=active_executor_id,
+        include_single_executor=previous is not None,
     )
     if not content:
+        if previous is None:
+            return
+        content = (
+            "No executors are currently assigned in this execution context. "
+            "This notice supersedes earlier executor assignment guidance."
+        )
+    if previous is not None and previous.get("content") == content:
         return
     messages.append(
         {
@@ -787,6 +858,14 @@ def _append_executor_pool_reminder(
             EXECUTOR_POOL_REMINDER: True,
             AUDIT_SOURCE: "executor_pool_reminder",
             AUDIT_ROLE: "developer",
+            AUDIT_METADATA: {
+                "context_injection": True,
+                "replayable": True,
+                "replay_scope": "same_session",
+                "visibility": "agent_context",
+                "model_role": "system",
+                "canonical_role": "developer",
+            },
         }
     )
 
@@ -1182,9 +1261,8 @@ class ContextAssembler:
         session history and before the user message.  Used by the workflow
         engine to inject prior step output.  Chat turns pass ``None``.
 
-        ``routing_reminder`` is ephemeral turn-local system guidance for the
-        current chat turn only. It must not be persisted to session history,
-        DB state, or audit content.
+        ``routing_reminder`` applies only to the current request. Its canonical
+        event remains in history so later turns preserve the delivered prefix.
 
         ``skip_memory`` skips Mnemory recall and memory instructions.
         Used for secondary agents that don't have memory integration.
@@ -1370,8 +1448,10 @@ class ContextAssembler:
             profile_switch=skip_user_message,
         )
         prefix_entries = context_snapshot.prefix_entries
-        project_messages = self._project_context_messages(session.session_id)
-        pruned_call_ids = self._resolve_pruned_call_ids(session)
+        project_messages = self._project_context_messages(
+            session.session_id, conversation=conversation
+        )
+        projection_decisions = context_snapshot.projection_decisions
 
         # Intention is best-effort (non-critical)
         if isinstance(intention_result, Exception):
@@ -1482,6 +1562,11 @@ class ContextAssembler:
                     task_type="default",
                     explicit_provider_id=explicit_provider_id,
                     acting_user_email=session.user_email,
+                    **(
+                        {"cognis_session_id": session.session_id}
+                        if hasattr(self.llm, "inference_recovery")
+                        else {}
+                    ),
                 )
             except TypeError:
                 resolved_model, provider_id = await self.llm.resolve_model_target(
@@ -1558,6 +1643,8 @@ class ContextAssembler:
 
         # ----- Mutable suffix -----
 
+        from cognis.core.current_policy_context import current_policy_message
+
         messages.append(
             {
                 "role": "system",
@@ -1570,6 +1657,7 @@ class ContextAssembler:
                 "_audit_role": "system",
             }
         )
+        messages.append(await current_policy_message(self.guardrails, session))
         if channel_context_info := _build_channel_context_info(conversation.context):
             messages.append(
                 {
@@ -1620,12 +1708,21 @@ class ContextAssembler:
                 }
             )
 
+        messages, context_snapshot = await self._freeze_preamble(
+            session,
+            agent,
+            messages,
+            context_snapshot,
+            turn_id=required_turn_id,
+            before_user=not skip_user_message,
+        )
+
         # History messages (append-only)
         prefix_event_seqs = {entry.seq for entry in prefix_entries if entry.seq > 0}
         prefix_event_sources = {entry.source for entry in prefix_entries}
         history_events = [
             event
-            for event in context_snapshot.events
+            for event in self._preamble_history_events(context_snapshot)
             if event.type in EVENT_TYPES_FOR_CONTEXT
             and _event_seq(event) not in prefix_event_seqs
             and _event_prefix_source(event) not in prefix_event_sources
@@ -1635,10 +1732,12 @@ class ContextAssembler:
             history_events,
             model_info=model_info,
             owner_email=session.user_email,
-            pruned_call_ids=pruned_call_ids,
+            projection_decisions=projection_decisions,
             disabled_artifact_urls=disabled_artifact_urls,
             disabled_artifact_ids=disabled_artifact_ids,
         )
+        for message in history_messages:
+            message["_candidate_history"] = True
         messages.extend(history_messages)
 
         if active_delegations:
@@ -1783,17 +1882,8 @@ class ContextAssembler:
                 }
             )
 
+        _append_routing_reminder(messages, routing_reminder, turn_id=required_turn_id)
         if not skip_user_message and not already_in_history:
-            if routing_reminder:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": routing_reminder,
-                        ROUTING_REMINDER: True,
-                        "_audit_source": "routing_reminder",
-                        "_audit_role": "developer",
-                    }
-                )
             if attachment_notice:
                 messages.append(
                     {
@@ -1813,22 +1903,12 @@ class ContextAssembler:
                 disabled_artifact_urls=disabled_artifact_urls,
                 disabled_artifact_ids=disabled_artifact_ids,
             )
+            for message in current_turn_messages:
+                message["_candidate_current_turn"] = True
             messages.extend(current_turn_messages)
         elif already_in_history or skip_user_message:
-            # Prompt already recorded in history; still surface any
-            # turn-local signals that were meant to accompany it. The
-            # prompt-replay side does not carry these because they are
-            # ephemeral (not persisted to history).
-            if routing_reminder:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": routing_reminder,
-                        ROUTING_REMINDER: True,
-                        "_audit_source": "routing_reminder",
-                        "_audit_role": "developer",
-                    }
-                )
+            # Prompt already recorded in history; still surface attachment
+            # diagnostics that accompany this request.
             if attachment_notice:
                 # Controller diagnostic about unsupported attachments for
                 # this model — must survive dedupe or the model is not
@@ -1864,6 +1944,8 @@ class ContextAssembler:
                     disabled_artifact_urls=disabled_artifact_urls,
                     disabled_artifact_ids=disabled_artifact_ids,
                 )
+                for message in current_turn_attachments:
+                    message["_candidate_current_turn"] = True
                 messages.extend(current_turn_attachments)
 
         _append_executor_pool_reminder(
@@ -1871,6 +1953,53 @@ class ContextAssembler:
             executor_pool=executor_pool,
             active_executor_id=active_executor_id,
         )
+
+        canonical_messages = copy.deepcopy(messages)
+
+        async def render_candidate(
+            source_messages: list[dict[str, Any]], candidate_info: Any
+        ) -> list[dict[str, Any]]:
+            """Render collected history/attachments without repeating recall or audit."""
+            rendered_history = await self._events_to_messages(
+                history_events,
+                model_info=candidate_info,
+                owner_email=session.user_email,
+                projection_decisions=projection_decisions,
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
+            )
+            if already_in_history and model_user_message != persisted_model_user_message:
+                _replace_trailing_user_text(
+                    rendered_history,
+                    expected=persisted_model_user_message,
+                    replacement=model_user_message,
+                )
+            rendered_current = _current_turn_attachment_messages(
+                user_message=model_user_message if not already_in_history else user_message,
+                user_message_role=user_message_role,
+                user_attachments=user_attachments,
+                model_info=candidate_info,
+                include_user_message=not skip_user_message and not already_in_history,
+                include_attachment_note=not skip_user_message
+                and not already_in_history
+                and user_message_role != "user",
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
+            )
+            result = []
+            history_added = current_added = False
+            for message in source_messages:
+                if message.get("_candidate_history"):
+                    if not history_added:
+                        result.extend(copy.deepcopy(rendered_history))
+                        history_added = True
+                elif message.get("_candidate_current_turn"):
+                    if not current_added:
+                        result.extend(copy.deepcopy(rendered_current))
+                        current_added = True
+                else:
+                    result.append(copy.deepcopy(message))
+            return result
 
         # Cross-turn projection, pruning and the exact prompt count are
         # CPU-bound over the whole transcript; run them off the loop. The
@@ -1882,9 +2011,14 @@ class ContextAssembler:
             audit_messages,
             cache_breakpoint_index,
             prompt_tokens,
+            projection_decision_delta,
         ) = await run_cpu_bound(
             self._finalize_assembled_messages,
             messages=messages,
+            session_id=session.session_id,
+            effective_input_tokens=(
+                budget.available_prompt_tokens + budget.prompt_serialization_margin_tokens
+            ),
             resolved_model=resolved_model,
             calibration_ratio=self._projection_calibration_ratio(
                 session.session_id, resolved_model, provider_id
@@ -1893,6 +2027,14 @@ class ContextAssembler:
             available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
+        )
+        await self._persist_projection_decisions(
+            session=session,
+            agent=agent,
+            decisions=self._new_projection_decisions(
+                projection_decision_delta,
+                projection_decisions,
+            ),
         )
         recommend_compaction = (
             budget.available_prompt_tokens > 0
@@ -1913,6 +2055,8 @@ class ContextAssembler:
         )
         return ContextAssemblyResult(
             messages=messages,
+            canonical_messages=canonical_messages,
+            candidate_renderer=render_candidate,
             audit_messages=audit_messages,
             degraded=bool(degraded_sources),
             degraded_sources=sorted(set(degraded_sources)),
@@ -1935,6 +2079,39 @@ class ContextAssembler:
             cache_breakpoint_index=cache_breakpoint_index,
             projection_mutable_start_index=projection.mutable_start_index,
             projection_compacted_tool_group_anchors=projection_compacted_anchors,
+        )
+
+    async def assemble_snapshot(
+        self,
+        *,
+        snapshot: CanonicalContextSnapshot,
+        session: SessionModel,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        instruction: str,
+        tool_schema_tokens: int,
+        context: PromptContext = PromptContext.CHAT,
+        resolved_target: tuple[str, str | None] | None = None,
+        executor_environment: ExecutorEnvironmentSnapshot | None = None,
+        executor_pool: Any = None,
+        active_executor_id: str | None = None,
+    ) -> ContextAssemblyResult:
+        """Prepare auxiliary inference from detached history, without memory or prefix writes."""
+        if not snapshot.prefix_entries:
+            raise ImmutablePrefixUnavailable("Conversation context is not ready for a handoff.")
+        return await self._assemble_without_memory(
+            session=session,
+            conversation=conversation,
+            agent=agent,
+            user_message=instruction,
+            user_message_role="user",
+            tool_schema_tokens_override=tool_schema_tokens,
+            prompt_context=context,
+            executor_environment=executor_environment,
+            executor_pool=executor_pool,
+            active_executor_id=active_executor_id,
+            snapshot=snapshot,
+            resolved_target=resolved_target,
         )
 
     async def _assemble_without_memory(
@@ -1969,6 +2146,8 @@ class ContextAssembler:
         disabled_artifact_ids: set[str] | None = None,
         tool_schema_tokens_override: int | None = None,
         memory_policy: MemoryRuntimePolicy | None = None,
+        snapshot: CanonicalContextSnapshot | None = None,
+        resolved_target: tuple[str, str | None] | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -1984,21 +2163,20 @@ class ContextAssembler:
         degraded_sources: list[str] = []
 
         # Still need Intaris event refresh for history
-        try:
-            cache_result = await self.session_cache.refresh(session)
-        except Exception as exc:
-            cache_result = exc
-        if isinstance(cache_result, Exception):
-            cache_entry = self.session_cache.get_entry(session.session_id)
-            if (
-                cache_entry is None
-                or not cache_entry.initialized
-                or getattr(cache_entry, "canonical_stale", False)
-            ):
-                raise cache_result
-            degraded_sources.append("events")
-        else:
-            cache_entry = cache_result
+        if snapshot is None:
+            try:
+                cache_result = await self.session_cache.refresh(session)
+            except Exception as exc:
+                cache_result = exc
+            if isinstance(cache_result, Exception):
+                cache_entry = self.session_cache.get_entry(session.session_id)
+                if (
+                    cache_entry is None
+                    or not cache_entry.initialized
+                    or getattr(cache_entry, "canonical_stale", False)
+                ):
+                    raise cache_result
+                degraded_sources.append("events")
 
         from cognis.core.runtime_selection import resolve_runtime_selection
 
@@ -2007,7 +2185,9 @@ class ContextAssembler:
         explicit_model = runtime_selection.model
         explicit_provider_id = runtime_selection.provider_id
         provider_id: str | None = None
-        if hasattr(self.llm, "resolve_model_target"):
+        if resolved_target is not None:
+            resolved_model, provider_id = resolved_target
+        elif hasattr(self.llm, "resolve_model_target"):
             try:
                 resolved_model, provider_id = await self.llm.resolve_model_target(
                     explicit_model=explicit_model,
@@ -2063,24 +2243,27 @@ class ContextAssembler:
             ),
         )
         max_context_tokens = budget.max_context_tokens
-        prefix_entries = await self._ensure_immutable_prefix(
-            session=session,
-            agent=agent,
-            project_instructions=[],
-            memory_labels=conversation.context.memory_labels,
-            context=None,
-            allow_empty_memory=True,
-            memory_policy=memory_policy,
-        )
-        context_snapshot = await self.session_cache.acquire_context_snapshot(session)
+        if snapshot is None:
+            await self._ensure_immutable_prefix(
+                session=session,
+                agent=agent,
+                project_instructions=[],
+                memory_labels=conversation.context.memory_labels,
+                context=None,
+                allow_empty_memory=True,
+                memory_policy=memory_policy,
+            )
+        context_snapshot = snapshot or await self.session_cache.acquire_context_snapshot(session)
         context_snapshot.require_turn(
             required_turn_id,
             user_event=require_user_event,
             profile_switch=skip_user_message,
         )
         prefix_entries = context_snapshot.prefix_entries
-        project_messages = self._project_context_messages(session.session_id)
-        pruned_call_ids = self._resolve_pruned_call_ids(session)
+        project_messages = self._project_context_messages(
+            session.session_id, conversation=conversation
+        )
+        projection_decisions = context_snapshot.projection_decisions
         max_prompt_tokens = budget.available_prompt_tokens
         # Prefix composition and exact static counts are CPU-bound; run them
         # off the loop so lease renewals and probes keep flowing.
@@ -2106,6 +2289,8 @@ class ContextAssembler:
         if include_project_context:
             messages.extend(project_messages)
 
+        from cognis.core.current_policy_context import current_policy_message
+
         messages.append(
             {
                 "role": "system",
@@ -2118,6 +2303,7 @@ class ContextAssembler:
                 "_audit_role": "system",
             }
         )
+        messages.append(await current_policy_message(self.guardrails, session))
         if channel_context_info := _build_channel_context_info(conversation.context):
             messages.append(
                 {
@@ -2168,21 +2354,32 @@ class ContextAssembler:
                 }
             )
 
+        messages, context_snapshot = await self._freeze_preamble(
+            session,
+            agent,
+            messages,
+            context_snapshot,
+            turn_id=required_turn_id,
+            before_user=not skip_user_message,
+            read_only=snapshot is not None,
+        )
+
         prefix_event_seqs = {entry.seq for entry in prefix_entries if entry.seq > 0}
         prefix_event_sources = {entry.source for entry in prefix_entries}
         history_events = [
             event
-            for event in context_snapshot.events
+            for event in self._preamble_history_events(context_snapshot)
             if event.type in EVENT_TYPES_FOR_CONTEXT
             and _event_seq(event) not in prefix_event_seqs
             and _event_prefix_source(event) not in prefix_event_sources
         ]
-        self._record_assembled_history(session, history_events, resolved_model)
+        if snapshot is None:
+            self._record_assembled_history(session, history_events, resolved_model)
         history_messages = await self._events_to_messages(
             history_events,
             model_info=model_info,
             owner_email=session.user_email,
-            pruned_call_ids=pruned_call_ids,
+            projection_decisions=projection_decisions,
             disabled_artifact_urls=disabled_artifact_urls,
             disabled_artifact_ids=disabled_artifact_ids,
         )
@@ -2285,17 +2482,8 @@ class ContextAssembler:
                 replacement=model_user_message,
             )
 
+        _append_routing_reminder(messages, routing_reminder, turn_id=required_turn_id)
         if not skip_user_message and not already_in_history:
-            if routing_reminder:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": routing_reminder,
-                        ROUTING_REMINDER: True,
-                        "_audit_source": "routing_reminder",
-                        "_audit_role": "developer",
-                    }
-                )
             if attachment_notice:
                 messages.append(
                     {
@@ -2317,16 +2505,6 @@ class ContextAssembler:
             )
             messages.extend(current_turn_messages)
         elif already_in_history or skip_user_message:
-            if routing_reminder:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": routing_reminder,
-                        ROUTING_REMINDER: True,
-                        "_audit_source": "routing_reminder",
-                        "_audit_role": "developer",
-                    }
-                )
             if attachment_notice:
                 messages.append(
                     {
@@ -2377,9 +2555,13 @@ class ContextAssembler:
             audit_messages,
             cache_breakpoint_index,
             prompt_tokens,
+            projection_decision_delta,
         ) = await run_cpu_bound(
             self._finalize_assembled_messages,
             messages=messages,
+            effective_input_tokens=(
+                budget.available_prompt_tokens + budget.prompt_serialization_margin_tokens
+            ),
             resolved_model=resolved_model,
             calibration_ratio=self._projection_calibration_ratio(
                 session.session_id, resolved_model, provider_id
@@ -2389,6 +2571,15 @@ class ContextAssembler:
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
         )
+        if snapshot is None:
+            await self._persist_projection_decisions(
+                session=session,
+                agent=agent,
+                decisions=self._new_projection_decisions(
+                    projection_decision_delta,
+                    projection_decisions,
+                ),
+            )
         recommend_compaction = (
             budget.available_prompt_tokens > 0
             and (prompt_tokens / budget.available_prompt_tokens) >= self.compaction_threshold
@@ -2831,10 +3022,192 @@ class ContextAssembler:
                 return entry.content
         return None
 
+    async def _freeze_preamble(
+        self,
+        session: SessionModel,
+        agent: AgentDefinition,
+        messages: list[dict[str, Any]],
+        snapshot: CanonicalContextSnapshot,
+        *,
+        turn_id: str | None,
+        before_user: bool,
+        read_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], CanonicalContextSnapshot]:
+        """Freeze rendered pre-history context; commit changes before exposing them.
+
+        Turn admission serializes writers. Intaris is the durable owner; the
+        detached cache snapshot is advanced only after a confirmed append.
+        Preview/compaction candidates never write.
+        """
+        immutable = [message for message in messages if message.get(IMMUTABLE_PREFIX)]
+        current = copy.deepcopy(
+            [message for message in messages if not message.get(IMMUTABLE_PREFIX)]
+        )
+        revisions = snapshot.preamble_events()
+        exposed_projects = {
+            event.data.get("content")
+            for event in snapshot.events
+            if event.data.get("source") == "project_context_exposure"
+        }
+        initial_project_contents = {
+            block["content"]
+            for block in (revisions[0].data["blocks"] if revisions else [])
+            if block.get(PROJECT_CONTEXT)
+        }
+        current = [
+            block
+            for block in current
+            if not block.get(PROJECT_CONTEXT)
+            or block["content"] not in exposed_projects
+            or block["content"] in initial_project_contents
+        ]
+        previous = copy.deepcopy(revisions[-1].data["blocks"]) if revisions else None
+        if revisions:
+            from cognis.core.current_policy_context import is_current_policy_message
+
+            for policy_event in snapshot.events:
+                if (
+                    policy_event.seq > revisions[-1].seq
+                    and policy_event.data.get("source") == "current_policy_update"
+                ):
+                    previous = [
+                        {**block, "content": policy_event.data["content"]}
+                        if is_current_policy_message(block)
+                        else block
+                        for block in previous or []
+                    ]
+        if previous != current and not read_only:
+            data: dict[str, Any] = {
+                "event": "context_preamble",
+                "version": 1,
+                "blocks": current,
+                "turn_id": turn_id,
+            }
+            if revisions:
+                previous_contents = {message["content"] for message in previous or []}
+                changed = [
+                    str(message["content"])
+                    for message in current
+                    if message["content"] not in previous_contents
+                ]
+                data["content"] = (
+                    "Context update: the following current context supersedes earlier "
+                    "context for the same subjects. Earlier notices remain historical.\n\n"
+                    + "\n\n".join(changed)
+                    if changed
+                    else "Context update: previously supplied optional context is no longer active."
+                )
+                current_subjects = {
+                    message.get(AUDIT_SOURCE) or str(message["content"]).splitlines()[0]
+                    for message in current
+                }
+                removed_subjects = [
+                    str(message.get(AUDIT_SOURCE) or str(message["content"]).splitlines()[0])
+                    for message in previous or []
+                    if (message.get(AUDIT_SOURCE) or str(message["content"]).splitlines()[0])
+                    not in current_subjects
+                ]
+                if removed_subjects:
+                    data["content"] += "\n\nEarlier context no longer active: " + ", ".join(
+                        removed_subjects
+                    )
+                if before_user and turn_id:
+                    user_events = [
+                        event
+                        for event in snapshot.events
+                        if event.type == "user_message" and event.data.get("turn_id") == turn_id
+                    ]
+                    if user_events and not any(
+                        event.type in {"assistant_message", "tool_call"}
+                        and event.seq > user_events[0].seq
+                        for event in snapshot.events
+                    ):
+                        data["before_user_seq"] = user_events[0].seq
+            event = SessionEvent(type="lifecycle", data=data)
+            digest = sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+            intaris_id = session.intaris_session_id or session.session_id
+            try:
+                with scoped_runtime_context(
+                    user_email=session.user_email,
+                    agent_id=session.agent_id,
+                    agent_owner_email=agent.owner_email,
+                ):
+                    result = await self.guardrails.record_events(
+                        session_id=intaris_id,
+                        events=[event],
+                        source="cognis",
+                        idempotency_key=f"{intaris_id}:preamble:{snapshot.last_event_seq}:{digest}",
+                    )
+                if not result.ok:
+                    raise ImmutablePrefixUnavailable(
+                        "Context preamble could not be persisted.", reason="record_failed"
+                    )
+                await self.session_cache.append_recorded_events(session, [event], result)
+            except BaseException:
+                # An interrupted append may have committed remotely. Force
+                # reconciliation before a retry can choose another snapshot.
+                await self.session_cache.invalidate_canonical(session.session_id)
+                raise
+            snapshot = replace(
+                snapshot,
+                events=[
+                    *snapshot.events,
+                    CachedEvent(
+                        seq=result.first_seq,
+                        type=event.type,
+                        data=copy.deepcopy(data),
+                    ),
+                ],
+                last_event_seq=result.last_seq,
+            )
+            revisions = snapshot.preamble_events()
+        frozen = copy.deepcopy(revisions[0].data["blocks"] if revisions else current)
+        for message in frozen:
+            # The lifecycle record owns this exposure; per-turn audit must not
+            # turn frozen preamble blocks into duplicate transcript notices.
+            message.pop(AUDIT_SOURCE, None)
+            message.pop(AUDIT_ROLE, None)
+            message[AUDIT_METADATA] = {"session_preamble": True}
+        return immutable + frozen, snapshot
+
+    @staticmethod
+    def _preamble_history_events(snapshot: CanonicalContextSnapshot) -> list[CachedEvent]:
+        """Replay updates at their durable placement, including early user admission."""
+        before: dict[int, list[CachedEvent]] = {}
+        inline: dict[int, CachedEvent] = {}
+        for event in snapshot.preamble_events():
+            content = event.data.get("content")
+            if not isinstance(content, str):
+                continue
+            notice = CachedEvent(
+                seq=event.seq,
+                type="developer_message",
+                data={
+                    "content": content,
+                    "context_injection": True,
+                    "replayable": True,
+                    "visibility": "agent_context",
+                    "model_role": "system",
+                    "session_preamble": True,
+                },
+            )
+            anchor = event.data.get("before_user_seq")
+            if isinstance(anchor, int):
+                before.setdefault(anchor, []).append(notice)
+            else:
+                inline[event.seq] = notice
+        events: list[CachedEvent] = []
+        for event in snapshot.events:
+            events.extend(before.get(_event_seq(event), []))
+            events.append(inline.get(_event_seq(event), event))
+        return events
+
     @staticmethod
     def _collect_audit_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         audit_messages: list[dict[str, Any]] = []
         for index, message in enumerate(messages):
+            if message.get(PROJECTION_EVENT_SEQS):
+                continue  # The canonical event already owns this audit.
             audit_source = message.get("_audit_source")
             content = message.get("content")
             if not isinstance(audit_source, str) or not isinstance(content, str):
@@ -2853,7 +3226,9 @@ class ContextAssembler:
             )
         return audit_messages
 
-    def _project_context_messages(self, session_id: str) -> list[dict[str, Any]]:
+    def _project_context_messages(
+        self, session_id: str, *, conversation: Any | None = None
+    ) -> list[dict[str, Any]]:
         get_project_metadata_contexts = getattr(
             self.session_cache, "get_project_metadata_contexts", None
         )
@@ -2866,6 +3241,8 @@ class ContextAssembler:
             if isinstance(metadata_contexts, list):
                 for entry in metadata_contexts:
                     if not getattr(entry, "content", None):
+                        continue
+                    if not _project_metadata_applies(entry, conversation):
                         continue
                     messages.append(
                         {
@@ -3072,28 +3449,96 @@ class ContextAssembler:
             tool_schema_tokens = max(0, int(tool_schema_tokens_override))
         return system_prompt_tokens, tool_schema_tokens
 
-    def _resolve_pruned_call_ids(self, session: SessionModel) -> set[str] | None:
-        """Return the session's pruned tool-result call ids, if any.
-
-        The set is registered by ``AgentLoop._prune_tool_outputs_after_step``
-        once a step's tail of tool output exceeds OpenCode's
-        ``PRUNE_PROTECT`` budget. Returning ``None`` keeps the legacy
-        full-output rendering path on sessions that have not been pruned.
-        """
-
+    def _resolve_projection_decisions(
+        self, session: SessionModel
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return projection decisions already reconstructed from Intaris."""
         cache = self.session_cache
-        if cache is None or not hasattr(cache, "get_entry"):
-            return None
+        if cache is None or not hasattr(cache, "get_projection_decisions"):
+            return {}
+        return cast(
+            dict[str, list[dict[str, Any]]],
+            cache.get_projection_decisions(session.session_id),
+        )
+
+    @staticmethod
+    def _new_projection_decisions(
+        candidate: dict[str, list[dict[str, Any]]],
+        existing: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Keep only monotonic operations not already durable for each call."""
+        return {
+            call_id: [
+                decision for decision in decisions if decision not in existing.get(call_id, [])
+            ]
+            for call_id, decisions in candidate.items()
+            if any(decision not in existing.get(call_id, []) for decision in decisions)
+        }
+
+    async def _persist_projection_decisions(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        decisions: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Persist new projection deltas before returning projected model input."""
+        if not decisions:
+            return
+
+        intaris_session_id = session.intaris_session_id or session.session_id
+        from cognis.core.context_projection import projection_decision_batches
+
+        # Each batch is independently replayable. Interrupted writes reconcile
+        # from accepted events; no snapshot, commit marker, or duplicated text.
         try:
-            entry = cache.get_entry(session.session_id)
-        except Exception:
-            return None
-        if entry is None:
-            return None
-        pruned = getattr(entry, "pruned_tool_call_ids", None)
-        if not pruned:
-            return None
-        return set(pruned)
+            batches = projection_decision_batches(decisions)
+        except ValueError as exc:
+            raise ImmutablePrefixUnavailable(
+                "Projection decision exceeds the safe Intaris request size.",
+                reason="record_failed",
+            ) from exc
+        try:
+            with scoped_runtime_context(
+                user_email=session.user_email,
+                agent_id=session.agent_id,
+                agent_owner_email=agent.owner_email,
+            ):
+                for data in batches:
+                    events = [SessionEvent(type="lifecycle", data=data)]
+                    event_digest = sha256(
+                        json.dumps(
+                            data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    result = await self.guardrails.record_events(
+                        session_id=intaris_session_id,
+                        events=events,
+                        source="cognis",
+                        idempotency_key=f"{intaris_session_id}:context_projection:{event_digest}",
+                    )
+                    if not result.ok:
+                        raise ImmutablePrefixUnavailable(
+                            "Projection decisions could not be persisted.",
+                            reason="record_failed",
+                        )
+                    await self.session_cache.append_recorded_events(session, events, result)
+        except BaseException:
+            await self.session_cache.invalidate_canonical(session.session_id)
+            raise
+
+    async def persist_projection_decisions(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        decisions: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Commit only new decisions selected at the live inference boundary."""
+        delta = self._new_projection_decisions(
+            decisions, self._resolve_projection_decisions(session)
+        )
+        await self._persist_projection_decisions(session=session, agent=agent, decisions=delta)
 
     async def _events_to_messages(
         self,
@@ -3101,7 +3546,7 @@ class ContextAssembler:
         *,
         model_info: Any | None,
         owner_email: str | None,
-        pruned_call_ids: set[str] | None = None,
+        projection_decisions: dict[str, list[dict[str, Any]]] | None = None,
         disabled_artifact_urls: set[str] | None = None,
         disabled_artifact_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
@@ -3112,7 +3557,7 @@ class ContextAssembler:
         return events_to_messages(
             hydrated_events,
             model_info=model_info,
-            pruned_call_ids=pruned_call_ids,
+            projection_decisions=projection_decisions,
             disabled_artifact_urls=disabled_artifact_urls,
             disabled_artifact_ids=disabled_artifact_ids,
         )
@@ -3332,6 +3777,8 @@ class ContextAssembler:
         max_prompt_tokens: int,
         tool_schema_tokens: int,
         calibration_ratio: float = 1.0,
+        effective_input_tokens: int | None = None,
+        session_id: str | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         ProjectionResult,
@@ -3339,6 +3786,7 @@ class ContextAssembler:
         list[dict[str, Any]],
         int | None,
         int,
+        dict[str, list[dict[str, Any]]],
     ]:
         """Project, prune, strip markers and count the final prompt (sync, CPU-bound).
 
@@ -3354,7 +3802,10 @@ class ContextAssembler:
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
             calibration_ratio=calibration_ratio,
+            effective_input_tokens=effective_input_tokens,
+            session_id=session_id,
         )
+        projection_decision_delta = projection.decisions
         projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
 
         audit_messages = self._collect_audit_messages(messages)
@@ -3362,15 +3813,9 @@ class ContextAssembler:
         # Recompute cache breakpoint after pruning while internal markers are still present.
         cache_breakpoint_index = _find_cache_breakpoint(messages)
 
-        # Strip internal markers before returning to the agent loop.  Keep the
-        # turn-boundary marker in-memory so the loop can compute moving provider
-        # cache breakpoints on the projected transcript; the provider-facing
-        # projection strips it before the request is sent.
-        for msg in messages:
-            for _marker in ALL_INTERNAL_MARKERS:
-                if _marker == TURN_BOUNDARY:
-                    continue
-                msg.pop(_marker, None)
+        # The loop may project again under pressure. Keep canonical rendering
+        # inputs (names, recovery, protection, provenance) until its provider
+        # boundary strips controller-only fields.
 
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
@@ -3383,6 +3828,7 @@ class ContextAssembler:
             audit_messages,
             cache_breakpoint_index,
             prompt_tokens,
+            projection_decision_delta,
         )
 
     def _project_cross_turn_messages(
@@ -3395,6 +3841,8 @@ class ContextAssembler:
         max_prompt_tokens: int,
         tool_schema_tokens: int,
         calibration_ratio: float = 1.0,
+        effective_input_tokens: int | None = None,
+        session_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], ProjectionResult]:
         """Project only enough history to return to the steady prompt target."""
 
@@ -3403,6 +3851,7 @@ class ContextAssembler:
             available_prompt_tokens=available_prompt_tokens,
             phase="cross_turn",
             pressure_mode="normal",
+            effective_input_tokens=effective_input_tokens,
         )
         raw_prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
@@ -3411,7 +3860,10 @@ class ContextAssembler:
         # Convert the budget, not just the trigger, so a calibrated overage
         # requests enough raw savings without double-scaling message counters.
         raw_steady_target = math.floor(policy.steady_target_tokens / calibration_ratio)
-        if raw_prompt_tokens <= raw_steady_target:
+        if (
+            raw_prompt_tokens * calibration_ratio
+            <= (effective_input_tokens or available_prompt_tokens) * 0.75
+        ):
             projection = ProjectionResult(messages=list(messages), mutable_start_index=0)
         else:
             # Critical projection is a hard-pressure fallback that may discard
@@ -3445,7 +3897,49 @@ class ContextAssembler:
             ),
             tool_schema_tokens=tool_schema_tokens,
         )
-        return pruned_messages, projection_result_from_messages(pruned_messages)
+        decisions = projection_decisions_from_diff(
+            messages, pruned_messages, arg_clear_threshold=policy.arg_clear_threshold
+        )
+        if decisions:
+            after_tokens = (
+                self.llm.count_messages_tokens(pruned_messages, resolved_model) + tool_schema_tokens
+            )
+            logger.info(
+                "Context projection decision",
+                extra={
+                    "extra_data": {
+                        "session_id": session_id,
+                        "projection_decision_targets": len(decisions),
+                        **projection_diagnostic_fields(
+                            ProjectionPolicy.from_budget(
+                                max_context_tokens=max_context_tokens,
+                                available_prompt_tokens=available_prompt_tokens,
+                                effective_input_tokens=effective_input_tokens,
+                                phase="cross_turn",
+                                pressure_mode=policy.pressure_mode,
+                            ),
+                            reason=(
+                                "cross_turn_threshold"
+                                if raw_prompt_tokens * calibration_ratio
+                                > (effective_input_tokens or available_prompt_tokens) * 0.75
+                                else "hard_budget_prune"
+                            ),
+                            before_prompt_tokens=math.ceil(raw_prompt_tokens * calibration_ratio),
+                            after_prompt_tokens=math.ceil(after_tokens * calibration_ratio),
+                            trigger_tokens=int(
+                                (effective_input_tokens or available_prompt_tokens) * 0.75
+                            ),
+                            savings_target_tokens=math.ceil(raw_steady_target * calibration_ratio),
+                        ),
+                    }
+                },
+            )
+        result = projection_result_from_messages(pruned_messages)
+        return pruned_messages, ProjectionResult(
+            messages=result.messages,
+            mutable_start_index=result.mutable_start_index,
+            decisions=decisions,
+        )
 
     def _prune_messages(
         self,
@@ -3464,23 +3958,19 @@ class ContextAssembler:
         ]
         current_tokens = sum(estimates) + tool_schema_tokens
 
-        while current_tokens > max_prompt_tokens:
-            # Priority 1: Compact old tool outputs to recoverable placeholders.
-            # This keeps call_id handles visible before we resort to dropping
-            # complete tool-call groups under hard context pressure.
-            compacted_messages = _compact_oldest_droppable_tool_group(pruned_messages)
-            if compacted_messages is not None:
-                for idx, (old_message, new_message) in enumerate(
-                    zip(pruned_messages, compacted_messages, strict=True)
-                ):
-                    if old_message is new_message:
-                        continue
+        # Compact in one forward pass before dropping any history. Restarting
+        # the scan per group makes long sessions quadratic.
+        if current_tokens > max_prompt_tokens:
+            for replacements in _compact_droppable_tool_groups(pruned_messages):
+                for idx, new_message in replacements.items():
                     new_estimate = self._message_token_estimate(new_message, resolved_model)
                     current_tokens += new_estimate - estimates[idx]
                     estimates[idx] = new_estimate
-                pruned_messages = compacted_messages
-                continue
+                    pruned_messages[idx] = new_message
+                if current_tokens <= max_prompt_tokens:
+                    break
 
+        while current_tokens > max_prompt_tokens:
             # Priority 2: Drop oldest non-protected messages (history).
             # Tool call groups (assistant message with tool_calls + matching
             # tool role responses) must be dropped atomically to avoid
@@ -3497,12 +3987,14 @@ class ContextAssembler:
 
         # Cached estimates should be close, but preserve the old exact-count
         # behavior if an estimate under-counted under extreme pressure.
+        for replacements in _compact_droppable_tool_groups(pruned_messages):
+            for idx, new_message in replacements.items():
+                pruned_messages[idx] = new_message
+            exact_tokens = self.llm.count_messages_tokens(pruned_messages, resolved_model)
+            if exact_tokens + tool_schema_tokens <= max_prompt_tokens:
+                return pruned_messages
+
         while exact_tokens + tool_schema_tokens > max_prompt_tokens:
-            compacted_messages = _compact_oldest_droppable_tool_group(pruned_messages)
-            if compacted_messages is not None:
-                pruned_messages = compacted_messages
-                exact_tokens = self.llm.count_messages_tokens(pruned_messages, resolved_model)
-                continue
             indices_to_drop = _find_oldest_droppable_group(pruned_messages)
             if not indices_to_drop:
                 break
@@ -3611,7 +4103,25 @@ def events_to_messages(
     events: list[Any],
     *,
     model_info: Any | None = None,
-    pruned_call_ids: set[str] | None = None,
+    projection_decisions: dict[str, list[dict[str, Any]]] | None = None,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Replay canonical events without the retired full-transcript snapshots."""
+    return _events_to_messages_base(
+        events,
+        model_info=model_info,
+        projection_decisions=projection_decisions,
+        disabled_artifact_urls=disabled_artifact_urls,
+        disabled_artifact_ids=disabled_artifact_ids,
+    )
+
+
+def _events_to_messages_base(
+    events: list[Any],
+    *,
+    model_info: Any | None = None,
+    projection_decisions: dict[str, list[dict[str, Any]]] | None = None,
     disabled_artifact_urls: set[str] | None = None,
     disabled_artifact_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -3629,30 +4139,47 @@ def events_to_messages(
     When an ``assistant_message`` immediately precedes tool calls (same
     LLM response), the tool_calls array is merged onto that message.
 
-    ``pruned_call_ids`` is an optional set of tool-call ids whose result
-    content should render as a clearance marker instead of the full
-    output. Pruning is honoured per-call but never overrides
-    ``protect_from_pruning`` on the underlying event.
+    ``projection_decisions`` contains compact call/event-scoped operations
+    reconstructed from durable Intaris lifecycle events and reapplied to the
+    original canonical messages.
     """
     messages: list[dict[str, Any]] = []
     # Buffer for consecutive tool_call events (flushed on non-tool_call)
     pending_tool_calls: list[dict[str, Any]] = []
+    pending_tool_call_event_seqs: list[int] = []
     pending_responses_output_items: list[dict[str, Any]] = []
     pending_anthropic_native_envelope: dict[str, Any] | None = None
     open_tool_call_ids: list[str] = []
+    tool_call_event_seqs: dict[str, int] = {}
     canonical_tool_calls: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     native_open_tool_call_ids: set[str] = set()
     native_tool_batch_by_call_id: dict[str, set[str]] = {}
+    # One provider response owns all of its native tool calls. Sequential
+    # execution records call/result pairs, but the live loop sent the batch as
+    # one assistant message followed by its results.
+    native_response_owner_by_call_id: dict[str, dict[str, Any]] = {}
+    # Old recordings keep their original grouping and omission semantics.
+    # Only newly recorded native responses opt into faithful batch replay.
+    batch_replay_call_ids: set[str] = set()
 
     from cognis.core.history_replay import (
         defer_tool_batch_notices,
+        format_tool_result_message,
         interrupted_batch_evidence,
         is_model_history_event,
         recorded_tool_output,
     )
+    from cognis.core.tool_result_context import (
+        format_tool_attachment_context,
+        format_tool_notice,
+    )
 
     normalized_events = [event for event in events if is_model_history_event(event)]
     seen_call_ids: set[tuple[Any, Any, Any]] = set()
+
+    def _event_seq(item: Any) -> int | None:
+        seq = item.get("seq") if isinstance(item, dict) else getattr(item, "seq", None)
+        return seq if isinstance(seq, int) and seq > 0 else None
 
     def _tool_identity(item: Any) -> tuple[Any, Any, Any] | None:
         item_data = item.get("data", {}) if isinstance(item, dict) else item.data
@@ -3729,20 +4256,95 @@ def events_to_messages(
                 index += len(repaired_calls)
         index += 1
 
+    def _register_native_response_owner(message: dict[str, Any]) -> None:
+        if not any(
+            call.get("id") in batch_replay_call_ids for call in message.get("tool_calls", [])
+        ):
+            return
+        call_ids: set[str] = set()
+        items = message.get("_responses_output_items")
+        if isinstance(items, list):
+            call_ids.update(
+                item["call_id"]
+                for item in items
+                if isinstance(item, dict)
+                and item.get("type") in RESPONSES_TOOL_CALL_TYPES
+                and isinstance(item.get("call_id"), str)
+                and item["call_id"]
+            )
+        envelope = message.get("_anthropic_native_envelope")
+        if isinstance(envelope, dict) and isinstance(envelope.get("native_blocks"), list):
+            call_ids.update(
+                block["id"]
+                for block in envelope["native_blocks"]
+                if isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and isinstance(block.get("id"), str)
+                and block["id"]
+            )
+        for call_id in call_ids:
+            native_response_owner_by_call_id.setdefault(call_id, message)
+
+    def _native_response_owner(tc_array: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Return the earlier assistant message whose native response owns these calls."""
+
+        call_ids = [tc.get("id") for tc in tc_array]
+        owners = {id(native_response_owner_by_call_id.get(str(call_id))) for call_id in call_ids}
+        owner = native_response_owner_by_call_id.get(str(call_ids[0])) if call_ids else None
+        if owner is None or len(owners) != 1 or not isinstance(owner.get("tool_calls"), list):
+            return None
+        owner_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if messages[index] is owner),
+            None,
+        )
+        if owner_index is None:
+            return None
+        owned_ids = {call.get("id") for call in owner["tool_calls"] if isinstance(call, dict)}
+        if owned_ids & set(call_ids):
+            return None
+        # A completed call may also append explicitly recorded auxiliary context.
+        # Unrelated messages still terminate ownership of this native batch.
+        if not all(
+            (message.get("role") == "tool" and message.get("tool_call_id") in owned_ids)
+            or (
+                isinstance(message.get("_tool_context_call_id"), str)
+                and message["_tool_context_call_id"] in owned_ids
+            )
+            or (
+                message.get("_tool_attachment_context") is True
+                and message.get("_tool_call_id") in owned_ids
+            )
+            for message in messages[owner_index + 1 :]
+        ):
+            return None
+        return owner
+
     def _flush_tool_calls() -> None:
         """Flush buffered tool_call events into an assistant message."""
         nonlocal pending_anthropic_native_envelope
         if not pending_tool_calls:
             return
         tc_array = list(pending_tool_calls)
+        event_seqs = list(pending_tool_call_event_seqs)
         responses_output_items = list(pending_responses_output_items)
         native_envelope = pending_anthropic_native_envelope
         pending_tool_calls.clear()
+        pending_tool_call_event_seqs.clear()
         pending_responses_output_items.clear()
         pending_anthropic_native_envelope = None
         open_tool_call_ids.extend(
             tc.get("id", "") for tc in tc_array if isinstance(tc.get("id", ""), str)
         )
+        owner = (
+            _native_response_owner(tc_array)
+            if not responses_output_items and native_envelope is None
+            else None
+        )
+        if owner is not None:
+            owner["tool_calls"] = [*owner["tool_calls"], *tc_array]
+            if event_seqs:
+                owner[PROJECTION_EVENT_SEQS] = [*owner.get(PROJECTION_EVENT_SEQS, []), *event_seqs]
+            return
         # Merge onto preceding assistant message if it has no tool_calls yet
         if (
             messages
@@ -3750,6 +4352,11 @@ def events_to_messages(
             and "tool_calls" not in messages[-1]
         ):
             messages[-1]["tool_calls"] = tc_array
+            if event_seqs:
+                messages[-1][PROJECTION_EVENT_SEQS] = [
+                    *messages[-1].get(PROJECTION_EVENT_SEQS, []),
+                    *event_seqs,
+                ]
             if responses_output_items:
                 existing_items = messages[-1].get("_responses_output_items")
                 if isinstance(existing_items, list):
@@ -3768,11 +4375,14 @@ def events_to_messages(
                 messages[-1]["content"] = None
         else:
             message: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": tc_array}
+            if event_seqs:
+                message[PROJECTION_EVENT_SEQS] = event_seqs
             if responses_output_items:
                 message["_responses_output_items"] = [dict(item) for item in responses_output_items]
             if native_envelope is not None:
                 message["_anthropic_native_envelope"] = native_envelope
             messages.append(message)
+        _register_native_response_owner(messages[-1])
 
     def _discard_native_tool_batch(call_id: str) -> None:
         """Replace an incomplete native turn with explicitly uncertain evidence."""
@@ -3797,6 +4407,7 @@ def events_to_messages(
         native_open_tool_call_ids.difference_update(discarded_call_ids)
         for discarded_id in discarded_call_ids:
             native_tool_batch_by_call_id.pop(discarded_id, None)
+            tool_call_event_seqs.pop(discarded_id, None)
         open_tool_call_ids[:] = [
             open_id for open_id in open_tool_call_ids if open_id not in discarded_call_ids
         ]
@@ -3849,6 +4460,12 @@ def events_to_messages(
                     "role": "tool",
                     "tool_call_id": tc_id,
                     "content": "[No result recorded - step may have been interrupted]",
+                    PROTECTED_TOOL_OUTPUT: True,
+                    **(
+                        {PROJECTION_EVENT_SEQS: [tool_call_event_seqs[tc_id]]}
+                        if tc_id in tool_call_event_seqs
+                        else {}
+                    ),
                 },
             )
 
@@ -3859,8 +4476,19 @@ def events_to_messages(
         else:
             event_type = event.type
             event_data = event.data
+        event_seq = _event_seq(event)
 
+        if event_type == "assistant_message" and event_data.get("native_batch_replay_version") == 1:
+            batch_replay_call_ids.update(
+                item["call_id"]
+                for item in event_data.get("responses_output_items", [])
+                if isinstance(item, dict)
+                and item.get("type") in RESPONSES_TOOL_CALL_TYPES
+                and isinstance(item.get("call_id"), str)
+            )
         if event_type == "tool_call":
+            if event_data.get("native_batch_replay_version") == 1:
+                batch_replay_call_ids.add(str(event_data.get("call_id", "")))
             tool_name = (
                 event_data.get("visible_name")
                 or event_data.get("tool_name")
@@ -3880,7 +4508,32 @@ def events_to_messages(
             )
             if isinstance(tool_name, str):
                 # Serialize arguments to JSON string as required by the format
-                if isinstance(arguments, dict):
+                provider_arguments_json = event_data.get("provider_arguments_json")
+                if (
+                    isinstance(provider_arguments_json, str)
+                    and not event_data.get("visible_name")
+                    and isinstance(arguments, (dict, str))
+                ):
+                    try:
+                        recorded_arguments = (
+                            json.loads(arguments) if isinstance(arguments, str) else arguments
+                        )
+                        preserves_arguments = (
+                            isinstance(recorded_arguments, dict)
+                            and json.loads(provider_arguments_json) == recorded_arguments
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        preserves_arguments = False
+                    args_str = (
+                        provider_arguments_json
+                        if preserves_arguments
+                        else (
+                            arguments
+                            if isinstance(arguments, str)
+                            else json.dumps(arguments, default=str)
+                        )
+                    )
+                elif isinstance(arguments, dict):
                     args_str = json.dumps(arguments, default=str)
                 elif isinstance(arguments, str):
                     args_str = arguments
@@ -3893,6 +4546,10 @@ def events_to_messages(
                         "function": {"name": tool_name, "arguments": args_str},
                     }
                 )
+                if event_seq is not None:
+                    pending_tool_call_event_seqs.append(event_seq)
+                    if isinstance(call_id, str) and call_id:
+                        tool_call_event_seqs[call_id] = event_seq
                 responses_output_items = event_data.get("responses_output_items")
                 if isinstance(responses_output_items, list):
                     pending_responses_output_items.extend(
@@ -3950,9 +4607,14 @@ def events_to_messages(
                         disabled_artifact_ids=disabled_artifact_ids,
                     )
                     msg[TURN_BOUNDARY] = True
+                    if event_seq is not None:
+                        msg[PROJECTION_EVENT_SEQS] = [event_seq]
                     messages.append(msg)
                 else:
-                    messages.append({"role": "user", "content": content, TURN_BOUNDARY: True})
+                    user_message = {"role": "user", "content": content, TURN_BOUNDARY: True}
+                    if event_seq is not None:
+                        user_message[PROJECTION_EVENT_SEQS] = [event_seq]
+                    messages.append(user_message)
         elif event_type == "assistant_message":
             _append_orphan_placeholders()
             content = event_data.get("content")
@@ -3980,9 +4642,12 @@ def events_to_messages(
                         and envelope.continuation_status is AnthropicContinuationStatus.CONTINUABLE
                     ):
                         msg["_anthropic_native_envelope"] = envelope.to_dict()
+                if event_seq is not None:
+                    msg[PROJECTION_EVENT_SEQS] = [event_seq]
                 messages.append(msg)
         elif event_type == "developer_message":
-            _append_orphan_placeholders()
+            if event_data.get("tool_context_notice_version") != 1:
+                _append_orphan_placeholders()
             content = event_data.get("content")
             if (
                 isinstance(content, str)
@@ -3993,24 +4658,38 @@ def events_to_messages(
                 role = event_data.get("model_role")
                 if role not in {"system", "developer"}:
                     role = "system"
-                messages.append(
-                    {
-                        "role": role,
-                        "content": content,
-                        AUDIT_METADATA: {
-                            key: event_data[key]
-                            for key in (
-                                "context_injection",
-                                "replayable",
-                                "replay_scope",
-                                "visibility",
-                                "model_role",
-                                "trust",
-                            )
-                            if key in event_data
-                        },
-                    }
-                )
+                developer_message = {
+                    "role": role,
+                    "content": content,
+                    **(
+                        {
+                            AUDIT_SOURCE: event_data["source"],
+                            AUDIT_ROLE: event_data.get("canonical_role", "developer"),
+                        }
+                        if isinstance(event_data.get("source"), str)
+                        else {}
+                    ),
+                    AUDIT_METADATA: {
+                        key: event_data[key]
+                        for key in (
+                            "context_injection",
+                            "replayable",
+                            "replay_scope",
+                            "visibility",
+                            "model_role",
+                            "canonical_role",
+                            "turn_id",
+                            "trust",
+                            "session_preamble",
+                        )
+                        if key in event_data
+                    },
+                }
+                if event_data.get("tool_context_notice_version") == 1:
+                    developer_message = format_tool_notice(event_data)
+                if event_seq is not None:
+                    developer_message[PROJECTION_EVENT_SEQS] = [event_seq]
+                messages.append(developer_message)
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";
             # fall back to "output" for forward-compatibility.
@@ -4018,23 +4697,7 @@ def events_to_messages(
             call_id = event_data.get("call_id", "")
             if isinstance(output, str) and call_id in open_tool_call_ids:
                 open_tool_call_ids.remove(call_id)
-                # Honor controller-side prune markers: an earlier
-                # post-step prune may have flagged this call_id for
-                # clearance to keep the context budget healthy. The
-                # full output is still recoverable via read_tool_output.
-                rendered_output = output
-                pruned_view = False
-                if (
-                    pruned_call_ids
-                    and call_id in pruned_call_ids
-                    and isinstance(event_data.get("recovery_call_id"), str)
-                    and bool(event_data["recovery_call_id"].strip())
-                    and not bool(event_data.get("protect_from_pruning"))
-                ):
-                    from cognis.core.tool_output_prune import cleared_tool_result_marker
-
-                    rendered_output = cleared_tool_result_marker(event_data["recovery_call_id"])
-                    pruned_view = True
+                tool_call_event_seqs.pop(call_id, None)
                 presentation = event_data.get("tool_output_presentation")
                 if not isinstance(presentation, dict):
                     presentation = {}
@@ -4072,14 +4735,16 @@ def events_to_messages(
                     and isinstance(legacy_anchor_count, int)
                     and legacy_anchor_count > 0
                 )
-                messages.append(
+                tool_message = format_tool_result_message(
+                    call_id=call_id,
+                    content=output,
+                    tool_name=event_data.get("name"),
+                    is_error=bool(event_data.get("is_error")),
+                    protected=bool(event_data.get("protect_from_pruning")),
+                )
+                tool_message.update(
                     {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": rendered_output,
-                        "_tool_name": event_data.get("name"),
-                        "_tool_is_error": bool(event_data.get("is_error")),
-                        "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                         "_has_full_output": bool(event_data.get("has_full_output")),
                         "_recovery_call_id": event_data.get("recovery_call_id"),
                         "_tool_output_artifact_id": event_data.get("tool_output_artifact_id"),
@@ -4102,9 +4767,32 @@ def events_to_messages(
                             if isinstance(event_data.get("materialized_artifact_evidence"), dict)
                             else {}
                         ),
-                        "_pruned_view": pruned_view,
                     }
                 )
+                messages.append(tool_message)
+                if event_data.get("tool_attachment_context_version") == 1:
+                    attachments = event_data.get("tool_attachment_context_refs")
+                    safe_attachments = (
+                        [item for item in attachments if isinstance(item, dict)]
+                        if isinstance(attachments, list)
+                        else []
+                    )
+                    blocks, unsupported = _native_attachment_blocks(
+                        safe_attachments,
+                        model_info,
+                        disabled_artifact_urls=disabled_artifact_urls,
+                        disabled_artifact_ids=disabled_artifact_ids,
+                    )
+                    attachment_context = format_tool_attachment_context(
+                        call_id=call_id,
+                        tool_name=str(event_data.get("name") or ""),
+                        attachments=safe_attachments,
+                        blocks=blocks,
+                        unsupported=unsupported,
+                    )
+                    if attachment_context is not None:
+                        attachment_context["_recovery_call_id"] = event_data.get("recovery_call_id")
+                        messages.append(attachment_context)
         elif event_type == "delegation":
             _append_orphan_placeholders()
             status = event_data.get("status")
@@ -4131,6 +4819,7 @@ def events_to_messages(
                         "_delegation_result_replay": True,
                         "_recovery_call_id": event_data.get("call_id"),
                         "_source_session_id": child_id,
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                     }
                 )
             elif status == "failed":
@@ -4145,6 +4834,7 @@ def events_to_messages(
                             f"Error: {error}\n"
                             f"</delegation_result>"
                         ),
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                     }
                 )
             else:
@@ -4153,6 +4843,7 @@ def events_to_messages(
                     {
                         "role": "system",
                         "content": _format_delegation_status(event_data),
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                     }
                 )
         elif event_type == "lifecycle":
@@ -4163,6 +4854,7 @@ def events_to_messages(
                     {
                         "role": "system",
                         "content": _format_task_update(lifecycle_event, event_data),
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                     }
                 )
             elif lifecycle_event == "step_complete":
@@ -4172,12 +4864,27 @@ def events_to_messages(
                         {
                             "role": "system",
                             "content": f"Step completed: {summary}",
+                            **(
+                                {PROJECTION_EVENT_SEQS: [event_seq]}
+                                if event_seq is not None
+                                else {}
+                            ),
                         }
                     )
             elif lifecycle_event == "system_notice":
                 notice_msg = event_data.get("agent_context") or event_data.get("message", "")
                 if notice_msg:
-                    messages.append({"role": "system", "content": notice_msg})
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": notice_msg,
+                            **(
+                                {PROJECTION_EVENT_SEQS: [event_seq]}
+                                if event_seq is not None
+                                else {}
+                            ),
+                        }
+                    )
             # Other lifecycle events (task_status, etc.) are informational — skip
         elif event_type == "evaluation":
             _append_orphan_placeholders()
@@ -4195,6 +4902,7 @@ def events_to_messages(
                             f"Feedback: {feedback}\n"
                             f"</evaluation_feedback>"
                         ),
+                        **({PROJECTION_EVENT_SEQS: [event_seq]} if event_seq is not None else {}),
                     }
                 )
     # Flush any remaining buffered tool calls at the end of the event list.
@@ -4205,7 +4913,7 @@ def events_to_messages(
     if pending_tool_calls:
         _flush_tool_calls()
     _append_orphan_placeholders()
-    return messages
+    return apply_projection_decisions(messages, projection_decisions or {})
 
 
 def _current_user_message_already_in_history(
@@ -4430,10 +5138,14 @@ def _format_search_results(search_results: Any) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-def _compact_oldest_droppable_tool_group(
+def _compact_droppable_tool_groups(
     messages: list[dict[str, Any]],
-) -> list[dict[str, Any]] | None:
-    """Compact the oldest unprotected tool group instead of dropping it outright."""
+) -> Iterator[dict[int, dict[str, Any]]]:
+    """Yield oldest-first replacements without rescanning already visited groups.
+
+    The caller may replace messages at the yielded indices, but must not insert
+    or remove messages until this iterator is exhausted or abandoned.
+    """
 
     last_idx = len(messages) - 1
     current_user_idx = _current_turn_anchor_index(messages)
@@ -4464,11 +5176,11 @@ def _compact_oldest_droppable_tool_group(
         if not result_indices:
             continue
 
-        compacted = list(messages)
-        compacted[index] = clear_large_tool_call_arguments(message)
-        if compacted[index] is not message:
-            compacted[index] = {k: v for k, v in compacted[index].items() if k != TOKEN_ESTIMATE}
-        changed = compacted[index] != message
+        replacements: dict[int, dict[str, Any]] = {}
+        compacted_call = clear_large_tool_call_arguments(message)
+        compacted_call.pop(TOKEN_ESTIMATE, None)
+        if compacted_call != message:
+            replacements[index] = compacted_call
         for result_index in result_indices:
             tool_message = messages[result_index]
             if tool_message.get("_protected_tool_output") or tool_message.get(
@@ -4478,18 +5190,15 @@ def _compact_oldest_droppable_tool_group(
             content = tool_message.get("content")
             if not isinstance(content, str) or not content:
                 continue
-            placeholder = build_compacted_tool_result_placeholder(tool_message)
-            if len(placeholder) >= len(content):
+            if not compaction_shrinks_tool_result(tool_message):
                 continue
-            compacted[result_index] = {
+            replacements[result_index] = {
                 **{k: v for k, v in tool_message.items() if k != TOKEN_ESTIMATE},
-                "content": placeholder,
+                "content": build_compacted_tool_result_placeholder(tool_message),
                 "_projected_compacted": True,
             }
-            changed = True
-        if changed:
-            return compacted
-    return None
+        if replacements:
+            yield replacements
 
 
 def _find_oldest_droppable_group(
@@ -4584,6 +5293,12 @@ def _is_protected_context_message(message: dict[str, Any]) -> bool:
     - Frozen project instruction messages loaded during the session
     - Prior step context (workflow step output from a previous step)
     """
+    from cognis.core.current_policy_context import is_current_policy_message
+
+    if is_current_policy_message(message) or (message.get(AUDIT_METADATA) or {}).get(
+        "session_preamble"
+    ):
+        return True
     if message.get("_prior_context"):
         return True
     if message.get(PROJECT_CONTEXT):
@@ -4704,3 +5419,27 @@ def _format_task_update(lifecycle_event: str, data: dict[str, Any]) -> str:
         "task_cancelled": "cancelled",
     }.get(lifecycle_event, "updated")
     return f"Task update: {title} {status}. Summary: {result_summary}"
+
+
+def _project_metadata_applies(entry: Any, conversation: Any | None) -> bool:
+    """Return whether loaded project metadata still applies to a conversation.
+
+    Path-matched metadata (``source_id`` set) follows the touched repository.
+    Explicitly assigned project metadata applies only while the topic
+    conversation is still assigned to that project; long-lived chats keep the
+    agent-default project they derived.
+    """
+
+    if conversation is None or getattr(entry, "source_id", None):
+        return True
+    stored = getattr(conversation, "project_id", None)
+    if isinstance(stored, str) and stored:
+        return bool(getattr(entry, "project_id", None) == stored)
+    from cognis.core.long_lived_chat import is_long_lived_chat_context
+
+    if not is_long_lived_chat_context(getattr(conversation, "context", None)):
+        return False
+    # Long-lived chats follow the agent's current default project; metadata
+    # from a previous default (or a removed one) must stop applying.
+    effective = getattr(conversation, "effective_project_id", None)
+    return bool(effective) and getattr(entry, "project_id", None) == effective

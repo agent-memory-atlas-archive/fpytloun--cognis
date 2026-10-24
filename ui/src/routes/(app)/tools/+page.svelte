@@ -1,5 +1,9 @@
 <script lang="ts">
+import { findTarget } from '$lib/find';
 import { onMount } from 'svelte';
+  import type { PageData } from './$types';
+import HookRegistry from '$lib/components/hooks/HookRegistry.svelte';
+import RegistryCard from '$lib/components/ui/RegistryCard.svelte';
 import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
 import ChevronDown from 'lucide-svelte/icons/chevron-down';
 import ChevronRight from 'lucide-svelte/icons/chevron-right';
@@ -26,6 +30,7 @@ import Server from 'lucide-svelte/icons/server';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { addToast } from '$lib/stores/toasts';
+  import { connectivity, isConnectivityError, onConnectivityRestored } from '$lib/connectivity';
   import {
     buildRegistryWarnings,
     CATEGORY_ORDER,
@@ -49,10 +54,13 @@ import Server from 'lucide-svelte/icons/server';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import type { ExecutorConfig, MCPServerConfigResponse, IntarisMCPServer, Skill, ToolDefinitionSummary, SystemDiagnostics } from '$lib/types/api';
 
-  type ToolsTab = 'builtin' | 'intaris_mcp' | 'executor_mcp' | 'skills';
+  type ToolsTab = 'builtin' | 'intaris_mcp' | 'executor_mcp' | 'skills' | 'hooks';
   type SkillImportMode = 'url' | 'content' | 'package';
 
   let activeTab: ToolsTab = 'builtin';
+  export let data: PageData;
+  $: activeTab = ['builtin', 'intaris_mcp', 'executor_mcp', 'skills', 'hooks'].includes(data.tab)
+    ? data.tab as ToolsTab : 'builtin';
   let staticTools: ToolDefinitionSummary[] = [];
   let intarisMcpTools: ToolDefinitionSummary[] = [];
   let observedLocalMcpTools: ToolDefinitionSummary[] = [];
@@ -61,7 +69,11 @@ import Server from 'lucide-svelte/icons/server';
   let executors: ExecutorConfig[] = [];
   let mcpServerConfigs: MCPServerConfigResponse[] = [];
   let loading = true;
-  let registryWarnings: string[] = [];
+  let allRegistryWarnings: string[] = [];
+  let nonConnectivityRegistryWarnings: string[] = [];
+  // While the global connection banner applies, it owns connectivity
+  // failures; only other registry failures are shown here.
+  $: registryWarnings = $connectivity.degraded ? nonConnectivityRegistryWarnings : allRegistryWarnings;
   let intarisUrl: string | null = null;
 
   let builtinSearch = '';
@@ -123,13 +135,19 @@ import Server from 'lucide-svelte/icons/server';
       return left.name.localeCompare(right.name);
     });
 
-  onMount(async () => {
-    await loadData();
+  // A load that failed for connectivity reasons stays quiet (the global
+  // connection banner covers it) and reloads when the connection returns.
+  let reloadOnRestore = false;
+
+  onMount(() => {
+    void loadData();
+    return onConnectivityRestored(() => { if (reloadOnRestore) void loadData(); });
   });
 
   async function loadData() {
     loading = true;
-    registryWarnings = [];
+    allRegistryWarnings = [];
+    nonConnectivityRegistryWarnings = [];
     try {
       const [toolsResult, intarisToolsResult, observedToolsResult, intarisServersResult, skillsResult, executorsResult, mcpServersResult, diagResult] = await Promise.allSettled([
         api.tools.list(),
@@ -141,6 +159,12 @@ import Server from 'lucide-svelte/icons/server';
         api.tools.listMcpServerConfigs(),
         api.system.diagnostics()
       ]);
+      const connectivityRejected = (result: PromiseSettledResult<unknown>) =>
+        result.status === 'rejected' && isConnectivityError(result.reason);
+      reloadOnRestore = [
+        toolsResult, intarisToolsResult, observedToolsResult, intarisServersResult,
+        skillsResult, executorsResult, mcpServersResult, diagResult,
+      ].some(connectivityRejected);
 
       staticTools = toolsResult.status === 'fulfilled' ? toolsResult.value : [];
       intarisMcpTools = intarisToolsResult.status === 'fulfilled' ? intarisToolsResult.value : [];
@@ -156,7 +180,7 @@ import Server from 'lucide-svelte/icons/server';
         intarisUrl = typeof url === 'string' && url ? url : null;
       }
 
-      registryWarnings = buildRegistryWarnings({
+      allRegistryWarnings = buildRegistryWarnings({
         staticTools: toolsResult.status === 'fulfilled',
         intarisMcpTools: intarisToolsResult.status === 'fulfilled',
         observedLocalMcpTools: observedToolsResult.status === 'fulfilled',
@@ -164,8 +188,21 @@ import Server from 'lucide-svelte/icons/server';
         executors: executorsResult.status === 'fulfilled',
         mcpServers: mcpServersResult.status === 'fulfilled'
       });
+      // Warnings that remain when connectivity failures are left to the
+      // global connection banner (shown while it is degraded).
+      const okOrConnectivity = (result: PromiseSettledResult<unknown>) =>
+        result.status === 'fulfilled' || connectivityRejected(result);
+      nonConnectivityRegistryWarnings = buildRegistryWarnings({
+        staticTools: okOrConnectivity(toolsResult),
+        intarisMcpTools: okOrConnectivity(intarisToolsResult),
+        observedLocalMcpTools: okOrConnectivity(observedToolsResult),
+        skills: okOrConnectivity(skillsResult),
+        executors: okOrConnectivity(executorsResult),
+        mcpServers: okOrConnectivity(mcpServersResult)
+      });
     } catch (err) {
-      addToast('Failed to load tools data', 'error');
+      if (isConnectivityError(err)) reloadOnRestore = true;
+      else addToast('Failed to load tools data', 'error');
     } finally {
       loading = false;
     }
@@ -439,70 +476,73 @@ import Server from 'lucide-svelte/icons/server';
 </script>
 
 <svelte:head>
-  <title>Tools & Skills - Cognis</title>
+  <title>{activeTab === 'hooks' ? 'Hooks · Tools' : 'Tools & Skills'} - Cognis</title>
 </svelte:head>
 
 <div class="max-w-6xl mx-auto px-4 py-6">
   <div class="flex items-center justify-between mb-6">
-    <h1 class="text-2xl font-bold text-zinc-100">Tools & Skills</h1>
+    <h1 class="text-2xl font-bold text-foreground">Tools & Skills</h1>
   </div>
 
-  <div class="flex gap-1 mb-6 border-b border-zinc-700 overflow-x-auto">
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'builtin' ? 'text-sky-400 border-b-2 border-sky-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'builtin'}>
+  <nav aria-label="Tool registries" class="flex gap-1 mb-6 border-b border-control-border overflow-x-auto">
+    <a href="/tools" aria-current={activeTab === 'builtin' ? 'page' : undefined} class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'builtin' ? 'text-accent border-b-2 border-accent' : 'text-muted hover:text-foreground'}">
       Native Tools ({staticTools.length})
-    </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'intaris_mcp' ? 'text-sky-400 border-b-2 border-sky-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'intaris_mcp'}>
+    </a>
+    <a href="/tools?tab=intaris_mcp" aria-current={activeTab === 'intaris_mcp' ? 'page' : undefined} class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'intaris_mcp' ? 'text-accent border-b-2 border-accent' : 'text-muted hover:text-foreground'}">
       Intaris MCP ({intarisMcpTools.length})
-    </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'executor_mcp' ? 'text-sky-400 border-b-2 border-sky-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'executor_mcp'}>
+    </a>
+    <a href="/tools?tab=executor_mcp" aria-current={activeTab === 'executor_mcp' ? 'page' : undefined} class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'executor_mcp' ? 'text-accent border-b-2 border-accent' : 'text-muted hover:text-foreground'}">
       Executor MCP ({observedLocalMcpTools.length})
-    </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'skills' ? 'text-sky-400 border-b-2 border-sky-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'skills'}>
+    </a>
+    <a href="/tools?tab=skills" aria-current={activeTab === 'skills' ? 'page' : undefined} class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'skills' ? 'text-accent border-b-2 border-accent' : 'text-muted hover:text-foreground'}">
       Skills ({skills.length})
-    </button>
-  </div>
+    </a>
+    <a href="/tools?tab=hooks" aria-current={activeTab === 'hooks' ? 'page' : undefined} class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'hooks' ? 'text-accent border-b-2 border-accent' : 'text-muted hover:text-foreground'}">Hooks</a>
+  </nav>
 
-  {#if loading}
-    <div class="text-zinc-400 text-center py-12">Loading...</div>
+  {#if activeTab === 'hooks'}
+    <HookRegistry />
+  {:else if loading}
+    <div class="text-muted text-center py-12">Loading...</div>
 
   {:else if activeTab === 'builtin'}
     <div class="space-y-4">
       {#if registryWarnings.some(w => w.includes('Static'))}
-        <div class="rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-2 text-sm text-sky-200">Native tool registry failed to load.</div>
+        <div class="rounded-lg border border-accent/30 bg-accent-subtle px-4 py-2 text-sm text-accent">Native tool registry failed to load.</div>
       {/if}
 
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
-          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search tools..." bind:value={builtinSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-sky-500" />
+          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-quiet" />
+          <input use:findTarget type="text" placeholder="Search tools..." bind:value={builtinSearch} class="w-full pl-10 pr-4 py-2 bg-raised border border-control-border rounded-lg text-sm text-foreground placeholder-quiet focus:outline-none focus:border-accent" />
         </div>
-        <select bind:value={builtinCategoryFilter} class="px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500">
+        <select bind:value={builtinCategoryFilter} class="px-3 py-2 bg-raised border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent">
           <option value="all">All categories</option>
           {#each orderedBuiltinCategories as cat}
             <option value={cat}>{getCategoryLabel(cat)}</option>
           {/each}
         </select>
-        <span class="text-sm text-zinc-500">{filteredBuiltinTools.length} tools</span>
+        <span class="text-sm text-quiet">{filteredBuiltinTools.length} tools</span>
         <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
           <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
         </Button>
       </div>
 
       {#each groupedBuiltinTools as group}
-        <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-          <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(group.category)}>
+        <div class="bg-raised/50 border border-control-border rounded-lg overflow-hidden">
+          <button class="w-full px-4 py-3 bg-raised border-b border-control-border flex items-center gap-2 text-left hover:bg-inset transition-colors" onclick={() => toggleGroup(group.category)}>
             {#if expandedGroups.has(group.category)}
-              <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+              <ChevronDown class="w-4 h-4 text-quiet shrink-0" />
             {:else}
-              <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+              <ChevronRight class="w-4 h-4 text-quiet shrink-0" />
             {/if}
-            <svelte:component this={getCategoryIcon(group.category)} class="w-4 h-4 text-zinc-400" />
-            <span class="text-sm font-medium text-zinc-200">{getCategoryLabel(group.category)}</span>
+            <svelte:component this={getCategoryIcon(group.category)} class="w-4 h-4 text-muted" />
+            <span class="text-sm font-medium text-foreground">{getCategoryLabel(group.category)}</span>
             <Badge>{group.tools.length}</Badge>
-            <span class="text-xs text-zinc-500 ml-auto">{formatSourceSummary(group.sourceTypes)}</span>
+            <span class="text-xs text-quiet ml-auto">{formatSourceSummary(group.sourceTypes)}</span>
           </button>
           {#if expandedGroups.has(group.category)}
-            <div class="divide-y divide-zinc-700/50">
+            <div class="divide-y divide-control-border/50">
               {#each group.tools as tool}
                 {@const toolKey = getToolKey(tool)}
                 {@render toolRow(tool, toolKey)}
@@ -513,28 +553,28 @@ import Server from 'lucide-svelte/icons/server';
       {/each}
 
       {#if filteredBuiltinTools.length === 0}
-        <div class="text-center py-12 text-zinc-500">No tools match your search.</div>
+        <div class="text-center py-12 text-quiet">No tools match your search.</div>
       {/if}
     </div>
 
   {:else if activeTab === 'intaris_mcp'}
     <div class="space-y-4">
       {#if registryWarnings.some(w => w.includes('Intaris'))}
-        <div class="rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-2 text-sm text-sky-200">Intaris MCP tools are unavailable right now.</div>
+        <div class="rounded-lg border border-accent/30 bg-accent-subtle px-4 py-2 text-sm text-accent">Intaris MCP tools are unavailable right now.</div>
       {/if}
 
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
-          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search Intaris MCP tools..." bind:value={intarisSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-sky-500" />
+          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-quiet" />
+          <input use:findTarget type="text" placeholder="Search Intaris MCP tools..." bind:value={intarisSearch} class="w-full pl-10 pr-4 py-2 bg-raised border border-control-border rounded-lg text-sm text-foreground placeholder-quiet focus:outline-none focus:border-accent" />
         </div>
-        <span class="text-sm text-zinc-500">{filteredIntarisTools.length} tools</span>
+        <span class="text-sm text-quiet">{filteredIntarisTools.length} tools</span>
         <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
           <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
         </Button>
         <div class="ml-auto">
           {#if intarisUrl}
-            <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-sky-400 hover:text-sky-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
+            <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-accent hover:text-accent-hover border border-control-border rounded-lg hover:border-control-border transition-colors">
               <ExternalLink class="w-3.5 h-3.5" />
               Configure in Intaris
             </a>
@@ -543,30 +583,30 @@ import Server from 'lucide-svelte/icons/server';
       </div>
 
       {#if intarisServerGroups.length === 0 && !intarisSearch}
-        <div class="text-center py-12 text-zinc-500">
+        <div class="text-center py-12 text-quiet">
           <Plug class="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p>No Intaris MCP servers configured.</p>
           {#if intarisUrl}
-            <p class="text-sm mt-1">Configure MCP servers in the <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="text-sky-400 hover:text-sky-300">Intaris web UI</a>.</p>
+            <p class="text-sm mt-1">Configure MCP servers in the <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="text-accent hover:text-accent-hover">Intaris web UI</a>.</p>
           {/if}
         </div>
       {:else}
         {#each intarisServerGroups as serverGroup}
           {@const groupKey = `intaris:${serverGroup.serverName}`}
-          <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-            <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(groupKey)}>
+          <div class="bg-raised/50 border border-control-border rounded-lg overflow-hidden">
+            <button class="w-full px-4 py-3 bg-raised border-b border-control-border flex items-center gap-2 text-left hover:bg-inset transition-colors" onclick={() => toggleGroup(groupKey)}>
               {#if expandedGroups.has(groupKey)}
-                <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+                <ChevronDown class="w-4 h-4 text-quiet shrink-0" />
               {:else}
-                <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+                <ChevronRight class="w-4 h-4 text-quiet shrink-0" />
               {/if}
-              <Plug class="w-4 h-4 text-zinc-400" />
-              <span class="text-sm font-medium text-zinc-200">{serverGroup.serverName}</span>
+              <Plug class="w-4 h-4 text-muted" />
+              <span class="text-sm font-medium text-foreground">{serverGroup.serverName}</span>
               <Badge>{serverGroup.tools.length}</Badge>
-              <span class="text-xs text-zinc-500 ml-auto">Intaris MCP</span>
+              <span class="text-xs text-quiet ml-auto">Intaris MCP</span>
             </button>
             {#if expandedGroups.has(groupKey)}
-              <div class="divide-y divide-zinc-700/50">
+              <div class="divide-y divide-control-border/50">
                 {#each serverGroup.tools as tool}
                   {@const toolKey = getToolKey(tool)}
                   {@render mcpToolRow(tool, toolKey)}
@@ -576,7 +616,7 @@ import Server from 'lucide-svelte/icons/server';
           </div>
         {/each}
         {#if filteredIntarisTools.length === 0 && intarisSearch}
-          <div class="text-center py-12 text-zinc-500">No Intaris MCP tools match your search.</div>
+          <div class="text-center py-12 text-quiet">No Intaris MCP tools match your search.</div>
         {/if}
       {/if}
     </div>
@@ -585,14 +625,14 @@ import Server from 'lucide-svelte/icons/server';
     <div class="space-y-4">
       {#if registryWarnings.some(w => w.includes('local MCP') || w.includes('MCP servers'))}
         {#each registryWarnings.filter(w => w.includes('local MCP') || w.includes('MCP servers')) as warning}
-          <div class="rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-2 text-sm text-sky-200">{warning}</div>
+          <div class="rounded-lg border border-accent/30 bg-accent-subtle px-4 py-2 text-sm text-accent">{warning}</div>
         {/each}
       {/if}
       {#if degradedExecutorConfigs.length > 0}
-        <div class="space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+        <div class="space-y-2 rounded-lg border border-accent/30 bg-accent-subtle px-4 py-3 text-sm text-accent">
           <div class="font-medium">{degradedExecutorConfigs.length} degraded executor(s) may affect executor-hosted tools or capabilities.</div>
           {#each degradedExecutorConfigs as exec}
-            <div class="text-xs text-sky-100/90">
+            <div class="text-xs text-accent/90">
               <span class="font-medium">{exec.name}</span>
               {#if executorRuntimeSummary(exec)}
                 <span> — {executorRuntimeSummary(exec)}</span>
@@ -611,15 +651,15 @@ import Server from 'lucide-svelte/icons/server';
 
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
-          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search executor MCP tools..." bind:value={executorMcpSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-sky-500" />
+          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-quiet" />
+          <input use:findTarget type="text" placeholder="Search executor MCP tools..." bind:value={executorMcpSearch} class="w-full pl-10 pr-4 py-2 bg-raised border border-control-border rounded-lg text-sm text-foreground placeholder-quiet focus:outline-none focus:border-accent" />
         </div>
-        <span class="text-sm text-zinc-500">{filteredExecutorMcpTools.length} tools</span>
+        <span class="text-sm text-quiet">{filteredExecutorMcpTools.length} tools</span>
         <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
           <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
         </Button>
         <div class="ml-auto">
-          <a href="/settings#tools" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-sky-400 hover:text-sky-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
+          <a href="/settings#tools" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-accent hover:text-accent-hover border border-control-border rounded-lg hover:border-control-border transition-colors">
             <Settings class="w-3.5 h-3.5" />
             Configure MCP Servers
           </a>
@@ -629,21 +669,21 @@ import Server from 'lucide-svelte/icons/server';
       {#if executorMcpServerGroups.length > 0}
         {#each executorMcpServerGroups as serverGroup}
           {@const groupKey = `executor:${serverGroup.serverName}`}
-          <div class="bg-zinc-800/50 border border-zinc-700 rounded-lg overflow-hidden">
-            <button class="w-full px-4 py-3 bg-zinc-800 border-b border-zinc-700 flex items-center gap-2 text-left hover:bg-zinc-750 transition-colors" onclick={() => toggleGroup(groupKey)}>
+          <div class="bg-raised/50 border border-control-border rounded-lg overflow-hidden">
+            <button class="w-full px-4 py-3 bg-raised border-b border-control-border flex items-center gap-2 text-left hover:bg-inset transition-colors" onclick={() => toggleGroup(groupKey)}>
               {#if expandedGroups.has(groupKey)}
-                <ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />
+                <ChevronDown class="w-4 h-4 text-quiet shrink-0" />
               {:else}
-                <ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />
+                <ChevronRight class="w-4 h-4 text-quiet shrink-0" />
               {/if}
-              <Plug class="w-4 h-4 text-zinc-400" />
-              <span class="text-sm font-medium text-zinc-200">{serverGroup.serverName}</span>
+              <Plug class="w-4 h-4 text-muted" />
+              <span class="text-sm font-medium text-foreground">{serverGroup.serverName}</span>
               <Badge>{serverGroup.tools.length}</Badge>
-              <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">cached</Badge>
-              <span class="text-xs text-zinc-500 ml-auto">Executor MCP</span>
+              <Badge class="border-accent/30 bg-accent-subtle text-accent">cached</Badge>
+              <span class="text-xs text-quiet ml-auto">Executor MCP</span>
             </button>
             {#if expandedGroups.has(groupKey)}
-              <div class="divide-y divide-zinc-700/50">
+              <div class="divide-y divide-control-border/50">
                 {#each serverGroup.tools as tool}
                   {@const toolKey = getToolKey(tool)}
                   {@render mcpToolRow(tool, toolKey)}
@@ -655,44 +695,44 @@ import Server from 'lucide-svelte/icons/server';
       {/if}
 
       {#if filteredExecutorMcpTools.length === 0 && executorMcpSearch}
-        <div class="text-center py-12 text-zinc-500">No executor MCP tools match your search.</div>
+        <div class="text-center py-12 text-quiet">No executor MCP tools match your search.</div>
       {/if}
 
       {#if mcpServerConfigs.length > 0}
-        <div class="space-y-3 {executorMcpServerGroups.length > 0 ? 'mt-6 pt-6 border-t border-zinc-700' : ''}">
+        <div class="space-y-3 {executorMcpServerGroups.length > 0 ? 'mt-6 pt-6 border-t border-control-border' : ''}">
           <div>
-            <h2 class="text-lg font-medium text-zinc-100">Configured MCP Servers</h2>
-            <p class="text-sm text-zinc-400">Server definitions managed in Settings. Tools above are cached from executor inventory.</p>
+            <h2 class="text-lg font-medium text-foreground">Configured MCP Servers</h2>
+            <p class="text-sm text-muted">Server definitions managed in Settings. Tools above are cached from executor inventory.</p>
           </div>
           <div class="grid gap-3 md:grid-cols-2">
             {#each mcpServerConfigs as server}
-              <div class="rounded-lg border border-zinc-700 bg-zinc-800/50 p-4 space-y-2">
+              <div class="rounded-lg border border-control-border bg-raised/50 p-4 space-y-2">
                 <div class="flex items-center gap-2">
-                  <span class="font-medium text-zinc-100">{server.name}</span>
+                  <span class="font-medium text-foreground">{server.name}</span>
                   <Badge>{server.transport}</Badge>
-                  <Badge class={server.status === 'active' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-zinc-700 bg-zinc-800 text-zinc-400'}>{server.status}</Badge>
+                  <Badge class={server.status === 'active' ? 'border-success-border bg-success-subtle text-success' : 'border-control-border bg-raised text-muted'}>{server.status}</Badge>
                 </div>
                 {#if server.description}
-                  <p class="text-sm text-zinc-400">{server.description}</p>
+                  <p class="text-sm text-muted">{server.description}</p>
                 {/if}
-                <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
+                <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-quiet">
                   {#if server.command}
-                    <span>Command: <span class="font-mono text-zinc-400">{formatMcpCommand(server.command, server.args)}</span></span>
+                    <span>Command: <span class="font-mono text-muted">{formatMcpCommand(server.command, server.args)}</span></span>
                   {/if}
                   {#if server.url}
-                    <span>URL: <span class="text-zinc-400">{server.url}</span></span>
+                    <span>URL: <span class="text-muted">{server.url}</span></span>
                   {/if}
-                  <span>Timeout: <span class="text-zinc-400">{server.timeout_seconds}s</span></span>
+                  <span>Timeout: <span class="text-muted">{server.timeout_seconds}s</span></span>
                 </div>
               </div>
             {/each}
           </div>
         </div>
       {:else if executorMcpServerGroups.length === 0 && !executorMcpSearch}
-        <div class="text-center py-12 text-zinc-500">
+        <div class="text-center py-12 text-quiet">
           <Plug class="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p>No MCP servers configured.</p>
-          <p class="text-sm mt-1">Add MCP servers in <a href="/settings#tools" class="text-sky-400 hover:text-sky-300">Settings</a> and assign them to executors.</p>
+          <p class="text-sm mt-1">Add MCP servers in <a href="/settings#tools" class="text-accent hover:text-accent-hover">Settings</a> and assign them to executors.</p>
         </div>
       {/if}
     </div>
@@ -700,7 +740,7 @@ import Server from 'lucide-svelte/icons/server';
   {:else}
     <div class="space-y-4">
       <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <p class="text-sm text-zinc-400">Skills are versioned instruction, tool, and asset bundles stored in Cognis and staged to executors only when needed.</p>
+        <p class="text-sm text-muted">Skills are versioned instruction, tool, and asset bundles stored in Cognis and staged to executors only when needed.</p>
         <div class="flex flex-wrap gap-2">
           <Button variant="ghost" size="sm" onclick={openImportForm}><Import class="w-4 h-4 mr-1" /> Import</Button>
           <Button variant="primary" size="sm" onclick={() => openSkillSheet(null, 'create')}><Plus class="w-4 h-4 mr-1" /> New Skill</Button>
@@ -709,46 +749,46 @@ import Server from 'lucide-svelte/icons/server';
 
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
-          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search skills..." bind:value={skillsSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-sky-500" />
+          <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-quiet" />
+          <input use:findTarget type="text" placeholder="Search skills..." bind:value={skillsSearch} class="w-full pl-10 pr-4 py-2 bg-raised border border-control-border rounded-lg text-sm text-foreground placeholder-quiet focus:outline-none focus:border-accent" />
         </div>
-        <span class="text-sm text-zinc-500">{filteredSkills.length} skills</span>
+        <span class="text-sm text-quiet">{filteredSkills.length} skills</span>
       </div>
 
       {#if showImportForm}
-        <div class="bg-zinc-800 border border-zinc-700 rounded-lg p-4 space-y-4">
-          <h3 class="text-lg font-medium text-zinc-100">Import Skill</h3>
+        <div class="bg-raised border border-control-border rounded-lg p-4 space-y-4">
+          <h3 class="text-lg font-medium text-foreground">Import Skill</h3>
           <div class="flex flex-wrap gap-2">
             <Button size="sm" variant={importMode === 'url' ? 'primary' : 'secondary'} onclick={() => importMode = 'url'}>URL</Button>
             <Button size="sm" variant={importMode === 'content' ? 'primary' : 'secondary'} onclick={() => importMode = 'content'}>Paste content</Button>
             <Button size="sm" variant={importMode === 'package' ? 'primary' : 'secondary'} onclick={() => importMode = 'package'}>Package</Button>
           </div>
           {#if importMode === 'url'}
-            <p class="text-sm text-zinc-400">Import a SKILL.md file or GitHub skill URL. Cognis will best-effort parse upstream/community formats.</p>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>URL</span><input type="url" bind:value={importForm.url} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500" placeholder="https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md" /></label>
+            <p class="text-sm text-muted">Import a SKILL.md file or GitHub skill URL. Cognis will best-effort parse upstream/community formats.</p>
+            <label class="block text-sm text-muted space-y-1"><span>URL</span><input type="url" bind:value={importForm.url} class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent" placeholder="https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md" /></label>
           {:else if importMode === 'content'}
-            <p class="text-sm text-zinc-400">Paste SKILL.md or Cognis YAML content directly.</p>
-            <label class="block text-sm text-zinc-400 space-y-1">
+            <p class="text-sm text-muted">Paste SKILL.md or Cognis YAML content directly.</p>
+            <label class="block text-sm text-muted space-y-1">
               <span>Format (optional)</span>
-              <select bind:value={importForm.contentFormat} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500">
+              <select bind:value={importForm.contentFormat} class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent">
                 <option value="">Auto-detect</option>
                 <option value="skill_md">SKILL.md</option>
                 <option value="cognis_yaml">Cognis YAML</option>
               </select>
             </label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Content</span><textarea bind:value={importForm.content} rows="12" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-sky-500" placeholder="---&#10;name: my-skill&#10;---&#10;&#10;Instructions..."></textarea></label>
+            <label class="block text-sm text-muted space-y-1"><span>Content</span><textarea bind:value={importForm.content} rows="12" class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground font-mono focus:outline-none focus:border-accent" placeholder="---&#10;name: my-skill&#10;---&#10;&#10;Instructions..."></textarea></label>
           {:else}
-            <p class="text-sm text-zinc-400">Upload a full Cognis package to import instructions together with assets.</p>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Package file</span><input type="file" accept=".zip,application/zip" onchange={loadPackageFile} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500" /></label>
+            <p class="text-sm text-muted">Upload a full Cognis package to import instructions together with assets.</p>
+            <label class="block text-sm text-muted space-y-1"><span>Package file</span><input type="file" accept=".zip,application/zip" onchange={loadPackageFile} class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent" /></label>
             {#if importForm.packageName}
-              <p class="text-xs text-zinc-500">Loaded {importForm.packageName}</p>
+              <p class="text-xs text-quiet">Loaded {importForm.packageName}</p>
             {/if}
           {/if}
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Name override (optional)</span><input type="text" bind:value={importForm.name} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500" placeholder="Leave empty to use imported name" /></label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={importForm.tags} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-sky-500" placeholder="e.g. imported, claude" /></label>
+            <label class="block text-sm text-muted space-y-1"><span>Name override (optional)</span><input type="text" bind:value={importForm.name} class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent" placeholder="Leave empty to use imported name" /></label>
+            <label class="block text-sm text-muted space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={importForm.tags} class="w-full px-3 py-2 bg-surface border border-control-border rounded-lg text-sm text-foreground focus:outline-none focus:border-accent" placeholder="e.g. imported, claude" /></label>
           </div>
-          <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-zinc-600" /> Attach to all agents</label>
+          <label class="flex items-center gap-2 text-sm text-muted"><input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-control-border" /> Attach to all agents</label>
           <div class="flex gap-2 justify-end">
             <Button variant="ghost" size="sm" onclick={() => showImportForm = false}>Cancel</Button>
             <Button variant="primary" size="sm" onclick={importSkill}>Import</Button>
@@ -757,7 +797,7 @@ import Server from 'lucide-svelte/icons/server';
       {/if}
 
       {#if filteredSkills.length === 0}
-        <div class="text-center py-12 text-zinc-500">
+        <div class="text-center py-12 text-quiet">
           <BookOpen class="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p>{skillsSearch ? 'No skills match your search.' : 'No skills defined yet.'}</p>
           <p class="text-sm mt-1">{skillsSearch ? 'Try a different search term.' : 'Create a skill to bundle instructions and tools for your agents.'}</p>
@@ -765,34 +805,34 @@ import Server from 'lucide-svelte/icons/server';
       {:else}
         <div class="space-y-2">
           {#each filteredSkills as skill}
-            <button class="w-full rounded-lg border border-zinc-700 bg-zinc-800/50 p-4 text-left transition-colors hover:border-zinc-600 hover:bg-zinc-800/70" onclick={() => openSkillSheet(skill, 'view')}>
+            <RegistryCard onclick={() => openSkillSheet(skill, 'view')}>
               <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                 <div class="flex-1 min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
-                    <BookOpen class="w-4 h-4 text-zinc-400" />
-                    <span class="font-medium text-zinc-100">{skill.name}</span>
+                    <BookOpen class="w-4 h-4 text-muted" />
+                    <span class="font-medium text-foreground">{skill.name}</span>
                     <Badge>{skill.source}</Badge>
-                    {#if skill.is_system}<Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">system</Badge>{/if}
-                    {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">attached to all agents</Badge>{/if}
-                    {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>{/if}
-                    {#if skill.current_version?.decomposition_stale}<Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">stale</Badge>{/if}
+                    {#if skill.is_system}<Badge class="border-accent/30 bg-accent-subtle text-accent">system</Badge>{/if}
+                    {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-accent/30 bg-accent-subtle text-accent">attached to all agents</Badge>{/if}
+                    {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-success-border bg-success-subtle text-success">workflow</Badge>{/if}
+                    {#if skill.current_version?.decomposition_stale}<Badge class="border-accent/30 bg-accent-subtle text-accent">stale</Badge>{/if}
                   </div>
-                  {#if skill.description}<p class="mt-1 text-sm text-zinc-400">{skill.description}</p>{/if}
+                  {#if skill.description}<p class="mt-1 text-sm text-muted">{skill.description}</p>{/if}
                   {#if skill.tags && skill.tags.length > 0}<div class="mt-2 flex flex-wrap gap-1">{#each skill.tags as tag}<Badge>{tag}</Badge>{/each}</div>{/if}
                 </div>
-                <div class="text-xs text-zinc-500">Open details</div>
+                <div class="text-xs text-quiet">Open details</div>
               </div>
               {#if skill.current_version}
-                <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-500">
-                  <span>Version: <span class="text-zinc-400">v{skill.current_version.version_number}</span></span>
-                  <span>Hash: <span class="font-mono text-zinc-400">{skill.current_version.content_hash.slice(0, 8)}</span></span>
-                  {#if skill.current_version.tools && skill.current_version.tools.length > 0}<span>Tools: <span class="text-zinc-400">{skill.current_version.tools.length}</span></span>{/if}
-                  {#if skill.current_version.steps && skill.current_version.steps.length > 0}<span>Workflow steps: <span class="text-zinc-400">{skill.current_version.steps.length}</span></span>{/if}
-                  {#if skill.current_version.asset_manifest && skill.current_version.asset_manifest.length > 0}<span>Assets: <span class="text-zinc-400">{skill.current_version.asset_manifest.length}</span></span>{/if}
-                  {#if skill.current_version.secret_placeholders && skill.current_version.secret_placeholders.length > 0}<span>Secrets: <span class="text-zinc-400">{skill.current_version.secret_placeholders.length}</span></span>{/if}
+                <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-quiet">
+                  <span>Version: <span class="text-muted">v{skill.current_version.version_number}</span></span>
+                  <span>Hash: <span class="font-mono text-muted">{skill.current_version.content_hash.slice(0, 8)}</span></span>
+                  {#if skill.current_version.tools && skill.current_version.tools.length > 0}<span>Tools: <span class="text-muted">{skill.current_version.tools.length}</span></span>{/if}
+                  {#if skill.current_version.steps && skill.current_version.steps.length > 0}<span>Workflow steps: <span class="text-muted">{skill.current_version.steps.length}</span></span>{/if}
+                  {#if skill.current_version.asset_manifest && skill.current_version.asset_manifest.length > 0}<span>Assets: <span class="text-muted">{skill.current_version.asset_manifest.length}</span></span>{/if}
+                  {#if skill.current_version.secret_placeholders && skill.current_version.secret_placeholders.length > 0}<span>Secrets: <span class="text-muted">{skill.current_version.secret_placeholders.length}</span></span>{/if}
                 </div>
               {/if}
-            </button>
+            </RegistryCard>
           {/each}
         </div>
       {/if}
@@ -822,27 +862,27 @@ import Server from 'lucide-svelte/icons/server';
 {#snippet toolRow(tool: ToolDefinitionSummary, toolKey: string)}
   <div class="px-4 py-3">
     <button class="w-full flex items-center gap-3 text-left" onclick={() => toggleTool(toolKey)}>
-      {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />{/if}
-      <span class="font-mono text-sm text-zinc-100">{tool.name}</span>
-      <Badge class={getSourceType(tool) === 'executor' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-sky-500/30 bg-sky-500/10 text-sky-300'}>
+      {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-quiet shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-quiet shrink-0" />{/if}
+      <span class="font-mono text-sm text-foreground">{tool.name}</span>
+      <Badge class={getSourceType(tool) === 'executor' ? 'border-success-border bg-success-subtle text-success' : 'border-accent/30 bg-accent-subtle text-accent'}>
         {getSourceLabel(getSourceType(tool))}
       </Badge>
       {#if tool.configurable === false}
-        <Badge class="border-purple-500/30 bg-purple-500/10 text-purple-300">core</Badge>
+        <Badge class="border-purple-border bg-purple-subtle text-purple-tone">core</Badge>
       {/if}
       {#if toolAliases(tool).length > 0}
-        <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">aliases: {toolAliases(tool).length}</Badge>
+        <Badge class="border-control-border bg-raised text-secondary">aliases: {toolAliases(tool).length}</Badge>
       {/if}
-      <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
+      <span class="text-sm text-muted truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}
         {#if classificationPending(tool)}
-          <span class="inline-flex items-center gap-1 text-xs text-sky-300" title="Classification is being refined in the background.">
+          <span class="inline-flex items-center gap-1 text-xs text-accent" title="Classification is being refined in the background.">
             <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
             <span>classification pending</span>
           </span>
         {/if}
-        {#if tool.non_bypassable}<span title="Non-bypassable (always evaluated by guardrails)"><ShieldCheck class="w-4 h-4 text-sky-400" /></span>{/if}
+        {#if tool.non_bypassable}<span title="Non-bypassable (always evaluated by guardrails)"><ShieldCheck class="w-4 h-4 text-accent" /></span>{/if}
       </div>
     </button>
     {#if expandedTools.has(toolKey)}
@@ -854,18 +894,18 @@ import Server from 'lucide-svelte/icons/server';
 {#snippet mcpToolRow(tool: ToolDefinitionSummary, toolKey: string)}
   <div class="px-4 py-3">
     <button class="w-full flex items-center gap-3 text-left" onclick={() => toggleTool(toolKey)}>
-      {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />{/if}
-      <span class="font-mono text-sm text-zinc-100">{tool.source.raw_tool_name || tool.name}</span>
-      <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
+      {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-quiet shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-quiet shrink-0" />{/if}
+      <span class="font-mono text-sm text-foreground">{tool.source.raw_tool_name || tool.name}</span>
+      <span class="text-sm text-muted truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}
         {#if classificationPending(tool)}
-          <span class="inline-flex items-center gap-1 text-xs text-sky-300" title="Classification is being refined in the background.">
+          <span class="inline-flex items-center gap-1 text-xs text-accent" title="Classification is being refined in the background.">
             <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
             <span>classification pending</span>
           </span>
         {/if}
-        {#if tool.non_bypassable}<span title="Non-bypassable"><ShieldCheck class="w-4 h-4 text-sky-400" /></span>{/if}
+        {#if tool.non_bypassable}<span title="Non-bypassable"><ShieldCheck class="w-4 h-4 text-accent" /></span>{/if}
       </div>
     </button>
     {#if expandedTools.has(toolKey)}
@@ -875,38 +915,38 @@ import Server from 'lucide-svelte/icons/server';
 {/snippet}
 
 {#snippet toolDetail(tool: ToolDefinitionSummary)}
-  <div class="mt-2 ml-11 p-3 bg-zinc-900/50 rounded-lg text-sm space-y-3">
-    <p class="text-zinc-300">{tool.description}</p>
+  <div class="mt-2 ml-11 p-3 bg-surface/50 rounded-lg text-sm space-y-3">
+    <p class="text-secondary">{tool.description}</p>
     <div class="flex flex-wrap items-center gap-2">
       <Badge>{tool.profile_group || 'development'}</Badge>
       {#each tool.capabilities || [] as capability}
-        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{capability}</Badge>
+        <Badge class="border-accent/30 bg-accent-subtle text-accent">{capability}</Badge>
       {/each}
-      <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{tool.classification_source || 'heuristic'}</Badge>
+      <Badge class="border-control-border bg-raised text-secondary">{tool.classification_source || 'heuristic'}</Badge>
       {#if tool.configurable === false}
-        <Badge class="border-purple-500/30 bg-purple-500/10 text-purple-300">core / not assignable</Badge>
+        <Badge class="border-purple-border bg-purple-subtle text-purple-tone">core / not assignable</Badge>
       {/if}
       {#if tool.classification_confidence != null}
-        <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{Math.round(tool.classification_confidence * 100)}%</Badge>
+        <Badge class="border-control-border bg-raised text-secondary">{Math.round(tool.classification_confidence * 100)}%</Badge>
       {/if}
       {#if classificationPending(tool)}
-        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">pending refinement</Badge>
+        <Badge class="border-accent/30 bg-accent-subtle text-accent">pending refinement</Badge>
       {/if}
     </div>
     {#if toolAliases(tool).length > 0 || toolSurfaces(tool).length > 0}
-      <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
-        <span class="text-zinc-500 text-xs uppercase tracking-wider">Names and aliases</span>
+      <div class="rounded-lg border border-separator bg-canvas/40 p-3">
+        <span class="text-quiet text-xs uppercase tracking-wider">Names and aliases</span>
         <div class="mt-2 flex flex-wrap gap-2 text-xs">
-          <span class="rounded bg-zinc-800 px-2 py-1 font-mono text-zinc-200">canonical: {tool.canonical_name || tool.name}</span>
+          <span class="rounded bg-raised px-2 py-1 font-mono text-foreground">canonical: {tool.canonical_name || tool.name}</span>
           {#if tool.primary_name}
-            <span class="rounded bg-zinc-800 px-2 py-1 font-mono text-zinc-300">primary: {tool.primary_name}</span>
+            <span class="rounded bg-raised px-2 py-1 font-mono text-secondary">primary: {tool.primary_name}</span>
           {/if}
           {#each toolAliases(tool) as alias}
             {@const name = aliasName(alias)}
             {@const surface = aliasSurface(alias)}
             {#if name}
-              <span class="rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 font-mono text-sky-200">
-                alias: {name}{#if surface}<span class="ml-1 font-sans text-sky-300/80">({surface})</span>{/if}
+              <span class="rounded border border-accent/30 bg-accent-subtle px-2 py-1 font-mono text-accent">
+                alias: {name}{#if surface}<span class="ml-1 font-sans text-accent/80">({surface})</span>{/if}
               </span>
             {/if}
           {/each}
@@ -914,8 +954,8 @@ import Server from 'lucide-svelte/icons/server';
         {#if toolSurfaces(tool).length > 0}
           <div class="mt-2 flex flex-wrap gap-2 text-xs">
             {#each toolSurfaces(tool) as [surface, name]}
-              <span class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-300">
-                <span class="text-zinc-500">{surface}:</span> <span class="font-mono">{name}</span>
+              <span class="rounded border border-control-border bg-surface px-2 py-1 text-secondary">
+                <span class="text-quiet">{surface}:</span> <span class="font-mono">{name}</span>
               </span>
             {/each}
           </div>
@@ -924,35 +964,35 @@ import Server from 'lucide-svelte/icons/server';
     {/if}
     {#if tool.parameters?.properties && Object.keys(tool.parameters.properties).length > 0}
       <div>
-        <span class="text-zinc-500 text-xs uppercase tracking-wider">Parameters</span>
+        <span class="text-quiet text-xs uppercase tracking-wider">Parameters</span>
         <!-- Mobile: stacked card per parameter. Desktop: 3-column table. -->
         <div class="mt-1.5 md:hidden space-y-2">
           {#each Object.entries(tool.parameters.properties) as [paramName, param]}
             {@const isRequired = (tool.parameters.required || []).includes(paramName)}
-            <div class="rounded-lg border border-zinc-700/50 bg-zinc-900/60 p-3">
+            <div class="rounded-lg border border-control-border/50 bg-surface/60 p-3">
               <div class="flex items-start justify-between gap-3">
-                <span class="font-mono text-sm text-zinc-100 break-all">{paramName}{#if isRequired}<span class="text-red-400 ml-0.5">*</span>{/if}</span>
-                <span class="shrink-0 font-mono text-xs text-zinc-400">{param.type || 'any'}</span>
+                <span class="font-mono text-sm text-foreground break-all">{paramName}{#if isRequired}<span class="text-danger ml-0.5">*</span>{/if}</span>
+                <span class="shrink-0 font-mono text-xs text-muted">{param.type || 'any'}</span>
               </div>
               {#if param.enum}
-                <p class="mt-1 text-xs text-zinc-500">({param.enum.join(' | ')})</p>
+                <p class="mt-1 text-xs text-quiet">({param.enum.join(' | ')})</p>
               {/if}
               {#if param.description}
-                <p class="mt-2 text-xs text-zinc-400">{param.description}</p>
+                <p class="mt-2 text-xs text-muted">{param.description}</p>
               {/if}
             </div>
           {/each}
         </div>
-        <div class="mt-1.5 hidden rounded-lg border border-zinc-700/50 md:block overflow-x-auto">
+        <div class="mt-1.5 hidden rounded-lg border border-control-border/50 md:block overflow-x-auto">
           <table class="w-full text-sm">
-            <thead><tr class="bg-zinc-800/50"><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Name</th><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Type</th><th class="text-left px-3 py-1.5 text-zinc-400 font-medium">Description</th></tr></thead>
-            <tbody class="divide-y divide-zinc-700/30">
+            <thead><tr class="bg-raised/50"><th class="text-left px-3 py-1.5 text-muted font-medium">Name</th><th class="text-left px-3 py-1.5 text-muted font-medium">Type</th><th class="text-left px-3 py-1.5 text-muted font-medium">Description</th></tr></thead>
+            <tbody class="divide-y divide-control-border/30">
               {#each Object.entries(tool.parameters.properties) as [paramName, param]}
                 {@const isRequired = (tool.parameters.required || []).includes(paramName)}
                 <tr>
-                  <td class="px-3 py-1.5"><span class="font-mono text-zinc-100">{paramName}</span>{#if isRequired}<span class="text-red-400 ml-0.5">*</span>{/if}</td>
-                  <td class="px-3 py-1.5 text-zinc-400 font-mono">{param.type || 'any'}{#if param.enum}<span class="text-zinc-500"> ({param.enum.join(' | ')})</span>{/if}</td>
-                  <td class="px-3 py-1.5 text-zinc-400">{param.description || ''}</td>
+                  <td class="px-3 py-1.5"><span class="font-mono text-foreground">{paramName}</span>{#if isRequired}<span class="text-danger ml-0.5">*</span>{/if}</td>
+                  <td class="px-3 py-1.5 text-muted font-mono">{param.type || 'any'}{#if param.enum}<span class="text-quiet"> ({param.enum.join(' | ')})</span>{/if}</td>
+                  <td class="px-3 py-1.5 text-muted">{param.description || ''}</td>
                 </tr>
               {/each}
             </tbody>
@@ -962,31 +1002,31 @@ import Server from 'lucide-svelte/icons/server';
     {/if}
     {#if getSourceType(tool) === 'executor' && executors.length > 0}
       <div class="flex flex-wrap gap-1.5 items-center">
-        <span class="text-xs text-zinc-500">Enabled on:</span>
+        <span class="text-xs text-quiet">Enabled on:</span>
         {#each executors as exec}
           {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
           {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
           {#if enabledByGroup || enabledByName}
-            <span class="px-2 py-0.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs rounded">{exec.name}</span>
+            <span class="px-2 py-0.5 bg-success-subtle border border-success-border text-success text-xs rounded">{exec.name}</span>
           {:else}
-            <span class="px-2 py-0.5 bg-zinc-800 border border-zinc-700 text-zinc-500 text-xs rounded line-through">{exec.name}</span>
+            <span class="px-2 py-0.5 bg-raised border border-control-border text-quiet text-xs rounded line-through">{exec.name}</span>
           {/if}
         {/each}
       </div>
     {/if}
-    <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-zinc-500">
-      <span>Source: <span class="text-zinc-400">{getSourceLabel(getSourceType(tool))}</span></span>
-      <span>Group: <span class="text-zinc-400">{tool.profile_group || 'development'}</span></span>
-      <span>Timeout: <span class="text-zinc-400">{tool.timeout_seconds}s</span></span>
-      <span>Classification: <span class="text-zinc-400">{tool.classification_status || 'ready'}</span></span>
-      <span>Raw category: <span class="text-zinc-400">{tool.category}</span></span>
-      {#if tool.source.server_name}<span>Server: <span class="text-zinc-400">{tool.source.server_name}</span></span>{/if}
-      {#if !tool.read_only}<span>Non-bypassable: <span class="text-zinc-400">{tool.non_bypassable ? 'Yes' : 'No'}</span></span>{/if}
+    <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-quiet">
+      <span>Source: <span class="text-muted">{getSourceLabel(getSourceType(tool))}</span></span>
+      <span>Group: <span class="text-muted">{tool.profile_group || 'development'}</span></span>
+      <span>Timeout: <span class="text-muted">{tool.timeout_seconds}s</span></span>
+      <span>Classification: <span class="text-muted">{tool.classification_status || 'ready'}</span></span>
+      <span>Raw category: <span class="text-muted">{tool.category}</span></span>
+      {#if tool.source.server_name}<span>Server: <span class="text-muted">{tool.source.server_name}</span></span>{/if}
+      {#if !tool.read_only}<span>Non-bypassable: <span class="text-muted">{tool.non_bypassable ? 'Yes' : 'No'}</span></span>{/if}
     </div>
     {#if classificationManageable(tool)}
       {@const overrideKey = getToolKey(tool)}
       {@const draft = overrideDraft(tool)}
-      <div class="space-y-3 rounded-lg border border-zinc-700/50 bg-zinc-950/60 p-3">
+      <div class="space-y-3 rounded-lg border border-control-border/50 bg-canvas/60 p-3">
         <div class="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:' + tool.tool_id)} onclick={() => void rerunToolClassification(tool)}>
             <RotateCcw class="w-4 h-4 mr-1" /> Re-run classification
@@ -998,10 +1038,10 @@ import Server from 'lucide-svelte/icons/server';
           {/if}
         </div>
         <div class="grid gap-3 md:grid-cols-2">
-          <label class="space-y-1 text-xs text-zinc-400">
+          <label class="space-y-1 text-xs text-muted">
             <span>Override group</span>
             <select
-              class="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100"
+              class="w-full rounded-lg border border-control-border bg-surface px-3 py-2 text-sm text-foreground"
               value={draft.profile_group}
               onchange={(event) => {
                 ensureOverrideEditor(tool);
@@ -1016,9 +1056,9 @@ import Server from 'lucide-svelte/icons/server';
               {/each}
             </select>
           </label>
-          <div class="space-y-1 text-xs text-zinc-400">
+          <div class="space-y-1 text-xs text-muted">
             <span>Override capabilities</span>
-            <div class="flex flex-wrap gap-3 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100">
+            <div class="flex flex-wrap gap-3 rounded-lg border border-control-border bg-surface px-3 py-2 text-sm text-foreground">
               {#each STEP_PROFILE_CAPABILITIES as capability}
                 <label class="inline-flex items-center gap-2">
                   <input type="checkbox" checked={draft.capabilities.includes(capability)} onchange={() => toggleOverrideCapability(tool, capability)} />

@@ -34,12 +34,18 @@ thinking  — emit a thinking block (may be incomplete, triggering streaming)
 text      — emit text chunks (streaming assistant message)
 tool_call — emit a tool call (triggers phase bump)
 tool_result — emit a tool result (for the previous tool_call)
+
+Tool-call argument strings may reference an earlier tool result in the same
+conversation with ``{{tool_result:<call_id>:<key>}}``. The placeholder is
+replaced by the first JSON string value of ``key`` in that tool result, which
+lets a scenario reuse server-generated IDs such as a ``dlv_`` deliverable ID.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -190,11 +196,47 @@ def _turn_ends_with_tool_call(turn: dict[str, Any]) -> bool:
     return bool(steps[-1].get("type") == "tool_call")
 
 
+_TOOL_RESULT_PLACEHOLDER = re.compile(r"\{\{tool_result:([^:}]+):([^}]+)\}\}")
+
+
+def _tool_result_text(messages: list[dict[str, Any]], call_id: str) -> str:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return ""
+
+
+def resolve_argument_placeholders(value: Any, messages: list[dict[str, Any]]) -> Any:
+    """Replace ``{{tool_result:<call_id>:<key>}}`` placeholders in tool arguments."""
+
+    if isinstance(value, dict):
+        return {key: resolve_argument_placeholders(item, messages) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_argument_placeholders(item, messages) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def substitute(match: re.Match[str]) -> str:
+        text = _tool_result_text(messages, match.group(1))
+        # Tolerate tool results that arrive JSON-escaped inside a wrapper.
+        key = re.escape(match.group(2))
+        found = re.search(rf'\\*"{key}\\*"\s*:\s*\\*"([^"\\]+)', text)
+        return found.group(1) if found else match.group(0)
+
+    return _TOOL_RESULT_PLACEHOLDER.sub(substitute, value)
+
+
 def render_chat_completion_stream(
     scenario: dict[str, Any],
     model: str = "mock-model",
     request_id: str = "chatcmpl-mock",
     turn_index: int = 0,
+    messages: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Convert a scenario into a list of SSE data lines for chat completions.
 
@@ -288,7 +330,7 @@ def render_chat_completion_stream(
         elif step_type == "tool_call":
             call_id = step.get("call_id", "call_mock")
             name = step.get("name", "unknown")
-            arguments = step.get("arguments", {})
+            arguments = resolve_argument_placeholders(step.get("arguments", {}), messages or [])
             delta = {
                 "id": request_id,
                 "object": "chat.completion.chunk",

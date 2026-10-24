@@ -1920,6 +1920,8 @@ def test_failed_task_preserves_approved_rich_step_deliverable(
 
 
 def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_path: Path) -> None:
+    from cognis.store.models import NotificationRow, Task
+
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
@@ -1945,6 +1947,27 @@ def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_p
                     agent_id="agent-1",
                     title="Paused task",
                     status="paused",
+                    workflow_state={
+                        "status": "paused",
+                        "pending_pause_type": "gate",
+                        "pending_pause_payload": {
+                            "pause_id": "gate_1",
+                            "step_name": "review",
+                            "options": [{"label": "Continue", "action": "continue"}],
+                        },
+                    },
+                )
+                session.add(
+                    NotificationRow(
+                        notification_id="gate_1",
+                        notification_type="gate",
+                        user_email="user@example.com",
+                        conversation_id="gate-review",
+                        task_id=task.task_id,
+                        status="pending",
+                        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                        payload={"options": [{"label": "Continue", "action": "continue"}]},
+                    )
                 )
                 await session.commit()
                 return task.task_id
@@ -1964,12 +1987,21 @@ def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_p
         first = client.post(
             f"/api/v1/tasks/{task_id}/gate-response",
             headers=_auth_headers(app, email="user@example.com"),
-            json={"step_name": "review", "action": "continue"},
+            json={"pause_id": "gate_1", "step_name": "review", "action": "continue"},
         )
+
+        async def _consume():
+            async with app.state.session_factory() as session:
+                row = await session.get(Task, task_id)
+                row.status = "running"
+                row.workflow_state = {"status": "running", "current_step_index": 1}
+                await session.commit()
+
+        asyncio.run(_consume())
         second = client.post(
             f"/api/v1/tasks/{task_id}/gate-response",
             headers=_auth_headers(app, email="user@example.com"),
-            json={"step_name": "review", "action": "continue"},
+            json={"pause_id": "gate_1", "step_name": "review", "action": "continue"},
         )
         assert first.status_code == 200
         assert second.status_code == 409
@@ -2506,6 +2538,10 @@ def test_websocket_direct_chat_step_response_resolves_notification(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
+        app.state.providers.guardrails.record_events = AsyncMock(
+            return_value=SimpleNamespace(ok=True)
+        )
+        app.state.providers.guardrails.report_reasoning = AsyncMock()
 
         async def _seed() -> tuple[str, str]:
             async with app.state.session_factory() as session:
@@ -2620,6 +2656,17 @@ def test_websocket_direct_chat_step_response_resolves_notification(
         )
         assert manager.errors[-1]["code"] == "conflict"
 
+        answer_record = app.state.providers.guardrails.record_events.await_args_list[0]
+        assert answer_record.kwargs["idempotency_key"] == (
+            f"{session_id}:question_answer:{notification.notification_id}"
+        )
+        assert answer_record.kwargs["events"][1].data["intention_eligible"] is True
+        app.state.providers.guardrails.report_reasoning.assert_awaited_once_with(
+            session_id=session_id,
+            from_events=True,
+            wait_for_intention=True,
+            wait_timeout_ms=10000,
+        )
         resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
         assert resolved is not None
         assert resolved.status == "resolved"
@@ -2634,6 +2681,7 @@ def test_websocket_direct_chat_step_response_resolves_notification(
             ],
             "mode": "structured",
             "state": "resolved",
+            "human_answer": True,
         }
 
 
@@ -2795,6 +2843,10 @@ def test_websocket_direct_chat_step_response_uses_persisted_questions_without_lo
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
+        app.state.providers.guardrails.record_events = AsyncMock(
+            return_value=SimpleNamespace(ok=True)
+        )
+        app.state.providers.guardrails.report_reasoning = AsyncMock()
 
         async def _seed() -> tuple[str, str]:
             async with app.state.session_factory() as session:
@@ -2891,6 +2943,14 @@ def test_websocket_direct_chat_step_response_uses_persisted_questions_without_lo
         resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
         assert resolved is not None
         assert resolved.status == "resolved"
+        answer_record = app.state.providers.guardrails.record_events.await_args_list[0]
+        assert answer_record.kwargs["events"][1].data["intention_eligible"] is True
+        app.state.providers.guardrails.report_reasoning.assert_awaited_once_with(
+            session_id=session_id,
+            from_events=True,
+            wait_for_intention=True,
+            wait_timeout_ms=10000,
+        )
 
 
 def test_websocket_step_response_rejects_mismatched_task_and_notification(
@@ -4083,6 +4143,19 @@ def test_conversation_sidebar_projection_returns_shaped_sidebar_payload(
         )
         assert signal_response.status_code == 200
         assert signal_response.json()["agent_direct_chats"] == []
+        project = client.post(
+            "/api/v1/projects",
+            json={"name": "Sidebar scope"},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert project.status_code == 201
+        project_response = client.get(
+            "/api/v1/conversations/sidebar",
+            params={"project_id": project.json()["project_id"]},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert project_response.status_code == 200
+        assert project_response.json()["agent_direct_chats"] == []
 
 
 def test_conversation_sidebar_task_filter_isolated_and_paginated(
@@ -4181,6 +4254,10 @@ def test_conversation_sidebar_task_filter_isolated_and_paginated(
 def test_conversation_sidebar_legacy_delta_request_returns_filtered_full_reconciliation(
     monkeypatch: object, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(
+        "cognis.api.routes.conversations._active_background_shells",
+        AsyncMock(return_value=[]),
+    )
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 

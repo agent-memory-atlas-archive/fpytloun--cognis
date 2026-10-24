@@ -17,17 +17,17 @@
   <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between" data-testid="pairing-request-card">
     <div>
       <div class="flex flex-wrap items-center gap-2">
-        <h2 class="text-lg font-semibold text-white">{request.sender_name || request.sender_id}</h2>
-        <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{request.channel_type}</span>
-        <span class="rounded-full border border-sky-500/20 bg-sky-500/10 px-3 py-1 text-xs text-sky-300">{formatRemaining(request.expires_at)}</span>
+        <h2 class="text-lg font-semibold text-strong">{request.sender_name || request.sender_id}</h2>
+        <span class="rounded-full border border-control-border px-3 py-1 text-xs text-secondary">{request.channel_type}</span>
+        <span class="rounded-full border border-accent/20 bg-accent-subtle px-3 py-1 text-xs text-accent">{formatRemaining(request.expires_at)}</span>
       </div>
-      <div class="mt-3 space-y-1 text-sm text-slate-400">
+      <div class="mt-3 space-y-1 text-sm text-muted">
         <p>Account: {request.account_display_name || request.account_id}</p>
         <p>Agent: {request.agent_name || request.agent_id || 'Unknown agent'}</p>
         <p>Sender ID: {request.sender_id}</p>
         <p>Chat: {request.chat_name || request.chat_id}</p>
       </div>
-      <code class="mt-3 inline-block rounded-xl bg-slate-950/80 px-3 py-2 text-sm text-slate-100">{request.code}</code>
+      <code class="mt-3 inline-block rounded-xl bg-canvas/80 px-3 py-2 text-sm text-foreground">{request.code}</code>
     </div>
     <div class="flex gap-2">
       <Button variant="secondary" size="sm" onclick={onApprove} disabled={busy}>

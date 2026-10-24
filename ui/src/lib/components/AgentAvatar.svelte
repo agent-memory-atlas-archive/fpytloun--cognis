@@ -1,9 +1,10 @@
 <script lang="ts">
   import { cn } from '$lib/utils';
 
-  let { name, avatarUrl = null, class: className = '' } = $props<{
+  let { name, avatarUrl = null, draggable = true, class: className = '' } = $props<{
     name: string;
     avatarUrl?: string | null;
+    draggable?: boolean;
     class?: string;
   }>();
 
@@ -31,9 +32,9 @@
 </script>
 
 {#if avatarUrl && !imgFailed}
-  <img alt={name} class={cn('h-10 w-10 shrink-0 aspect-square rounded-2xl object-cover', className)} src={avatarUrl} onerror={handleError} />
+  <img alt={name} {draggable} class={cn('h-10 w-10 shrink-0 aspect-square rounded-2xl object-cover', className)} src={avatarUrl} onerror={handleError} />
 {:else}
-  <div class={cn('flex h-10 w-10 shrink-0 aspect-square items-center justify-center rounded-2xl bg-sky-500/20 text-sm font-semibold text-sky-200', className)}>
+  <div class={cn('flex h-10 w-10 shrink-0 aspect-square items-center justify-center rounded-2xl bg-accent-subtle text-sm font-semibold text-accent', className)}>
     {initials() || '?'}
   </div>
 {/if}

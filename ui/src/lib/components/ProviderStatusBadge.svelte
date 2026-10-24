@@ -8,12 +8,12 @@
   function tone(): string {
     const normalized = normalizedStatus();
     return normalized === 'healthy' || normalized === 'active'
-      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
+      ? 'border-success-border bg-success-subtle text-success'
       : normalized === 'degraded'
-        ? 'border-sky-500/40 bg-sky-500/10 text-sky-100'
+        ? 'border-warning-border bg-warning-subtle text-warning'
         : normalized === 'disabled' || normalized === 'unknown'
-          ? 'border-slate-700 bg-slate-900/80 text-slate-300'
-          : 'border-rose-500/40 bg-rose-500/10 text-rose-100';
+          ? 'border-control-border bg-surface/80 text-secondary'
+          : 'border-danger-border bg-danger-subtle text-danger';
   }
 </script>
 

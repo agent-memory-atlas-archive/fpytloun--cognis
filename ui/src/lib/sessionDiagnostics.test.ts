@@ -3,8 +3,10 @@ import {
   acceptsSessionDiagnostics,
   diagnosticsForSession,
   mergeContextUsage,
+  runtimeModelPresentation,
 } from './sessionDiagnostics';
 import type { SessionInfoData } from './sessionInfoCache';
+import type { RuntimeSelection } from '$lib/types/api';
 
 function detail(sessionId: string, promptTokens: number): SessionInfoData {
   return {
@@ -32,6 +34,23 @@ function detail(sessionId: string, promptTokens: number): SessionInfoData {
 }
 
 describe('session diagnostics ownership', () => {
+  it('switches model and effort together until the new selection is measured', () => {
+    const usage = {
+      ...detail('session', 1).context_usage!, model: 'gpt-6.1-sol',
+      provider_id: 'codex', reasoning_effort: 'medium', runtime_selection_revision: 3,
+    };
+    const selected = { revision: 4, model: 'cognis/claude-opus', provider_id: null,
+      reasoning_effort: null } as RuntimeSelection;
+    expect(runtimeModelPresentation(usage, selected)).toEqual({
+      model: 'cognis/claude-opus', providerId: null, effort: null, selected: true,
+    });
+    expect(runtimeModelPresentation({
+      ...usage, model: 'claude-opus-5-5', provider_id: 'anthropic',
+      reasoning_effort: 'high', runtime_selection_revision: 4,
+    }, selected)).toEqual({
+      model: 'claude-opus-5-5', providerId: 'anthropic', effort: 'high', selected: false,
+    });
+  });
   it('restores distinct cached diagnostics for A, B, and structural Back', () => {
     const sessionA = detail('session-a', 1);
     const sessionB = detail('session-b', 2);

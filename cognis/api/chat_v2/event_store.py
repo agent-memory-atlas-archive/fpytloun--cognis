@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 from pydantic import Field, model_validator
 
 from cognis.api.chat_v2.schemas import StrictModel
+from cognis.core.event_timestamps import history_event_timestamp
 from cognis.models.session import EventReadResult
 from cognis.providers.guardrails.events import EventStoreAuthority
 from cognis.runtime_context import scoped_runtime_context
@@ -346,7 +347,7 @@ def _raw_event(store_id: str, session_id: str, item: dict[str, Any]) -> RawSessi
         or data.get("updatedAt")
         or data.get("ts")
     )
-    parsed_timestamp = _parse_timestamp(timestamp)
+    parsed_timestamp = _parse_timestamp(history_event_timestamp(data, timestamp))
     return RawSessionEvent(
         store_id=store_id,
         session_id=session_id,

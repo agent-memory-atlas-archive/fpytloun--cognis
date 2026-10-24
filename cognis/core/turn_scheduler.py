@@ -24,7 +24,6 @@ import contextlib
 import hashlib
 import html
 import inspect
-import re
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -92,6 +91,7 @@ from cognis.core.followups import (
     FollowUpStatus,
     build_automatic_continuation_follow_up,
     build_follow_up_id,
+    is_hook_follow_up,
     parse_follow_up_metadata,
     positive_optional_int,
     render_follow_up_turn_notice,
@@ -113,8 +113,13 @@ from cognis.core.observability import (
     reset_attribution,
     set_attribution,
 )
-from cognis.core.runtime import TransientExecutorUnavailable
+from cognis.core.runtime import ExecutorConfigurationError, TransientExecutorUnavailable
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
+from cognis.core.session_cache import is_retry_admission_notice
+from cognis.core.session_recovery import (
+    SESSION_TRANSIENT_MAX_ATTEMPTS as DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS,
+)
+from cognis.core.session_recovery import step_failure_traits
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
 from cognis.core.tool_output_presentation import build_transport_tool_output_preview
 from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
@@ -189,6 +194,7 @@ from cognis.store.direct_turns import (
     DirectTurnStatus,
     DirectTurnStore,
     MaterializedDirectTurnPayload,
+    direct_turn_content_is_editable,
     read_tool_dispatch_groups,
 )
 from cognis.store.models import (
@@ -245,6 +251,15 @@ def _durable_turn_error_message(error: TurnError) -> str:
 
     if error.code == "executor_unavailable":
         return "The selected executor is temporarily unavailable. Try again shortly."
+    if error.code == "executor_recovery_timeout":
+        return (
+            "Executor recovery timed out. This turn has stopped. "
+            "Once the executor is available, send a new message to try again."
+        )
+    if error.code == "executor_configuration_invalid":
+        return (
+            "Executor configuration is missing or invalid. Configure an executor on the agent page."
+        )
     if error.code in _CANCELLED_TURN_ERROR_CODES:
         return "The turn was cancelled."
     if error.code.startswith("provider_"):
@@ -310,7 +325,6 @@ _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
 FOLLOW_UP_INTENT_LEASE_SECONDS = 120.0
 FOLLOW_UP_INTENT_MAX_ATTEMPTS = 3
-DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS = 120
 MAX_TURN_TOOL_CALL_LEDGERS = 4096
 
 
@@ -487,6 +501,7 @@ class ActiveStreamState:
     chunk_count: int = 0
     assistant_phase_index: int = 0
     turn_cycle_index: int = 0
+    text_streaming: bool = True
     updated_at: datetime = field(default_factory=_utcnow)
 
     def snapshot(self) -> dict[str, Any]:
@@ -497,6 +512,7 @@ class ActiveStreamState:
             "turn_id": self.turn_id,
             "content": self.content,
             "chunk_count": self.chunk_count,
+            "text_streaming": self.text_streaming,
             "assistant_phase_index": self.assistant_phase_index,
             "assistant_phase_authoritative": True,
             "content_offset": _utf16_code_units(self.content),
@@ -706,6 +722,7 @@ class _QueuedMessage:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "position": position,
+            "can_edit": True,
         }
         snapshot.update(_automatic_continuation_queue_fields(self.follow_up))
         return snapshot
@@ -844,32 +861,7 @@ def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
     message = summary or error_text
     metadata = getattr(step_output, "metadata", None)
     model_error = metadata.get("model_error") if isinstance(metadata, dict) else None
-    structured_transient = model_error.get("transient") if isinstance(model_error, dict) else None
-    lowered = error_text.lower()
-    database_conflict = _is_database_conflict_text(error_text)
-    transient = (
-        bool(structured_transient)
-        if isinstance(structured_transient, bool)
-        else (
-            database_conflict
-            or any(
-                marker in lowered
-                for marker in (
-                    "circuit breaker",
-                    "dns",
-                    "connection reset",
-                    "temporar",
-                    "timeout",
-                    "timed out",
-                )
-            )
-            or re.search(
-                r"\b(?:http(?:/\d(?:\.\d)?)?|status(?:_code)?)\s*[:=/ -]\s*5\d\d\b",
-                lowered,
-            )
-            is not None
-        )
-    )
+    transient, database_conflict = step_failure_traits(step_output)
     # Every other TurnError producer stores an already sanitized error_detail,
     # and this one is read by the live WebSocket path, so sanitize it here too.
     detail: dict[str, Any] = {
@@ -1059,6 +1051,9 @@ def _recovered_escalation_tool_result_event(
     turn_id: str,
 ) -> SessionEvent:
     approved = resolution.decision == "approve"
+    from cognis.providers.guardrails.resolution_errors import stale_approval_result
+
+    stale_result = stale_approval_result(resolution.decision, resolution.data)
     note = str(resolution.data.get("note") or "").strip()
     payload = {
         "status": "interrupted" if approved else "rejected",
@@ -1071,7 +1066,9 @@ def _recovered_escalation_tool_result_event(
         ),
         "retryable": approved,
     }
-    if note:
+    if stale_result is not None:
+        payload = stale_result
+    if note and stale_result is None:
         payload["note"] = note
     return SessionEvent(
         type="tool_result",
@@ -1079,7 +1076,7 @@ def _recovered_escalation_tool_result_event(
             "call_id": descriptor["call_id"],
             "name": descriptor["tool_name"],
             "is_error": True,
-            "status": "failed" if approved else "denied",
+            "status": "failed" if approved or stale_result is not None else "denied",
             "result": json.dumps(payload, sort_keys=True),
             "agent_visible": True,
             "view_kind": "model_tool_result",
@@ -2062,8 +2059,22 @@ class TurnScheduler:
             offset = _utf16_code_units(stream.content)
             stream.content += delta
             stream.chunk_count += 1
+            stream.text_streaming = True
             stream.updated_at = _utcnow()
             return index, offset
+
+    async def _pause_active_text_stream(
+        self, conversation_id: str, turn_id: str | None, turn_cycle_index: int
+    ) -> None:
+        """Retain text identity while the same model cycle prepares tool input."""
+        async with self._active_streams_lock:
+            stream = self._active_streams.get(conversation_id)
+            if (
+                stream is not None
+                and stream.turn_id == turn_id
+                and stream.turn_cycle_index == turn_cycle_index
+            ):
+                stream.text_streaming = False
 
     async def _reset_active_stream(self, conversation_id: str) -> None:
         async with self._active_streams_lock:
@@ -2479,19 +2490,31 @@ class TurnScheduler:
         session_id = session.session_id
         intaris_session_id = getattr(session, "intaris_session_id", None) or session_id
         idempotency_key = f"{intaris_session_id}:retry_turn:{turn_id}"
-        append_result = await self._providers.guardrails.record_events(
+        from cognis.core.retry_notice import RetryNoticePersistenceError, record_retry_notice
+
+        receipt = await record_retry_notice(
+            self._providers.guardrails,
             session_id=intaris_session_id,
-            events=[event],
-            source="cognis",
+            event=event,
             idempotency_key=idempotency_key,
+            source_turn_id=retry_source_turn_id,
             user_email=user_email,
             agent_id=agent.agent_id,
             agent_owner_email=getattr(agent, "owner_email", user_email),
         )
-        if not append_result.ok:
-            raise CanonicalHistoryUnavailable("Retry turn notice was not persisted")
+        if receipt.appended is None:
+            # Canonical history, not a freshly rebuilt payload, won admission.
+            try:
+                await self._session_cache.refresh(session)
+            except Exception as exc:
+                raise RetryNoticePersistenceError(recoverable=True) from exc
+            return
+        append_result = receipt.appended
         if append_result.count > 0:
-            await self._session_cache.append_recorded_events(session, [event], append_result)
+            try:
+                await self._session_cache.append_recorded_events(session, [event], append_result)
+            except Exception as exc:
+                raise RetryNoticePersistenceError(recoverable=True) from exc
             await self._notify_observers_system_message(
                 conversation_id,
                 text,
@@ -2922,6 +2945,7 @@ class TurnScheduler:
         channel_default_agent_profile_id: str | None = None,
         channel_account_id: str | None = None,
         channel_delivery: ChannelDeliveryDescriptor | None = None,
+        channel_assistant_delivery_mode: str | None = None,
         is_retry: bool = False,
         retry_source_turn_id: str | None = None,
         retry_reason: RetryReason | str | None = None,
@@ -3428,11 +3452,13 @@ class TurnScheduler:
                 "one_shot_chat_mode": one_shot_chat_mode,
                 "channel_default_agent_profile_id": channel_default_agent_profile_id,
                 "channel_account_id": channel_account_id,
+                "channel_assistant_delivery_mode": channel_assistant_delivery_mode,
                 "is_retry": is_retry,
                 "retry_source_turn_id": retry_source_turn_id,
                 "retry_reason": (normalize_retry_reason(retry_reason).value if is_retry else None),
                 "retry_attempt": max(1, retry_attempt),
-                "absorbable": all(
+                "absorbable": not is_hook_follow_up(follow_up)
+                and all(
                     getattr(observer, "supports_mid_turn_absorb", False)
                     for observer in (turn_observers or ())
                 ),
@@ -3972,11 +3998,23 @@ class TurnScheduler:
         if runtime is not None:
             await runtime.wake()
 
-    def _can_claim_direct_turn(self, row: DirectTurnRequestRow) -> bool:
+    async def _can_claim_direct_turn(self, row: DirectTurnRequestRow) -> bool:
         runtime = self._controller_runtime
         if runtime is None or not runtime.schema_compatible:
             return False
         if runtime.state is not ControllerLifecycleState.READY:
+            return False
+        active = self._active_turns.get(row.conversation_id)
+        if active is not None and not active.done():
+            return False
+        if self._pause_waiter.find_pending(
+            pause_type="escalation", conversation_id=row.conversation_id
+        ) is not None and not await self._notification_service.reconcile_escalation_pauses(
+            conversation_id=row.conversation_id, user_email=row.user_id
+        ):
+            return False
+        # Reconciliation yields; lifecycle, active turns, and new pauses can change.
+        if not runtime.schema_compatible or runtime.state is not ControllerLifecycleState.READY:
             return False
         active = self._active_turns.get(row.conversation_id)
         if active is not None and not active.done():
@@ -4125,10 +4163,16 @@ class TurnScheduler:
         attachments: list[dict[str, Any]] | None,
         error: bool = False,
     ) -> None:
-        if descriptor is None or self._channel_delivery is None:
+        if self._channel_delivery is None:
             return
         if self._direct_turn_store is None:
             raise RuntimeError("Source-aware delivery requires a durable request")
+        effective_descriptor, _ = await self._direct_turn_store.effective_channel_delivery(
+            request_id
+        )
+        descriptor = effective_descriptor or descriptor
+        if descriptor is None:
+            return
         request = await self._direct_turn_store.get(request_id)
         if request is None or request.session_id is None:
             raise RuntimeError("Channel delivery request has no source session")
@@ -4461,6 +4505,26 @@ class TurnScheduler:
                 "; ".join(str(failure) for failure in failures),
                 ambiguous=any(failure.ambiguous for failure in failures),
             )
+
+    async def recover_internal_tool_batch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        descriptors: list[dict[str, Any]],
+    ) -> None:
+        """Reconcile a lease-owned internal session batch without redispatching it.
+
+        The caller owns the execution lease and journal. Settlement uses the same
+        canonical tool-result repair and executor reconciliation as turn recovery.
+        """
+        await self._recover_tool_call_group(
+            session_id=session_id,
+            turn_id=turn_id,
+            raw_descriptors=descriptors,
+            deadline=datetime.now(UTC) + timedelta(seconds=30),
+        )
+        await self._session_cache.invalidate_canonical(session_id)
 
     async def _recover_tool_call_group(
         self,
@@ -5581,6 +5645,36 @@ class TurnScheduler:
             "abandoned": len(pending),
         }
 
+    async def cancel_request(self, conversation_id: str, request_id: str) -> bool:
+        """Cancel exactly one admitted automation request, never a newer user turn."""
+        if self._direct_turn_store is None:
+            return False
+        row = await self._direct_turn_store.get(request_id)
+        if row is None or row.conversation_id != conversation_id:
+            return False
+        result = await self._direct_turn_store.request_cancel(request_id)
+        if result is None:
+            return False
+        self._remove_durable_queue_cache_entry(conversation_id, request_id)
+        await self._publish_durable_turn_change(result.request)
+        await self._notify_queue_updated(conversation_id)
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.wake()
+        cluster_signals = getattr(self, "cluster_signals", None)
+        if cluster_signals is not None and result.cancellation_requested:
+            from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
+
+            await cluster_signals.publish(
+                ClusterSignalKind.TURN_CANCEL_REQUESTED,
+                scope=ClusterSignalScope(
+                    conversation_id=conversation_id,
+                    direct_request_id=request_id,
+                ),
+                revision=datetime.now(UTC),
+            )
+        return True
+
     async def cancel_turn(
         self,
         conversation_id: str,
@@ -6291,6 +6385,7 @@ class TurnScheduler:
                     "committing" if row.status == DirectTurnStatus.ABSORBING.value else row.status
                 ),
                 "cancel_requested": row.cancel_requested_at is not None,
+                "can_edit": direct_turn_content_is_editable(row),
                 "position": index + 1,
                 **_automatic_continuation_queue_fields(
                     (row.payload.get("metadata") or {}).get("follow_up")
@@ -6981,7 +7076,7 @@ class TurnScheduler:
     def _queued_message_is_absorbable(self, queued: _QueuedMessage) -> bool:
         """Return whether a queued message can be merged mid-turn."""
 
-        return all(
+        return not is_hook_follow_up(queued.follow_up) and all(
             getattr(observer, "supports_mid_turn_absorb", False)
             for observer in queued.turn_observers
         )
@@ -7163,7 +7258,12 @@ class TurnScheduler:
         )
 
     async def channel_pending_sources(
-        self, conversation_id: str, session_id: str, turn_id: str
+        self,
+        conversation_id: str,
+        session_id: str,
+        turn_id: str,
+        *,
+        first_only: bool = False,
     ) -> tuple[str, list[dict[str, Any]]]:
         from cognis.channels.source_delivery import pending_sources
 
@@ -7176,7 +7276,51 @@ class TurnScheduler:
         refs = [row.intaris_session_id or row.session_id for row in rows]
         if not refs:
             raise RuntimeError("Channel source session chain is unavailable")
-        return await pending_sources(self._providers.guardrails, refs, turn_id)
+        return await pending_sources(
+            self._providers.guardrails,
+            refs,
+            turn_id,
+            is_queued=(
+                self._channel_delivery.source_is_queued
+                if self._channel_delivery is not None
+                else None
+            ),
+            first_only=first_only,
+        )
+
+    async def _deliver_durable_channel_progress(self, conversation_id: str) -> None:
+        """Queue committed immediate replies under the executing request's fence."""
+        request_id = self._durable_request_by_conversation.get(conversation_id)
+        if request_id is None or self._direct_turn_store is None or self._channel_delivery is None:
+            return
+        fence = self._durable_fences.get(request_id)
+        if fence is None:
+            return
+        request = await self._direct_turn_store.get(request_id)
+        if request is None or request.session_id is None:
+            return
+        descriptor, mode = await self._direct_turn_store.effective_channel_delivery(request_id)
+        if descriptor is None or mode != "immediate":
+            return
+        while True:
+            content, sources = await self.channel_pending_sources(
+                conversation_id, request.session_id, request.turn_id, first_only=True
+            )
+            if not sources:
+                return
+            await fence.assert_current()
+            await self._channel_delivery.deliver_fenced_direct_turn(
+                request_id=request_id,
+                lease=fence.lease,
+                descriptor=descriptor,
+                content=content,
+                attachments=None,
+                progress_source=sources[0],
+            )
+            # Enqueue, not a transport acknowledgement, transfers ownership.
+            # A different controller owning the adapter can drain the same outbox.
+            if not await self._channel_delivery.source_is_queued(sources[0]):
+                raise StaleDirectTurnOwner(request_id)
 
     async def _ensure_channel_source_tracking(self, session_id: str, turn_id: str) -> None:
         from cognis.channels.source_delivery import record_state
@@ -7399,6 +7543,14 @@ class TurnScheduler:
                 logical_turn_id=logical_turn_id,
             )
 
+        delivery_mode = None
+        predecessor_id = self._durable_request_by_conversation.get(conversation_id)
+        if predecessor_id is not None:
+            (
+                effective_descriptor,
+                delivery_mode,
+            ) = await self._direct_turn_store.effective_channel_delivery(predecessor_id)
+            channel_delivery = effective_descriptor or channel_delivery
         submission_error = await self.submit_turn(
             conversation_id,
             "",
@@ -7414,6 +7566,7 @@ class TurnScheduler:
             delivery_fallback_text=delivery_fallback_text,
             channel_account_id=channel_account_id,
             channel_delivery=channel_delivery,
+            channel_assistant_delivery_mode=delivery_mode,
             outbound_attachments=outbound_attachments,
             admission_transaction_participant=(
                 _advance_managed_link if self._direct_turn_store is not None else None
@@ -8256,6 +8409,9 @@ class TurnScheduler:
     ) -> int:
         """Claim pending or durably stale intents without stealing healthy work."""
 
+        recover_questions = getattr(self._notification_service, "recover_questions", None)
+        if callable(recover_questions):
+            await recover_questions(limit=limit)
         async with self._follow_up_recovery_lock:
             del reclaim_processing  # Leases, not process startup, define safe reclamation.
             await self._renew_owned_follow_up_leases()
@@ -11178,6 +11334,7 @@ class TurnScheduler:
             arguments: dict[str, Any] | None = None,
             turn_cycle_index: int | None = None,
         ) -> None:
+            await self._deliver_durable_channel_progress(conversation_id)
             if tool_name == "delegate" and isinstance(arguments, dict):
                 arguments = {
                     "title": arguments.get("title")
@@ -11248,6 +11405,10 @@ class TurnScheduler:
                 call_id,
                 turn_cycle_index,
             )
+            if progress.get("phase") == "preparing_input":
+                await self._pause_active_text_stream(
+                    conversation_id, turn_id, effective_turn_cycle_index
+                )
             await self._update_active_tool_progress(
                 conversation_id=conversation_id,
                 session_id=session_id,
@@ -11515,6 +11676,9 @@ class TurnScheduler:
             self._clear_assistant_phase(result.conversation_id, result.turn_id)
             return
         await self._persist_follow_up_result_delivery(result)
+        from cognis.core.hook_handoff import capture_fork_response
+
+        await capture_fork_response(self._session_factory, self._providers, result)
         await self._event_bus.publish(
             Event(
                 type=EventType.TURN_COMPLETED,
@@ -12313,11 +12477,17 @@ class TurnScheduler:
                             _should_bootstrap_wait_for_intention(conversation_model),
                         )
 
-                compaction_summary, tail_start_seq = await self._read_compaction_metadata(
-                    session_model
-                )
+                (
+                    compaction_summary,
+                    tail_start_seq,
+                    tail_pinned_seqs,
+                ) = await self._read_compaction_metadata(session_model)
                 tail_events = (
-                    await self._read_tail_events(session_model, tail_start_seq)
+                    await self._read_tail_events(
+                        session_model,
+                        tail_start_seq,
+                        pinned_seqs=tail_pinned_seqs,
+                    )
                     if tail_start_seq is not None
                     else None
                 )
@@ -12385,12 +12555,14 @@ class TurnScheduler:
 
     async def _read_compaction_metadata(
         self, session: SessionModel
-    ) -> tuple[str | None, int | None]:
+    ) -> tuple[str | None, int | None, list[int]]:
         """Read the last compaction_summary event from a completed session.
 
-        Returns ``(summary, tail_start_seq)`` so the deferred-rotation path
-        can re-fetch the preserved tail events and seed them into the new
-        session via ``rotate_session(tail_events=...)``.
+        Returns ``(summary, tail_start_seq, tail_pinned_seqs)`` so the
+        deferred-rotation path can re-fetch the preserved tail and seed it into
+        the new session via ``rotate_session(tail_events=...)``. Pinned seqs are
+        the active turn's admission anchors kept verbatim when compaction cut
+        inside that turn; they precede ``tail_start_seq``.
         """
         try:
             result = await self._providers.guardrails.read_events(
@@ -12401,16 +12573,26 @@ class TurnScheduler:
             for event in reversed(result.events):
                 if event.get("type") == "compaction_summary":
                     data = event.get("data", {})
-                    return data.get("summary"), data.get("tail_start_seq")
+                    raw_pinned = data.get("tail_pinned_seqs")
+                    pinned_seqs = (
+                        [seq for seq in raw_pinned if isinstance(seq, int)]
+                        if isinstance(raw_pinned, list)
+                        else []
+                    )
+                    return data.get("summary"), data.get("tail_start_seq"), pinned_seqs
         except Exception:
             logger.warning(
                 "turn_scheduler: failed to read compaction metadata",
                 extra={"extra_data": {"session_id": session.session_id}},
             )
-        return None, None
+        return None, None, []
 
     async def _read_tail_events(
-        self, session: SessionModel, tail_start_seq: int
+        self,
+        session: SessionModel,
+        tail_start_seq: int,
+        *,
+        pinned_seqs: list[int] | None = None,
     ) -> list[Any] | None:
         """Fetch the preserved tail events from the old session's Intaris stream.
 
@@ -12443,9 +12625,30 @@ class TurnScheduler:
                 self.data = data
                 self.seq = seq
 
+        intaris_session_id = session.intaris_session_id or session.session_id
         try:
+            pinned_events: list[_TailEvent] = []
+            if pinned_seqs:
+                pinned_result = await self._providers.guardrails.read_events(
+                    session_id=intaris_session_id,
+                    seqs=sorted(set(pinned_seqs)),
+                    allow_missing_stream=True,
+                )
+                # Pinned anchors were selected by compaction; keep them
+                # regardless of the content-type filter (retry notices are
+                # system messages) so continuation validation still holds.
+                pinned_events = [
+                    _TailEvent(etype=e["type"], data=e.get("data", {}), seq=e.get("seq"))
+                    for e in sorted(
+                        (e for e in pinned_result.events if isinstance(e, dict)),
+                        key=lambda e: e.get("seq") or 0,
+                    )
+                    if isinstance(e.get("type"), str)
+                ]
+                if len(pinned_events) != len(set(pinned_seqs)):
+                    raise RuntimeError("compaction tail pinned events are incomplete")
             result = await self._providers.guardrails.read_events(
-                session_id=session.intaris_session_id or session.session_id,
+                session_id=intaris_session_id,
                 after_seq=tail_start_seq - 1,
                 allow_missing_stream=True,
             )
@@ -12456,9 +12659,16 @@ class TurnScheduler:
                     seq=e.get("seq"),
                 )
                 for e in result.events
-                if isinstance(e, dict) and e.get("type") in _TAIL_EVENT_TYPES
+                if isinstance(e, dict)
+                and (
+                    e.get("type") in _TAIL_EVENT_TYPES
+                    # Retry admission notices carry continuation lineage.
+                    or is_retry_admission_notice(
+                        _TailEvent(etype=str(e.get("type")), data=e.get("data", {}), seq=None)
+                    )
+                )
             ]
-            return wrapped or None
+            return [*pinned_events, *wrapped] or None
         except Exception:
             logger.warning(
                 "turn_scheduler: failed to read tail events for deferred rotation",
@@ -12514,6 +12724,28 @@ async def classify_turn_error(providers: Any, error: Exception) -> TurnError:
     """
     lowered = str(error).lower()
     safe_detail = sanitize_client_error_detail(error, fallback="request failed")
+    from cognis.core.retry_notice import RetryNoticePersistenceError
+
+    if isinstance(error, RetryNoticePersistenceError):
+        return TurnError(
+            code="event_persistence_error:intaris",
+            message="The recovery notice could not be persisted in the event store.",
+            recoverable=error.recoverable,
+            transient=error.recoverable,
+            detail={"provider_category": "guardrails", "provider_name": "intaris"},
+        )
+
+    if isinstance(error, ExecutorConfigurationError):
+        return TurnError(
+            code="executor_configuration_invalid",
+            message=(
+                "Executor configuration is missing or invalid. "
+                "Configure an executor on the agent page."
+            ),
+            recoverable=False,
+            detail={"error_detail": safe_detail, "client_safe_detail": safe_detail},
+            transient=False,
+        )
 
     if _is_database_conflict_text(str(error)):
         return TurnError(

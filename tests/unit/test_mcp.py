@@ -530,10 +530,10 @@ def test_strip_empty_optionals_preserves_nonempty_values() -> None:
         "tasks": [
             {
                 "content": "Fix bug",
-                "projectId": "6gH6CVp2fcHrJxvh",
-                "sectionId": "6gJvjvQxfcmXw3Ph",
-                "parentId": "abc",
-                "responsibleUser": "filip@pytloun.cz",
+                "projectId": "synthetic-project",
+                "sectionId": "synthetic-section",
+                "parentId": "synthetic-parent-task",
+                "responsibleUser": "reader@example.test",
                 "labels": ["bug"],
             }
         ]
@@ -541,10 +541,10 @@ def test_strip_empty_optionals_preserves_nonempty_values() -> None:
     result = _strip_empty_optionals(args, _TODOIST_ADD_TASKS_SCHEMA)
     task = result["tasks"][0]
     assert task["content"] == "Fix bug"
-    assert task["projectId"] == "6gH6CVp2fcHrJxvh"
-    assert task["sectionId"] == "6gJvjvQxfcmXw3Ph"
-    assert task["parentId"] == "abc"
-    assert task["responsibleUser"] == "filip@pytloun.cz"
+    assert task["projectId"] == "synthetic-project"
+    assert task["sectionId"] == "synthetic-section"
+    assert task["parentId"] == "synthetic-parent-task"
+    assert task["responsibleUser"] == "reader@example.test"
     assert task["labels"] == ["bug"]
 
 
@@ -797,13 +797,13 @@ def test_runtime_mcp_server_key_falls_back_safely() -> None:
 
 
 def test_coerce_client_error_extracts_http_status_from_exception_group() -> None:
-    request = httpx.Request("POST", "https://mfg.prd.lumilens.com/mcp")
+    request = httpx.Request("POST", "https://mcp.example.test/catalog/mcp")
     response = httpx.Response(
         401,
         headers={
             "www-authenticate": (
                 'Bearer error="insufficient_scope", scope="tools.write tools.read", '
-                'resource_metadata="https://mfg.example/.well-known/oauth-protected-resource/mcp"'
+                'resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/catalog/mcp"'
             )
         },
         request=request,
@@ -819,7 +819,7 @@ def test_coerce_client_error_extracts_http_status_from_exception_group() -> None
         ],
     )
 
-    result = mcp_module._coerce_client_error("mfg-portal", "list_tools", exc)
+    result = mcp_module._coerce_client_error("catalog-service", "list_tools", exc)
 
     assert result.status_code == 401
     assert result.auth_error == "authorization_required"
@@ -828,7 +828,7 @@ def test_coerce_client_error_extracts_http_status_from_exception_group() -> None
     assert result.authorization_challenge == {
         "error": "insufficient_scope",
         "scope": "tools.write tools.read",
-        "resource_metadata": "https://mfg.example/.well-known/oauth-protected-resource/mcp",
+        "resource_metadata": "https://mcp.example.test/.well-known/oauth-protected-resource/catalog/mcp",
     }
 
 
@@ -843,7 +843,7 @@ def test_coerce_client_error_only_classifies_explicit_403_insufficient_scope(
     header: str,
     expected_auth_error: str,
 ) -> None:
-    request = httpx.Request("POST", "https://mfg.example/mcp")
+    request = httpx.Request("POST", "https://mcp.example.test/catalog/mcp")
     response = httpx.Response(
         403,
         headers={"www-authenticate": header},
@@ -851,7 +851,7 @@ def test_coerce_client_error_only_classifies_explicit_403_insufficient_scope(
     )
     exc = httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
 
-    result = mcp_module._coerce_client_error("mfg-portal", "call_tool", exc)
+    result = mcp_module._coerce_client_error("catalog-service", "call_tool", exc)
 
     assert result.status_code == 403
     assert result.auth_error == expected_auth_error

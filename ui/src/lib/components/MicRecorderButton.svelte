@@ -428,16 +428,16 @@
 
 <span class={`inline-flex items-center gap-1 ${className}`}>
   {#if uploading}
-    <span class="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-[11px] font-medium text-slate-300" aria-live="polite">
-      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400"></span>
+    <span class="inline-flex items-center gap-2 rounded-full border border-control-border bg-surface/90 px-3 py-1.5 text-[11px] font-medium text-secondary" aria-live="polite">
+      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-info"></span>
       Uploading voice…
     </span>
   {:else if recording}
     <span
-      class={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] font-medium ${cancelling ? 'bg-rose-500/25 text-rose-100' : 'bg-rose-500/20 text-rose-300'}`}
+      class={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] font-medium ${cancelling ? 'bg-danger-subtle text-danger' : 'bg-danger-subtle text-danger'}`}
       aria-live="polite"
     >
-      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-rose-400"></span>
+      <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-danger"></span>
       <span class="tabular-nums">{formatVoiceDuration(elapsedSeconds)}</span>
       <span class="hidden items-end gap-0.5 sm:inline-flex" aria-hidden="true">
         {#each [0.35, 0.65, 0.95, 0.55, 0.8] as scale}
@@ -447,7 +447,7 @@
           ></span>
         {/each}
       </span>
-      <span class="hidden text-slate-400 sm:inline">{cancelling ? 'Release to cancel' : 'Release to save'}</span>
+      <span class="hidden text-muted sm:inline">{cancelling ? 'Release to cancel' : 'Release to save'}</span>
     </span>
     <button
       type="button"
@@ -455,7 +455,7 @@
       disabled={disabled || busy}
       aria-label="Cancel recording"
       title="Cancel recording"
-      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-slate-800 text-slate-300 transition hover:bg-rose-500/25 hover:text-rose-200 disabled:pointer-events-none disabled:opacity-40"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-raised text-secondary transition hover:bg-danger-subtle hover:text-danger disabled:pointer-events-none disabled:opacity-40"
     >
       <X class="h-4 w-4" />
     </button>
@@ -465,7 +465,7 @@
       disabled={disabled || (busy && !recording)}
       aria-label="Stop recording"
       title="Stop recording"
-      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-rose-500/15 text-rose-300 transition hover:bg-rose-500/25 hover:text-rose-200 disabled:pointer-events-none disabled:opacity-40"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-danger-subtle text-danger transition hover:bg-surface-hover disabled:pointer-events-none disabled:opacity-40"
     >
       <Square class="h-4 w-4 fill-current" />
     </button>
@@ -475,7 +475,7 @@
       disabled={disabled || busy}
       aria-label="Finish recording and send"
       title="Finish recording and send"
-      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:pointer-events-none disabled:opacity-40"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-accent text-on-accent transition hover:bg-accent-hover disabled:pointer-events-none disabled:opacity-40"
     >
       <ArrowUp class="h-4 w-4" stroke-width="2.5" />
     </button>
@@ -490,7 +490,7 @@
       disabled={disabled || busy}
       aria-label="Record voice message. Tap to start, or press and hold to record."
       title="Tap to record, or hold and release to save"
-      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 disabled:pointer-events-none disabled:opacity-40"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted transition hover:bg-surface-hover hover:text-foreground focus-within:bg-surface-hover focus-within:text-foreground disabled:pointer-events-none disabled:opacity-40"
     >
       <Mic class="h-4 w-4" />
     </button>

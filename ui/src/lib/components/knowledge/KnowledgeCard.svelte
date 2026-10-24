@@ -23,9 +23,9 @@
     diagnostics?: KnowledgebaseDiagnostics | null;
     canMutate?: boolean;
     onOpen: (kb: KnowledgebaseModel) => void;
-    onArchive: (kb: KnowledgebaseModel) => void;
-    onReactivate: (kb: KnowledgebaseModel) => void;
-    onDelete: (kb: KnowledgebaseModel) => void;
+    onArchive?: (kb: KnowledgebaseModel) => void;
+    onReactivate?: (kb: KnowledgebaseModel) => void;
+    onDelete?: (kb: KnowledgebaseModel) => void;
   } = $props();
 
   const documentCount = $derived(
@@ -40,24 +40,24 @@
   const isShared = $derived(kb.access_level === 'shared');
 </script>
 
-<Card class="flex flex-col gap-4 p-5">
+<Card class="flex min-w-0 flex-col gap-4 p-5">
   <div class="flex items-start justify-between gap-3">
     <button
       type="button"
-      class="flex items-start gap-3 text-left"
+      class="flex min-w-0 items-start gap-3 text-left [overflow-wrap:anywhere]"
       onclick={() => onOpen(kb)}
       data-testid="knowledge-card-open"
     >
-      <span class="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-sky-500/10 text-sky-300">
+      <span class="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-accent-subtle text-accent">
         <Library class="h-5 w-5" />
       </span>
       <span>
-        <span class="block text-base font-semibold text-white">{kb.name}</span>
-        <span class="mt-1 block text-xs text-slate-500">
+        <span class="block text-base font-semibold text-strong">{kb.name}</span>
+        <span class="mt-1 block text-xs text-quiet">
           {isShared ? `Shared by ${kb.owner_email ?? 'another user'}` : 'Owned by you'}
         </span>
         {#if kb.description}
-          <span class="mt-1 block max-w-md text-sm text-slate-400 line-clamp-2">{kb.description}</span>
+          <span class="mt-1 block max-w-md text-sm text-muted line-clamp-2">{kb.description}</span>
         {/if}
       </span>
     </button>
@@ -69,7 +69,7 @@
     </div>
   </div>
 
-  <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+  <div class="flex flex-wrap items-center gap-2 text-xs text-muted">
     {#if documentCount !== null}
       <Badge>{documentCount} document{documentCount === 1 ? '' : 's'}</Badge>
     {/if}
@@ -83,22 +83,22 @@
     {/if}
   </div>
 
-  <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-3">
-    <span class="flex items-center gap-1.5 text-xs text-slate-500">
+  <div class="flex flex-wrap items-center justify-between gap-2 border-t border-separator/80 pt-3">
+    <span class="flex items-center gap-1.5 text-xs text-quiet">
       <History class="h-3.5 w-3.5" />
       Updated {kb.updated_at ? new Date(kb.updated_at).toLocaleDateString() : '—'}
     </span>
     <div class="flex flex-wrap gap-2">
       <Button size="sm" variant="secondary" onclick={() => onOpen(kb)}>Open</Button>
-      {#if canMutate && !isShared && isArchived}
-        <Button size="sm" variant="secondary" onclick={() => onReactivate(kb)}>Reactivate</Button>
-      {:else if canMutate && !isShared}
-        <Button size="sm" variant="ghost" onclick={() => onArchive(kb)}>
+      {#if canMutate && !isShared && isArchived && onReactivate}
+        <Button size="sm" variant="secondary" onclick={() => onReactivate?.(kb)}>Reactivate</Button>
+      {:else if canMutate && !isShared && onArchive}
+        <Button size="sm" variant="ghost" onclick={() => onArchive?.(kb)}>
           <Archive class="mr-1.5 h-3.5 w-3.5" /> Archive
         </Button>
       {/if}
-      {#if canMutate && !isShared}
-        <Button size="sm" variant="ghost" onclick={() => onDelete(kb)} class="text-rose-300 hover:text-rose-200">
+      {#if canMutate && !isShared && onDelete}
+        <Button size="sm" variant="ghost" onclick={() => onDelete?.(kb)} class="text-danger hover:text-danger">
           <Trash class="mr-1.5 h-3.5 w-3.5" /> Delete
         </Button>
       {/if}

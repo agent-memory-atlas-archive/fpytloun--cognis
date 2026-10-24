@@ -9,6 +9,7 @@ from cognis.core.canonical_history import (
     CanonicalHistoryUnavailable,
     read_complete_history,
 )
+from cognis.core.event_timestamps import HISTORY_SOURCE_TIMESTAMP, history_event_timestamp
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
     ImmutablePrefixEntry,
@@ -110,6 +111,10 @@ async def fork_session_events(
             # Never mix cached prefix entries with a different durable generation.
             prefix_entries = []
             ordered_events = sorted(event_read.events, key=lambda event: int(event.get("seq", 0)))
+            if max_source_seq is not None:
+                ordered_events = [
+                    event for event in ordered_events if int(event.get("seq", 0)) <= max_source_seq
+                ]
             latest_snapshot = next(
                 (
                     event
@@ -226,7 +231,18 @@ async def fork_session_events(
                     batch_start : batch_start + INTARIS_EVENT_APPEND_BATCH_SIZE
                 ]
                 session_events = [
-                    SessionEvent(type=event.type, data=event.data) for event in source_batch
+                    SessionEvent(
+                        type=event.type,
+                        data={
+                            **event.data,
+                            **(
+                                {HISTORY_SOURCE_TIMESTAMP: original}
+                                if (original := history_event_timestamp(event.data, event.ts))
+                                else {}
+                            ),
+                        },
+                    )
+                    for event in source_batch
                 ]
                 append_result = await providers.guardrails.record_events(
                     session_id=target_intaris_id,
@@ -242,9 +258,9 @@ async def fork_session_events(
                     CachedEvent(
                         seq=append_result.first_seq + index,
                         type=event.type,
-                        data=event.data,
+                        data=session_events[index].data,
                         source=record_source,
-                        ts=event.ts,
+                        ts=history_event_timestamp(session_events[index].data, event.ts),
                     )
                     for index, event in enumerate(source_batch)
                 ]

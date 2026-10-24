@@ -52,6 +52,7 @@ class _FakeCompactionStrategy:
             summary="Auto-compaction summary text",
             compaction_seq=10,
             turns_compacted=5,
+            events_compacted=40,
         )
         self._fail = fail
         self._slow = slow
@@ -89,6 +90,7 @@ class _FakeCompactionStrategy:
             summary="Mechanical fallback summary",
             compaction_seq=20,
             turns_compacted=5,
+            events_compacted=40,
         )
 
 
@@ -351,8 +353,38 @@ def _minimal_agent_loop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger", ["pre_model_pressure", "tool_loop_pressure", "provider_context_overflow"]
+)
+@pytest.mark.parametrize("depth", [1, 2])
+async def test_compaction_bounds_only_consecutive_recovery_attempts(
+    trigger: str, depth: int
+) -> None:
+    compaction = _FakeCompactionStrategy()
+    loop = _minimal_agent_loop(
+        compaction=compaction,
+        session_cache=_FakeSessionCache(entry=_cache_entry_with_events(5)),
+    )
+    ctx = _step_context()
+    ctx.compaction_recursion_depth = depth
+    run = CompactionRunContext(trigger=trigger, reason="context_pressure")
+
+    result = await loop._auto_compact(ctx, run=run, trigger=trigger)
+
+    if depth == 2:
+        assert result is None
+        assert not compaction.calls
+        assert run.reason == "compaction_recursion_exhausted"
+    else:
+        assert result is not None and result.compacted
+        assert len(compaction.calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_run", [True, False])
-async def test_zero_turn_compaction_publishes_terminal_status(explicit_run: bool) -> None:
+async def test_compaction_without_summarized_events_publishes_terminal_status(
+    explicit_run: bool,
+) -> None:
     published: list[Event] = []
     bus = EventBus()
 
@@ -548,25 +580,41 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_zero_turn_compaction_does_not_rotate() -> None:
+@pytest.mark.parametrize(
+    ("events_compacted", "rotates"),
+    [
+        (0, False),
+        # A cut inside one long user turn summarizes events but no whole turn.
+        (30, True),
+    ],
+)
+async def test_rotation_requires_summarized_events_not_whole_turns(
+    events_compacted: int,
+    rotates: bool,
+) -> None:
     session_manager = _FakeSessionManager()
     loop = _minimal_agent_loop(session_manager=session_manager)
     result = CompactionResult(
         compacted=True,
         method="llm",
-        summary="No effective history",
+        summary="Earlier work in this turn",
         compaction_seq=1,
         turns_compacted=0,
+        events_compacted=events_compacted,
     )
 
     rotated = await loop._rotate_after_compaction(
         _step_context(),
         result,
-        trigger="automatic",
+        trigger="tool_loop_pressure",
     )
 
-    assert rotated is None
-    assert session_manager.rotations == []
+    assert (rotated is not None) is rotates
+    assert len(session_manager.rotations) == (1 if rotates else 0)
+    if rotates:
+        seed_data = session_manager.rotations[0]["compaction_summary_event_data"]
+        assert seed_data["turns_compacted"] == 0
+        assert seed_data["events_compacted"] == 30
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,9 @@ describe('docs routes', () => {
     const doc = await getEmbeddedDoc('getting-started');
 
     expect(doc?.title).toBe('Getting Started');
-    expect(doc?.content).toContain('This guide walks through the shortest path to a working Cognis system');
+    expect(doc?.content).toContain('deploy → account → models → executor → XO → first chat');
+    expect(doc?.content).toContain('Image generation is optional but recommended');
+    expect(doc?.content).toContain('brew tap fpytloun/tap');
     expect(await getRelatedDocs(doc!)).not.toHaveLength(0);
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });

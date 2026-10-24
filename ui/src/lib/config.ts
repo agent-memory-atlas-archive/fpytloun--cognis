@@ -1,4 +1,5 @@
 import { env as publicEnv } from '$env/dynamic/public';
+import { nativeConfiguration } from '$lib/native/host';
 
 export type LinkedServiceTarget = 'intaris' | 'mnemory';
 
@@ -30,7 +31,7 @@ function deriveLocalServiceUrl(port: number): string | null {
 }
 
 export function getApiBaseUrl(): string {
-  return trimTrailingSlash(publicEnv.PUBLIC_COGNIS_API_URL || '');
+  return trimTrailingSlash(nativeConfiguration()?.server || publicEnv.PUBLIC_COGNIS_API_URL || '');
 }
 
 export function apiUrl(path: string): string {

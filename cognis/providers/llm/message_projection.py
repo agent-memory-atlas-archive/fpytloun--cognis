@@ -49,6 +49,7 @@ def project_messages_for_provider(
     *,
     provider: Any | None,
     llm_api: str,
+    preserve_internal_fields: frozenset[str] = frozenset(),
 ) -> MessageProjectionResult:
     """Return provider-safe messages for the selected LLM API."""
 
@@ -57,10 +58,12 @@ def project_messages_for_provider(
     messages = strip_cognis_artifact_metadata(messages)
     policy = resolve_message_projection_policy(provider=provider, llm_api=llm_api)
     if policy == "anthropic_messages":
-        return _project_anthropic_messages(messages)
+        return _project_anthropic_messages(messages, preserve_internal_fields)
     if policy == "openai_chat":
-        return _project_openai_chat_messages(messages)
-    return _unchanged_projection(messages, policy=policy)
+        return _project_openai_chat_messages(messages, preserve_internal_fields)
+    return _unchanged_projection(
+        messages, policy=policy, preserve_internal_fields=preserve_internal_fields
+    )
 
 
 def resolve_message_projection_policy(*, provider: Any | None, llm_api: str) -> str:
@@ -86,7 +89,9 @@ def resolve_message_projection_policy(*, provider: Any | None, llm_api: str) -> 
     return "none"
 
 
-def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjectionResult:
+def _project_anthropic_messages(
+    messages: list[dict[str, Any]], preserve_internal_fields: frozenset[str]
+) -> MessageProjectionResult:
     projected: list[dict[str, Any]] = []
     deferred_notices: list[dict[str, Any]] = []
     pending_tool_result_ids: set[str] = set()
@@ -144,7 +149,8 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
     if deferred_notices:
         projected.extend(deferred_notices)
 
-    if converted:
+    # A later turn can introduce the first notice without changing the prefix.
+    if converted or (projected and projected[0].get("role") == "system"):
         projected = _insert_system_notice_instruction(projected)
 
     diagnostics = _projection_diagnostics(
@@ -157,10 +163,15 @@ def _project_anthropic_messages(messages: list[dict[str, Any]]) -> MessageProjec
         hidden_system_notice_hashes=hashes[:8],
         tool_boundary_notices_deferred=deferred_notice_count,
     )
-    return MessageProjectionResult(messages=projected, diagnostics=diagnostics)
+    return MessageProjectionResult(
+        messages=_strip_controller_message_fields(projected, preserve_internal_fields),
+        diagnostics=diagnostics,
+    )
 
 
-def _project_openai_chat_messages(messages: list[dict[str, Any]]) -> MessageProjectionResult:
+def _project_openai_chat_messages(
+    messages: list[dict[str, Any]], preserve_internal_fields: frozenset[str]
+) -> MessageProjectionResult:
     projected: list[dict[str, Any]] = []
     converted = 0
     for message in messages:
@@ -175,7 +186,7 @@ def _project_openai_chat_messages(messages: list[dict[str, Any]]) -> MessageProj
         projected.append(dict(message))
 
     return MessageProjectionResult(
-        messages=projected,
+        messages=_strip_controller_message_fields(projected, preserve_internal_fields),
         diagnostics=_projection_diagnostics(
             messages,
             projected,
@@ -186,13 +197,31 @@ def _project_openai_chat_messages(messages: list[dict[str, Any]]) -> MessageProj
 
 
 def _unchanged_projection(
-    messages: list[dict[str, Any]], *, policy: str
+    messages: list[dict[str, Any]],
+    *,
+    policy: str,
+    preserve_internal_fields: frozenset[str],
 ) -> MessageProjectionResult:
     projected = [dict(message) for message in messages if isinstance(message, dict)]
     return MessageProjectionResult(
-        messages=projected,
+        messages=_strip_controller_message_fields(projected, preserve_internal_fields),
         diagnostics=_projection_diagnostics(messages, projected, policy=policy),
     )
+
+
+def _strip_controller_message_fields(
+    messages: list[dict[str, Any]], preserve_internal_fields: frozenset[str]
+) -> list[dict[str, Any]]:
+    """Strip controller annotations except adapters consumed by the next converter."""
+
+    return [
+        {
+            key: value
+            for key, value in message.items()
+            if not str(key).startswith("_") or key in preserve_internal_fields
+        }
+        for message in messages
+    ]
 
 
 def _should_project_as_hidden_user_notice(

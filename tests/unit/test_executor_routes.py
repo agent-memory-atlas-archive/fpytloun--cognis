@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
@@ -28,6 +29,65 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
 def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, str]:
     token = app.state.auth_provider.sign_access_token(email, email.split("@")[0].title(), role)  # type: ignore[attr-defined]
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.parametrize(
+    ("owner", "role", "expected"),
+    [
+        ("user@example.com", "user", 202),
+        ("other@example.com", "admin", 404),
+        (None, "user", 403),
+        (None, "admin", 202),
+    ],
+)
+def test_executor_reconfigure_preserves_settings_and_ownership(
+    monkeypatch: object, tmp_path: Path, owner: str | None, role: str, expected: int
+) -> None:
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        executors_routes,
+        "schedule_executor_reconfigure",
+        lambda app, executor_id: scheduled.append(executor_id),
+    )
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as session:
+                for email in ("user@example.com", "other@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name="User",
+                        role=role,
+                        password_hash=client.app.state.password_hasher.hash("password123"),
+                    )
+                row = await create_executor(
+                    session,
+                    executor_id="exec-retry",
+                    name="Exec",
+                    executor_type="websocket",
+                    owner_email=owner,
+                    config={"mcp_server_ids": ["hass"]},
+                )
+                row.desired_config_version = 7
+                row.applied_config_version = 7
+                row.runtime_state = "degraded"
+                await session.commit()
+
+        asyncio.run(seed())
+        headers = _auth_headers(client.app, email="user@example.com", role=role)
+        before = client.get("/api/v1/executors/exec-retry", headers=headers)
+        response = client.post("/api/v1/executors/exec-retry/reconfigure", headers=headers)
+        assert response.status_code == expected
+        if expected == 202:
+            assert response.json()["desired_config_version"] == 8
+            assert response.json()["applied_config_version"] == 7
+            assert response.json()["config"] == before.json()["config"]
+            repeated = client.post("/api/v1/executors/exec-retry/reconfigure", headers=headers)
+            assert repeated.json()["desired_config_version"] == 8
+            assert scheduled == ["exec-retry", "exec-retry"]
+        else:
+            assert not scheduled
 
 
 def test_executor_update_atomically_bumps_normalized_legacy_generation(
@@ -319,7 +379,7 @@ def test_executor_local_inference_config_validation_and_defaults(
 ) -> None:
     audit_events: list[dict[str, object]] = []
     monkeypatch.setattr(  # type: ignore[attr-defined]
-        executors_routes._logger,
+        executors_routes.service._logger,
         "info",
         lambda _message, **kwargs: audit_events.append(kwargs["extra"]["extra_data"]),
     )
@@ -509,7 +569,7 @@ def test_executor_token_generation_rotates_token_version(
 
         async def _load_token_version() -> int:
             async with client.app.state.session_factory() as session:
-                row = await executors_routes.get_executor_row(session, "remote-1")
+                row = await executors_routes.service.get_executor_row(session, "remote-1")
                 assert row is not None
                 return row.token_version
 

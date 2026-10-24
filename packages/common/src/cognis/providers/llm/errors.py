@@ -163,6 +163,8 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
                 payload_message = str(payload.get("message") or exc)
                 if _looks_like_artifact_fetch_error(payload_message.lower(), None):
                     payload = {**payload, "category": MidStreamErrorCategory.ARTIFACT_FETCH.value}
+                elif _looks_like_tool_validation_error(payload_message):
+                    payload = {**payload, "category": MidStreamErrorCategory.INVALID_REQUEST.value}
                 elif is_deterministic_client_error_status(getattr(exc, "status_code", None)):
                     # A provider-normalized payload can still miss a deterministic
                     # rejection when it classifies by message text alone.
@@ -210,6 +212,10 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.ATTACHMENT_INPUT
     elif any(marker in lowered for marker in ("content policy", "content_filter", "refusal")):
         category = MidStreamErrorCategory.CONTENT_POLICY
+    elif _looks_like_tool_validation_error(message):
+        # Tool-name validation rejections cannot succeed when Cognis replays
+        # the same request with the same tool surface.
+        category = MidStreamErrorCategory.INVALID_REQUEST
     elif is_deterministic_client_error_status(status) or code == "invalid_request_error":
         # Deterministic provider rejection: replaying the identical request
         # cannot succeed, so this must never consume the retry budget. The
@@ -238,6 +244,21 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
     if ids:
         classified_payload["artifact_ids"] = ids
     return classified_payload
+
+
+def _looks_like_tool_validation_error(message: str) -> bool:
+    """Recognize provider rejection of a tool name absent from request.tools."""
+
+    lowered = message.lower()
+    return "attempted to call tool" in lowered and any(
+        marker in lowered
+        for marker in (
+            "not in request.tools",
+            "not in the request.tools",
+            "not in request tools",
+            "not in the request tools",
+        )
+    )
 
 
 def retry_after_seconds_from_headers(headers: Any) -> float | None:

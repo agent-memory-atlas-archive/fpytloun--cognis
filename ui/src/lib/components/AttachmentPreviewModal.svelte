@@ -1,29 +1,36 @@
 <script lang="ts">
-  import Download from 'lucide-svelte/icons/download';
   import X from 'lucide-svelte/icons/x';
-  import { onMount, tick } from 'svelte';
-  import hljs from 'highlight.js/lib/common';
-  import 'highlight.js/styles/github-dark.css';
+  import { getContext, onMount, tick } from 'svelte';
+  import { readable, type Readable } from 'svelte/store';
+  import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
 
   import { portal } from '$lib/actions/portal';
   import { api } from '$lib/api/client';
-  import { previewLanguage, type AttachmentPreviewKind } from '$lib/attachments/preview';
-  import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
+  import type { AttachmentPreviewKind } from '$lib/attachments/preview';
+  import ArtifactPreviewContent from './ArtifactPreviewContent.svelte';
+  import AttachmentSaveButton from './AttachmentSaveButton.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import type { AttachmentRef } from '$lib/types/api';
+  import DocumentLinkActions from './rich/DocumentLinkActions.svelte';
+  import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
+  import type { ShareLinkOptions } from './rich/share-options';
+  import { viewEligible } from '$lib/artifact-text';
+  import type { SignedHtmlPreview } from '$lib/attachments/html-preview';
 
   let {
     attachment,
     kind,
     mediaUrl = null,
+    htmlSource = null,
     onClose,
-    onDownload,
+    resolveDownloadUrl,
   }: {
     attachment: AttachmentRef;
     kind: AttachmentPreviewKind;
     mediaUrl?: string | null;
+    htmlSource?: SignedHtmlPreview | null;
     onClose: () => void;
-    onDownload: () => void;
+    resolveDownloadUrl: () => Promise<string | null>;
   } = $props();
 
   let panel = $state<HTMLDivElement | null>(null);
@@ -34,22 +41,10 @@
   let richPayload = $state<unknown>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
-
-  const highlighted = $derived.by(() => {
-    const escaped = () => content.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-    const language = previewLanguage(attachment.filename, attachment.mime_type);
-    try {
-      return language && hljs.getLanguage(language)
-        ? hljs.highlight(content, { language, ignoreIllegals: true }).value
-        : escaped();
-    } catch {
-      return escaped();
-    }
-  });
-
-  const visibleRichPayload = $derived(
-    ['markdown', 'mermaid', 'csv'].includes(kind) ? richPayload : null,
-  );
+  const sharingPermission = getContext<Readable<boolean>>(DELIVERABLE_SHARING_CONTEXT) ?? readable(true);
+  async function createPublicLink(options: ShareLinkOptions): Promise<string> {
+    return (await api.artifactDocuments.publicLink('artifact', attachment.artifact_id, { ...options, mode: options.mode ?? 'download' })).url;
+  }
 
   function handleKeydown(event: KeyboardEvent): void {
     if (!isTopOverlay(overlayId)) return;
@@ -74,7 +69,7 @@
 
   onMount(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const overlay = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    const overlay = registerOverlay({ kind: 'fullscreen', blocksChrome: true });
     overlayId = overlay.id;
     void tick().then(() => closeButton?.focus());
     if (['text', 'markdown', 'mermaid', 'csv'].includes(kind)) {
@@ -100,51 +95,26 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div use:portal class="fixed inset-0 z-[90] isolate flex items-center justify-center p-4" role="presentation">
-  <button aria-label="Dismiss preview" class="absolute inset-0 bg-slate-950/80 backdrop-blur" onclick={onClose} tabindex="-1" type="button"></button>
-  <div bind:this={panel} class="relative z-10 flex max-h-full w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-card" role="dialog" aria-modal="true" aria-labelledby="attachment-preview-title" tabindex="-1" data-blocking-overlay>
-    <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800/80 px-5 py-4">
+<div use:portal bind:this={panel} class="app-viewport-overlay app-safe-fullscreen z-[90] isolate overflow-hidden bg-surface text-foreground" role="dialog" aria-modal="true" aria-labelledby="attachment-preview-title" tabindex="-1" data-blocking-overlay>
+    <div class="app-safe-fullscreen__toolbar flex min-w-0 items-center justify-between gap-2 border-b border-separator bg-chrome px-2 py-1">
       <div class="min-w-0">
-        <h2 id="attachment-preview-title" class="truncate text-lg font-semibold text-slate-100">{attachment.filename}</h2>
-        <p class="mt-0.5 text-xs text-slate-400">{attachment.mime_type ?? 'file'}</p>
+        <h2 id="attachment-preview-title" class="truncate text-lg font-semibold text-foreground">{attachment.filename}</h2>
+        <p class="mt-0.5 text-xs text-muted">{attachment.mime_type ?? 'file'}</p>
       </div>
       <div class="flex shrink-0 items-center gap-2">
-        <button class="copy-icon-button" onclick={onDownload} type="button" title="Download" aria-label={`Download ${attachment.filename}`}><Download /></button>
-        <button bind:this={closeButton} class="copy-icon-button" onclick={onClose} type="button" title="Close" aria-label="Close preview"><X /></button>
+        <AttachmentSaveButton filename={attachment.filename} resolveUrl={resolveDownloadUrl} class="document-icon-action" />
+        <DocumentFavoriteButton kind="artifact" id={attachment.artifact_id} />
+        <DocumentLinkActions internalUrl={`/library/artifact/${encodeURIComponent(attachment.artifact_id)}`} createLink={$sharingPermission ? createPublicLink : undefined} defaultMode={viewEligible(attachment.mime_type ?? '', attachment.filename) ? 'view' : 'download'} />
+        <button bind:this={closeButton} class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-foreground hover:bg-surface-hover" onclick={onClose} type="button" title="Close" aria-label="Close preview"><X class="h-5 w-5" /></button>
       </div>
     </div>
-    <div class="min-h-0 flex-1 overflow-auto p-5">
+    <div class={`app-safe-fullscreen__content min-w-0 ${['html', 'pdf', 'video', 'audio'].includes(kind) ? 'overflow-hidden' : 'overflow-auto p-3'}`}>
       {#if loading}
-        <p class="text-sm text-slate-400">Loading preview…</p>
+        <p class="text-sm text-muted">Loading preview…</p>
       {:else if error}
-        <p class="text-sm text-rose-300">{error}</p>
-      {:else if ['html', 'pdf'].includes(kind) && mediaUrl}
-        <iframe
-          class="h-[72vh] min-h-96 w-full rounded-xl border border-slate-800 bg-white"
-          src={mediaUrl}
-          title={`Preview of ${attachment.filename}`}
-          sandbox={kind === 'html' ? 'allow-scripts' : undefined}
-        ></iframe>
-      {:else if ['html', 'pdf'].includes(kind)}
-        <p class="text-sm text-rose-300">The document preview could not be loaded.</p>
-      {:else if kind === 'video' && mediaUrl}
-        <!-- svelte-ignore a11y_media_has_caption: previews cannot synthesize a caption track -->
-        <video class="mx-auto max-h-[70vh] max-w-full rounded-xl bg-black" src={mediaUrl} controls playsinline></video>
-      {:else if kind === 'video'}
-        <p class="text-sm text-rose-300">The video preview could not be loaded.</p>
-      {:else if visibleRichPayload}
-        {#if truncated}<p class="mb-3 text-xs text-amber-300">Preview is truncated to safe display limits.</p>{/if}
-        <RichDeliverable
-          content={content}
-          instanceId={`attachment-${attachment.artifact_id}`}
-          payload={visibleRichPayload}
-          surface="embedded"
-          title={attachment.filename}
-        />
+        <p class="text-sm text-danger">{error}</p>
       {:else}
-        {#if truncated}<p class="mb-3 text-xs text-amber-300">Preview limited to the first 512 KB.</p>{/if}
-        <pre class="min-h-full overflow-x-auto rounded-xl bg-slate-900 p-4 text-sm leading-6 text-slate-100"><code class="hljs">{@html highlighted}</code></pre>
+        <ArtifactPreviewContent {kind} filename={attachment.filename} mime={attachment.mime_type} {content} {richPayload} {truncated} {mediaUrl} {htmlSource} />
       {/if}
     </div>
-  </div>
 </div>

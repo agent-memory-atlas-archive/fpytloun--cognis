@@ -11,6 +11,15 @@ export interface SidebarConversationLanes {
   recent: Conversation[];
 }
 
+/** The canonical Waiting eligibility; session outcomes only affect row color. */
+export function isSidebarConversationWaiting(
+  conversation: Pick<Conversation, 'has_unread' | 'pending_notification_types'>,
+  isActive: boolean,
+): boolean {
+  return isDashboardConversationWaiting(conversation)
+    || (conversation.has_unread && !isActive);
+}
+
 export function partitionSidebarConversationLanes(
   conversations: Conversation[],
   backgroundWork: readonly BackgroundWorkItem[] = [],
@@ -22,8 +31,7 @@ export function partitionSidebarConversationLanes(
     isDashboardConversationActive(conversation)
     || backgroundActiveIds.has(conversation.conversation_id);
   const waiting = conversations.filter((conversation) =>
-    isDashboardConversationWaiting(conversation)
-    || (conversation.has_unread && !isActive(conversation))
+    isSidebarConversationWaiting(conversation, isActive(conversation))
   );
   const waitingIds = new Set(waiting.map((conversation) => conversation.conversation_id));
   const active = conversations.filter(

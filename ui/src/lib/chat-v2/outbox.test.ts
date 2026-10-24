@@ -97,9 +97,11 @@ class FakeDb {
 
   transaction(_name: string): IDBTransaction {
     this.store ??= new FakeObjectStore(this.entries);
-    return {
+    const transaction = {
       objectStore: () => this.store as unknown as IDBObjectStore
     } as unknown as IDBTransaction;
+    setTimeout(() => transaction.oncomplete?.call(transaction, new Event('complete')), 0);
+    return transaction;
   }
 }
 
@@ -174,6 +176,21 @@ describe('Chat v2 outbox', () => {
 
     await outbox.delete('txn-2');
     expect(await outbox.list()).toEqual([]);
+  });
+
+  it('reports durability and loses it after falling back to memory', async () => {
+    const outbox = new IndexedDbChatV2Outbox(new FakeIndexedDbFactory() as unknown as IDBFactory);
+    expect(outbox.isDurable()).toBe(true);
+    expect(new MemoryChatV2Outbox().isDurable()).toBe(false);
+
+    const broken = new IndexedDbChatV2Outbox({
+      open() {
+        throw new Error('quota exceeded');
+      }
+    } as unknown as IDBFactory);
+    await broken.put(entry());
+    expect(await broken.get('txn-1')).toMatchObject({ content: 'hello' });
+    expect(broken.isDurable()).toBe(false);
   });
 
   it('fails explicitly when IndexedDB is unavailable', () => {

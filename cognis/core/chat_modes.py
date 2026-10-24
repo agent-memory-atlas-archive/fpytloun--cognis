@@ -42,10 +42,6 @@ class ResolvedChatMode:
     mode: ChatMode
     source: ChatModeSource
 
-    @property
-    def read_only_required(self) -> bool:
-        return self.mode == "plan"
-
 
 def normalize_chat_mode(value: object, *, default: ChatMode = "default") -> ChatMode:
     """Return a supported chat mode, falling back to *default*."""
@@ -134,7 +130,7 @@ def chat_mode_system_message(mode: ChatMode) -> str:
     """Return a user-facing confirmation for persistent chat-mode changes."""
 
     if mode == "plan":
-        return "Plan mode enabled for this conversation. New turns will stay read-only until the mode changes."
+        return "Plan mode enabled for this conversation. New turns will focus on analysis and planning, not implementation."
     if mode == "build":
         return "Build mode enabled for this conversation. New turns may implement changes normally."
     return "Default chat mode restored for this conversation."
@@ -148,27 +144,39 @@ def plan_mode_reminder(*, source: ChatModeSource) -> str:
         "<system-reminder>\n"
         f"Plan mode is active for {scope}. The user wants analysis, exploration, "
         "design, or planning only.\n\n"
-        "You must remain read-only by behavior:\n"
-        "- Do not edit, write, patch, delete, move, format, install, commit, "
-        "push, deploy, or change external systems.\n"
-        "- You may inspect code, search, read files, run read-only diagnostics, "
-        "reason about architecture, ask clarifying questions, and produce plans.\n"
+        "Planning is an intent boundary, not a strict read-only sandbox:\n"
+        "- You may inspect code, search, read files, reason about architecture, "
+        "ask clarifying questions, and produce plans.\n"
+        "- Planning documents, scratch files and proportionate local setup or "
+        "diagnostics are allowed when they support the plan. Consider their "
+        "actual effects; incidental writes do not make them implementation.\n"
+        "- Do not perform substantive implementation, commit implementation changes, "
+        "push, deploy, or make consequential external changes merely to complete a plan.\n"
+        "- Explicit read-only restrictions, scope limits and required approvals "
+        "still apply. Planning mode is not permission to bypass them.\n"
         "- When a question tool is available, use targeted clarification when the "
         "answer would materially shape the plan, scope, acceptance criteria, or "
         "user-visible behavior. Do not ask low-value questions when a safe default "
         "or explicit assumption is sufficient.\n"
-        "- Bash may be available, but only read-only commands are allowed.\n"
-        "- If implementation is needed, explain that plan mode prevents changes "
-        "in this turn.\n"
-        "- Use subagents only for read-only exploration, research, architecture, "
-        "or review; do not delegate mutating implementation work.\n"
+        "- If implementation is needed, explain the proposed changes rather than "
+        "performing them in this turn.\n"
+        "- Use subagents only for planning, exploration, research, architecture, "
+        "or review; do not delegate implementation work.\n"
         "</system-reminder>"
     )
+
+
+def is_plan_command_tool(tool: ToolDefinition) -> bool:
+    """Identify native executor Bash, whose effects depend on its command."""
+
+    return tool.source.type == "executor" and tool.category == "shell" and tool.name == "bash"
 
 
 def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
     """Return whether a tool is clearly mutating and should be hidden in plan mode."""
 
+    if is_plan_command_tool(tool):
+        return False
     operations = tool.native_operations or []
     if operations and any(
         operation.mutation_kind is ToolMutationKind.READ for operation in operations
@@ -213,6 +221,9 @@ def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
 def is_plan_mutating_tool_call(tool: ToolDefinition, arguments: dict[str, object]) -> bool:
     """Return whether a concrete tool call can mutate state in plan mode."""
 
+    if is_plan_command_tool(tool):
+        # Exposure is not read-only proof; the router requires command evaluation.
+        return False
     operations = tool.native_operations or []
     if len(operations) > 1:
         requested = arguments.get("action") or arguments.get("operation")

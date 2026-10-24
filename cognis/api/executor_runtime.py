@@ -39,6 +39,157 @@ CONFIGURE_CAPABILITY_MCP_RUNTIME_STATUS = "mcp_runtime_status_v1"
 MAX_SAFE_ERROR_LENGTH = 240
 MAX_SAFE_STDERR_LENGTH = 240
 RESOURCE_SNAPSHOT_MIN_PERSIST_INTERVAL_SECONDS = 30
+MCP_RETRY_DELAYS_SECONDS = (5.0, 15.0, 30.0)
+
+
+def _retryable_mcp_server_ids(metadata: dict[str, Any]) -> set[str]:
+    return {
+        item["server_id"]
+        for item in metadata.get("mcp_servers", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("server_id"), str)
+        and item.get("status") == "failed"
+        and item.get("timed_out") is True
+        and not item.get("authorization_required")
+    }
+
+
+def schedule_executor_mcp_retries(
+    app: Any, executor_id: str, connection: Any, version: int
+) -> None:
+    """Retry timed-out MCP startup in the background after admission is ready."""
+    tasks = getattr(app.state, "executor_mcp_retry_tasks", None)
+    if tasks is None:
+        tasks = app.state.executor_mcp_retry_tasks = {}
+    key = (executor_id, connection, version)
+    if key in tasks and not tasks[key].done():
+        return
+    for old_key, old_task in list(tasks.items()):
+        if old_key[:2] == key[:2]:
+            tasks.pop(old_key, None)
+            old_task.cancel()
+
+    async def _run() -> None:
+        try:
+            for delay in MCP_RETRY_DELAYS_SECONDS:
+                await asyncio.sleep(delay)
+                async with _get_executor_lock(app, executor_id):
+                    if not _is_current_connection(app, executor_id, connection):
+                        return
+                    async with app.state.session_factory() as session:
+                        row = await get_executor_row(session, executor_id)
+                    if (
+                        row is None
+                        or row.status != "active"
+                        or int(row.desired_config_version or 0) != version
+                        or int(row.applied_config_version or 0) != version
+                    ):
+                        return
+                    failed_ids = _retryable_mcp_server_ids(row.runtime_metadata or {})
+                    if not failed_ids:
+                        return
+                    payload, metadata = await _build_configure_payload(app, row, version)
+                    servers = [
+                        server
+                        for server in payload.get("mcp_servers", [])
+                        if server.get("server_id") in failed_ids
+                    ]
+                    if not servers:
+                        return
+                    try:
+                        result = await connection.rpc_call(
+                            "executor.mcp.retry",
+                            {
+                                "config_version": version,
+                                "mcp_servers": servers,
+                                "secrets": payload.get("secrets", {}),
+                            },
+                            timeout=CONFIGURE_RPC_TIMEOUT_SECONDS,
+                        )
+                    except Exception as exc:
+                        # Old executors do not implement targeted recovery. Do
+                        # not fall back to a disruptive full reconfiguration.
+                        _logger.warning(
+                            "executor_runtime: background MCP retry stopped for %s (%s)",
+                            executor_id,
+                            type(exc).__name__,
+                        )
+                        return
+                    if result.get("state") != "applied":
+                        return
+                    async with app.state.session_factory() as session:
+                        current = await get_executor_row(
+                            session, executor_id, defer_observed_tools=True
+                        )
+                    if current is None or int(current.desired_config_version or 0) != version:
+                        return
+                    runtime_metadata = _merge_runtime_metadata(
+                        metadata,
+                        _sanitize_configure_result_runtime_metadata(
+                            result.get("runtime_metadata"), received_at=datetime.now(UTC)
+                        ),
+                    )
+                    observed_tools = list(result.get("observed_tools") or [])
+                    report = normalize_runtime_capability_report(
+                        (result.get("runtime_metadata") or {}).get("observed_capabilities")
+                    )
+                    if report is not None:
+                        runtime_metadata["observed_capabilities"] = report.model_dump(mode="json")
+                        runtime_metadata.pop("observed_capabilities_state", None)
+                    capabilities = ExecutorCapabilities.model_validate(
+                        (row.runtime_metadata or {}).get("capabilities") or {}
+                    )
+                    capabilities.tools = [str(tool["name"]) for tool in observed_tools]
+                    runtime_metadata["capabilities"] = capabilities.model_dump(mode="json")
+                    persisted = await _persist_runtime_state(
+                        app,
+                        executor_id,
+                        connection=connection,
+                        runtime_state=str(result.get("runtime_state") or "degraded"),
+                        applied_config_version=version,
+                        observed_tools=observed_tools,
+                        runtime_metadata=runtime_metadata,
+                    )
+                    if persisted is None or not await _connection_ownership_is_current(
+                        app, connection
+                    ):
+                        return
+                    app.state.providers.executor.websocket.mark_ready(
+                        executor_id,
+                        capabilities,
+                        metadata=_executor_connection_metadata(
+                            labels=row.labels or {},
+                            environment=runtime_metadata.get("environment"),
+                            platform=runtime_metadata.get("platform") or {},
+                            status=row.status,
+                            owner_email=row.owner_email,
+                            runtime_metadata=runtime_metadata,
+                        ),
+                        expected_connection=connection,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.warning(
+                "executor_runtime: background MCP recovery failed for %s",
+                executor_id,
+                exc_info=True,
+            )
+        finally:
+            if tasks.get(key) is asyncio.current_task():
+                tasks.pop(key, None)
+
+    tasks[key] = asyncio.create_task(_run(), name=f"executor-mcp-retry-{executor_id}")
+
+
+async def cancel_executor_mcp_retries(app: Any, executor_id: str, connection: Any) -> None:
+    """Drain retries owned by a closing executor connection."""
+    tasks = getattr(app.state, "executor_mcp_retry_tasks", {})
+    selected = [tasks.pop(key) for key in list(tasks) if key[:2] == (executor_id, connection)]
+    for task in selected:
+        task.cancel()
+    if selected:
+        await asyncio.gather(*selected, return_exceptions=True)
 
 
 def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
@@ -352,6 +503,8 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     target_version,
                     getattr(row, "runtime_state", "?"),
                 )
+                if _retryable_mcp_server_ids(runtime_metadata):
+                    schedule_executor_mcp_retries(app, executor_id, current_conn, target_version)
                 return True
 
             _logger.info(
@@ -543,6 +696,8 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 applied_version,
                 runtime_state,
             )
+            if _retryable_mcp_server_ids(runtime_metadata):
+                schedule_executor_mcp_retries(app, executor_id, current_conn, applied_version)
             return True
 
 
@@ -556,6 +711,10 @@ async def _persist_runtime_state(
     observed_tools: list[dict[str, Any]] | None = None,
     runtime_metadata: dict[str, Any],
 ) -> Any | None:
+    runtime_metadata = {
+        **runtime_metadata,
+        "monitor_runtime_revision": datetime.now(UTC).isoformat(),
+    }
     async with app.state.session_factory() as session:
         if connection is None:
             row = await update_executor_runtime_state(
@@ -583,6 +742,10 @@ async def _persist_runtime_state(
     cluster_signals = getattr(app.state, "cluster_signals", None)
     if cluster_signals is not None:
         await cluster_signals.publish_executor_change(executor_id)
+    if row is not None:
+        from cognis.api.executor_monitor import publish_executor_monitor_change
+
+        await publish_executor_monitor_change(app, executor_id)
     queue = getattr(app.state, "tool_classification_queue", None)
     if queue is None or row is None or not observed_tools:
         return row
@@ -669,6 +832,9 @@ async def persist_executor_resource_snapshot(
             await session.commit()
             if updated is None:
                 return False
+    from cognis.api.executor_monitor import publish_executor_monitor_change
+
+    await publish_executor_monitor_change(app, executor_id)
     return True
 
 
@@ -971,6 +1137,7 @@ async def _build_configure_payload(
         for skill in resolved.skills:
             if skill.tools or skill.asset_manifest:
                 manifest: dict[str, Any] = {
+                    "owner_email": row.owner_email,
                     "skill_id": skill.skill_id,
                     "version_id": skill.version_id,
                     "content_hash": skill.content_hash,

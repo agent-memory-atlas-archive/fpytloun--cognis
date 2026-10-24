@@ -56,6 +56,10 @@ def loop_with_pool():
     instance.tool_router.execute = AsyncMock()
     instance.providers = MagicMock()
     instance.session_manager = SimpleNamespace(session_factory=None)
+    instance.session_cache = SimpleNamespace(
+        get_loaded_skill_snapshots=lambda _: {},
+        get_events_since_compaction=lambda *_, **__: [],
+    )
     return instance
 
 
@@ -148,10 +152,10 @@ async def test_target_executor_stripped_before_dispatch(loop_with_pool, monkeypa
     ws_provider.get_handle_metadata = MagicMock(
         return_value={
             "environment": {
-                "user": "fpytloun",
-                "home": "/Users/fpytloun",
-                "cwd": "/Users/fpytloun/src/project",
-                "hostname": "olorin",
+                "user": "alice",
+                "home": "/Users/alice",
+                "cwd": "/Users/alice/src/project",
+                "hostname": "sample-mac",
             }
         }
     )
@@ -177,11 +181,9 @@ async def test_target_executor_stripped_before_dispatch(loop_with_pool, monkeypa
     assert routed_tc.arguments == {"command": "ls"}
     assert routed_tc.runtime_metadata["tool_call_id"] == "call-1"
     assert routed_tc.runtime_metadata["tool_name"] == "bash"
-    assert routed_tc.runtime_metadata["working_directory"] == "/Users/fpytloun/src/project"
+    assert routed_tc.runtime_metadata["working_directory"] == "/Users/alice/src/project"
     assert routed_tc.runtime_metadata["executor_environment"]["executor_id"] == "exec-other"
-    assert routed_tc.runtime_metadata["executor_environment"]["cwd"] == (
-        "/Users/fpytloun/src/project"
-    )
+    assert routed_tc.runtime_metadata["executor_environment"]["cwd"] == ("/Users/alice/src/project")
     assert "workspace_root" not in routed_tc.runtime_metadata
     # Connection used should be the other one (not the active)
     assert call.args[4] is other_conn
@@ -291,10 +293,10 @@ async def test_target_executor_refreshes_policy_with_target_paths_before_evaluat
     ws_provider.get_handle_metadata = MagicMock(
         return_value={
             "environment": {
-                "home": "/Users/fpytloun",
-                "cwd": "/Users/fpytloun/src/cognis",
-                "tmpdir": "/var/folders/cognis/tmp",
-                "hostname": "olorin",
+                "home": "/Users/alice",
+                "cwd": "/Users/alice/src/sample",
+                "tmpdir": "/var/folders/sample/tmp",
+                "hostname": "sample-mac",
             }
         }
     )
@@ -314,8 +316,8 @@ async def test_target_executor_refreshes_policy_with_target_paths_before_evaluat
     tc = _toolcall(
         "bash",
         {
-            "command": "git worktree add --detach /Users/fpytloun/src/worktrees/task HEAD",
-            "workdir": "/Users/fpytloun/src/cognis",
+            "command": "git worktree add --detach /Users/alice/src/worktrees/task HEAD",
+            "workdir": "/Users/alice/src/sample",
             "target_executor": "exec-other",
         },
     )
@@ -327,8 +329,8 @@ async def test_target_executor_refreshes_policy_with_target_paths_before_evaluat
     assert refresh.kwargs == {
         "session_policy_override": {"allow_policies": ["shell"]},
         "additional_allowed_paths": [
-            "/Users/fpytloun",
-            "/Users/fpytloun/src/cognis",
+            "/Users/alice",
+            "/Users/alice/src/sample",
         ],
     }
     assert loop_with_pool.tool_router.execute.await_args.args[4] is other_conn
@@ -406,10 +408,10 @@ def test_install_active_executor_target_rebinds_same_turn_runtime(loop_with_pool
     ws_provider.get_handle_metadata = MagicMock(
         return_value={
             "environment": {
-                "user": "fpytloun",
-                "home": "/Users/fpytloun",
-                "cwd": "/Users/fpytloun",
-                "hostname": "olorin",
+                "user": "alice",
+                "home": "/Users/alice",
+                "cwd": "/Users/alice",
+                "hostname": "sample-mac",
             },
             "platform": {"os": "darwin", "arch": "arm64", "python": "3.12"},
         }
@@ -419,6 +421,7 @@ def test_install_active_executor_target_rebinds_same_turn_runtime(loop_with_pool
     switched = loop_with_pool._install_active_executor_target(
         ctx,
         pool.by_id("exec-other"),
+        replacement_registry=ctx.tool_registry,
     )
 
     assert switched is True
@@ -427,9 +430,9 @@ def test_install_active_executor_target_rebinds_same_turn_runtime(loop_with_pool
     assert ctx.executor_connection is other_conn
     assert ctx.executor_connection is not old_conn
     assert ctx.executor_environment.executor_id == "exec-other"
-    assert ctx.executor_environment.home == "/Users/fpytloun"
-    assert ctx.workspace_root == "/Users/fpytloun"
-    assert ctx.working_directory == "/Users/fpytloun"
+    assert ctx.executor_environment.home == "/Users/alice"
+    assert ctx.workspace_root == "/Users/alice"
+    assert ctx.working_directory == "/Users/alice"
 
 
 def test_install_active_executor_target_keeps_current_target_when_replacement_is_pending(
@@ -444,7 +447,9 @@ def test_install_active_executor_target_keeps_current_target_when_replacement_is
     ws_provider.get_ready_connection = MagicMock(return_value=None)
     loop_with_pool.providers.executor.websocket = ws_provider
 
-    switched = loop_with_pool._install_active_executor_target(ctx, pool.by_id("exec-other"))
+    switched = loop_with_pool._install_active_executor_target(
+        ctx, pool.by_id("exec-other"), replacement_registry=ctx.tool_registry
+    )
 
     assert switched is False
     assert ctx.active_executor_id == "exec-active"
@@ -464,7 +469,9 @@ async def test_no_target_after_switch_uses_rebound_connection(loop_with_pool) ->
     ws_provider.get_ready_connection = MagicMock(return_value=other_conn)
     ws_provider.get_handle_metadata = MagicMock(return_value={"environment": {}})
     loop_with_pool.providers.executor.websocket = ws_provider
-    loop_with_pool._install_active_executor_target(ctx, pool.by_id("exec-other"))
+    loop_with_pool._install_active_executor_target(
+        ctx, pool.by_id("exec-other"), replacement_registry=ctx.tool_registry
+    )
 
     loop_with_pool._get_tool_registry = lambda c: c.tool_registry
     loop_with_pool._tool_runtime_metadata = lambda c: {}
@@ -474,9 +481,10 @@ async def test_no_target_after_switch_uses_rebound_connection(loop_with_pool) ->
     )
 
     tc = _toolcall("bash", {"command": "pwd"})
-    await loop_with_pool._execute_regular_tool(ctx, tc)
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
 
     call = loop_with_pool.tool_router.execute.await_args
+    assert call is not None, result
     assert call.args[4] is other_conn
     assert call.args[0].arguments == {"command": "pwd"}
 

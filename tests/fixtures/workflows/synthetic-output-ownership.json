@@ -1,0 +1,131 @@
+{
+  "source": {
+    "kind": "synthetic_contract_fixture",
+    "description": "Constructed collector/publisher examples for output-ownership regressions. No persisted task identities, historical digests, deployment topology or operational prompts are included.",
+    "historical_snapshot": false
+  },
+  "handoff": {
+    "attempt_number": 2,
+    "workflow": {
+      "workflow_id": "synthetic-evidence-handoff",
+      "version": 2,
+      "interaction": {"mode": "none"},
+      "defaults": {
+        "max_attempts": 1,
+        "evaluate": false,
+        "on_exhausted": "fail",
+        "delivery": {"completion_mode_family": "default", "allow_silent_completion": false},
+        "session_policy": {"allow_policies": [], "deny_policies": []}
+      },
+      "steps": [
+        {
+          "name": "collect_evidence", "type": "run",
+          "agent_override": "collector", "agent_profile_id": "developer", "reasoning_effort": null,
+          "input": {"type": "null", "source": null, "reuse_session_from": null},
+          "completion": {"evaluate": false, "evaluator_prompt": null, "max_attempts": 1, "on_exhausted": "fail"},
+          "allow_questions": false, "require_deliverable": true,
+          "step_profile_id": null, "step_profile_mode": "soft",
+          "step_profile": {"matrix": {}, "tool_overrides": {"include": [], "exclude": []}, "allow_tool_search": true},
+          "gate": null, "on_reject": null,
+          "outcome_routes": [{"status": "rejected", "action": "continue", "max_loop_iterations": null, "on_exhausted": "gate"}],
+          "revision": {"allowed": true, "use_when": ""},
+          "metadata_contract": null,
+          "when": null, "on_skip": null, "on_error": null, "next": null,
+          "tool_call": null, "condition": null, "complete": null
+        },
+        {
+          "name": "execute", "type": "run",
+          "agent_override": "publisher", "agent_profile_id": "default", "reasoning_effort": null,
+          "input": {"type": "last", "source": "collect_evidence", "reuse_session_from": null},
+          "completion": {"evaluate": false, "evaluator_prompt": null, "max_attempts": 3, "on_exhausted": "fail"},
+          "allow_questions": false, "require_deliverable": true,
+          "step_profile_id": null, "step_profile_mode": "soft",
+          "step_profile": {"matrix": {}, "tool_overrides": {"include": [], "exclude": []}, "allow_tool_search": true},
+          "gate": null, "on_reject": null, "outcome_routes": [],
+          "revision": {"allowed": true, "use_when": ""},
+          "metadata_contract": {
+            "fields": [
+              {"name": "result_status", "type": "string", "required": true, "description": "", "enum": ["completed", "blocked"]},
+              {"name": "verification", "type": "object", "required": true, "description": "", "enum": null}
+            ]
+          },
+          "when": null, "on_skip": null, "on_error": null, "next": null,
+          "tool_call": null, "condition": null, "complete": null
+        }
+      ]
+    }
+  },
+  "silent_completion": {
+    "attempt_number": 1,
+    "workflow": {
+      "workflow_id": "synthetic-silent-output-contract",
+      "version": 1,
+      "interaction": {"mode": "none"},
+      "defaults": {
+        "max_attempts": 1,
+        "evaluate": false,
+        "on_exhausted": "fail",
+        "delivery": {"completion_mode_family": "default", "allow_silent_completion": false},
+        "session_policy": {"allow_policies": [], "deny_policies": []}
+      },
+      "steps": [
+        {
+          "name": "collect_evidence", "type": "run",
+          "agent_override": "collector", "agent_profile_id": "developer", "reasoning_effort": null,
+          "input": {"type": "null", "source": null, "reuse_session_from": null},
+          "completion": {"evaluate": false, "evaluator_prompt": null, "max_attempts": 1, "on_exhausted": "fail"},
+          "allow_questions": false, "require_deliverable": true,
+          "step_profile_id": null, "step_profile_mode": "soft",
+          "step_profile": {"matrix": {}, "tool_overrides": {"include": [], "exclude": []}, "allow_tool_search": true},
+          "gate": null, "on_reject": null,
+          "outcome_routes": [{"status": "rejected", "action": "continue", "max_loop_iterations": null, "on_exhausted": "gate"}],
+          "revision": {"allowed": true, "use_when": ""},
+          "metadata_contract": null,
+          "when": null, "on_skip": null, "on_error": null, "next": null,
+          "tool_call": null, "condition": null, "complete": null
+        },
+        {
+          "name": "execute", "type": "run",
+          "agent_override": "publisher", "agent_profile_id": "default", "reasoning_effort": null,
+          "input": {"type": "last", "source": "collect_evidence", "reuse_session_from": null},
+          "completion": {"evaluate": false, "evaluator_prompt": null, "max_attempts": 1, "on_exhausted": "fail"},
+          "allow_questions": false, "require_deliverable": true,
+          "step_profile_id": null, "step_profile_mode": "soft",
+          "step_profile": {"matrix": {}, "tool_overrides": {"include": [], "exclude": []}, "allow_tool_search": true},
+          "gate": null, "on_reject": null, "outcome_routes": [],
+          "revision": {"allowed": true, "use_when": ""},
+          "metadata_contract": null,
+          "when": null, "on_skip": null, "on_error": null, "next": null,
+          "tool_call": null, "condition": null, "complete": null
+        },
+        {
+          "name": "complete_silent", "type": "complete",
+          "agent_override": null, "agent_profile_id": null, "reasoning_effort": null,
+          "input": null, "completion": null,
+          "allow_questions": false, "require_deliverable": true,
+          "step_profile_id": null, "step_profile_mode": "soft", "step_profile": null,
+          "gate": null, "on_reject": null, "outcome_routes": [],
+          "revision": {"allowed": true, "use_when": ""},
+          "metadata_contract": null,
+          "when": null, "on_skip": null, "on_error": null, "next": null,
+          "tool_call": null, "condition": null,
+          "complete": {
+            "status": "completed",
+            "summary": "Synthetic collector/publisher output-ownership example completed; no normal brief was published.",
+            "content": null,
+            "outputs": {"synthetic": true, "normal_brief_published": false},
+            "notification": null,
+            "delivery_mode_override": "silent"
+          }
+        }
+      ]
+    }
+  },
+  "implementation_constraints": {
+    "no_general_nonrun_bypass": true,
+    "no_claim_that_complete_outputs_are_empty": true,
+    "content_is_null_in_synthetic_silent_completion": true,
+    "complete_require_deliverable_true_is_normalized_default_not_run_producer_evidence": true,
+    "producer_semantics_must_match_engine_and_delivery_behavior": true
+  }
+}

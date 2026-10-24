@@ -56,6 +56,62 @@ data model.
 
 ## Design Principles
 
+### Native management contract
+
+REST and native project tools use `ProjectManagementService` for grant
+transitions and workflow authorization. Grant changes recheck owner access under
+the existing resource-share lock and stage notifications in the same transaction.
+Identical create/update/revoke retries do not create additional inbox entries.
+Recipient lookup is owner-only, bounded to 20 active, non-system accounts, and
+returns only name/email after a nonempty name query or exact email match.
+
+`get_project` and `list_project_grants` expose persisted grants rather than an
+unpopulated response default. Non-owners see only active membership.
+
+Project KB tools reuse `set_project_knowledgebase` and the REST metadata
+projection. Assignment requires KB ownership plus project management access;
+removal also permits the KB owner to withdraw content without project access.
+The shared mutation owner rejects inactive/global-viewer actors and serializes
+duplicate transitions using the existing project resource-sharing lock.
+`get_project` includes assigned KB metadata; listing alone does not change
+retrieval permissions.
+
+`list_project_conversations` uses the existing project-visible history query
+with a shared-only filter. It requires fresh active-project/agent authorization
+and binds keyset cursors to actor, project, active agent, and author-agent filter.
+No message bodies, tool results, or reasoning are included in list metadata.
+
+Project schedule association is part of `manage_schedules` create/update/list
+contracts. Explicit null clears assignment; omitted preserves it. Relational
+edits validate effective project, agent and workflow before the database commit.
+Metadata-only edits do not reassign or reactivate resources.
+
+`set_conversation_project` reuses `change_conversation_project` for current or
+explicitly identified owned topic chats, including the shared-by-default policy
+for newly assigned chats. An explicit visibility override is passed into that
+owner so document migration uses the final scope. `update_task` passes the
+existing store clear flag for explicit null
+and revalidates effective agent/workflow access. No new runtime/session state or
+external side effects are introduced; these metadata changes take effect through
+normal next-turn/project resolution.
+
+`leave_project` and REST leave share `ProjectManagementService.leave`: privacy
+changes and grant revocation are one transaction under the project sharing lock.
+Cancellation before commit rolls back both changes. After successful leave,
+read authorization denies further access; there is no retry grant recreation.
+Project-task metadata listing uses the existing visibility query and fresh
+active-agent/project authorization on every cursor page.
+
+`set_project_avatar` accepts exactly one of `content_ref` or `clear=true`.
+Artifact references require the normal active-agent content entitlement; REST
+may also use owner-authorized legacy image uploads. Both validate the bytes and
+create a project-owned snapshot without granting access to the source artifact.
+There is no administrator content-ownership bypass.
+
+Generated images are registered with conversation/session provenance before a
+stable `artifact_id` is returned. The ID is accepted unchanged by image
+generation references and avatar tools.
+
 ### 1. Project is a controller-side context, not a data set
 
 Projects live in Cognis. They describe what the system is working on and

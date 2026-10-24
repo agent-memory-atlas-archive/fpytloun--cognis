@@ -197,6 +197,31 @@ def test_capability_guidance_preserves_runtime_precedence_boundary() -> None:
     assert "cannot grant tools, permissions, target agent types, or asynchronous modes" in guidance
 
 
+@pytest.mark.parametrize(
+    "tools",
+    [
+        {"delegate"},
+        {"agent_conversation_create"},
+        {"agent_conversation_send"},
+        {"create_task", "create_workflow"},
+    ],
+)
+def test_message_readability_guidance_is_scoped_to_inter_agent_tools(tools: set[str]) -> None:
+    guidance = _guidance(
+        ConversationContext(type="web"),
+        OrchestrationMode.FULL,
+        tools,
+    )
+
+    assert guidance is not None
+    if "create_task" in tools:
+        assert "Keep inter-agent messages human-readable" not in guidance
+    else:
+        assert "Keep inter-agent messages human-readable" in guidance
+        assert "normal grammar and spaces between words and numbers" in guidance
+        assert "preserve identifiers and quoted text exactly" in guidance
+
+
 def test_delegate_guidance_reuses_existing_child_context() -> None:
     description = DELEGATE_TOOL.description
     assert "before creating a fresh child" in description.lower()
@@ -392,7 +417,7 @@ def test_nested_session_policy_uses_explicit_inheritance_without_widening() -> N
     )
 
 
-def test_mutable_guidance_is_audit_marked_after_prefix_and_replaced_without_duplicates() -> None:
+def test_mutable_guidance_appends_audit_marked_updates_without_rewriting_history() -> None:
     messages = [
         {"role": "system", "content": "immutable", "_immutable_prefix": True},
         {"role": "user", "content": "request"},
@@ -407,16 +432,24 @@ def test_mutable_guidance_is_audit_marked_after_prefix_and_replaced_without_dupl
         "_audit_role": "developer",
     }
     assert messages[0]["content"] == "immutable"
+    original_prefix = [dict(message) for message in messages]
 
     replace_orchestration_capability_guidance(messages, "updated capabilities")
     capability_messages = [
         message for message in messages if message.get("_orchestration_capability_guidance")
     ]
-    assert len(capability_messages) == 1
-    assert capability_messages[0]["content"] == "updated capabilities"
+    assert messages[: len(original_prefix)] == original_prefix
+    assert [message["content"] for message in capability_messages] == [
+        "first capabilities",
+        "updated capabilities",
+    ]
+    assert not replace_orchestration_capability_guidance(messages, "updated capabilities")
 
     replace_orchestration_capability_guidance(messages, None)
-    assert not any(message.get("_orchestration_capability_guidance") for message in messages)
+    assert messages[: len(original_prefix)] == original_prefix
+    assert messages[-1]["_orchestration_capability_guidance"] is True
+    assert "no longer available" in messages[-1]["content"]
+    assert not replace_orchestration_capability_guidance(messages, None)
 
 
 @pytest.mark.parametrize(

@@ -35,6 +35,7 @@ from cognis.models.tool import (
 )
 from cognis.models.tool import (
     ToolCall,
+    ToolCapability,
     ToolDynamicOption,
     ToolResult,
     ToolSource,
@@ -629,8 +630,10 @@ UPDATE_TASK_TOOL = ToolDefinition(
                 "description": "New workflow template ID.",
             },
             "project_id": {
-                "type": "string",
-                "description": "Optional project ID. Only use when there is an exact project match.",
+                "type": ["string", "null"],
+                "minLength": 1,
+                "description": "Known project ID. Omitted preserves assignment; null removes it. "
+                "Only use when there is an exact project match.",
             },
             "session_policy": {
                 "type": "object",
@@ -1805,6 +1808,7 @@ UPDATE_WORKFLOW_TOOL = ToolDefinition(
 
 DELETE_WORKFLOW_TOOL = ToolDefinition(
     name="delete_workflow",
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
     description="Delete a user-owned workflow. Active workflow references are protected.",
     parameters={
         "type": "object",

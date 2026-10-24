@@ -12,7 +12,6 @@ from cognis.models.artifact import ArtifactStatus, AttachmentRef
 from cognis.store.queries import (
     get_artifact_record,
     get_conversation,
-    get_managed_conversation_ancestry,
     get_managed_conversation_link_for_target,
 )
 
@@ -185,52 +184,19 @@ async def authorize_outbound_artifact_refs_in_session(
         if total_size > MAX_OUTBOUND_ARTIFACT_TOTAL_BYTES:
             raise ValueError(f"Outbound artifacts exceed {MAX_OUTBOUND_ARTIFACT_TOTAL_BYTES} bytes")
         grant: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "owner_email": user_email,
             "accessor_conversation_id": conversation_id,
             "accessor_agent_id": resolved_agent_id,
             "source_conversation_id": record.conversation_id,
+            "scope": "agent",
         }
-        if record.conversation_id is None:
-            grant["scope"] = "owner_global"
-        elif record.conversation_id == conversation_id:
-            grant["scope"] = "conversation"
-        else:
-            link = await get_managed_conversation_link_for_target(
-                session,
-                target_conversation_id=record.conversation_id,
-            )
-            scope = None
-            if link is not None and link.depth <= 2:
-                try:
-                    ancestry = await get_managed_conversation_ancestry(
-                        session,
-                        link,
-                        user_email=user_email,
-                    )
-                except ValueError:
-                    ancestry = []
-                if any(
-                    item.controller_conversation_id == conversation_id
-                    and item.controller_agent_id == resolved_agent_id
-                    for item in ancestry
-                ):
-                    scope = "descendant"
-            if scope is None:
-                link = await get_managed_conversation_link_for_target(
-                    session,
-                    target_conversation_id=conversation_id,
-                )
-                scope = "ancestor"
-            if link is None:
-                raise ValueError(f"Artifact is unavailable: {ref.artifact_id}")
-            grant.update(
-                {
-                    "scope": scope,
-                    "descendant_link_id": link.link_id,
-                    "descendant_owner_epoch": link.owner_epoch,
-                }
-            )
+        accessor_link = await get_managed_conversation_link_for_target(
+            session, conversation_id, user_email=user_email
+        )
+        if accessor_link is not None:
+            grant["accessor_link_id"] = accessor_link.link_id
+            grant["accessor_owner_epoch"] = accessor_link.owner_epoch
         payload = safe_attachment_metadata([ref])[0]
         payload[OUTBOUND_ARTIFACT_GRANT_KEY] = grant
         authorized.append(payload)
@@ -247,6 +213,35 @@ async def outbound_artifact_grant_is_valid(
     """Revalidate an attachment against the exact persisted authorization grant."""
 
     grant = attachment.get(OUTBOUND_ARTIFACT_GRANT_KEY)
+    if isinstance(grant, dict) and grant.get("version") == 2:
+        if artifact is None or grant.get("owner_email") != owner_email:
+            return False
+        try:
+            _validate_outbound_record(artifact, AttachmentRef.model_validate(attachment))
+        except ValueError:
+            return False
+        if grant.get("accessor_link_id"):
+            accessor_conversation_id = grant.get("accessor_conversation_id")
+            if not isinstance(accessor_conversation_id, str) or not accessor_conversation_id:
+                return False
+            link = await get_managed_conversation_link_for_target(
+                session, accessor_conversation_id, user_email=owner_email
+            )
+            if (
+                link is None
+                or link.link_id != grant["accessor_link_id"]
+                or link.owner_epoch != grant.get("accessor_owner_epoch")
+                or link.conversation_state != "open"
+            ):
+                return False
+        return await artifact_authorized_for_conversation(
+            session,
+            artifact=artifact,
+            owner_email=owner_email,
+            conversation_id=grant.get("accessor_conversation_id"),
+            agent_id=grant.get("accessor_agent_id"),
+        )
+    # Retain validation of already-queued v1 outbox payloads during rollout.
     if not isinstance(grant, dict) or grant.get("version") != 1 or artifact is None:
         return False
     if grant.get("owner_email") != owner_email or artifact.owner_email != owner_email:

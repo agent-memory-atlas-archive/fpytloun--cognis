@@ -1231,8 +1231,9 @@ async def test_conversation_scoped_deliverable_access_checks_owner(tmp_path) -> 
         published = await get_artifact_record(session, row.deliverable_id)
         assert published is not None
         assert published.owner_email == "owner@example.com"
-        assert published.conversation_id is None
-        assert published.session_id is None
+        assert published.conversation_id == "conv"
+        assert published.session_id == "sess"
+        assert published.owner_agent_id == "agent"
         assert published.purpose == "conversation_deliverable"
         assert (
             await get_accessible_conversation_deliverable(

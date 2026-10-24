@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Schedule, Workflow } from '$lib/types/api';
+import { syncHealthWorkflow } from '$lib/testing/workflow-plan-fixture';
 import ScheduleDashboardModal from './ScheduleDashboardModal.svelte';
 
 const { workflowDetail, scheduleDetail } = vi.hoisted(() => ({
@@ -63,6 +64,29 @@ function schedule(workflowId: string | null): Schedule {
 }
 
 describe('ScheduleDashboardModal', () => {
+  it('explains a synthetic blank-description workflow and its alternative outcomes', async () => {
+    scheduleDetail.mockResolvedValue(schedule('wf_synthetic_catalog_health'));
+    workflowDetail.mockResolvedValue(syncHealthWorkflow());
+    render(ScheduleDashboardModal, { scheduleId: 'schedule-1', onClose: vi.fn() });
+    await fireEvent.click(await screen.findByTestId('dashboard-schedule-modal-tab-steps'));
+    const plan = await screen.findByTestId('dashboard-schedule-planned-steps');
+    expect(plan).toHaveTextContent('Notify only when unhealthy');
+    expect(plan).toHaveTextContent('Synthetic catalog health probe');
+    expect(plan).toHaveTextContent('not every step runs');
+    expect(screen.getByTestId('planned-step-route')).toHaveTextContent('If true: healthy');
+    expect(screen.getByTestId('planned-step-route')).toHaveTextContent('If false: unhealthy');
+    expect(screen.getByTestId('planned-step-healthy')).toHaveTextContent('Finish silently');
+    const unhealthy = screen.getByTestId('planned-step-unhealthy');
+    expect(unhealthy).toHaveTextContent('preferred channel');
+    const details = unhealthy.querySelector('details')!;
+    expect(details.open).toBe(false);
+    await fireEvent.click(details.querySelector('summary')!);
+    // jsdom does not implement the native summary toggle; the browser test
+    // verifies keyboard expansion. Content remains available without truncation.
+    expect(details).toHaveTextContent('Ukázkový katalog vyžaduje kontrolu. Ověřte pouze demonstrační záznamy.');
+    expect(plan.querySelector('ol')).toBeNull();
+  });
+
   it('shows only Description and Planned steps and loads the workflow once', async () => {
     scheduleDetail.mockResolvedValue(schedule('workflow-1'));
     workflowDetail.mockResolvedValue({
@@ -86,6 +110,26 @@ describe('ScheduleDashboardModal', () => {
     await fireEvent.click(screen.getByTestId('dashboard-schedule-modal-tab-description'));
     await fireEvent.click(screen.getByTestId('dashboard-schedule-modal-tab-steps'));
     expect(workflowDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies scheduled task interaction and silent-completion policy to the preview', async () => {
+    const workflow = syncHealthWorkflow();
+    workflow.interaction = { mode: 'explicit_gates' };
+    workflow.steps.unshift({
+      name: 'approval', type: 'gate', gate: {
+        message: 'Approve the check?', options: [{ label: 'Approve', action: 'continue' }],
+        conditions: [{ expression: 'requires_approval' }],
+      },
+    });
+    scheduleDetail.mockResolvedValue({ ...schedule(workflow.workflow_id), allow_silent_completion: true });
+    workflowDetail.mockResolvedValue(workflow);
+    render(ScheduleDashboardModal, { scheduleId: 'schedule-1', onClose: vi.fn() });
+    await fireEvent.click(await screen.findByTestId('dashboard-schedule-modal-tab-steps'));
+    const gate = await screen.findByTestId('planned-step-approval');
+    expect(gate).toHaveTextContent('Autonomous mode bypasses this gate');
+    const outcome = screen.getByTestId('planned-step-unhealthy');
+    expect(outcome).toHaveTextContent('Finish silently');
+    expect(outcome).not.toHaveTextContent('Send the result through the preferred channel');
   });
 
   it('shows the ad-hoc state without a workflow request', async () => {

@@ -435,29 +435,30 @@ Pulse guarantees:
 - responsive single-column composition on narrow screens and restrained newsroom
   columns on desktop/PDF.
 
-The recommended daily-brief payload is:
+The following fictional museum-day payload illustrates the daily-brief structure.
+Dates, activities, conditions, and institutions are invented:
 
 ```json
 {
   "metadata": {
     "presentation": "pulse",
-    "eyebrow": "Neděle · Lovosice",
-    "subtitle": "12. července 2026 · data 07:10 CEST"
+    "eyebrow": "Ukázkové muzeum · fiktivní den",
+    "subtitle": "16. dubna 2030 · data 08:00 CEST"
   },
   "blocks": [
     {
       "type": "hero",
-      "eyebrow": "Osobní intelligence · 07:10",
+      "eyebrow": "Demonstrační přehled · 08:00",
       "title": "Ranní pulse",
       "subtitle": "Místní datum, časové pásmo a nejstarší čas dat"
     },
     {
       "type": "grid",
       "blocks": [
-        { "type": "metric", "label": "Agenda", "value": "3", "delta": "Další 09:30" },
-        { "type": "metric", "label": "Lovosice", "value": "18 °C", "delta": "25 °C · déšť 20 %" },
-        { "type": "metric", "label": "Trhy", "value": "↗ mírně", "delta": "USD/CZK i BTC výše" },
-        { "type": "metric", "label": "Dominantní signál", "value": "Okno 9–12", "delta": "Jedna věta" }
+        { "type": "metric", "label": "Agenda", "value": "2", "delta": "Kontrola 10:00" },
+        { "type": "metric", "label": "Podmínky", "value": "11 °C", "delta": "Syntetická hodnota" },
+        { "type": "metric", "label": "Katalog", "value": "Ukázka", "delta": "Žádné skutečné záznamy" },
+        { "type": "metric", "label": "Priorita", "value": "Popisky", "delta": "Demonstrační kontrola" }
       ]
     },
     {
@@ -467,7 +468,7 @@ The recommended daily-brief payload is:
           "type": "section",
           "eyebrow": "Hlavní zpráva",
           "title": "Silný konkrétní titulek",
-          "content": "Dvě až tři věty briefingu.\\n\\n**Pro Filipa:** konkrétní dopad.",
+          "content": "Fiktivní muzeum předvádí ukázkový katalog.\\n\\n**Pro návštěvníka:** přístupné popisky.",
           "blocks": [{
             "type": "figure",
             "src": "https://verified.example/news-image.jpg",
@@ -487,7 +488,7 @@ The recommended daily-brief payload is:
     },
     {
       "type": "day_agenda",
-      "title": "Neděle 12. července",
+      "title": "Ukázkový den 16. dubna",
       "now": "2026-07-12T07:10:00+02:00",
       "timezone": "Europe/Prague",
       "freshness": "07:08 CEST",

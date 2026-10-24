@@ -79,15 +79,15 @@
   <button
     type="button"
     onclick={toggle}
-    class="flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-cyan-500/5 focus:outline-none"
+    class="flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-cyan-subtle focus-visible:outline-accent"
     aria-expanded={expanded}
   >
     <Brain
       class="mt-0.5 h-3.5 w-3.5 shrink-0 {item.streaming && live
-        ? 'text-cyan-400 animate-pulse'
-        : 'text-cyan-500/70'}"
+        ? 'text-cyan-tone animate-pulse'
+        : 'text-cyan-tone'}"
     />
-    <span class="min-w-0 flex-1 truncate font-medium text-cyan-300/80">
+    <span class="min-w-0 flex-1 truncate font-medium text-cyan-tone">
       {#if item.streaming && live && item.blocks.length === 0}
         Thinking…
       {:else}
@@ -95,48 +95,48 @@
       {/if}
     </span>
     {#if durationLabel}
-      <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
+      <span class="shrink-0 text-xs tabular-nums text-quiet">{durationLabel}</span>
     {/if}
     {#if item.streaming && live}
       <LiveDots inline={true} size="sm" tone="sky" />
     {:else}
       {#if expanded}
-        <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        <ChevronUp class="h-3.5 w-3.5 shrink-0 text-quiet" />
       {:else}
-        <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        <ChevronDown class="h-3.5 w-3.5 shrink-0 text-quiet" />
       {/if}
     {/if}
   </button>
 
   <!-- Expanded body -->
   {#if expanded}
-    <div class="mx-3 mb-2 overflow-hidden rounded-lg border border-cyan-500/20 bg-cyan-950/20">
+    <div class="mx-3 mb-2 overflow-hidden rounded-lg border border-cyan-border bg-cyan-subtle">
       {#each item.blocks as block, i (block.block_id)}
         {#if i > 0}
-          <hr class="border-cyan-500/10" />
+          <hr class="border-cyan-border" />
         {/if}
         <div class="px-3 py-2.5">
           {#if !(i === 0 && displayTitle(block.title) === headerTitle)}
             {@const duration = formatDurationMs(blockDurationMs(block))}
-            <p class="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-cyan-400/60">
+            <p class="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-cyan-tone">
               <span>Thinking: {displayTitle(block.title)}</span>
               {#if duration}
-                <span class="normal-case tracking-normal text-slate-500">{duration}</span>
+                <span class="normal-case tracking-normal text-quiet">{duration}</span>
               {/if}
             </p>
           {/if}
           <!-- Markdown-rendered thinking content -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="prose prose-sm prose-invert max-w-none text-slate-300/80 prose-p:my-1 prose-ul:my-1 prose-li:my-0 prose-code:text-cyan-200 prose-code:bg-cyan-900/30"
+            class="prose prose-sm max-w-none text-secondary prose-p:my-1 prose-ul:my-1 prose-li:my-0 prose-code:text-cyan-tone prose-code:bg-cyan-subtle"
           >
             {#if hasRenderedBody(block)}
               {@html block.html}
             {:else}
-              <p class="my-1 text-sm text-slate-400/80">Thinking details unavailable.</p>
+              <p class="my-1 text-sm text-muted">Thinking details unavailable.</p>
             {/if}
             {#if !block.complete}
-              <span class="inline-block h-3 w-0.5 animate-pulse bg-cyan-400/60 align-middle"></span>
+              <span class="inline-block h-3 w-0.5 animate-pulse bg-cyan-tone align-middle"></span>
             {/if}
           </div>
         </div>

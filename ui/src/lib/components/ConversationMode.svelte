@@ -850,12 +850,12 @@
   }
 
   function stateToneClass(): string {
-    if (muted) return 'from-slate-500/35 via-slate-600/25 to-slate-800/35';
-    if (missedUtterance) return 'from-amber-500/40 via-sky-500/25 to-slate-600/30';
-    if (modeState === 'listening') return 'from-emerald-400/45 via-sky-400/30 to-cyan-500/35';
-    if (modeState === 'processing') return 'from-sky-400/45 via-cyan-400/30 to-violet-500/35';
-    if (modeState === 'speaking') return 'from-sky-500/45 via-cyan-500/30 to-violet-500/40';
-    return 'from-slate-500/35 via-sky-500/20 to-slate-800/35';
+    if (muted) return 'from-muted/35 via-secondary/25 to-inset/35';
+    if (missedUtterance) return 'from-warning/40 via-info/25 to-muted/30';
+    if (modeState === 'listening') return 'from-success/45 via-info/30 to-cyan-tone/35';
+    if (modeState === 'processing') return 'from-info/45 via-cyan-tone/30 to-violet-tone/35';
+    if (modeState === 'speaking') return 'from-info/45 via-cyan-tone/30 to-violet-tone/40';
+    return 'from-muted/35 via-info/20 to-inset/35';
   }
 
   function agentLabel(): string {
@@ -869,7 +869,7 @@
 
 {#if open}
   <div
-    class="app-viewport-overlay app-safe-fullscreen z-50 bg-slate-950/95 backdrop-blur-md"
+    class="app-viewport-overlay app-safe-fullscreen z-50 bg-canvas/95 backdrop-blur-md"
     role="dialog"
     aria-modal="true"
     aria-label="Voice conversation mode"
@@ -879,7 +879,7 @@
     <div class="app-safe-fullscreen__toolbar flex justify-end">
       <button
         type="button"
-        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-900/90 text-slate-300 shadow-lg backdrop-blur transition hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-surface/90 text-secondary shadow-lg backdrop-blur transition hover:bg-surface-hover hover:text-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         aria-label="End conversation"
         onclick={handleClose}
       >
@@ -891,15 +891,15 @@
       <div class="flex w-full items-center gap-3">
         <AgentAvatar name={agentLabel()} avatarUrl={agent?.avatar_url ?? null} class="h-11 w-11 rounded-2xl" />
         <div class="min-w-0">
-          <p class="truncate text-base font-semibold text-white">{agentLabel()}</p>
-          <p class="truncate text-xs text-slate-500">Conversation mode · {voiceLabel()}</p>
+          <p class="truncate text-base font-semibold text-strong">{agentLabel()}</p>
+          <p class="truncate text-xs text-quiet">Conversation mode · {voiceLabel()}</p>
         </div>
       </div>
 
       <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 text-center">
         <button
           type="button"
-          class="relative h-56 w-56 rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:h-72 sm:w-72"
+          class="relative h-56 w-56 rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:h-72 sm:w-72"
           aria-label={playbackNeedsGesture ? 'Enable audio playback' : modeState === 'speaking' ? 'Interrupt assistant and listen' : modeState === 'listening' ? 'Finish speaking' : 'Voice conversation status'}
           onclick={() => {
             if (playbackNeedsGesture) void unlockPlayback();
@@ -911,15 +911,15 @@
             class={`absolute inset-0 rounded-full bg-gradient-to-br ${stateToneClass()} transition`}
             class:animate-pulse={modeState === 'speaking' || modeState === 'listening'}
           ></span>
-          <span class="absolute inset-3 rounded-full bg-slate-950 shadow-2xl shadow-sky-500/30"></span>
+          <span class="absolute inset-3 rounded-full bg-canvas shadow-2xl shadow-accent/30"></span>
           <span class="absolute inset-0 flex flex-col items-center justify-center gap-3">
-            <Headphones class="h-12 w-12 text-sky-300 sm:h-14 sm:w-14" />
-            <span class="text-xs font-medium uppercase tracking-[0.3em] text-slate-300">Conversation</span>
+            <Headphones class="h-12 w-12 text-accent sm:h-14 sm:w-14" />
+            <span class="text-xs font-medium uppercase tracking-[0.3em] text-secondary">Conversation</span>
             {#if modeState === 'listening' && !muted}
               <span class="mt-1 flex h-10 items-end gap-1" aria-hidden="true">
                 {#each [0.35, 0.7, 1, 0.6, 0.85, 0.45] as scale}
                   <span
-                    class="w-1 rounded-full bg-sky-300 transition-[height] duration-75"
+                    class="w-1 rounded-full bg-accent transition-[height] duration-75"
                     style={`height: ${Math.max(8, Math.round(38 * Math.max(0.15, voiceLevel * scale)))}px;`}
                   ></span>
                 {/each}
@@ -929,8 +929,8 @@
         </button>
 
         <div>
-          <p class="text-lg font-semibold text-slate-100" aria-live="polite">{stateLabel(modeState)}</p>
-          <p class="mt-2 text-sm text-slate-500">
+          <p class="text-lg font-semibold text-foreground" aria-live="polite">{stateLabel(modeState)}</p>
+          <p class="mt-2 text-sm text-quiet">
             {#if playbackNeedsGesture}
               Tap the orb to enable audio playback.
             {:else if modeState === 'speaking'}
@@ -968,14 +968,14 @@
       </div>
 
       {#if playbackNeedsGesture && !assistantTurnActive && pendingSentenceSyntheses === 0}
-        <p class="text-center text-xs text-slate-500">Audio playback was blocked. Tap the orb to retry; text remains available.</p>
+        <p class="text-center text-xs text-quiet">Audio playback was blocked. Tap the orb to retry; text remains available.</p>
       {/if}
 
       {#if transcriptOpen && transcript.length > 0}
-        <div id="conversation-mode-transcript" class="max-h-56 w-full overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900/70 p-3 text-left text-sm text-slate-200">
+        <div id="conversation-mode-transcript" class="max-h-56 w-full overflow-y-auto rounded-2xl border border-separator bg-surface/70 p-3 text-left text-sm text-foreground">
           {#each transcript as entry, i (i)}
-            <p class={`mb-2 last:mb-0 ${entry.role === 'user' ? 'text-sky-300' : 'text-slate-200'}`}>
-              <span class="text-[10px] font-medium uppercase tracking-wider text-slate-500">{entry.role}</span>
+            <p class={`mb-2 last:mb-0 ${entry.role === 'user' ? 'text-accent' : 'text-foreground'}`}>
+              <span class="text-[10px] font-medium uppercase tracking-wider text-quiet">{entry.role}</span>
               <span class="ml-2">{entry.text}</span>
             </p>
           {/each}

@@ -307,11 +307,11 @@ describe('renderMarkdown', () => {
     expect(preCount(html)).toBe(2);
   });
 
-  it('highlights fenced code blocks with known languages', () => {
+  it('marks fenced code blocks for deferred highlighting', () => {
     const html = renderMarkdown(['```python', 'def hello():', '    return "world"', '```'].join('\n'));
 
-    expect(html).toContain('class="hljs language-python"');
-    expect(html).toContain('hljs-keyword');
+    expect(html).toContain('class="language-python"');
+    expect(html).toContain('data-cognis-highlight="python"');
     expect(html).toContain('hello');
   });
 

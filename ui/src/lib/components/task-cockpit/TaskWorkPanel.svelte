@@ -25,6 +25,7 @@
   import type { Agent } from '$lib/types/api';
   import { classifyActivityOverviewPresentation } from '$lib/work/activityOverviewState';
   import type { WorkInitialFocus } from '$lib/work/workFocus';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
 
   let {
     stepRuns,
@@ -57,6 +58,9 @@
   let projections = $state<Array<{ run: StepRun; projection: WorkProjectionResponse }>>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
+  // Hidden while the global connection banner applies; refresh on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(error), retry: () => refresh() });
+  const visibleError = $derived(net.hideErrors ? null : error);
   let expanded = $state(false);
   let selectedStepRunId = $state<string | null>(null);
   let selectedWorkCategory = $state<'files' | 'commands' | 'mutations' | 'artifacts' | 'results'>('files');
@@ -314,16 +318,16 @@
 <Card class="p-4">
   <div class="flex items-start justify-between gap-3">
     <div>
-      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-sky-300">{view === 'deliverable' ? 'Final deliverable' : 'Activity'}</p>
-      <p class="mt-1 text-xs text-slate-500">{view === 'deliverable' ? 'Canonical task result.' : 'Persisted task-step evidence; no log reconstruction.'}</p>
+      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-accent">{view === 'deliverable' ? 'Final deliverable' : 'Activity'}</p>
+      <p class="mt-1 text-xs text-quiet">{view === 'deliverable' ? 'Canonical task result.' : 'Persisted task-step evidence; no log reconstruction.'}</p>
     </div>
     {#if view !== 'deliverable'}
       <Button size="sm" variant="secondary" onclick={() => { selectedWorkInitialFocus = null; expanded = true; }}>Explore <ChevronRight class="ml-1 h-3.5 w-3.5" /></Button>
     {/if}
   </div>
   {#if view !== 'activity' && finalResult}
-    <section class="mt-4 border-t border-slate-800 pt-4" aria-label="Task result" data-testid="task-final-result">
-      <p class="mb-2 text-[10px] font-semibold uppercase tracking-widest text-emerald-300">Task result</p>
+    <section class="mt-4 border-t border-separator pt-4" aria-label="Task result" data-testid="task-final-result">
+      <p class="mb-2 text-[10px] font-semibold uppercase tracking-widest text-success">Task result</p>
       <AssistantDeliverableBlock
         item={finalResult}
         loadDeliverable={resultEntry?.run.step_run_id ? loadFinalDeliverable : undefined}
@@ -333,13 +337,13 @@
     </section>
   {/if}
   {#if view === 'deliverable' && !finalResult && !loading && !error}
-    <p class="mt-3 rounded-xl border border-dashed border-slate-700 p-6 text-center text-sm text-slate-400" data-testid="task-final-result-empty">
+    <p class="mt-3 rounded-xl border border-dashed border-control-border p-6 text-center text-sm text-muted" data-testid="task-final-result-empty">
       The final deliverable is not available yet.
     </p>
   {/if}
-  {#if error}
-    <div class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100" role="alert">
-      <p>{view === 'deliverable' ? 'Final deliverable could not be loaded' : 'Task work refresh failed'}: {error}</p>
+  {#if visibleError}
+    <div class="mt-4 rounded-xl border border-warning-border bg-warning-subtle px-3 py-2 text-xs text-warning" role="alert">
+      <p>{view === 'deliverable' ? 'Final deliverable could not be loaded' : 'Task work refresh failed'}: {visibleError}</p>
       <button class="mt-1 underline" type="button" onclick={() => void refresh()}>Try again</button>
     </div>
   {/if}
@@ -349,7 +353,7 @@
       <ActivityLifecycleStatus materialization={selectedOverview.materialization} onRetry={() => void refresh()} />
       {#if !presentation.hasContent}
         {#if !selectedOverview.materialization || selectedOverview.materialization.state === 'live'}
-          <p class="rounded-xl border border-dashed border-slate-700 p-6 text-center text-xs text-slate-400" data-testid="task-work-overview-empty">No activity yet.</p>
+          <p class="rounded-xl border border-dashed border-control-border p-6 text-center text-xs text-muted" data-testid="task-work-overview-empty">No activity yet.</p>
         {/if}
       {:else}
         <ActivitySummaryStrip metrics={[
@@ -363,22 +367,22 @@
         {:else}
           <RecentActivityList items={Object.values(selectedOverview.recent).flat().slice(0, 5).map((item) => ({ id: item.id, title: item.title ?? item.category, detail: item.category }))} />
         {/if}
-        <details class="rounded-xl border border-slate-800 p-3">
-          <summary class="cursor-pointer text-xs font-medium text-slate-300">Execution sessions</summary>
+        <details class="rounded-xl border border-separator p-3">
+          <summary class="cursor-pointer text-xs font-medium text-secondary">Execution sessions</summary>
           <div class="mt-3"><ActivityTree nodes={selectedOverview.workstreams} {agents} onViewSession={viewTaskSession} onViewWork={viewTaskWork} /></div>
         </details>
       {/if}
     </div>
   {/if}
-  {#if view !== 'deliverable' && loading && !selectedOverview}<p class="mt-3 text-xs text-slate-500">Loading persisted work…</p>
-  {:else if view !== 'deliverable' && !selectedOverview && !error}<p class="mt-3 text-xs text-slate-500">No persisted task work yet.</p>{/if}
+  {#if view !== 'deliverable' && loading && !selectedOverview}<p class="mt-3 text-xs text-quiet">Loading persisted work…</p>
+  {:else if view !== 'deliverable' && !selectedOverview && !error}<p class="mt-3 text-xs text-quiet">No persisted task work yet.</p>{/if}
 </Card>
 </div>
 
 <BlockingDialog open={expanded} onClose={() => { expanded = false; }} label="Task work" panelClass="max-w-6xl">
   {#snippet header()}
     <div class="flex min-w-0 flex-1 items-center justify-between gap-3">
-      <div><h2 class="text-lg font-semibold text-white">Task Work</h2><p class="text-xs text-slate-500">Final deliverable, diffs, commands, and mutations by authorized step scope.</p></div>
+      <div><h2 class="text-lg font-semibold text-strong">Task Work</h2><p class="text-xs text-quiet">Final deliverable, diffs, commands, and mutations by authorized step scope.</p></div>
       <Button size="sm" variant="secondary" onclick={() => { expanded = false; }}>Close</Button>
     </div>
   {/snippet}
@@ -387,11 +391,11 @@
       {#if authorizedRuns.length > 1}
         <div class="mb-4 flex gap-2 overflow-x-auto pb-1" role="tablist" aria-label="Task step work">
           {#each authorizedRuns as run (run.step_run_id)}
-            <button type="button" role="tab" aria-selected={selectedRun?.step_run_id === run.step_run_id} class={`shrink-0 rounded-lg border px-3 py-2 text-xs ${selectedRun?.step_run_id === run.step_run_id ? 'border-sky-500/50 bg-sky-500/10 text-sky-100' : 'border-slate-700 text-slate-400'}`} onclick={() => { selectedWorkInitialFocus = null; selectedStepRunId = run.step_run_id; }}>{run.step_name}</button>
+            <button type="button" role="tab" aria-selected={selectedRun?.step_run_id === run.step_run_id} class={`shrink-0 rounded-lg border px-3 py-2 text-xs ${selectedRun?.step_run_id === run.step_run_id ? 'border-accent/50 bg-accent-subtle text-accent' : 'border-control-border text-muted'}`} onclick={() => { selectedWorkInitialFocus = null; selectedStepRunId = run.step_run_id; }}>{run.step_name}</button>
           {/each}
         </div>
       {/if}
-      {#if selectedScope}<WorkView scope={selectedWorkInitialFocus?.sourceScope ?? selectedScope} live={selectedRunLive} initialTab={selectedWorkCategory} forceInitialTab initialFocus={selectedWorkInitialFocus} />{:else}<p class="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400">No authorized task-step work scope is available.</p>{/if}
+      {#if selectedScope}<WorkView scope={selectedWorkInitialFocus?.sourceScope ?? selectedScope} live={selectedRunLive} initialTab={selectedWorkCategory} forceInitialTab initialFocus={selectedWorkInitialFocus} />{:else}<p class="rounded-xl border border-dashed border-control-border p-8 text-center text-sm text-muted">No authorized task-step work scope is available.</p>{/if}
     </div>
   {/snippet}
 </BlockingDialog>

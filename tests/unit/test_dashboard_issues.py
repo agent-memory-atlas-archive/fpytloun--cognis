@@ -13,7 +13,7 @@ from cognis.api.dashboard_issues import (
     ISSUE_LIMIT,
     schedule_incident_token,
 )
-from cognis.store.models import MCPOAuthTokenRow, Schedule
+from cognis.store.models import MCPOAuthTokenRow, Schedule, Task
 from cognis.store.queries import (
     create_agent,
     create_executor,
@@ -47,6 +47,63 @@ def test_taskless_schedule_incidents_use_the_durable_fire_time() -> None:
     )
 
     assert first != second
+
+
+def test_schedule_issue_task_actions_are_owner_scoped_and_failed_only(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as session:
+                for owner in ("owner@example.com", "other@example.com"):
+                    await create_user(session, email=owner, name=owner, password_hash="unused")
+                    await create_agent(
+                        session, agent_id=f"agent-{owner}", owner_email=owner, name=owner
+                    )
+                for name, task_owner, status in [
+                    ("failed", "owner@example.com", "failed"),
+                    ("completed", "owner@example.com", "completed"),
+                    ("foreign", "other@example.com", "failed"),
+                    ("missing", "owner@example.com", None),
+                ]:
+                    if status:
+                        session.add(
+                            Task(
+                                task_id=f"task-{name}",
+                                title=name,
+                                created_by=task_owner,
+                                agent_id=f"agent-{task_owner}",
+                                status=status,
+                            )
+                        )
+                    schedule = await create_schedule(
+                        session,
+                        schedule_id=f"sched-{name}",
+                        name=name,
+                        schedule_type="interval",
+                        interval_seconds=60,
+                        agent_id="agent-owner@example.com",
+                        task_template={},
+                        created_by="owner@example.com",
+                    )
+                    schedule.last_terminal_task_id = f"task-{name}"
+                    schedule.last_run_status = "failed"
+                await session.commit()
+
+        client.portal.call(seed)
+        response = client.get(
+            "/api/v1/dashboard/issues", headers=_headers(client.app, "owner@example.com")
+        )
+        assert response.status_code == 200
+        issues = {issue["resource"]["id"]: issue for issue in response.json()["issues"]}
+        assert issues["sched-failed"]["task_id"] == "task-failed"
+        assert issues["sched-failed"]["task_retry_available"] is True
+        assert issues["sched-completed"]["task_id"] == "task-completed"
+        assert issues["sched-completed"]["task_retry_available"] is False
+        for name in ("foreign", "missing"):
+            assert issues[f"sched-{name}"]["task_id"] is None
+            assert issues[f"sched-{name}"]["task_retry_available"] is False
 
 
 def test_dashboard_issues_are_user_scoped_typed_and_bounded(
@@ -163,8 +220,8 @@ def test_dashboard_issues_are_user_scoped_typed_and_bounded(
         assert response.status_code == 200, response.text
         payload = response.json()
         # Authentication adds one user lookup. The issue projection itself uses
-        # four fixed queries, independent of executor, MCP, and schedule counts.
-        assert statements == 5
+        # five fixed queries, including shared provider snapshots, independent of resource counts.
+        assert statements == 6
         assert payload["generated_at"]
         assert payload["summary"]["total"] == len(payload["issues"])
         assert {

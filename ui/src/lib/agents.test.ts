@@ -12,6 +12,34 @@ import {
 } from '$lib/agents';
 
 describe('agent payload mapping', () => {
+  it('round-trips Cognis routes for agent defaults and profiles without a physical provider', () => {
+    const form = agentToFormState({
+      agent_id: 'route-agent', name: 'Route agent', agent_type: 'primary',
+      llm_config: { model: 'cognis/chat' },
+      agent_profiles: { claude: { profile_id: 'claude', model: 'cognis/claude' } }
+    } as never);
+    expect(form.providerId).toBe('cognis');
+    expect(form.agentProfiles[0].providerId).toBe('cognis');
+    for (const payload of [formStateToPayload(form), formStateToSystemOverridePayload(form)]) {
+      expect(payload.llm_config).toMatchObject({ model: 'cognis/chat' });
+      expect(payload.llm_config).toHaveProperty('provider_id', undefined);
+      expect(payload.agent_profiles).toMatchObject({
+        claude: { model: 'cognis/claude', provider_id: null }
+      });
+    }
+  });
+  it.each(['legacy', 'strict', 'balanced', 'bounded_autonomy'] as const)('round-trips Intaris evaluation %s', (mode) => {
+    const form = agentToFormState({
+      agent_id: 'agent-evaluation', name: 'Agent', agent_type: 'primary',
+      capabilities: { intaris_evaluation: mode }
+    } as never);
+    expect(form.intarisEvaluation).toBe(mode);
+    expect(formStateToPayload(form).capabilities).toMatchObject({ intaris_evaluation: mode });
+  });
+
+  it('defaults new agents to Balanced', () => {
+    expect(createEmptyAgentForm().intarisEvaluation).toBe('balanced');
+  });
   it('round-trips agent outcome bounds without disabling Intaris', () => {
     const form = agentToFormState({
       agent_id: 'agent-1', name: 'Agent', agent_type: 'primary',
@@ -30,6 +58,18 @@ describe('agent payload mapping', () => {
     form.guardrailsBackend = 'none';
     expect(formStateToPayload(form).capabilities).not.toHaveProperty('maximum_outcome');
     expect(formStateToPayload(form).capabilities).not.toHaveProperty('minimum_outcome');
+  });
+
+  it('round-trips the approval mode and resets it without Intaris', () => {
+    expect(createEmptyAgentForm().approvalMode).toBe('ask');
+    const form = agentToFormState({
+      agent_id: 'agent-approvals', name: 'Agent', agent_type: 'primary',
+      capabilities: { guardrails_backend: 'intaris', approval_mode: 'unattended' }
+    } as never);
+    expect(form.approvalMode).toBe('unattended');
+    expect(formStateToPayload(form).capabilities).toMatchObject({ approval_mode: 'unattended' });
+    form.guardrailsBackend = 'none';
+    expect(formStateToPayload(form).capabilities).toMatchObject({ approval_mode: 'ask' });
   });
 
   it('round-trips the agent escalation wait and clears it to inherit', () => {
@@ -260,6 +300,8 @@ describe('agent payload mapping', () => {
     expect(payload.capabilities).toEqual({
       memory_backend: 'none',
       memory_backend_options: {},
+      intaris_evaluation: 'balanced',
+      approval_mode: 'ask',
       guardrails_backend: 'none'
     });
   });
@@ -425,6 +467,9 @@ describe('agent payload mapping', () => {
           memory_backend_options: { mode: 'proactive' },
           enabled: true,
           agent_switchable: true,
+          quick_switch: true,
+          quick_switch_index: 2,
+          quick_switch_color: 'violet',
           metadata: { tier: 'cheap' }
         }
       },
@@ -448,7 +493,10 @@ describe('agent payload mapping', () => {
         memoryMode: 'proactive',
         memoryBackendOptions: { mode: 'proactive' },
         enabled: true,
-        agentSwitchable: true
+        agentSwitchable: true,
+        quickSwitch: true,
+        quickSwitchIndex: 2,
+        quickSwitchColor: 'violet'
       }
     ]);
     expect(form.defaultAgentProfileId).toBe('fast');
@@ -472,7 +520,10 @@ describe('agent payload mapping', () => {
         memory_enabled: false,
         memory_backend_options: { mode: 'proactive' },
         enabled: true,
-        agent_switchable: true
+        agent_switchable: true,
+        quick_switch: true,
+        quick_switch_index: 2,
+        quick_switch_color: 'violet'
       }
     });
     expect(payload.default_agent_profile_id).toBe('fast');
@@ -497,7 +548,9 @@ describe('agent payload mapping', () => {
         memoryMode: '',
         memoryBackendOptions: {},
         enabled: true,
-        agentSwitchable: false
+        agentSwitchable: false,
+        quickSwitch: false,
+        quickSwitchIndex: 0
       }
     ];
     form.defaultAgentProfileId = 'missing';
@@ -524,6 +577,8 @@ describe('agent payload mapping', () => {
     expect(formStateToPayload(form).capabilities).toEqual({
       memory_backend: 'future-memory',
       memory_backend_options: { mode: 'future-mode', future_flag: true },
+      intaris_evaluation: 'balanced',
+      approval_mode: 'ask',
       guardrails_backend: 'intaris'
     });
   });
@@ -551,6 +606,8 @@ describe('agent payload mapping', () => {
     expect(payload.capabilities).toEqual({
       memory_backend: 'future-memory',
       memory_backend_options: { strategy: 'compact', future_flag: true },
+      intaris_evaluation: 'balanced',
+      approval_mode: 'ask',
       guardrails_backend: 'intaris'
     });
     expect(payload.agent_profiles).toMatchObject({

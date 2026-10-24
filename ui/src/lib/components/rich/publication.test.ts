@@ -13,6 +13,18 @@ import {
 } from './publication';
 
 describe('rich publication helpers', () => {
+  it('counts same-level headings inside one markdown block as document sections', () => {
+    const content = [{ type: 'markdown', content: Array.from({ length: 11 }, (_, index) =>
+      `## ${index + 1}. Section\n\n${'Substantial design details. '.repeat(20)}`
+    ).join('\n\n') }];
+    const options = publicationOptions({}, content);
+    expect(options.showToc).toBe(true);
+    const items = buildTocItems(content, options.tocDepth);
+    expect(items).toHaveLength(11);
+    expect(items.every(item => item.level === 2)).toBe(true);
+    expect(items[1].markdownIndex).toBe(1);
+    expect(publicationOptions({ toc: false }, content).showToc).toBe(false);
+  });
   const blocks = [
     { type: 'section', title: 'Overview', children: [{ type: 'section', title: 'Detail' }] },
     { type: 'section', title: 'Overview' },

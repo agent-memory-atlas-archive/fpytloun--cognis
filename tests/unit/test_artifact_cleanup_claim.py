@@ -5,10 +5,11 @@ import pytest
 
 from cognis.core.artifact_maintenance import ArtifactMaintenanceService
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Base
+from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     claim_artifact_cleanup,
     create_artifact_record,
+    create_conversation,
     get_artifact_record,
     mark_artifacts_attached,
 )
@@ -24,13 +25,24 @@ async def test_attachment_and_cleanup_have_only_one_winner(tmp_path, attach_firs
     now = datetime.now(UTC)
     try:
         async with factory() as db:
+            db.add(User(email="owner@example.com", name="Owner"))
+            await db.flush()
+            db.add(Agent(agent_id="agent-owner", owner_email="owner@example.com", name="Owner"))
+            await db.flush()
+            await create_conversation(
+                db,
+                "owner@example.com",
+                "agent-owner",
+                "agent_direct",
+                conversation_id="conversation-1",
+            )
             candidate = await create_artifact_record(
                 db,
                 artifact_id="art-cleanup",
                 namespace="uploads",
                 object_id="art-cleanup",
                 filename="file.txt",
-                owner_email=None,
+                owner_email="owner@example.com",
                 purpose="attachment",
                 kind="file",
                 mime_type="text/plain",

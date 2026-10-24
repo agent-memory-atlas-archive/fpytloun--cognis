@@ -35,6 +35,7 @@ from cognis.core.chat_v2_runtime_relay import (
     RelayKind,
     RelayOrigin,
     RelayOwner,
+    RuntimeAuthoritySource,
     compare_admission,
 )
 
@@ -1244,11 +1245,46 @@ async def test_latest_hydration_does_not_suppress_delayed_pubsub_delivery() -> N
     assert applied == ["hydrated"]
 
 
-def test_invalidation_clears_bounded_generation_state() -> None:
+def test_invalidation_preserves_generation_ordering() -> None:
     relay = _relay()
     assert relay.next_revision(_context()) == 1
     relay.invalidate(_context().conversation_id)
-    assert relay.next_revision(_context()) == 1
+    assert relay.next_revision(_context()) == 2
+
+
+def test_evicted_generation_cannot_restart_its_revision() -> None:
+    source = RuntimeAuthoritySource("test-epoch", max_entries=1)
+    context = _context()
+    assert source.next_revision(context) == 1
+    assert source.next_revision(context) == 2
+    source.next_revision(_context(turn="turn-2"))
+    assert len(source.revisions) == 1
+    assert source.next_revision(context) > 2
+
+
+def test_runtime_envelopes_remain_admissible_after_repeated_invalidation() -> None:
+    relay = _relay()
+    context = _context()
+    active_turn = _envelope().active_turn
+    previous = relay.make_envelope(context, has_active_turn=True, active_turn=active_turn)
+    for _ in range(4):
+        relay.invalidate(context.conversation_id)
+        incoming = relay.make_envelope(context, has_active_turn=True, active_turn=active_turn)
+        assert incoming.origin == previous.origin
+        assert incoming.source_revision > previous.source_revision
+        assert compare_admission(previous, incoming) == AdmissionDecision.ACCEPT
+        previous = incoming
+
+
+def test_discarded_revision_preserves_redis_safe_integer_guard() -> None:
+    source = RuntimeAuthoritySource("test-epoch")
+    context = _context()
+    source.next_revision(context)
+    key = next(iter(source.revisions))
+    source.revisions[key] = MAX_REDIS_SAFE_INTEGER
+    source.invalidate(context.conversation_id)
+    with pytest.raises(ValueError, match="source_revision"):
+        source.next_revision(context)
 
 
 def test_metric_drop_reasons_are_exact_and_identity_free() -> None:

@@ -13,19 +13,22 @@
   $: profileOptions = profileOptionsForAgent(selectedAgent);
 </script>
 
-<label class="block space-y-2 text-sm font-medium text-slate-200">
+<label class="block space-y-2 text-sm font-medium text-foreground">
   <span>{label}</span>
   <select
     bind:value
     disabled={disabled || !selectedAgent || profileOptions.length === 0}
-    class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50"
+    class="w-full rounded-xl border border-control-border bg-surface px-3 py-2 text-sm text-foreground focus:border-accent disabled:opacity-50"
   >
     <option value="">Default profile</option>
+    {#if value && !profileOptions.some((profile) => profile.profileId === value)}
+      <option value={value}>{value}</option>
+    {/if}
     {#each profileOptions as profile}
       <option value={profile.profileId}>{profile.label}</option>
     {/each}
   </select>
   {#if help}
-    <small class="block text-xs font-normal text-slate-500">{help}</small>
+    <small class="block text-xs font-normal text-quiet">{help}</small>
   {/if}
 </label>

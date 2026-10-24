@@ -68,27 +68,27 @@
 </script>
 
 <section id="attention" class="scroll-mt-20" aria-label="Action required" aria-live="polite" data-testid="task-attention">
-  <Card class={`overflow-hidden border-amber-500/30 bg-amber-500/5 p-0 ${compact ? 'rounded-2xl' : ''}`}>
+  <Card class={`overflow-hidden border-warning-border bg-warning-subtle p-0 ${compact ? 'rounded-2xl' : ''}`}>
     <div class={compact ? 'px-4 py-3' : 'px-5 py-4'}>
       <div class="flex flex-wrap items-center gap-2">
-        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-amber-300">Attention</p>
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-warning">Attention</p>
         {#if pause.step_name}
-          <span class="rounded-full border border-amber-500/30 px-2 py-0.5 text-[10px] text-amber-100">{pause.step_name}</span>
+          <span class="rounded-full border border-warning-border px-2 py-0.5 text-[10px] text-warning">{pause.step_name}</span>
         {/if}
       </div>
-      <h2 class={`mt-2 font-semibold text-white ${compact ? 'text-sm' : 'text-lg'}`}>
+      <h2 class={`mt-2 font-semibold text-strong ${compact ? 'text-sm' : 'text-lg'}`}>
         {pause.question ?? questions[0]?.question ?? 'The task needs your decision.'}
       </h2>
-      <p class="mt-1 text-xs text-slate-400">
+      <p class="mt-1 text-xs text-muted">
         {pause.pause_type === 'gate' ? 'Review the evidence, then approve or request changes.' : 'Answer the question to continue the task.'}
       </p>
     </div>
 
-    <div class={`border-t border-amber-500/20 ${compact ? 'space-y-3 px-4 py-3' : 'space-y-4 px-5 py-5'}`}>
+    <div class={`border-t border-warning-border ${compact ? 'space-y-3 px-4 py-3' : 'space-y-4 px-5 py-5'}`}>
       {#if pause.pause_type === 'gate'}
-        <label class="block space-y-2 text-sm text-slate-200">
+        <label class="block space-y-2 text-sm text-foreground">
           <span>Optional instruction</span>
-          <textarea bind:value={instruction} class={`w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm ${compact ? 'min-h-20' : 'min-h-28'}`} placeholder="Add guidance for the next attempt."></textarea>
+          <textarea bind:value={instruction} class={`w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm ${compact ? 'min-h-20' : 'min-h-28'}`} placeholder="Add guidance for the next attempt."></textarea>
         </label>
         <div class="flex flex-wrap gap-2">
           {#if gateOptions.length > 0}
@@ -104,16 +104,16 @@
         </div>
       {:else}
         {#each questions as question (question.id)}
-          <fieldset class="space-y-2">
-            <legend class="text-sm font-medium text-slate-100">{question.question}</legend>
+          <fieldset class="min-w-0 space-y-2">
+            <legend class="request-prose mb-3 w-full whitespace-normal font-medium text-foreground">{question.question}</legend>
             {#each question.options as option (option.id)}
-              <label class="flex min-h-11 cursor-pointer items-start gap-3 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
+              <label class="flex min-h-11 cursor-pointer items-start gap-3 rounded-xl border border-separator bg-inset px-3 py-2 text-sm text-foreground">
                 <input type={question.multiple ? 'checkbox' : 'radio'} name={question.id} checked={answerFor(question).selected.includes(option.id)} onchange={() => toggle(question, option.id)} />
-                <span><span class="block">{option.label}</span>{#if option.description}<span class="text-xs text-slate-400">{option.description}</span>{/if}</span>
+                <span><span class="block">{option.label}</span>{#if option.description}<span class="text-xs text-muted">{option.description}</span>{/if}</span>
               </label>
             {/each}
             {#if question.allow_custom}
-              <textarea value={answerFor(question).custom} oninput={(event) => setCustom(question, event.currentTarget.value)} class="min-h-20 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm" placeholder="Custom answer"></textarea>
+              <textarea value={answerFor(question).custom} oninput={(event) => setCustom(question, event.currentTarget.value)} class="min-h-20 w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm" placeholder="Custom answer"></textarea>
             {/if}
           </fieldset>
         {/each}

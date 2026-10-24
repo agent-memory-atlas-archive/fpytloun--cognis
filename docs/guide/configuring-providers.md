@@ -8,6 +8,20 @@ Open `Settings` and use the providers and routing sections.
 
 Provider configuration is stored in the Cognis database. All provider settings are managed through structured UI forms.
 
+## OpenAI-compatible base URLs and model names
+
+OpenAI-compatible, OpenAI API and LiteLLM-proxy providers accept either a service
+root or an API base ending in `/v1`, with optional trailing slash. For example,
+`https://api.groq.com/openai` and `https://api.groq.com/openai/v1` resolve to the
+same API base. Discovery, provider checks, chat, embeddings and audio use that
+same normalization; `/v1` is never appended twice. Proxy management metadata
+(`/model/info`) stays at the service root. Native Anthropic, Ollama and
+subscription-provider URL contracts are unchanged.
+
+For compatible/proxy providers, model IDs are the literal names advertised by
+the upstream service. Keep vendor namespaces such as `openai/gpt-oss-20b`.
+Do not add a LiteLLM transport prefix yourself: Cognis adds it separately.
+
 ## Supported presets
 
 To check publicly documented Claude and GPT model changes from a Cognis
@@ -22,11 +36,75 @@ The UI includes guided forms for:
 - **Anthropic** for direct Anthropic API access
 - **Ollama** for local Ollama deployments
 - **LiteLLM Proxy** for a LiteLLM proxy that performs routing upstream
+- **Groq**, **OpenRouter**, and **Google Gemini** for hosted inference
+- **System One (TypeSafe Jev)** for typed decisions, not chat
+- **AWS Bedrock (IAM)** for AWS-managed inference with the SDK credential chain
 - **ChatGPT Subscription (Codex)** for ChatGPT Pro/Max subscription access through LiteLLM's `chatgpt/` provider route
 
 For provider-specific settings not covered by the structured fields (e.g., Azure `api_version`), use the collapsible **Advanced settings** section to add key-value pairs.
 
 ## Common provider choices
+
+### Hosted providers and System One
+
+Select Groq, OpenRouter, Gemini, or System One in the provider form. The form
+fills the endpoint and environment credential name (`GROQ_API_KEY`,
+`OPENROUTER_API_KEY`, `GEMINI_API_KEY`, or `TYPESAFE_API_KEY`). Saved encrypted
+secrets are also supported. Discover models before choosing defaults, and keep
+provider model IDs intact: for example `openai/gpt-oss-20b` on Groq and
+`typesafe/jev-1.13` on OpenRouter.
+
+Gemini discovery uses header authentication and follows catalog pagination.
+Gemini 2.5 uses thinking budgets; Gemini 3 uses thinking levels and cannot
+disable thinking. OpenRouter uses its own reasoning controls, not the
+publisher's native request fields.
+
+Discovery classifies models by their advertised output modalities or protocol
+metadata, not by a product-name prefix. OpenRouter discovery requests the full
+catalog (`output_modalities=all`), including decision and embedding models;
+this also applies to compatible providers using the OpenRouter endpoint.
+These compatible providers can also execute typed evaluations through that
+endpoint, on either the controller or an executor.
+
+System One models return typed Choice, Score, and Noul results, not generated
+text. Cognis excludes decision models from agent/chat model options. Select
+`typesafe/jev-1.13` (pinned version) or `~typesafe/jev-latest` (latest alias) only
+for the `intaris_evaluation` companion override, or access it explicitly through
+the [inference API](inference-api.md). OpenRouter and direct TypeSafe providers
+use the same native contract. Both controller and executor locations work;
+credentials are resolved by the controller before executor dispatch.
+
+`typesafe/jev-router` is a **chat router**, not a System One evaluator. It
+remains available for chat. Rediscover models after upgrading to refresh the
+catalog. Existing manually configured native Jev versions and aliases without
+metadata remain supported; fresh protocol metadata takes precedence over this
+narrow compatibility fallback. Explicit user capability restrictions remain
+unchanged when imported provider metadata is refreshed.
+For older imports, capability restrictions are preserved conservatively even
+when the editor did not record their origin. Use the model editor's registry
+reset to opt into corrected capability values.
+
+### AWS Bedrock
+
+Bedrock uses IAM via the AWS SDK credential chain on the selected runtime.
+Set the region in the provider form, or supply the runtime's AWS region.
+Optionally select a shared AWS profile. Environment credentials, shared
+profiles (including previously authenticated SSO), and workload roles are
+supported. Cognis does not provision IAM roles or perform SSO login.
+
+This is the same credential mechanism as S3 object storage, but S3 permissions
+do **not** authorize Bedrock. Grant:
+
+- `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles` for discovery;
+- `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the
+  permitted model/profile ARNs for generation and streaming.
+
+Cross-region inference profiles also need permission to invoke their underlying
+foundation models in the destination regions. Scope invocation policies to the
+models you actually permit. Discovery lists on-demand foundation models and
+active inference profiles; provisioned-throughput ARNs can be added manually.
+Catalog connectivity is read-only; the provider's generation test invokes the
+configured model and may incur cost.
 
 ### OpenAI
 
@@ -59,6 +137,45 @@ Native strict tool schemas are emitted only for models with the
 enabled only when the model advertises tool search, native search,
 `defer_loading`, and `pause_turn`; otherwise Cognis falls back to controller
 tool discovery. Prompt-cache controls remain capability-gated.
+
+#### Claude Sonnet 5.5
+
+`claude-sonnet-5-5` is available in the bundled catalog alongside Sonnet 5.
+It uses a 1M-token context window, a 128K-token output limit, and $2/$10 per
+million input/output tokens. Cognis supports it through the native Messages
+transport (API key on controller or executor, or subscription OAuth). The
+LiteLLM compatibility transport is rejected for this model because it cannot
+provide the native signed-history validation described below.
+
+- **Thinking:** adaptive by default, with `low`, `medium`, `high`, `xhigh`,
+  and `max` effort. `none`, native `disabled`, and manual budgets fail before
+  sending. They are never mapped to `between_tools`. An explicitly supplied
+  native `thinking: {"type": "between_tools"}` is accepted at `low`, `medium`,
+  or `high` effort; it still allows thinking between tool calls.
+- **Tools:** automatic or disabled tool selection only. Required or named
+  tool choice fails before sending. Keep workflows that require a tool call
+  on a compatible model; automatic selection is not an equivalent guarantee.
+- **Continuation:** empty signed thinking and redacted blocks are persisted
+  unchanged. Cognis stores local prefix fingerprints with native envelopes
+  and verifies the provider, system prompt, tools, and preceding messages
+  before replay. Cache annotations can change. `between_tools` also binds the
+  effort level.
+- **Model switching:** switching between Opus, Sonnet 5, and Sonnet 5.5
+  preserves visible messages, tool calls, and tool results. Only incompatible
+  private reasoning is removed from the outgoing request. Cognis starts fresh
+  reasoning without failing the turn or resetting the visible conversation.
+  Returning to a previous model does not reintroduce pre-switch reasoning.
+- **Edited history:** after a prefix edit, compaction, or a change of provider
+  or tools, unproven thinking is removed from the outgoing request. Valid
+  reasoning generated against the new prefix remains reusable on subsequent
+  turns. Legacy thinking without provenance is handled the same way.
+  These request projections never rewrite durable history; reasoning resets
+  are logged with model and block counts, not content. Anthropic still validates
+  signatures and account ownership. Native-envelope corruption and incomplete
+  tool-result groups remain errors, rather than being repaired by discarding
+  tool history.
+
+See Anthropic's [migration guide](https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide).
 
 For a local Meridian endpoint, run Meridian on or near the executor, then create
 an **Anthropic** provider with:
@@ -122,6 +239,36 @@ provider stores only the env-var reference, not the API key value.
 Use this when Cognis should call LiteLLM's native ChatGPT subscription provider. This preset uses OAuth device-code authentication instead of an API key. Create the provider first, then start OAuth from the provider editor. The UI shows the verification URL and user code; after you approve in the browser, Cognis stores the resulting token cache in the encrypted secrets table.
 
 The controller remains stateless: LiteLLM's `CHATGPT_TOKEN_DIR` file is only hydrated into a temporary directory for each model call, and refreshed tokens are written back to encrypted database storage. On PostgreSQL, Cognis serializes OAuth token hydration and refresh with a transaction-scoped advisory lock so multiple controller replicas do not refresh the same token concurrently.
+
+#### Image preparation
+
+Direct Codex and Anthropic-preset chat requests normalize authorized Cognis
+image artifacts before sending them, for both streaming and non-streaming
+generation. Anthropic images are prepared on the controller before native,
+proxy, or executor dispatch; the 2048-pixel ceiling also satisfies Anthropic's
+3000-pixel limit for requests containing more than 20 images. External image
+URLs without Cognis artifact metadata are not fetched or normalized.
+Cognis keeps originals unchanged and limits the prepared image to 2048 pixels
+on its longest edge, preserving aspect ratio and applying EXIF orientation.
+Supported still-image formats are JPEG, PNG, and WebP; other decodable formats
+are converted to PNG, using the first frame for animations.
+
+These are Cognis safety and transport budgets, not model capability claims:
+source files are limited to 20 MiB, full decodes to 16 Mi pixels, and the total
+encoded image payload to 28 MiB (including repeated references). JPEG sources
+may contain up to 64 Mi pixels because the codec can downsample before full
+decode. Cognis checks the reduced dimensions before allocating the decoded
+pixels; other formats retain the 16 Mi-pixel source limit.
+JPEG-backed MPO phone photos use the same safe decoder downsampling and are
+flattened to a single JPEG primary frame; auxiliary frames are not decoded or
+sent to the model.
+
+Normalized content is reused through a bounded 64 MiB, content-hash LRU cache
+on each controller provider instance. Concurrent requests share normalization,
+but authorization is checked for every request. Eviction, provider recreation,
+or controller restart can require normalization again; the cache is not durable
+or shared between replicas. Unavailable or unsafe images are replaced with a
+model-facing notice identifying the artifact and the rejection reason.
 
 ## Provider ownership
 

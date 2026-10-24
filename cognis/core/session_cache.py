@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, Histogram
 
 from cognis import json_codec as json
 from cognis.core.canonical_history import (
@@ -49,6 +49,7 @@ from cognis.core.project_context import (
     project_metadata_from_event_data,
 )
 from cognis.core.redis_service import RedisService
+from cognis.guardrails_redaction import redact_runtime_evidence
 from cognis.logging import get_logger
 from cognis.models.config import GenerationPerformanceSnapshot
 from cognis.models.session import (
@@ -71,6 +72,15 @@ HISTORY_SHRINK_TOTAL = Counter(
 REDIS_HITS = Counter("cognis_session_cache_redis_hits_total", "Redis L2 cache hits")
 REDIS_MISSES = Counter("cognis_session_cache_redis_misses_total", "Redis L2 cache misses")
 REDIS_ERRORS = Counter("cognis_session_cache_redis_errors_total", "Redis L2 errors")
+CONTEXT_SNAPSHOT_COPY_SECONDS = Histogram(
+    "cognis_context_snapshot_copy_seconds",
+    "Time to detach canonical context under its snapshot boundary, before CPU admission.",
+)
+CONTEXT_SNAPSHOT_ITEMS = Histogram(
+    "cognis_context_snapshot_items",
+    "Number of top-level events and prefix entries copied per canonical snapshot, not bytes.",
+    buckets=(0, 10, 100, 1000, 10000, 100000),
+)
 
 
 @dataclass(slots=True)
@@ -201,6 +211,7 @@ class CachedSessionState:
     reasoning_effort_override: str | None = None
     fast_mode_override: bool | None = None
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
+    inference_target: dict[str, Any] = field(default_factory=dict)
     loaded_skill_ids: set[str] = field(default_factory=set)
     loaded_skill_context_hashes: dict[str, str] = field(default_factory=dict)
     loaded_skill_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -214,10 +225,9 @@ class CachedSessionState:
     # inventory.  Invalidated on skill mutation (via
     # ``skill_epoch_stale``) or explicitly by callers.
     classified_inventory: dict[str, list[Any]] = field(default_factory=dict)
-    # Tool call ids whose result content has been pruned from the
-    # in-context view (the LLM sees a clearance marker; the tool output
-    # store retains the original for ``read_tool_output`` recovery).
-    pruned_tool_call_ids: set[str] = field(default_factory=set)
+    # Monotonic projection decisions derived from canonical Intaris events.
+    # Keys are tool call ids; values contain only finite operation metadata.
+    projection_decisions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     discovered_tool_handles: dict[str, DiscoveredToolHandle] = field(default_factory=dict)
     project_metadata_contexts: dict[str, ProjectMetadataEntry] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
@@ -312,6 +322,10 @@ def _entry_payload(
         "loaded_skill_ids": sorted(entry.loaded_skill_ids),
         "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
         "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
+        "projection_decisions": {
+            call_id: [dict(decision) for decision in decisions]
+            for call_id, decisions in sorted(entry.projection_decisions.items())
+        },
         "activated_skill_ids": sorted(entry.activated_skill_ids),
         "activated_skill_tool_ids_by_skill": {
             skill_id: sorted(tool_ids)
@@ -406,6 +420,11 @@ def _entry_from_payload(data: dict[str, Any]) -> CachedSessionState:
         intention=data.get("intention"),
         intention_updated_at=data.get("intention_updated_at"),
         initialized=data.get("initialized", False),
+        projection_decisions={
+            str(call_id): [dict(decision) for decision in decisions if isinstance(decision, dict)]
+            for call_id, decisions in data.get("projection_decisions", {}).items()
+            if isinstance(call_id, str) and isinstance(decisions, list)
+        },
         prefix_entries=[
             ImmutablePrefixEntry(
                 role=str(item.get("role") or "developer"),
@@ -624,12 +643,20 @@ def _discovered_tool_handle_from_raw(raw: dict[str, Any]) -> DiscoveredToolHandl
 _MAX_EVENT_PAGES = 50
 
 
-def _is_retry_admission_notice(event: CachedEvent) -> bool:
+def is_retry_admission_notice(event: Any) -> bool:
+    """Return whether an event is a scheduler-owned retry admission notice.
+
+    Shared with compaction so a summarized retry keeps the lineage that
+    ``CanonicalContextSnapshot.require_turn`` resolves.
+    """
+    data = getattr(event, "data", None)
+    if not isinstance(data, dict):
+        return False
     return (
-        event.type == "system_message"
-        and event.data.get("event") == "system_notice"
-        and event.data.get("kind") == "model_recovery"
-        and event.data.get("scope") == "turn"
+        getattr(event, "type", None) == "system_message"
+        and data.get("event") == "system_notice"
+        and data.get("kind") == "model_recovery"
+        and data.get("scope") == "turn"
     )
 
 
@@ -643,6 +670,19 @@ class CanonicalContextSnapshot:
     last_event_seq: int
     last_compaction_seq: int
     projection_revision: int
+    projection_decisions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def preamble_events(self) -> list[CachedEvent]:
+        """Return durable preamble revisions in this Intaris session.
+
+        Keep the event log as the only stored representation so Redis eviction
+        and cold Intaris reconstruction have identical semantics.
+        """
+        return [
+            event
+            for event in self.events
+            if event.type == "lifecycle" and event.data.get("event") == "context_preamble"
+        ]
 
     def require_turn(self, turn_id: str | None, *, user_event: bool, profile_switch: bool) -> None:
         """Reject a continuation missing its durable admission or switch boundary."""
@@ -691,7 +731,7 @@ class CanonicalContextSnapshot:
             ]
             if any(event.type == "user_message" for event in events):
                 return True
-            notices = [event for event in events if _is_retry_admission_notice(event)]
+            notices = [event for event in events if is_retry_admission_notice(event)]
             sources: set[str] = set()
             for notice in notices:
                 source = notice.data.get("retry_source_turn_id")
@@ -1204,6 +1244,7 @@ class SessionCache:
                 "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
                 "last_llm_usage": dict(entry.last_llm_usage),
                 "last_generation_performance": entry.last_generation_performance,
+                "inference_target": entry.inference_target,
                 "context_metadata": dict(entry.context_metadata),
             }
             written = await self._redis_service.eval(
@@ -1646,6 +1687,7 @@ class SessionCache:
                 else {}
             )
             entry.runtime_metadata_revision = revision
+            entry.inference_target = dict(payload.get("inference_target") or {})
 
     async def persist_runtime_metadata(self, session_id: str) -> None:
         """Write the latest context and generation diagnostics through to Redis."""
@@ -1886,6 +1928,12 @@ class SessionCache:
         if entry is None:
             return
         entry.last_tool_runtime_info = dict(info or {})
+        if info and isinstance(info.get("inference_target"), dict):
+            entry.inference_target = dict(info["inference_target"])
+
+    def get_inference_target(self, session_id: str) -> dict[str, Any]:
+        entry = self.get_entry(session_id)
+        return dict(entry.inference_target) if entry else {}
 
     def get_tool_runtime_info(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest tool-exposure runtime metadata for a session."""
@@ -2032,7 +2080,10 @@ class SessionCache:
         if entry is None or not skill_id:
             return
         entry.loaded_skill_ids.add(skill_id)
-        entry.loaded_skill_snapshots[skill_id] = dict(snapshot)
+        snapshot = dict(snapshot)
+        if "description" in snapshot:
+            snapshot["description"] = redact_runtime_evidence(snapshot["description"])
+        entry.loaded_skill_snapshots[skill_id] = snapshot
         content_hash = snapshot.get("content_hash")
         if isinstance(content_hash, str):
             entry.loaded_skill_context_hashes[skill_id] = content_hash
@@ -2085,21 +2136,15 @@ class SessionCache:
             return
         entry.classified_inventory.clear()
 
-    def add_pruned_tool_call_ids(self, session_id: str, call_ids: set[str]) -> None:
-        """Mark tool call ids whose results should render as cleared markers."""
-
-        if not call_ids:
-            return
+    def get_projection_decisions(self, session_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Return a defensive copy of decisions reconstructed from Intaris events."""
         entry = self.get_entry(session_id)
         if entry is None:
-            return
-        entry.pruned_tool_call_ids.update(call_ids)
-
-    def is_tool_result_pruned(self, session_id: str, call_id: str) -> bool:
-        entry = self.get_entry(session_id)
-        if entry is None:
-            return False
-        return call_id in entry.pruned_tool_call_ids
+            return {}
+        return {
+            call_id: [dict(decision) for decision in decisions]
+            for call_id, decisions in entry.projection_decisions.items()
+        }
 
     def note_context_reserve_clamp(self, session_id: str) -> bool:
         """Return ``True`` the first time a session clamps output reserve."""
@@ -2204,8 +2249,14 @@ class SessionCache:
         self,
         session_id: str,
         project_metadata: ProjectMetadataEntry,
+        *,
+        replace: bool = False,
     ) -> ProjectMetadataEntry:
-        """Persist one frozen DB project metadata context in cache state."""
+        """Persist one DB project metadata context in cache state.
+
+        The first loaded context per project is frozen; ``replace`` installs a
+        newer rendering after the caller recorded its durable event.
+        """
 
         if (
             not isinstance(project_metadata.project_id, str)
@@ -2227,7 +2278,9 @@ class SessionCache:
         )
         async with entry.lock:
             existing = entry.project_metadata_contexts.get(project_metadata.project_id)
-            if existing is None or existing.seq <= 0:
+            if existing is None or existing.seq <= 0 or replace:
+                if replace and existing is not None:
+                    normalized_context.seq = max(normalized_context.seq, existing.seq)
                 entry.project_metadata_contexts[project_metadata.project_id] = normalized_context
             entry.touched_at = monotonic()
         await self._redis_set(entry)
@@ -2392,14 +2445,21 @@ class SessionCache:
         require_completed_history_copy(
             [event.data for event in entry.events if event.type == "lifecycle"]
         )
-        return CanonicalContextSnapshot(
+        started = monotonic()
+        snapshot = CanonicalContextSnapshot(
             events=deepcopy(entry.events),
             prefix_entries=deepcopy(entry.prefix_entries),
             last_compaction_summary=entry.last_compaction_summary,
             last_event_seq=entry.last_event_seq,
             last_compaction_seq=entry.last_compaction_seq,
             projection_revision=entry.projection_revision,
+            projection_decisions=deepcopy(entry.projection_decisions),
         )
+        # No serialization or recursive sizing on this event-loop critical path.
+        with contextlib.suppress(Exception):
+            CONTEXT_SNAPSHOT_COPY_SECONDS.observe(monotonic() - started)
+            CONTEXT_SNAPSHOT_ITEMS.observe(len(entry.events) + len(entry.prefix_entries))
+        return snapshot
 
     def record_assembled_history(
         self,
@@ -2892,26 +2952,98 @@ class SessionCache:
                     }
                 },
             )
+        if event.type == "lifecycle" and event.data.get("event") == "context_projection":
+            raw_decisions = event.data.get("decisions")
+            if isinstance(raw_decisions, list):
+                for raw_decision in raw_decisions:
+                    if not isinstance(raw_decision, dict):
+                        continue
+                    call_id = raw_decision.get("call_id")
+                    operation = raw_decision.get("operation")
+                    version = raw_decision.get("rendering_policy_version")
+                    parameters = raw_decision.get("parameters", {})
+                    event_seq = raw_decision.get("event_seq")
+                    if (
+                        operation == "omit_event"
+                        and isinstance(event_seq, int)
+                        and not isinstance(event_seq, bool)
+                        and event_seq > 0
+                    ):
+                        call_id = f"event:{event_seq}"
+                        parameters = {"event_seq": event_seq}
+                    allowed_parameter_keys = (
+                        {
+                            "compact_result": set(),
+                            "compact_attachment": set(),
+                            "clear_arguments": {"threshold"},
+                            "compact_delegation_result": set(),
+                            "omit_event": {"event_seq"},
+                            "omit_tool_group": set(),
+                        }.get(operation)
+                        if isinstance(operation, str)
+                        else None
+                    )
+                    parameters_are_bounded_numeric = (
+                        isinstance(parameters, dict)
+                        and set(parameters) == allowed_parameter_keys
+                        and all(
+                            isinstance(value, int) and not isinstance(value, bool) and value > 0
+                            for value in parameters.values()
+                        )
+                    )
+                    if (
+                        not isinstance(call_id, str)
+                        or not call_id
+                        or len(call_id) > 256
+                        or not isinstance(operation, str)
+                        or operation
+                        not in {
+                            "compact_result",
+                            "compact_attachment",
+                            "clear_arguments",
+                            "compact_delegation_result",
+                            "omit_event",
+                            "omit_tool_group",
+                        }
+                        or version != 1
+                        or not parameters_are_bounded_numeric
+                        or len(json.encode(parameters)) > 512
+                    ):
+                        continue
+                    decision = {
+                        "operation": operation,
+                        "rendering_policy_version": version,
+                        "parameters": dict(parameters),
+                    }
+                    existing_decisions = entry.projection_decisions.setdefault(call_id, [])
+                    if decision not in existing_decisions:
+                        existing_decisions.append(decision)
         loaded_skill_id = self._loaded_skill_id_from_event(event)
         if loaded_skill_id is not None:
-            superseded_event_seqs = {
-                existing.seq
-                for existing in entry.events
-                if self._loaded_skill_id_from_event(existing) == loaded_skill_id
-            }
-            entry.events = [
-                existing
-                for existing in entry.events
-                if self._loaded_skill_id_from_event(existing) != loaded_skill_id
-            ]
-            entry.events_since_compaction_memo.clear()
-            if superseded_event_seqs:
-                entry.projection_revision += 1
-                entry.prefix_entries = [
-                    item for item in entry.prefix_entries if item.seq not in superseded_event_seqs
+            if event.data.get("append_only_loaded_skill_version") != 1:
+                # Preserve the rendering of legacy records without deleting new
+                # canonical instruction notices that have already been exposed.
+                superseded_event_seqs = {
+                    existing.seq
+                    for existing in entry.events
+                    if self._loaded_skill_id_from_event(existing) == loaded_skill_id
+                    and existing.data.get("append_only_loaded_skill_version") != 1
+                }
+                entry.events = [
+                    existing
+                    for existing in entry.events
+                    if existing.seq not in superseded_event_seqs
                 ]
+                entry.events_since_compaction_memo.clear()
+                if superseded_event_seqs:
+                    entry.projection_revision += 1
+                    entry.prefix_entries = [
+                        item
+                        for item in entry.prefix_entries
+                        if item.seq not in superseded_event_seqs
+                    ]
             self._apply_loaded_skill_event(entry, event, loaded_skill_id)
-        if _is_retry_admission_notice(event):
+        if is_retry_admission_notice(event):
             # Notices are not immutable prompt-prefix entries. Retain their
             # durable lineage for admission checks on warm append and replay.
             if event.seq > entry.last_compaction_seq:
@@ -2923,7 +3055,13 @@ class SessionCache:
             project_metadata = project_metadata_from_event_data(event.data, seq=event.seq)
             if project_metadata is not None:
                 existing_metadata = entry.project_metadata_contexts.get(project_metadata.project_id)
-                if existing_metadata is None or existing_metadata.seq <= 0:
+                # Latest durable event wins so refreshed project instructions
+                # survive replay; unsequenced warm entries are always replaced.
+                if (
+                    existing_metadata is None
+                    or existing_metadata.seq <= 0
+                    or project_metadata.seq >= existing_metadata.seq
+                ):
                     entry.project_metadata_contexts[project_metadata.project_id] = project_metadata
             project_context = project_context_from_event_data(event.data, seq=event.seq)
             if project_context is not None:
@@ -2950,6 +3088,7 @@ class SessionCache:
             entry.last_compaction_summary = summary if isinstance(summary, str) else None
             entry.last_compaction_seq = event.seq
             entry.events = [existing for existing in entry.events if existing.seq > event.seq]
+            entry.projection_decisions.clear()
             entry.projection_revision += 1
             entry.events_since_compaction_memo.clear()
         elif event.type == "tool_discovery" or (
@@ -3018,6 +3157,7 @@ class SessionCache:
                 "skill_id",
                 "skill_name",
                 "name",
+                "description",
                 "version_id",
                 "version_number",
                 "content_hash",
@@ -3042,6 +3182,8 @@ class SessionCache:
             # Metadata-free loaded_skill events predate the v13 activation
             # contract. Preserve v12 rather than silently upgrading them.
             snapshot["contract_version"] = inferred or 12
+        if "description" in snapshot:
+            snapshot["description"] = redact_runtime_evidence(snapshot["description"])
         entry.loaded_skill_snapshots[skill_id] = snapshot
         raw_tool_ids = data.get("activated_tool_ids")
         if isinstance(raw_tool_ids, list):
@@ -3060,6 +3202,115 @@ class SessionCache:
             tool_id
             for tool_ids in entry.activated_skill_tool_ids_by_skill.values()
             for tool_id in tool_ids
+        }
+
+    def resource_memory_summary(self) -> dict[str, Any]:
+        """Estimate selected retained roots on the owner event loop, opt-in only.
+
+        Groups deduplicate internally, not across groups. Estimates are not
+        additive RSS. No mutation, I/O, cache touch or retained snapshot occurs.
+        """
+        from cognis.core.resource_attribution import measure_owned_objects
+
+        groups = {
+            "events": ("events", "event_seqs", "events_since_compaction_memo"),
+            "prefixes": ("prefix_entries", "last_compaction_summary"),
+            "skills": ("loaded_skill_snapshots",),
+            "inventory": ("classified_inventory", "discovered_tool_handles"),
+            "runtime": ("context_metadata", "last_tool_runtime_info", "inference_target"),
+        }
+        return {
+            "sessions": len(self._entries),
+            "groups": {
+                group: measure_owned_objects(
+                    getattr(entry, field) for entry in self._entries.values() for field in fields
+                )
+                for group, fields in groups.items()
+            },
+        }
+
+    async def resource_owner_accounting(self) -> dict[str, Any]:
+        """Measure fixed application roots in bounded owner-loop slices.
+
+        Read-only diagnostic state lives for this invocation only. No entry is
+        touched, hydrated, copied, serialized or evicted. Each slice releases
+        graph references before yielding; cancellation belongs to the capture.
+        Roots may change between slices and shared roots are non-additive.
+        """
+        from itertools import islice
+
+        from cognis.core.resource_attribution import measure_owned_objects
+
+        started = monotonic()
+        fields = (
+            "events",
+            "event_seqs",
+            "events_since_compaction_memo",
+            "prefix_entries",
+            "last_compaction_summary",
+            "loaded_skill_snapshots",
+            "classified_inventory",
+            "discovered_tool_handles",
+            "context_metadata",
+            "last_tool_runtime_info",
+            "inference_target",
+            "project_contexts",
+            "memory_aliases",
+            "skill_tool_classifications",
+        )
+        selected = list(islice(self._entries, 64))
+        counts = {
+            name: {
+                "estimated_bytes": 0,
+                "visited_objects": 0,
+                "shallow_only_objects": 0,
+                "roots_measured": 0,
+                "roots_truncated": 0,
+            }
+            for name in fields
+        }
+        work = largest_slice = 0.0
+        missing = 0
+        reason = None
+        for session_id in selected:
+            for name in fields:
+                if work >= 0.100 or monotonic() - started >= 5:
+                    reason = "work" if work >= 0.100 else "wall"
+                    break
+                slice_started = monotonic()
+                entry = self._entries.get(session_id)
+                if entry is None:
+                    missing += 1
+                    break
+                measured = measure_owned_objects(
+                    (getattr(entry, name),), max_nodes=2000, budget_seconds=0.002
+                )
+                entry = None
+                row = counts[name]
+                for key in ("estimated_bytes", "visited_objects", "shallow_only_objects"):
+                    row[key] += int(measured[key])
+                row["roots_measured"] += 1
+                row["roots_truncated"] += int(measured["truncated"])
+                elapsed = monotonic() - slice_started
+                work += elapsed
+                largest_slice = max(largest_slice, elapsed)
+                await asyncio.sleep(0)
+            if reason is not None:
+                break
+        return {
+            "sessions": len(self._entries),
+            "accounting": {
+                "kind": "non_additive_reachable_estimates",
+                "fields": counts,
+                "selected_sessions": len(selected),
+                "unselected_sessions": max(0, len(self._entries) - len(selected)),
+                "missing_sessions": missing,
+                "work_seconds": work,
+                "wall_seconds": monotonic() - started,
+                "largest_slice_seconds": largest_slice,
+                "slice_budget_seconds": 0.002,
+                "stopped_reason": reason,
+            },
         }
 
     async def resize(self, max_entries: int) -> None:

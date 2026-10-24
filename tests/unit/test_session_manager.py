@@ -96,6 +96,7 @@ class _Guardrails:
         self.policy_updates: list[tuple[str, dict | None, dict | None]] = []
         self.recorded_events: list[tuple[str, list[SessionEvent], str | None]] = []
         self.record_event_contexts: list[tuple[str | None, str | None, str | None]] = []
+        self.intentions: dict[str, str] = {}
 
     async def get_session(
         self,
@@ -107,7 +108,11 @@ class _Guardrails:
     ) -> SimpleNamespace:
         if self.fail:
             raise RuntimeError("intaris unavailable")
-        return SimpleNamespace(policy=self.last_policy, details=self.last_details)
+        return SimpleNamespace(
+            policy=self.last_policy,
+            details=self.last_details,
+            intention=self.intentions.get(session_id, "Develop the application"),
+        )
 
     async def create_session(
         self,
@@ -124,6 +129,7 @@ class _Guardrails:
         self.last_details = dict(details) if details is not None else None
         self.last_policy = dict(policy) if policy is not None else None
         self.calls.append((session_id, agent_id, parent_session_id))
+        self.intentions[session_id] = intention
 
     async def update_session_status(
         self,
@@ -326,7 +332,7 @@ class _StreamGuardrails(_Guardrails):
             has_more=False,
         )
 
-    async def get_session(self, session_id: str) -> object:
+    async def get_session(self, session_id: str, **kwargs: object) -> object:
         del session_id
         return SimpleNamespace(
             intention="Resolve the participant request.",
@@ -512,6 +518,92 @@ async def _session_factory(tmp_path, *, capabilities: dict | None = None) -> obj
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evaluation", ["legacy", "strict", "balanced", "bounded_autonomy"])
+@pytest.mark.parametrize("target", ["system:research", "agent-1"])
+async def test_system_child_inherits_effective_parent_mode_and_keeps_it_on_refresh(
+    tmp_path, evaluation, target
+) -> None:
+    from unittest.mock import AsyncMock
+
+    engine, factory = await _session_factory(
+        tmp_path, capabilities={"intaris_evaluation": "legacy"}
+    )
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    _, parent = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Research lights",
+    )
+    parent_policy = dict(providers.guardrails.last_policy)
+    parent_policy["evaluation_policy_version"] = "legacy" if evaluation == "legacy" else "hybrid_v1"
+    if evaluation != "legacy":
+        parent_policy["profile"] = evaluation
+    providers.guardrails.get_session = AsyncMock(return_value=SimpleNamespace(policy=parent_policy))
+    child = await manager.create_child_session(
+        parent,
+        mode="sync",
+        task_description="Research current offers",
+        agent_id=target,
+        effective_agent_id="agent-1",
+    )
+    expected = "legacy" if evaluation == "legacy" else "hybrid_v1"
+    assert providers.guardrails.last_policy["evaluation_policy_version"] == expected
+    if evaluation != "legacy":
+        assert providers.guardrails.last_policy["profile"] == evaluation
+    await manager.refresh_intaris_session_policy(child)
+    assert providers.guardrails.last_policy["evaluation_policy_version"] == expected
+    if evaluation != "legacy":
+        assert providers.guardrails.last_policy["profile"] == evaluation
+    # The parent is read with the parent's identity, never a system specialist
+    # credential or a separately cached Intaris policy in Cognis persistence.
+    for call in providers.guardrails.get_session.await_args_list:
+        assert call.args[0] == parent.intaris_session_id
+        assert call.kwargs["agent_id"] == "agent-1"
+        assert call.kwargs["agent_owner_email"] == "user@example.com"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_system_child_parent_policy_read_failure_does_not_create_child(tmp_path) -> None:
+    from unittest.mock import AsyncMock
+
+    engine, factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    _, parent = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Research",
+    )
+    providers.guardrails.get_session = AsyncMock(side_effect=RuntimeError("unavailable"))
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await manager.create_child_session(
+            parent,
+            mode="sync",
+            task_description="Research offers",
+            agent_id="system:research",
+            effective_agent_id="agent-1",
+        )
+    assert len(providers.guardrails.calls) == 1
+    async with factory() as db:
+        from sqlalchemy import select
+
+        assert (
+            not (
+                await db.execute(
+                    select(Session).where(Session.parent_session_id == parent.session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_require_agent_preserves_capabilities(tmp_path) -> None:
     engine, session_factory = await _session_factory(
         tmp_path,
@@ -555,9 +647,12 @@ async def test_session_manager_creates_conversation_and_root_session_atomically(
 
 
 @pytest.mark.asyncio
-async def test_yolo_sync_persists_conversation_policy_and_restores_agent_default(tmp_path) -> None:
+@pytest.mark.parametrize("evaluation", ["legacy", "strict"])
+async def test_yolo_sync_persists_conversation_policy_and_restores_agent_default(
+    tmp_path, evaluation
+) -> None:
     engine, session_factory = await _session_factory(
-        tmp_path, capabilities={"maximum_outcome": "escalate"}
+        tmp_path, capabilities={"maximum_outcome": "escalate", "intaris_evaluation": evaluation}
     )
     providers = _Providers()
     manager = SessionManager(session_factory, providers, _Cache())
@@ -567,8 +662,14 @@ async def test_yolo_sync_persists_conversation_policy_and_restores_agent_default
         context=ConversationContext(type="web"),
     )
     assert providers.guardrails.last_policy["maximum_outcome"] == "escalate"
+    assert providers.guardrails.last_policy["evaluation_policy_version"] == (
+        "legacy" if evaluation == "legacy" else "hybrid_v1"
+    )
     await manager.set_conversation_yolo(conversation, root, enabled=True)
     assert providers.guardrails.last_policy["maximum_outcome"] == "approve"
+    assert providers.guardrails.last_policy.get("profile") == (
+        None if evaluation == "legacy" else evaluation
+    )
     async with session_factory() as db_session:
         stored = await get_conversation(db_session, conversation.conversation_id)
         assert stored.context_data["maximum_outcome_override"] == "approve"
@@ -1034,6 +1135,159 @@ async def test_managed_policy_snapshot_rotates_once_from_creation_flow(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_evaluation_task_override_survives_child_rotation_and_refresh(tmp_path) -> None:
+    from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+
+    engine, factory = await _session_factory(
+        tmp_path, capabilities={"intaris_evaluation": "balanced"}
+    )
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    token = current_runtime_access_context.set(
+        RuntimeAccessContext(
+            task_id="task-evaluation",
+            session_policy={"intaris_evaluation": "strict", "deny_policies": ["No deployment"]},
+        )
+    )
+    try:
+        conversation, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        )
+        assert providers.guardrails.last_policy["profile"] == "strict"
+        child = await manager.create_child_session(
+            root,
+            mode="delegate",
+            task_description="Inspect source",
+            agent_id="agent-1",
+            effective_agent_id="agent-1",
+        )
+        assert providers.guardrails.last_policy["profile"] == "strict"
+        rotated = await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=child,
+            intention="Continue source inspection",
+            compaction_summary="Inspection in progress",
+        )
+        assert rotated.parent_session_id == root.session_id
+        assert providers.guardrails.last_policy["profile"] == "strict"
+        assert providers.guardrails.last_policy["deny_policies"] == ["No deployment"]
+        await manager.refresh_intaris_session_policy(
+            rotated, session_policy_override={"intaris_evaluation": "legacy"}
+        )
+        assert providers.guardrails.last_policy["evaluation_policy_version"] == "hybrid_v1"
+        assert providers.guardrails.last_policy["profile"] == "strict"
+        providers.guardrails.fail = True
+        for evaluation in ("strict", "legacy"):
+            with pytest.raises(RuntimeError, match="intaris unavailable"):
+                await manager.refresh_intaris_session_policy(
+                    rotated, session_policy_override={"intaris_evaluation": evaluation}
+                )
+    finally:
+        current_runtime_access_context.reset(token)
+        await engine.dispose()
+
+
+_UNATTENDED_JUDGE = {
+    "allowed_decisions": ["approve", "deny"],
+    "on_uncertain": "deny",
+    "allow_human_escalation": False,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval_mode", ["ask", "unattended"])
+async def test_agent_approval_mode_sets_unattended_intaris_policy(tmp_path, approval_mode) -> None:
+    engine, factory = await _session_factory(
+        tmp_path, capabilities={"approval_mode": approval_mode}
+    )
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    try:
+        _conversation, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        )
+        created = providers.guardrails.last_policy
+        await manager.create_child_session(
+            root,
+            mode="delegate",
+            task_description="Inspect source",
+            agent_id="agent-1",
+            effective_agent_id="agent-1",
+        )
+        child_policy = providers.guardrails.last_policy
+        await manager.refresh_intaris_session_policy(root)
+        refreshed = providers.guardrails.last_policy
+        for policy in (created, child_policy, refreshed):
+            if approval_mode == "unattended":
+                assert policy["interaction_mode"] == "none"
+                assert policy["judge"] == _UNATTENDED_JUDGE
+            else:
+                assert "interaction_mode" not in policy
+                assert "judge" not in policy
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_override", "workflow_mode", "expected_mode"),
+    [
+        (None, "explicit_gates", "none"),
+        ("step_requests", "step_requests", "step_requests"),
+        ("explicit_gates", "explicit_gates", "explicit_gates"),
+    ],
+)
+async def test_explicit_task_interaction_mode_overrides_unattended_agent_policy(
+    tmp_path, task_override, workflow_mode, expected_mode
+) -> None:
+    from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+
+    engine, factory = await _session_factory(tmp_path, capabilities={"approval_mode": "unattended"})
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    token = current_runtime_access_context.set(
+        RuntimeAccessContext(
+            task_id="task-approval",
+            interaction_mode=workflow_mode,
+            interaction_mode_override=task_override,
+        )
+    )
+
+    def assert_policy(policy: dict, *, refreshed: bool) -> None:
+        unattended = expected_mode == "none"
+        if refreshed or unattended:
+            assert policy["interaction_mode"] == expected_mode
+        else:
+            assert "interaction_mode" not in policy
+        assert ("judge" in policy) is unattended
+
+    try:
+        conversation, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        )
+        assert_policy(providers.guardrails.last_policy, refreshed=False)
+        # Mid-step compaction rotates without a workflow step-start refresh.
+        rotated = await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root,
+            intention="Continue the task",
+            compaction_summary="Task in progress",
+        )
+        assert_policy(providers.guardrails.last_policy, refreshed=False)
+        await manager.refresh_intaris_session_policy(rotated)
+        assert_policy(providers.guardrails.last_policy, refreshed=True)
+    finally:
+        current_runtime_access_context.reset(token)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_session_manager_rolls_back_when_intaris_creation_fails(tmp_path) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     manager = SessionManager(session_factory, _Providers(fail=True), _Cache())
@@ -1192,6 +1446,9 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
     )
 
     # Rotate
+    providers.guardrails.intentions[root_session.session_id] = (
+        "Update the Cognis Library controls and preserve the SVG logo."
+    )
     new_session = await manager.rotate_session(
         conversation_id=conversation.conversation_id,
         current_session=root_session,
@@ -1235,6 +1492,9 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
     # Verify Intaris session was created for new root
     assert len(providers.guardrails.calls) == 2  # original + rotation
     assert providers.guardrails.calls[1][0] == new_session.session_id
+    assert providers.guardrails.intentions[new_session.session_id] == (
+        "Update the Cognis Library controls and preserve the SVG logo."
+    )
     assert any(
         key == f"{new_session.session_id}:rotation_seed"
         and events
@@ -1262,6 +1522,72 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
         "user@example.com",
     ) in providers.guardrails.record_event_contexts
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_compaction_intention_lookup_failure_preserves_lane(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Lookup failure",
+    )
+    lookup = AsyncMock(side_effect=RuntimeError("Intaris unavailable"))
+    monkeypatch.setattr(providers.guardrails, "get_session", lookup)
+    with pytest.raises(RuntimeError, match="Intaris unavailable"):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root,
+            intention="Continued conversation",
+            completion_reason="compacted",
+        )
+    lookup.assert_awaited_once_with(
+        root.intaris_session_id or root.session_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+    )
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        old = await db.get(Session, root.session_id)
+        assert conv.active_session_id == root.session_id
+        assert old.status != "completed"
+    assert len(providers.guardrails.calls) == 1
+    assert root.session_id not in cache.evicted
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reset_does_not_inherit_old_intention(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Reset",
+    )
+    lookup = AsyncMock(side_effect=AssertionError("Must not inherit old task"))
+    monkeypatch.setattr(providers.guardrails, "get_session", lookup)
+    new = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root,
+        intention="Start a different task",
+        completion_reason="reset",
+        transition=SessionTransition.RESET,
+    )
+    lookup.assert_not_awaited()
+    assert providers.guardrails.intentions[new.session_id] == "Start a different task"
     await engine.dispose()
 
 
@@ -2287,19 +2613,19 @@ def test_intaris_session_policy_includes_additional_executor_paths() -> None:
     from cognis.core.session import _intaris_session_policy
 
     policy = _intaris_session_policy(
-        "/home/riker/src/cognis",
-        executor_home="/home/riker",
+        "/home/bob/src/sample-app",
+        executor_home="/home/bob",
         additional_allowed_paths=[
-            "/Users/fpytloun",
-            "/Users/fpytloun/src/infra/ansible",
-            "/var/folders/cognis/tmp",
+            "/Users/alice",
+            "/Users/alice/src/sample/config",
+            "/var/folders/sample/tmp",
         ],
     )
 
-    assert "/home/riker/*" in policy["allow_paths"]
-    assert "/Users/fpytloun/*" in policy["allow_paths"]
-    assert "/Users/fpytloun/src/infra/ansible/*" in policy["allow_paths"]
-    assert "/var/folders/cognis/tmp/*" in policy["allow_paths"]
+    assert "/home/bob/*" in policy["allow_paths"]
+    assert "/Users/alice/*" in policy["allow_paths"]
+    assert "/Users/alice/src/sample/config/*" in policy["allow_paths"]
+    assert "/var/folders/sample/tmp/*" in policy["allow_paths"]
 
 
 @pytest.mark.asyncio

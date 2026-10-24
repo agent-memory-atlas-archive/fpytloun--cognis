@@ -178,8 +178,8 @@
 
 <Sheet {open} {onClose} side="right" label="Add documents" dismissible={!uploading} class="w-[min(30rem,100vw)]">
   {#snippet header()}
-    <h2 class="text-lg font-semibold text-white">Add documents</h2>
-    <p class="mt-1 text-sm text-slate-400">Upload files or an entire folder. Only unsupported or oversized files are skipped.</p>
+    <h2 class="text-lg font-semibold text-strong">Add documents</h2>
+    <p class="mt-1 text-sm text-muted">Upload files or an entire folder. Only unsupported or oversized files are skipped.</p>
   {/snippet}
 
   {#snippet children()}
@@ -187,13 +187,13 @@
       <div class="flex flex-col gap-4">
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class={`flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed px-6 py-10 text-center transition ${dragActive ? 'border-sky-500 bg-sky-500/5' : 'border-slate-700'}`}
+          class={`flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed px-6 py-10 text-center transition ${dragActive ? 'border-accent bg-accent-subtle' : 'border-control-border'}`}
           ondragover={(event) => { event.preventDefault(); dragActive = true; }}
           ondragleave={() => (dragActive = false)}
           ondrop={handleDrop}
         >
-          <Upload class="h-8 w-8 text-slate-500" />
-          <p class="text-sm text-slate-400">Drag and drop files here, or</p>
+          <Upload class="h-8 w-8 text-quiet" />
+          <p class="text-sm text-muted">Drag and drop files here, or</p>
           <div class="flex flex-wrap justify-center gap-2">
             <Button size="sm" variant="secondary" onclick={() => filesInput?.click()}>Choose files</Button>
             <Button size="sm" variant="secondary" onclick={() => folderInput?.click()}>
@@ -213,14 +213,14 @@
         </div>
 
         {#if sources.length > 0}
-          <div class="max-h-64 overflow-y-auto rounded-xl border border-slate-800/80">
-            <ul class="divide-y divide-slate-800/80 text-sm">
+          <div class="max-h-64 overflow-y-auto rounded-xl border border-separator/80">
+            <ul class="divide-y divide-separator/80 text-sm">
               {#each sources as source, index (source.path + index)}
                 <li class="flex items-center justify-between gap-3 px-3 py-2">
-                  <span class="truncate text-slate-200" title={source.path}>{source.path}</span>
-                  <span class="flex shrink-0 items-center gap-2 text-xs text-slate-500">
+                  <span class="truncate text-foreground" title={source.path}>{source.path}</span>
+                  <span class="flex shrink-0 items-center gap-2 text-xs text-quiet">
                     {formatBytes(source.file.size)}
-                    <button type="button" class="text-slate-500 hover:text-rose-300" onclick={() => removeSource(index)} aria-label={`Remove ${source.path}`}>
+                    <button type="button" class="text-quiet hover:text-danger" onclick={() => removeSource(index)} aria-label={`Remove ${source.path}`}>
                       ✕
                     </button>
                   </span>
@@ -240,10 +240,10 @@
     {:else if step === 'review'}
       <div class="flex flex-col gap-4">
         <fieldset class="flex flex-col gap-2">
-          <legend class="text-sm font-medium text-slate-300">If a document already exists at the same path</legend>
+          <legend class="text-sm font-medium text-secondary">If a document already exists at the same path</legend>
           <div class="flex gap-2 text-sm">
             {#each [['skip', 'Skip'], ['replace', 'Replace'], ['keep_both', 'Keep both']] as [value, label] (value)}
-              <label class={`flex-1 cursor-pointer rounded-xl border px-3 py-2 text-center ${conflictPolicy === value ? 'border-sky-500 bg-sky-500/10 text-sky-200' : 'border-slate-700 text-slate-300'}`}>
+              <label class={`flex-1 cursor-pointer rounded-xl border px-3 py-2 text-center ${conflictPolicy === value ? 'border-accent bg-accent-subtle text-accent' : 'border-control-border text-secondary'}`}>
                 <input type="radio" class="sr-only" name="conflict-policy" value={value} checked={conflictPolicy === value} onchange={() => (conflictPolicy = value as KnowledgebaseDocumentConflictPolicy)} />
                 {label}
               </label>
@@ -251,21 +251,21 @@
           </div>
         </fieldset>
 
-        <p class="text-sm text-slate-400">
+        <p class="text-sm text-muted">
           {includedCount} of {plan.length} file{plan.length === 1 ? '' : 's'} will be uploaded ({formatBytes(totalSize)}).
           {#if skippedCount > 0}{skippedCount} will be skipped.{/if}
         </p>
 
-        <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800/80">
-          <ul class="divide-y divide-slate-800/80 text-sm">
+        <div class="max-h-72 overflow-y-auto rounded-xl border border-separator/80">
+          <ul class="divide-y divide-separator/80 text-sm">
             {#each plan as item (item.id)}
               <li class="flex items-center justify-between gap-3 px-3 py-2">
                 <span class="min-w-0 flex-1">
-                  <span class="block truncate text-slate-200" title={item.path}>{item.path}</span>
+                  <span class="block truncate text-foreground" title={item.path}>{item.path}</span>
                   {#if item.skipReason}
-                    <span class="block text-xs text-amber-300">{item.skipReason}</span>
+                    <span class="block text-xs text-warning">{item.skipReason}</span>
                   {:else if item.conflict}
-                    <span class="block text-xs text-slate-500">
+                    <span class="block text-xs text-quiet">
                       {item.action === 'replace'
                         ? 'Will replace existing document'
                         : item.action === 'keep_both'
@@ -274,7 +274,7 @@
                     </span>
                   {/if}
                 </span>
-                <span class="shrink-0 text-xs text-slate-500">{formatBytes(item.size)}</span>
+                <span class="shrink-0 text-xs text-quiet">{formatBytes(item.size)}</span>
               </li>
             {/each}
           </ul>
@@ -289,27 +289,27 @@
       </div>
     {:else}
       <div class="flex flex-col gap-4">
-        <p class="text-sm text-slate-400" aria-live="polite">
+        <p class="text-sm text-muted" aria-live="polite">
           {#if uploading}Uploading… {doneCount} of {includedCount} done.{:else}Upload finished. {failedCount} failed.{/if}
         </p>
-        <div class="h-2 overflow-hidden rounded-full bg-slate-800">
-          <div class="h-full bg-sky-500 transition-all" style={`width: ${includedCount ? (doneCount / includedCount) * 100 : 0}%`}></div>
+        <div class="h-2 overflow-hidden rounded-full bg-raised">
+          <div class="h-full bg-accent transition-all" style={`width: ${includedCount ? (doneCount / includedCount) * 100 : 0}%`}></div>
         </div>
 
-        <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800/80">
-          <ul class="divide-y divide-slate-800/80 text-sm">
+        <div class="max-h-72 overflow-y-auto rounded-xl border border-separator/80">
+          <ul class="divide-y divide-separator/80 text-sm">
             {#each outcomes as outcome (outcome.id)}
               <li class="flex items-center justify-between gap-3 px-3 py-2">
-                <span class="min-w-0 flex-1 truncate text-slate-200" title={outcome.resolvedPath}>{outcome.resolvedPath}</span>
+                <span class="min-w-0 flex-1 truncate text-foreground" title={outcome.resolvedPath}>{outcome.resolvedPath}</span>
                 <span class="flex shrink-0 items-center gap-1.5 text-xs">
                   {#if outcome.status === 'failed'}
-                    <CircleAlert class="h-3.5 w-3.5 text-rose-400" /> <span class="text-rose-300">{outcome.error ?? 'Failed'}</span>
+                    <CircleAlert class="h-3.5 w-3.5 text-danger" /> <span class="text-danger">{outcome.error ?? 'Failed'}</span>
                    {:else if outcome.status === 'skipped' || outcome.status === 'cancelled'}
-                     <span class="text-slate-500">{outcome.status === 'cancelled' ? 'Cancelled' : 'Skipped'}</span>
+                     <span class="text-quiet">{outcome.status === 'cancelled' ? 'Cancelled' : 'Skipped'}</span>
                   {:else if outcome.status === 'uploading' || outcome.status === 'pending'}
-                    <span class="text-slate-500">{outcome.status === 'uploading' ? 'Uploading…' : 'Queued'}</span>
+                    <span class="text-quiet">{outcome.status === 'uploading' ? 'Uploading…' : 'Queued'}</span>
                   {:else}
-                    <CircleCheck class="h-3.5 w-3.5 text-emerald-400" /> <span class="text-emerald-300 capitalize">{outcome.status}</span>
+                    <CircleCheck class="h-3.5 w-3.5 text-success" /> <span class="text-success capitalize">{outcome.status}</span>
                   {/if}
                 </span>
               </li>

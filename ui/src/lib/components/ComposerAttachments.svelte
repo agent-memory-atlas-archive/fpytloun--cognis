@@ -21,11 +21,22 @@
   interface Props {
     attachments: AttachmentRef[];
     onremove: (artifactId: string) => void;
+    /** Retry a failed background upload (local attachments only). */
+    onretry?: (attachment: AttachmentRef) => void;
     disabled?: boolean;
     class?: string;
   }
 
-  let { attachments, onremove, disabled = false, class: className = '' }: Props = $props();
+  let { attachments, onremove, onretry, disabled = false, class: className = '' }: Props = $props();
+
+  function uploadPercent(attachment: AttachmentRef): number {
+    return Math.round(Math.max(0, Math.min(1, attachment.upload_progress ?? 0)) * 100);
+  }
+
+  function uploadLabel(attachment: AttachmentRef): string {
+    if (attachment.upload_state === 'failed') return 'Upload failed';
+    return `Uploading ${uploadPercent(attachment)}%`;
+  }
 
   let playingId = $state<string | null>(null);
   const audioElements = new Map<string, HTMLAudioElement>();
@@ -76,16 +87,37 @@
   <div class={`flex flex-wrap gap-2 ${className}`}>
     {#each attachments as attachment (attachment.artifact_id)}
       {#if isImage(attachment) && attachment.url}
-        <div class="group relative h-20 w-20 overflow-hidden rounded-xl border border-slate-700 bg-slate-900">
+        <div class="group relative h-20 w-20 overflow-hidden rounded-xl border border-control-border bg-surface">
           <img
             alt={attachment.filename}
             class="h-full w-full object-cover"
             loading="lazy"
             src={attachment.url}
           />
+          {#if attachment.upload_state === 'uploading'}
+            <div
+              class="pointer-events-none absolute inset-x-0 bottom-0 bg-scrim/70 px-1 py-0.5 text-center text-[10px] font-medium tabular-nums text-white"
+              role="status"
+              aria-label={uploadLabel(attachment)}
+            >
+              {uploadPercent(attachment)}%
+              <div class="mt-0.5 h-0.5 w-full overflow-hidden rounded bg-white/25">
+                <div class="h-full bg-white transition-[width]" style={`width: ${uploadPercent(attachment)}%`}></div>
+              </div>
+            </div>
+          {:else if attachment.upload_state === 'failed'}
+            <button
+              type="button"
+              class="absolute inset-x-0 bottom-0 bg-danger-subtle py-0.5 text-[10px] font-medium text-danger"
+              title={attachment.upload_error ?? 'Upload failed'}
+              onclick={() => onretry?.(attachment)}
+            >
+              Retry
+            </button>
+          {/if}
           <button
             aria-label={`Remove ${attachment.filename}`}
-            class="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-slate-950/85 text-slate-100 shadow-md transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+            class="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-scrim/85 text-white shadow-md transition hover:bg-danger-subtle hover:text-danger disabled:cursor-not-allowed disabled:opacity-50"
             {disabled}
             onclick={() => onremove(attachment.artifact_id)}
             type="button"
@@ -94,10 +126,10 @@
           </button>
         </div>
       {:else if isAudio(attachment)}
-        <div class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/70 px-3 py-1.5 text-xs text-slate-200">
+        <div class="flex items-center gap-2 rounded-full border border-control-border bg-inset/70 px-3 py-1.5 text-xs text-foreground">
           <button
             aria-label={playingId === attachment.artifact_id ? 'Pause recording' : 'Play recording'}
-            class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-slate-800 text-slate-100 transition hover:bg-slate-700 disabled:opacity-50"
+            class="inline-flex h-7 w-7 items-center justify-center rounded-full bg-surface text-foreground transition hover:bg-surface-hover disabled:opacity-50"
             type="button"
             onclick={() => togglePlay(attachment)}
             disabled={!audioUrl(attachment)}
@@ -108,14 +140,14 @@
               <Play class="h-3.5 w-3.5" />
             {/if}
           </button>
-          <Mic class="h-3.5 w-3.5 text-rose-300" />
+          <Mic class="h-3.5 w-3.5 text-pink-tone" />
           <span class="font-medium tabular-nums">{formatVoiceDuration(attachment.duration_seconds ?? 0)}</span>
           {#if attachment.voice_recording}
-            <span class="text-[10px] uppercase tracking-wider text-slate-400">ready</span>
+            <span class="text-[10px] uppercase tracking-wider text-muted">ready</span>
           {/if}
           <button
             aria-label={`Remove ${attachment.filename}`}
-            class="text-slate-400 transition hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            class="text-muted transition hover:text-strong disabled:cursor-not-allowed disabled:opacity-50"
             {disabled}
             onclick={() => { haptic.warning(); onremove(attachment.artifact_id); }}
             type="button"
@@ -124,11 +156,23 @@
           </button>
         </div>
       {:else}
-        <div class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/70 px-3 py-2 text-xs text-slate-200">
+        <div class="flex items-center gap-2 rounded-full border border-control-border bg-inset/70 px-3 py-2 text-xs text-foreground">
           <span class="max-w-[220px] truncate">{attachment.filename}</span>
+          {#if attachment.upload_state === 'uploading'}
+            <span class="tabular-nums text-info" role="status" aria-label={uploadLabel(attachment)}>{uploadPercent(attachment)}%</span>
+          {:else if attachment.upload_state === 'failed'}
+            <button
+              type="button"
+              class="font-medium text-danger hover:underline"
+              title={attachment.upload_error ?? 'Upload failed'}
+              onclick={() => onretry?.(attachment)}
+            >
+              Retry
+            </button>
+          {/if}
           <button
             aria-label={`Remove ${attachment.filename}`}
-            class="text-slate-400 transition hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+            class="text-muted transition hover:text-strong disabled:cursor-not-allowed disabled:opacity-50"
             {disabled}
             onclick={() => onremove(attachment.artifact_id)}
             type="button"

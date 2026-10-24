@@ -178,6 +178,25 @@ describe('work page navigation', () => {
     ]);
   });
 
+  it('keeps only the newest revision of a deliverable lineage across pages', () => {
+    const newest = page(10, { hasMore: true, cursor: 'older' });
+    newest.deliverables = [
+      { deliverable_id: 'report-r2', lineage_id: 'report-r1', revision: 2, format: 'markdown', sort_key: '0010' },
+    ];
+    const older = page(8);
+    older.deliverables = [
+      { deliverable_id: 'report-r1', lineage_id: 'report-r1', revision: 1, format: 'markdown', sort_key: '0009' },
+      { deliverable_id: 'other', format: 'markdown', sort_key: '0008' },
+    ];
+    const state = appendOlderWorkPage(createAccumulatedWorkState(newest), older);
+    expect(state.projection.deliverables?.map((item) => item.deliverable_id)).toEqual(['report-r2', 'other']);
+
+    expect(orderedWorkDeliverables(
+      [{ deliverable_id: 'report-r1', lineage_id: 'report-r1', revision: 1, format: 'markdown', sort_key: '0009' }],
+      { deliverable_id: 'report-r2', lineage_id: 'report-r1', revision: 2, format: 'markdown', sort_key: '0010' },
+    ).map((item) => item.deliverable_id)).toEqual(['report-r2']);
+  });
+
   it('sorts an older primary by its key and preserves deterministic placement without a key', () => {
     const supporting = [
       { deliverable_id: 'new', format: 'markdown', sort_key: '0010' },

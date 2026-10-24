@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, call
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -76,6 +77,87 @@ def _assert_sidebar_upsert_call(
     assert kwargs == {"include_subscribers": True}
 
 
+@pytest.mark.parametrize("recipient_kind", ["owned", "missing", "foreign"])
+def test_handoff_link_requires_created_recipient_and_source_session(
+    monkeypatch: Any,
+    tmp_path: Path,
+    recipient_kind: str,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def seed() -> tuple[str, str, str]:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as db:
+                await create_user(
+                    db,
+                    email="other@example.com",
+                    name="Other",
+                    password_hash=app.state.password_hasher.hash("testpass123"),
+                    role="user",
+                )
+                source = await create_conversation(
+                    db,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                )
+                recipient = await create_conversation(
+                    db,
+                    user_email="other@example.com"
+                    if recipient_kind == "foreign"
+                    else "user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                )
+                session = await create_session(
+                    db,
+                    conversation_id=source.conversation_id,
+                    agent_id="agent-chat",
+                    session_id="sess-source-handoff",
+                    user_email="user@example.com",
+                )
+                await db.commit()
+                return source.conversation_id, recipient.conversation_id, session.session_id
+
+        source_id, recipient_id, session_id = asyncio.run(seed())
+        link = AsyncMock()
+        app.state.handoff_service = SimpleNamespace(link_recipient=link)
+        payload = {
+            "source_session_id": session_id,
+            "source_event_seq": 8,
+            "recipient_conversation_id": recipient_id
+            if recipient_kind != "missing"
+            else "missing-recipient",
+        }
+        response = client.post(
+            f"/api/v1/conversations/{source_id}/handoff-links",
+            json=payload,
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        if recipient_kind == "owned":
+            assert response.status_code == 200, response.text
+            assert response.json() == {"ok": True}
+            assert link.call_args.args[0].conversation_id == source_id
+            assert link.call_args.args[1].session_id == session_id
+            assert link.call_args.kwargs == {
+                "event_seq": 8,
+                "recipient_id": recipient_id,
+                "agent_owner_email": "user@example.com",
+            }
+        else:
+            assert response.status_code in {403, 404}
+            link.assert_not_awaited()
+        link.reset_mock()
+        denied = client.post(
+            f"/api/v1/conversations/{source_id}/handoff-links",
+            json=payload,
+            headers=_auth_headers(app, email="other@example.com"),
+        )
+        assert denied.status_code in {403, 404}
+        link.assert_not_awaited()
+
+
 def test_active_background_shells_filters_by_owner() -> None:
     matching = {
         "shell_id": "shell_owned",
@@ -122,9 +204,220 @@ def test_active_background_shells_filters_by_owner() -> None:
     connection.background_shell_status.assert_awaited_once_with(include_completed=False)
 
 
+def test_sidebar_completes_with_snapshot_revision_during_continuous_churn(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def seed() -> str:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as session:
+                row = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Title 0",
+                )
+                await session.commit()
+                return row.conversation_id
+
+        conversation_id = asyncio.run(seed())
+        original = conversations_routes._conversation_page_projection
+        written_revisions: list[int] = []
+
+        async def churn(request: Any, **kwargs: Any) -> Any:
+            assert kwargs["session"] is not None
+            async with app.state.session_factory() as writer:
+                row = await get_conversation(writer, conversation_id)
+                row.title = f"Title {len(written_revisions) + 1}"
+                await writer.commit()
+                written_revisions.append(
+                    await conversations_routes.read_live_work_revision(writer, "user@example.com")
+                )
+            return await original(request, **kwargs)
+
+        monkeypatch.setattr(conversations_routes, "_conversation_page_projection", churn)
+        monkeypatch.setattr(
+            conversations_routes, "_active_background_shells", AsyncMock(return_value=[])
+        )
+        for index in range(3):
+            response = client.get(
+                "/api/v1/conversations/sidebar",
+                headers=_auth_headers(app, email="user@example.com"),
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["conversations"]["items"][0]["title"] == f"Title {index}"
+            assert int(body["sidebar_revision"]) < written_revisions[-1]
+        assert len(written_revisions) == 3  # One assembly, never a churn retry.
+        monkeypatch.setattr(
+            conversations_routes,
+            "_active_background_shells",
+            AsyncMock(side_effect=TimeoutError("executor unavailable")),
+        )
+        response = client.get(
+            "/api/v1/conversations/sidebar",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        assert response.json()["background_work_changed"] is False
+        monkeypatch.setattr(conversations_routes, "_conversation_page_projection", original)
+        response = client.get(
+            "/api/v1/conversations/waiting",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        assert response.json()["activity_complete"] is False
+
+
+@pytest.mark.parametrize("failure", ["offline", "timeout", "malformed"])
+def test_waiting_refreshes_unread_data_when_executor_activity_is_unavailable(
+    monkeypatch: Any,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def seed() -> str:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as session:
+                row = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Fresh unread topic",
+                )
+                row.last_message_at = datetime.now(UTC)
+                row.last_read_at = row.last_message_at - timedelta(minutes=1)
+                await session.commit()
+                return row.conversation_id
+
+        conversation_id = client.portal.call(seed)
+        list_active = AsyncMock(return_value=[SimpleNamespace(executor_id="exec-a")])
+        if failure == "offline":
+            list_active.side_effect = ConnectionError("executor registry unavailable")
+        if failure == "timeout":
+            status = AsyncMock(side_effect=TimeoutError("executor timeout"))
+        else:
+            status = AsyncMock(return_value={})
+        monkeypatch.setattr(app.state.providers.executor, "list_active", list_active)
+        monkeypatch.setattr(
+            app.state.providers.executor,
+            "get_executor",
+            AsyncMock(return_value=SimpleNamespace(background_shell_status=status)),
+        )
+        headers = _auth_headers(app, email="user@example.com")
+        response = client.get("/api/v1/conversations/waiting", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["activity_complete"] is False
+        assert [item["conversation_id"] for item in response.json()["conversations"]["items"]] == [
+            conversation_id
+        ]
+
+        async def mark_read() -> None:
+            async with app.state.session_factory() as session:
+                row = await get_conversation(session, conversation_id)
+                row.last_read_at = datetime.now(UTC)
+                await session.commit()
+
+        client.portal.call(mark_read)
+        response = client.get("/api/v1/conversations/waiting", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["conversations"]["items"] == []
+        list_active.side_effect = None
+        status.side_effect = None
+        status.return_value = {"shells": []}
+        response = client.get("/api/v1/conversations/waiting", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["activity_complete"] is True
+
+
+def test_background_command_details_are_owner_conversation_and_executor_scoped(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def seed_owner() -> str:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="other@example.com",
+                    name="Other",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                row = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Command owner",
+                )
+                row.active_executor_id = "exec-a"
+                await session.commit()
+                return row.conversation_id
+
+        conversation_id = client.portal.call(seed_owner)
+        shell = {
+            "shell_id": "shell-preview",
+            "conversation_id": conversation_id,
+            "user_email": "user@example.com",
+            "command": "npm run dev",
+            "status": "completed",
+            "output_tail": "Ready",
+            "exit_code": 0,
+        }
+        connection = SimpleNamespace(
+            background_shell_status=AsyncMock(return_value={"shells": [shell]})
+        )
+        monkeypatch.setattr(
+            app.state.providers.executor,
+            "list_active",
+            AsyncMock(return_value=[SimpleNamespace(executor_id="exec-a")]),
+        )
+        monkeypatch.setattr(
+            app.state.providers.executor, "get_executor", AsyncMock(return_value=connection)
+        )
+        path = f"/api/v1/conversations/{conversation_id}/background-commands/shell-preview"
+        headers = _auth_headers(app, email="user@example.com")
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        assert response.json()["command"] == "npm run dev"
+        assert response.json()["output_tail"] == "Ready"
+        assert "user_email" not in response.json()
+        connection.background_shell_status.assert_awaited_once_with(include_completed=True)
+        assert (
+            client.get(
+                path, headers=_auth_headers(app, email="other@example.com", role="admin")
+            ).status_code
+            == 403
+        )
+        for field, value in [
+            ("user_email", "other@example.com"),
+            ("conversation_id", "another-conversation"),
+            ("shell_id", "another-shell"),
+        ]:
+            connection.background_shell_status.return_value = {"shells": [{**shell, field: value}]}
+            assert client.get(path, headers=headers).status_code == 404
+        app.state.providers.executor.list_active.return_value = [
+            SimpleNamespace(executor_id="exec-b")
+        ]
+        connection.background_shell_status.return_value = {"shells": [shell]}
+        assert client.get(path, headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize("path", ["/sidebar", "/background-work"])
 def test_sidebar_projects_active_background_command(
     monkeypatch: object,
     tmp_path: Path,
+    path: str,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = cast(Any, client.app)
@@ -159,7 +452,9 @@ def test_sidebar_projects_active_background_command(
 
         conversation_id, other_conversation_id = asyncio.run(_seed())
 
-        async def _background_shells(request: object, *, user_email: str):
+        async def _background_shells(
+            request: object, *, user_email: str, require_complete: bool = False
+        ):
             assert user_email == "user@example.com"
             return [
                 {
@@ -191,8 +486,20 @@ def test_sidebar_projects_active_background_command(
             "_active_background_shells",
             _background_shells,
         )
+        if path == "/background-work":
+            for name in (
+                "list_conversations",
+                "list_conversation_context_types",
+                "_agent_direct_chat_projection",
+            ):
+                monkeypatch.setattr(  # type: ignore[attr-defined]
+                    conversations_routes,
+                    name,
+                    AsyncMock(side_effect=AssertionError(f"background-only read invoked {name}")),
+                )
+            assert client.get("/api/v1/conversations/background-work").status_code == 401
         response = client.get(
-            "/api/v1/conversations/sidebar",
+            f"/api/v1/conversations{path}",
             headers=_auth_headers(app, email="user@example.com"),
         )
 
@@ -210,6 +517,28 @@ def test_sidebar_projects_active_background_command(
         assert item["status"] == "running"
         assert conversations_routes._background_shell_timestamp(float("nan")) is None
         assert conversations_routes._background_shell_timestamp(float("inf")) is None
+        if path == "/background-work":
+            assert response.json()["background_work_changed"] is True
+            assert response.json()["agent_direct_chats"] == []
+            homes = AsyncMock(return_value=[])
+            monkeypatch.setattr(conversations_routes, "_agent_direct_chat_projection", homes)  # type: ignore[attr-defined]
+            result = client.get(
+                "/api/v1/conversations/background-work?include_agent_direct=true",
+                headers=_auth_headers(app, email="user@example.com", role="admin"),
+            )
+            assert result.status_code == 200
+            assert homes.await_args.kwargs["user_email"] == "user@example.com"
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                conversations_routes,
+                "_active_background_shells",
+                AsyncMock(side_effect=RuntimeError("executor unavailable")),
+            )
+            partial = client.get(
+                "/api/v1/conversations/background-work",
+                headers=_auth_headers(app, email="user@example.com"),
+            )
+            assert partial.status_code == 200
+            assert partial.json()["background_work_changed"] is False
 
 
 def test_mark_read_always_emits_authoritative_acknowledgement(
@@ -319,6 +648,9 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
     monkeypatch: object,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        conversations_routes, "_active_background_shells", AsyncMock(return_value=[])
+    )
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = cast(Any, client.app)
 

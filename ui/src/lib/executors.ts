@@ -99,12 +99,12 @@ export function capabilityStatusLabel(state: RuntimeCapabilityState): string {
 
 export function capabilityStatusTone(state: RuntimeCapabilityState): string {
   return state === 'ready'
-    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+    ? 'border-success-border bg-success-subtle text-success'
     : state === 'installable'
-      ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+      ? 'border-warning-border bg-warning-subtle text-warning'
       : state === 'unavailable'
-        ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
-        : 'border-slate-700 bg-slate-900/70 text-slate-300';
+        ? 'border-danger-border bg-danger-subtle text-danger'
+        : 'border-control-border bg-surface/70 text-secondary';
 }
 
 export function executorCapabilityFreshness(
@@ -358,7 +358,7 @@ export function executorRuntimeSummary(executor: ExecutorConfig): string | null 
 
 function formatMcpFailure(server: ExecutorMCPServerRuntimeStatus): string {
   const details = [server.phase, server.error_class, server.timed_out ? 'timed out' : null].filter(Boolean).join(' · ');
-  const summary = server.stderr_summary ?? server.message ?? null;
+  const summary = [...new Set([server.message, server.stderr_summary].filter(Boolean))].join(' · ');
   return summary ? `${server.name}: ${details}${details ? ' · ' : ''}${summary}` : `${server.name}: ${details || 'failed'}`;
 }
 

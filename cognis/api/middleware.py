@@ -20,6 +20,7 @@ from typing import Any
 from argon2 import PasswordHasher
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from jose import JWTError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -31,8 +32,10 @@ from cognis.api.authentication import (
     authenticate_access_token,
 )
 from cognis.api.models import ErrorBody, ErrorResponse
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.runtime_context import current_user_email
 from cognis.security import parse_api_key, verify_api_key
+from cognis.store.models import InferenceCompanion
 from cognis.store.queries import (
     get_api_key,
     get_browser_session_by_token,
@@ -318,7 +321,7 @@ _AUTH_CACHES: weakref.WeakSet[_AuthLookupCache] = weakref.WeakSet()
 _AUTH_CACHE_INVALIDATOR_REGISTERED = False
 _PUBLIC_DELIVERABLE_SHARE_PATH = re.compile(
     r"/api/v1/deliverables/(?:s/[A-Za-z0-9_-]+|share/[A-Za-z0-9_-]+/"
-    r"(?:view|download\.pdf|media/media_[0-9a-f]{24}))"
+    r"(?:view|download\.(?:pdf|html|md)|media/media_[0-9a-f]{24}))"
 )
 _PUBLIC_STANDALONE_ASSET_PATH = re.compile(
     r"/api/v1/deliverables/standalone-assets/assets/[A-Za-z0-9_./-]+"
@@ -440,7 +443,8 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        if not request.url.path.startswith("/api/"):
+        inference = request.url.path.startswith("/v1/")
+        if not request.url.path.startswith("/api/") and not inference:
             return await call_next(request)
         if (request.method.upper(), request.url.path) in PUBLIC_ROUTES:
             return await call_next(request)
@@ -478,6 +482,9 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             ):
                 return _public_share_rate_limited_response()
             return await call_next(request)
+        if request.url.path == "/api/v1/videos/transfer" and request.method.upper() == "PUT":
+            # Independently authenticated by an expiring, exact-job transfer capability.
+            return await call_next(request)
         if request.method.upper() == "GET" and request.url.path.startswith(
             "/api/v1/artifacts/content/"
         ):
@@ -500,6 +507,43 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         authorization = request.headers.get("Authorization")
         api_key_header = request.headers.get("X-API-Key")
         cookie_token = request.cookies.get("cognis_session")
+
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.removeprefix("Bearer ").strip()
+            if inference and parse_api_key(token) is not None:
+                api_key_header = token
+                authorization = None
+            elif inference:
+                try:
+                    companion_claims = auth_provider.verify_inference_companion_token(token)
+                except JWTError:
+                    pass
+                else:
+                    async with session_factory() as session:
+                        companion = await session.get(InferenceCompanion, companion_claims["sub"])
+                    if (
+                        companion is None
+                        or not companion.enabled
+                        or companion.token_version != companion_claims["itv"]
+                    ):
+                        return JSONResponse(
+                            status_code=401,
+                            content={
+                                "error": {
+                                    "message": "Companion credential revoked",
+                                    "type": "authentication_error",
+                                    "code": "invalid_api_key",
+                                }
+                            },
+                        )
+                    request.state.user = AuthenticatedUser(
+                        email=SYSTEM_USER_EMAIL,
+                        role="service",
+                        auth_type="inference_companion",
+                    )
+                    request.state.claims = companion_claims
+                    request.state.inference_client_id = companion.service
+                    return await call_next(request)
 
         if authorization and authorization.startswith("Bearer "):
             token = authorization.removeprefix("Bearer ").strip()
@@ -526,6 +570,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             context_token = current_user_email.set(user.email)
             request.state.user = user
             request.state.claims = claims
+            request.state.inference_client_id = "user_jwt"
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
                 user_key=user.email,
                 path=request.url.path,
@@ -624,6 +669,25 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                 name=identity.name,
                 auth_type="api_key",
             )
+            # Read policy without caching: changing key scopes takes effect at
+            # the next admission, independently of the credential lookup cache.
+            async with session_factory() as session:
+                key_record = await get_api_key(session, identity.key_id)
+                if key_record is None:
+                    return JSONResponse(
+                        status_code=401, content={"error": {"message": "Invalid API key"}}
+                    )
+                scopes = dict(key_record.scopes or {})
+                if _datetime_expired(key_record.expires_at, datetime.now(UTC)):
+                    return JSONResponse(
+                        status_code=401, content={"error": {"message": "Expired API key"}}
+                    )
+            request.state.api_key_scopes = scopes
+            request.state.inference_client_id = identity.key_id
+            if scopes.get("inference_only") is True and not inference:
+                return JSONResponse(
+                    status_code=403, content={"error": {"message": "Inference-only API key"}}
+                )
             context_token = current_user_email.set(identity.user_email)
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
                 user_key=identity.user_email,

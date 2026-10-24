@@ -8,6 +8,7 @@ expected by the rest of the controller.
 from __future__ import annotations
 
 import hashlib
+import re
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator
@@ -43,6 +44,8 @@ RESPONSES_REPLAY_UNPAIRED_TOOL_CALLS_TOTAL = Counter(
 )
 
 _NATIVE_APPLY_PATCH_OPERATION_TYPES = {"create_file", "update_file", "delete_file"}
+_RESPONSES_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_RESPONSES_TOOL_NAME_INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 APPLY_PATCH_FREEFORM_LARK_GRAMMAR = """start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" NEWLINE
 end_patch: "*** End Patch" NEWLINE?
@@ -317,6 +320,18 @@ def _record_unpaired_tool_calls(unpaired_call_count: int) -> None:
     )
 
 
+def _responses_replay_tool_name(name: Any) -> str:
+    """Keep historical tool names valid without changing the durable transcript."""
+
+    if isinstance(name, str) and _RESPONSES_TOOL_NAME_PATTERN.fullmatch(name):
+        return name
+    if not isinstance(name, str) or not name:
+        return "unknown_tool"
+    cleaned = _RESPONSES_TOOL_NAME_INVALID_CHARS.sub("_", name).strip("_") or "tool"
+    suffix = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return f"{cleaned[: 64 - len(suffix) - 1]}_{suffix}"
+
+
 def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Translate canonical Cognis/OpenAI-chat messages into Responses input."""
 
@@ -382,7 +397,10 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         call_id = raw_item.get("call_id")
                         if isinstance(call_id, str) and call_id:
                             native_apply_patch_call_ids.add(call_id)
-                    items.append(dict(raw_item))
+                    replay_item = dict(raw_item)
+                    if raw_type in {"function_call", "custom_tool_call"}:
+                        replay_item["name"] = _responses_replay_tool_name(raw_item.get("name"))
+                    items.append(replay_item)
             if not has_raw_message_item and has_content and not reconstructed_content_emitted:
                 items.append({"role": "assistant", "content": normalized_content})
                 reconstructed_content_emitted = True
@@ -422,7 +440,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         {
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": function_name,
+                            "name": _responses_replay_tool_name(function_name),
                             "arguments": arguments,
                         }
                     )
@@ -478,7 +496,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                     {
                         "type": "function_call",
                         "call_id": call_id,
-                        "name": function_name,
+                        "name": _responses_replay_tool_name(function_name),
                         "arguments": arguments,
                     }
                 )
@@ -1103,6 +1121,13 @@ async def responses_stream_to_chat_chunks(
                 }
                 continue
             yield provider_liveness_chunk
+        if last_error_event_details is not None and not state.completed_seen:
+            # Some providers close after `error` without sending `response.failed`.
+            yield {
+                "error": str(last_error_event_details.get("message") or "Responses stream failed"),
+                "response_error": classify_response_failure(last_error_event_details),
+                "mid_stream_failure": True,
+            }
     finally:
         logger.debug(
             "Responses bridge stream summary",

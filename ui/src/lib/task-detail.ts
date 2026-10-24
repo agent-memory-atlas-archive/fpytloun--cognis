@@ -46,26 +46,36 @@ export type TaskPageRefresh = {
   auxiliaryError: string;
 };
 
-export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Promise<TaskPageData> {
-  const summary = await api.tasks.summary(taskId);
-  const stepRunsResult = await Promise.allSettled([api.tasks.stepSummaries(taskId)]);
+export async function loadTaskPageData(
+  api: TaskDetailApi, taskId: string
+): Promise<Pick<TaskPageData, 'task' | 'auxiliaryError'>> {
+  const [summary, stepRunsResult] = await Promise.all([
+    api.tasks.summary(taskId),
+    Promise.allSettled([api.tasks.stepSummaries(taskId)])
+  ]);
   const task = {
     ...summary,
     step_runs:
       stepRunsResult[0].status === 'fulfilled' ? stepRunsResult[0].value.items : summary.step_runs
   };
+  return { task, auxiliaryError: firstAuxiliaryError(stepRunsResult[0]) ?? '' };
+}
+
+export async function loadTaskPageOptions(
+  api: TaskDetailApi, task: TaskDetail
+): Promise<Omit<TaskPageData, 'task'>> {
   const sourceConversationPromise =
     task.source_ref && (task.source_type === 'chat' || task.source_type === 'agent')
       ? api.conversations.detail(task.source_ref)
       : Promise.resolve(null);
-  const [agentsResult, workflowsResult, conversationsResult, sourceConversationResult] =
+  const [agentsResult, workflowsResult, conversationsResult, sourceConversationResult, dependencyCandidatesResult] =
     await Promise.allSettled([
       api.agents.listAll(),
       api.workflows.listAll(),
       api.conversations.list(null, { status: 'all', includeAgentDirect: true }),
-      sourceConversationPromise
+      sourceConversationPromise,
+      api.tasks.list({ limit: 100 })
     ]);
-  const dependencyCandidatesResult = await Promise.allSettled([api.tasks.list({ limit: 100 })]);
 
   let workflows = workflowsResult.status === 'fulfilled' ? workflowsResult.value : [];
   if (task.workflow_id && !workflows.some((workflow) => workflow.workflow_id === task.workflow_id)) {
@@ -77,7 +87,6 @@ export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Prom
   }
 
   return {
-    task,
     agents: agentsResult.status === 'fulfilled' ? agentsResult.value : [],
     workflows,
     conversations: mergeConversationChoices(
@@ -85,8 +94,8 @@ export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Prom
       sourceConversationResult.status === 'fulfilled' ? sourceConversationResult.value : null
     ),
     allTasks:
-      dependencyCandidatesResult[0].status === 'fulfilled'
-        ? dependencyCandidatesResult[0].value.items
+      dependencyCandidatesResult.status === 'fulfilled'
+        ? dependencyCandidatesResult.value.items
         : [],
     auxiliaryError:
       firstAuxiliaryError(
@@ -94,8 +103,7 @@ export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Prom
         workflowsResult,
         conversationsResult,
         sourceConversationResult,
-        dependencyCandidatesResult[0],
-        stepRunsResult[0]
+        dependencyCandidatesResult
       ) ?? ''
   };
 }

@@ -38,4 +38,20 @@ describe('AccessibleTabs', () => {
     });
     expect(screen.queryByTestId('tabs-edge-fade')).toBeNull();
   });
+  it('only invokes the optional reselect action on activation, not navigation', async () => {
+    const onChange = vi.fn();
+    const onReselect = vi.fn();
+    render(AccessibleTabs, {
+      tabs: [{ id: 'one', label: 'One' }, { id: 'two', label: 'Two' }],
+      activeId: 'one', idPrefix: 'test', ariaLabel: 'Sections', onChange, onReselect,
+    });
+    const one = screen.getByRole('tab', { name: 'One' });
+    await fireEvent.click(one);
+    expect(onReselect).toHaveBeenCalledExactlyOnceWith('one');
+    await fireEvent.click(screen.getByRole('tab', { name: 'Two' }));
+    expect(onChange).toHaveBeenLastCalledWith('two');
+    await fireEvent.keyDown(one, { key: 'Home' });
+    expect(onChange).toHaveBeenLastCalledWith('one');
+    expect(onReselect).toHaveBeenCalledOnce();
+  });
 });

@@ -55,6 +55,11 @@ def normalize_executor_owner(value: Any) -> str:
     return "shared" if value == "shared" else normalize_email(value)
 
 
+def normalize_executor_label(name: Any, executor_id: Any) -> str:
+    """Prefer existing safe names; fall back only to a configured, validated ID."""
+    return normalize_slug(name, fallback="") or normalize_slug(executor_id, fallback="")
+
+
 def normalize_status(value: Any) -> str:
     candidate = normalize_slug(value)
     return candidate if candidate != "unknown" else "unknown"
@@ -95,6 +100,15 @@ class ObservabilitySnapshot:
     ]
     cardinality_omitted: tuple[tuple[str, int], ...] = ()
     executor_slugs: Mapping[str, tuple[str, str]] = MappingProxyType({})
+
+
+class InventoryCollectionError(RuntimeError):
+    """Sanitized inventory failure with a bounded, code-owned family name."""
+
+    def __init__(self, stage: str, category: str) -> None:
+        self.stage = stage
+        self.category = category
+        super().__init__(stage)
 
 
 async def _bounded_rows(
@@ -162,7 +176,10 @@ async def collect_observability_snapshot(
         *,
         normalizers: Mapping[str, Any] | None = None,
     ) -> None:
-        rows, overflow = await _bounded_rows(session, statement, limit)
+        try:
+            rows, overflow = await _bounded_rows(session, statement, limit)
+        except Exception as exc:
+            raise InventoryCollectionError(name, type(exc).__name__) from exc
         metric_rows = () if overflow else _metric_rows(rows, labels, normalizers=normalizers)
         if len(metric_rows) > limit:
             overflow = True
@@ -396,6 +413,7 @@ async def collect_observability_snapshot(
             "status": normalize_status,
         },
     )
+    channel_status = case((ChannelAccountRow.enabled.is_(True), "enabled"), else_="disabled")
     await grouped(
         "cognis_channel_accounts",
         "Configured channel accounts by type and state.",
@@ -405,14 +423,14 @@ async def collect_observability_snapshot(
             ChannelAccountRow.agent_id,
             ChannelAccountRow.default_agent_profile_id,
             ChannelAccountRow.channel_type,
-            case((ChannelAccountRow.enabled.is_(True), "enabled"), else_="disabled"),
+            channel_status,
             func.count(ChannelAccountRow.account_id),
         ).group_by(
             ChannelAccountRow.user_email,
             ChannelAccountRow.agent_id,
             ChannelAccountRow.default_agent_profile_id,
             ChannelAccountRow.channel_type,
-            case((ChannelAccountRow.enabled.is_(True), "enabled"), else_="disabled"),
+            channel_status,
         ),
         normalizers={
             "user": normalize_email,
@@ -465,35 +483,40 @@ async def collect_observability_snapshot(
             "status": normalize_status,
         },
     )
-    await grouped(
-        "cognis_executor_state",
-        "Configured executor runtime state by safe unique name.",
-        ("user", "executor", "type", "status"),
+    executor_rows, executor_overflow = await _bounded_rows(
+        session,
         select(
+            ExecutorRow.executor_id,
+            ExecutorRow.name,
             func.coalesce(ExecutorRow.owner_email, "shared"),
-            ExecutorRow.name,
-            ExecutorRow.executor_type,
-            ExecutorRow.runtime_state,
-            func.count(ExecutorRow.executor_id),
-        ).group_by(
-            ExecutorRow.owner_email,
-            ExecutorRow.name,
             ExecutorRow.executor_type,
             ExecutorRow.runtime_state,
         ),
-        normalizers={
-            "user": normalize_executor_owner,
-            "executor": normalize_slug,
-            "type": normalize_slug,
-            "status": normalize_status,
-        },
-    )
-
-    executor_rows, executor_overflow = await _bounded_rows(
-        session,
-        select(ExecutorRow.executor_id, ExecutorRow.name, ExecutorRow.owner_email),
         limit,
     )
+    state_labels = ("user", "executor", "type", "status")
+    state_rows = (
+        ()
+        if executor_overflow
+        else _metric_rows(
+            [
+                (owner, normalize_executor_label(name, executor_id) or "unknown", kind, state, 1)
+                for executor_id, name, owner, kind, state in executor_rows
+            ],
+            state_labels,
+            normalizers={"user": normalize_executor_owner},
+        )
+    )
+    families.append(
+        _family(
+            "cognis_executor_state",
+            "Configured executor runtime state by safe name or configured ID.",
+            state_labels,
+            state_rows,
+        )
+    )
+    if executor_overflow:
+        omitted.append(("executor_state", 1))
     executor_slugs: dict[str, tuple[str, str]] = {}
     if executor_overflow:
         # This is an internal lookup for LSP attribution, not another exported
@@ -501,8 +524,8 @@ async def collect_observability_snapshot(
         executor_slugs = {}
     else:
         candidates: dict[tuple[str, str], list[str]] = {}
-        for executor_id, name, owner_email in executor_rows:
-            slug = normalize_slug(name, fallback="")
+        for executor_id, name, owner_email, _kind, _state in executor_rows:
+            slug = normalize_executor_label(name, executor_id)
             if slug:
                 owner = normalize_executor_owner(owner_email)
                 candidates.setdefault((owner, slug), []).append(str(executor_id))

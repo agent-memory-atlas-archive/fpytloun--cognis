@@ -1,3 +1,47 @@
+/* Embedded boundaries opt into the app-owned palette for their own mode.
+   Standalone publications never carry this hook and retain the reader palette. */
+.theme-palette[data-theme-family][data-resolved-theme][data-viewer-theme]:is(.rich-deliverable, .rich-full, .rich-toc-drawer-root) {
+  --rich-surface: rgb(var(--color-surface));
+  --rich-surface-solid: rgb(var(--color-surface));
+  --rich-surface-raised: rgb(var(--color-elevated));
+  --rich-text: rgb(var(--color-foreground));
+  --rich-text-secondary: rgb(var(--color-secondary));
+  --rich-muted: rgb(var(--color-muted));
+  --rich-line: rgb(var(--color-separator));
+  --rich-accent: rgb(var(--color-accent));
+  --rich-accent-soft: rgb(var(--color-accent));
+  --rich-surface-wash-deep: rgb(var(--color-inset));
+  --rich-surface-wash: rgb(var(--color-inset));
+  --rich-tone-neutral-fg: rgb(var(--color-secondary));
+  --rich-tone-neutral-border: rgb(var(--color-separator));
+  --rich-tone-neutral-bg: rgb(var(--color-inset));
+  --rich-tone-info-fg: rgb(var(--color-info));
+  --rich-tone-info-border: rgb(var(--color-info-border));
+  --rich-tone-info-bg: rgb(var(--color-info-subtle));
+  --rich-tone-success-fg: rgb(var(--color-success));
+  --rich-tone-success-border: rgb(var(--color-success-border));
+  --rich-tone-success-bg: rgb(var(--color-success-subtle));
+  --rich-tone-success-accent: rgb(var(--color-success));
+  --rich-tone-warning-fg: rgb(var(--color-warning));
+  --rich-tone-warning-border: rgb(var(--color-warning-border));
+  --rich-tone-warning-bg: rgb(var(--color-warning-subtle));
+  --rich-tone-warning-accent: rgb(var(--color-warning));
+  --rich-tone-danger-fg: rgb(var(--color-danger));
+  --rich-tone-danger-border: rgb(var(--color-danger-border));
+  --rich-tone-danger-bg: rgb(var(--color-danger-subtle));
+  --rich-tone-danger-accent: rgb(var(--color-danger));
+  --rich-syntax-keyword: rgb(var(--color-syntax-keyword));
+  --rich-syntax-string: rgb(var(--color-syntax-string));
+  --rich-syntax-number: rgb(var(--color-syntax-number));
+  --rich-syntax-comment: rgb(var(--color-syntax-comment));
+  --rich-syntax-title: rgb(var(--color-syntax-title));
+  --rich-syntax-deletion: rgb(var(--color-danger));
+}
+
+.theme-palette[data-theme-family="paper"][data-resolved-theme] :is(.document-title, .rich-body h1, .rich-body h2, .rich-body h3, .rich-body h4) {
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
 /* Design tokens are defined on `.rich-deliverable`, `.rich-full`, AND
    `.rich-toc-drawer-root` (not `.rich-block-list`) for independent reasons,
    all real bugs found via rendered output rather than assumptions:
@@ -573,31 +617,31 @@
   }
 }
 
-@media (prefers-color-scheme: light) {
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel {
+:is(.rich-deliverable.pulse, .rich-full.pulse)[data-viewer-theme="light"] {
+  & .rich-panel {
     background: var(--rich-surface);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-action,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-status,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-metric {
+  & .rich-card-action,
+  & .rich-card-status,
+  & .rich-card-metric {
     background: var(--rich-surface-raised);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-card,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-sources,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric {
+  & .rich-hero,
+  & .rich-panel,
+  & .rich-card,
+  & .rich-chart-card,
+  & .rich-sources,
+  & .rich-metric {
     border-color: var(--rich-line);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-canvas {
+  & .rich-chart-canvas {
     background: var(--rich-surface-raised);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+  & :is(
     .rich-hero,
     .rich-panel,
     .rich-card,
@@ -609,7 +653,7 @@
     color: var(--rich-text);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+  & :is(
     .rich-hero,
     .rich-panel,
     .rich-card,
@@ -621,17 +665,17 @@
     color: var(--rich-text-secondary);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-timeline li.free,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-time time,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-day-agenda footer,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-empty,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure figcaption,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure-source,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source {
+  & .rich-agenda-timeline li.free,
+  & .rich-agenda-time time,
+  & .rich-day-agenda footer,
+  & .rich-agenda-empty,
+  & .rich-figure figcaption,
+  & .rich-figure-source,
+  & .rich-data-source {
     color: var(--rich-muted);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+  & :is(
     .rich-figure-source,
     .rich-data-source,
     .rich-card,
@@ -1370,6 +1414,44 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: var(--rich-fs-sm);
   line-height: var(--rich-lh-loose);
+}
+
+/* Syntax follows the document, including when the app uses the opposite theme. */
+:is(.rich-deliverable, .rich-full) {
+  --rich-syntax-text: var(--rich-text);
+  --rich-syntax-background: var(--rich-surface-raised);
+  --rich-syntax-keyword: #c4b5fd;
+  --rich-syntax-string: #86efac;
+  --rich-syntax-number: #fdba74;
+  --rich-syntax-comment: #94a3b8;
+  --rich-syntax-title: #7dd3fc;
+  --rich-syntax-deletion: #fda4af;
+}
+
+:is(.rich-deliverable, .rich-full)[data-viewer-theme="light"] {
+  --rich-syntax-keyword: #6d28d9;
+  --rich-syntax-string: #166534;
+  --rich-syntax-number: #9a3412;
+  --rich-syntax-comment: #475569;
+  --rich-syntax-title: #075985;
+  --rich-syntax-deletion: #9f1239;
+}
+
+:is(.rich-deliverable, .rich-full) :is(.rich-markdown pre, .rich-code) {
+  color: var(--rich-syntax-text);
+  background: var(--rich-syntax-background);
+}
+
+:is(.rich-deliverable, .rich-full) :is(.rich-markdown pre, .rich-code) code {
+  color: var(--rich-syntax-text);
+  background: transparent;
+  & :is(.hljs-keyword, .hljs-selector-tag, .hljs-built_in) { color: var(--rich-syntax-keyword); }
+  & :is(.hljs-string, .hljs-attr, .hljs-symbol, .hljs-addition) { color: var(--rich-syntax-string); }
+  & :is(.hljs-number, .hljs-literal) { color: var(--rich-syntax-number); }
+  & .hljs-comment { color: var(--rich-syntax-comment); }
+  & :is(.hljs-title, .hljs-name, .hljs-function) { color: var(--rich-syntax-title); }
+  & :is(.hljs-variable, .hljs-params, .hljs-punctuation, .hljs-operator) { color: var(--rich-syntax-text); }
+  & .hljs-deletion { color: var(--rich-syntax-deletion); }
 }
 
 .rich-markdown pre code {
@@ -2643,19 +2725,19 @@
   color: var(--rich-accent-soft);
 }
 
-@media (prefers-color-scheme: light) {
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary span,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel h4 {
+:is(.rich-deliverable.pulse, .rich-full.pulse)[data-viewer-theme="light"] {
+  & .rich-panel summary,
+  & .rich-panel summary span,
+  & .rich-panel h4 {
     color: var(--rich-text);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary small,
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel :is(p, li) {
+  & .rich-panel summary small,
+  & .rich-panel :is(p, li) {
     color: var(--rich-text-secondary);
   }
 
-  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel a {
+  & .rich-panel a {
     color: var(--rich-accent);
   }
 }

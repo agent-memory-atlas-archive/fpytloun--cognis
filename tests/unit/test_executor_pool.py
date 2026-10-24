@@ -97,8 +97,10 @@ class _FakeSessionFactory:
 async def _patched_queries(rows: list[FakeExecutorRow]):
     """Patch get_executor_row + list_executors used by resolve_executor_pool."""
 
-    async def _list_executors(_session, *, owner_email: str, include_shared: bool) -> list[Any]:
-        return list(rows)
+    async def _list_executors(
+        _session, *, owner_email: str, include_shared: bool, executor_ids=None
+    ) -> list[Any]:
+        return [row for row in rows if executor_ids is None or row.executor_id in executor_ids]
 
     async def _get_executor_row(_session, executor_id, *, owner_email, include_shared):
         for r in rows:

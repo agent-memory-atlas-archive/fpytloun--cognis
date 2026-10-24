@@ -6,15 +6,15 @@ use the unified ``/api/v1/notifications`` endpoints instead.
 
 from __future__ import annotations
 
-import contextlib
-
 from fastapi import APIRouter, HTTPException, Request
 
 from cognis.api.common import require_current_user
 from cognis.api.models import EscalationResolveRequest, EscalationResponse
 from cognis.api.serializers import escalation_to_response
-from cognis.core.agent_loop import PauseResolution
+from cognis.core.legacy_approvals import resolve_legacy_approval
 from cognis.core.notifications import NotificationService
+from cognis.providers.guardrails.resolution_errors import ResolutionRejected
+from cognis.store.queries import get_conversation
 
 router = APIRouter(prefix="/api/v1/escalations", tags=["escalations"])
 
@@ -42,12 +42,15 @@ async def resolve_escalation(
     # for escalation-type notifications).
     svc: NotificationService | None = getattr(request.app.state, "notification_service", None)
     if svc is not None:
-        ok = await svc.resolve(
-            call_id,
-            payload.decision,
-            {"note": payload.note or ""},
-            user_email=user.email,
-        )
+        try:
+            ok = await svc.resolve(
+                call_id,
+                payload.decision,
+                {"note": payload.note or ""},
+                user_email=user.email,
+            )
+        except ResolutionRejected as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.api_detail()) from None
         if ok:
             return {"ok": True, "call_id": call_id, "decision": payload.decision}
         raise HTTPException(
@@ -58,24 +61,32 @@ async def resolve_escalation(
     # Fallback: resolve via PauseWaiter directly (legacy path for
     # escalations created before the notification service was available).
     pause_id = f"escalation:{call_id}"
-    submitted = False
-    with contextlib.suppress(Exception):
-        await request.app.state.providers.guardrails.submit_decision(
-            call_id,
-            payload.decision,
-            payload.note,
+    waiter = request.app.state.pause_waiter
+    pending = waiter.get(pause_id) or waiter.get(call_id)
+    if pending is None or pending.conversation_id is None:
+        raise HTTPException(status_code=404, detail="No actionable approval.")
+    async with request.app.state.session_factory() as db:
+        conversation = await get_conversation(db, pending.conversation_id)
+        if conversation is None or conversation.user_email != user.email:
+            raise HTTPException(status_code=404, detail="No actionable approval.")
+    try:
+        ok = await resolve_legacy_approval(
+            waiter,
+            pending.pause_id,
+            conversation_id=conversation.conversation_id,
+            decision=payload.decision,
+            note=payload.note,
+            submit=request.app.state.providers.guardrails.submit_decision,
         )
-        submitted = True
-    if not submitted:
+    except ResolutionRejected as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.api_detail()) from None
+    except Exception:
         raise HTTPException(
             status_code=502,
             detail="Unable to submit escalation decision to Intaris.",
+        ) from None
+    if not ok:
+        raise HTTPException(
+            status_code=409, detail="Approval expired, closed or is being resolved."
         )
-    request.app.state.pause_waiter.resolve(
-        pause_id,
-        PauseResolution(
-            decision=payload.decision,
-            data={"note": payload.note or ""},
-        ),
-    )
     return {"ok": True, "call_id": call_id, "decision": payload.decision}

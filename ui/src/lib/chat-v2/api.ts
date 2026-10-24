@@ -1,6 +1,10 @@
 import { apiUrl } from '$lib/config';
-import { fetchWithTimeout, isFetchTimeoutError } from '$lib/api/fetch';
+import { fetchWithTimeout, withRequestDeadline, readJsonWithSignal, cancelResponseOnAbort, isFetchTimeoutError, isReplayableBody } from '$lib/api/fetch';
+import { auth } from '$lib/stores/auth';
+import { documentCoordination } from '$lib/document-coordination';
+import { reportRequestFailure, reportRequestSuccess } from '$lib/server-reachability';
 import type {
+  BackgroundToolCallV2Response,
   CancelTurnV2Response,
   ChatSnapshot,
   ChatSyncResponse,
@@ -10,6 +14,7 @@ import type {
   QueueMutationResponse,
   QueueUpdateV2Request,
   RetryTurnV2Response,
+  RetryProviderOptionsResponse,
   SendMessageV2Request,
   SendMessageV2Response,
   TimelineBackfillResponse,
@@ -74,10 +79,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-async function readError(response: Response): Promise<ChatV2ApiError> {
+async function readError(response: Response, signal?: AbortSignal | null): Promise<ChatV2ApiError> {
   let payload: unknown = null;
   try {
-    payload = await response.json();
+    payload = await readJsonWithSignal(response, signal);
   } catch {
     payload = null;
   }
@@ -108,30 +113,82 @@ async function readError(response: Response): Promise<ChatV2ApiError> {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const lease = documentCoordination().capture();
+  const signal = options.signal ? AbortSignal.any([options.signal, lease.signal]) : lease.signal;
+  try {
+    return await withRequestDeadline(
+      (operationSignal) => requestWithinDeadline<T>(path, { ...options, signal: operationSignal, timeoutMs: 0 }, lease),
+      { signal, timeoutMs: options.timeoutMs },
+    );
+  } catch (error) {
+    const normalized = isFetchTimeoutError(error)
+      ? new ChatV2ApiError(error.message, { code: 'request_timeout', status: 0 })
+      : error;
+    reportRequestFailure(normalized);
+    throw normalized;
+  }
+}
+
+async function requestWithinDeadline<T>(
+  path: string,
+  options: RequestOptions,
+  lease: ReturnType<ReturnType<typeof documentCoordination>['capture']>,
+): Promise<T> {
   const { fetchImpl = fetch, headers, body, timeoutMs, ...rest } = options;
+  const signal = rest.signal;
+  const responseOwners: Array<() => void> = [];
+  try {
   const nextHeaders = new Headers(headers ?? {});
 
   if (body && !nextHeaders.has('Content-Type') && !(body instanceof FormData)) {
     nextHeaders.set('Content-Type', 'application/json');
   }
 
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(apiUrl(path), {
-      ...rest,
-      credentials: 'include',
-      headers: nextHeaders,
-      body
-    }, { fetchImpl, timeoutMs });
-  } catch (error) {
-    if (isFetchTimeoutError(error)) {
-      throw new ChatV2ApiError(error.message, { code: 'request_timeout', status: 0 });
+  const send = async (): Promise<Response> => {
+    try {
+      await lease.validate();
+      signal?.throwIfAborted();
+      const response = await fetchWithTimeout(apiUrl(path), {
+        ...rest,
+        signal,
+        credentials: 'include',
+        headers: nextHeaders,
+        body
+      }, { fetchImpl, timeoutMs });
+      responseOwners.push(cancelResponseOnAbort(response, signal));
+      await lease.validate();
+      // Feed the global connectivity status (see $lib/server-reachability).
+      // Gateway/unavailable responses are reported once parsed (below), so
+      // critical application 503s (event_store_*) are not mistaken for an
+      // unreachable server.
+      if (response.status !== 502 && response.status !== 503 && response.status !== 504) {
+        reportRequestSuccess();
+      }
+      return response;
+    } catch (error) {
+      const normalized = isFetchTimeoutError(error)
+        ? new ChatV2ApiError(error.message, { code: 'request_timeout', status: 0 })
+        : error;
+      throw normalized;
     }
-    throw error;
+  };
+
+  let response = await send();
+
+  // A 401 is rejected before the request is handled. After one shared
+  // session refresh (mobile resume bursts), retry once with the same
+  // idempotency identifiers.
+  if (response.status === 401 && !rest.signal?.aborted && isReplayableBody(body)) {
+    if ((await auth.recoverSession()) === 'valid') {
+      signal?.throwIfAborted();
+      await lease.validate();
+      response = await send();
+    }
   }
 
   if (!response.ok) {
-    throw await readError(response);
+    const error = await readError(response, signal);
+    throw error;
   }
 
   if (response.status === 204) {
@@ -143,7 +200,13 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  const result = (await readJsonWithSignal(response, signal)) as T;
+  await lease.validate();
+  signal?.throwIfAborted();
+  return result;
+  } finally {
+    for (const release of responseOwners) release();
+  }
 }
 
 export class ChatV2ApiClient {
@@ -361,6 +424,22 @@ export class ChatV2ApiClient {
     );
   }
 
+  retryProviderOptions(
+    conversationId: string,
+    options: ChatV2TimelineRequestOptions & {
+      turnId?: string; providerId?: string | null; model?: string | null;
+    } = {}
+  ): Promise<RetryProviderOptionsResponse> {
+    const query = new URLSearchParams();
+    if (options.turnId) query.set('turn_id', options.turnId);
+    if (options.providerId) query.set('provider_id', options.providerId);
+    if (options.model) query.set('model', options.model);
+    return request<RetryProviderOptionsResponse>(
+      `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/retry-provider-options?${query}`,
+      { fetchImpl: this.fetchImpl, signal: options.signal }
+    );
+  }
+
   executeCommand(
     conversationId: string,
     clientTxnId: string,
@@ -400,6 +479,17 @@ export class ChatV2ApiClient {
       method: 'POST',
       body: JSON.stringify(payload)
     });
+  }
+
+  /** Ask the executor to continue a running foreground tool call as a background job. */
+  backgroundToolCall(conversationId: string, callId: string): Promise<BackgroundToolCallV2Response> {
+    return request<BackgroundToolCallV2Response>(
+      `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/tool-calls/${encodeURIComponent(callId)}/background`,
+      {
+        fetchImpl: this.fetchImpl,
+        method: 'POST'
+      }
+    );
   }
 
   retryTurn(

@@ -116,8 +116,14 @@ async def test_responses_stream_failed_event_includes_safe_error_details() -> No
     assert "<truncated" in chunk["response_error"]["details"]["details"]
 
 
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks],
+)
 @pytest.mark.asyncio
-async def test_responses_stream_failed_event_preserves_prior_error_event() -> None:
+async def test_responses_stream_failed_event_preserves_prior_error_event(
+    bridge: Callable[..., Any],
+) -> None:
     async def _stream():
         yield {
             "type": "error",
@@ -133,7 +139,7 @@ async def test_responses_stream_failed_event_preserves_prior_error_event() -> No
 
     chunks = [
         chunk
-        async for chunk in responses_stream_to_chat_chunks(
+        async for chunk in bridge(
             _stream(),
             dedupe_output_text_delta=True,
         )
@@ -155,6 +161,82 @@ async def test_responses_stream_failed_event_preserves_prior_error_event() -> No
         "param": "tools",
         "details": "tool schema exploded",
     }
+
+
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks],
+)
+@pytest.mark.parametrize("partial_output", [False, True])
+@pytest.mark.parametrize("nested_error", [False, True])
+@pytest.mark.asyncio
+async def test_responses_stream_error_only_eof_propagates_failure(
+    bridge: Callable[..., Any], partial_output: bool, nested_error: bool
+) -> None:
+    async def _stream():
+        if partial_output:
+            yield {
+                "type": "response.output_item.added",
+                "item": {"type": "message", "id": "msg_partial", "content": []},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_partial",
+                "delta": "Partial result",
+            }
+        error = {"code": "internal_error", "message": "backend stream crashed", "param": "tools"}
+        yield {"type": "error", "error": error} if nested_error else {"type": "error", **error}
+
+    chunks = [chunk async for chunk in bridge(_stream(), dedupe_output_text_delta=True)]
+
+    failures = [chunk for chunk in chunks if chunk.get("mid_stream_failure")]
+    assert len(failures) == 1
+    assert failures[0]["error"] == "backend stream crashed"
+    assert failures[0]["response_error"]["category"] == "provider_5xx"
+    assert failures[0]["response_error"]["code"] == "internal_error"
+    assert failures[0]["response_error"]["details"]["param"] == "tools"
+    content = "".join(
+        choice.get("delta", {}).get("content", "")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content == ("Partial result" if partial_output else "")
+    assert chunks[-1] is failures[0]
+
+
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks],
+)
+@pytest.mark.asyncio
+async def test_responses_stream_close_after_error_does_not_flush_failure(
+    bridge: Callable[..., Any],
+) -> None:
+    async def _stream():
+        yield {"type": "error", "message": "backend stream crashed"}
+        raise AssertionError("Closed stream must not be resumed")
+
+    stream = bridge(_stream())
+    chunk = await anext(stream)
+    assert chunk["provider_event_type"] == "error"
+    await stream.aclose()
+
+
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks],
+)
+@pytest.mark.asyncio
+async def test_responses_stream_completed_after_error_does_not_flush_failure(
+    bridge: Callable[..., Any],
+) -> None:
+    async def _stream():
+        yield {"type": "error", "message": "recovered error"}
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    chunks = [chunk async for chunk in bridge(_stream())]
+    assert not any(chunk.get("mid_stream_failure") for chunk in chunks)
+    assert chunks[-1]["response_status"] == "completed"
 
 
 @pytest.mark.parametrize(
@@ -290,6 +372,62 @@ async def test_responses_stream_accumulates_custom_apply_patch_input() -> None:
     assert len(calls) == 1
     assert calls[0].name == "apply_patch"
     assert calls[0].arguments == {"patchText": patch_text}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bridge", [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks]
+)
+@pytest.mark.parametrize("wrapper", [None, "call_tool", "validate_tool_call"])
+@pytest.mark.parametrize("terminal_snapshot", [False, True])
+async def test_nested_management_arguments_survive_responses_stream(
+    bridge, wrapper: str | None, terminal_snapshot: bool
+) -> None:
+    settings = {
+        "executor_id": "maitrea_riker",
+        "memory_backend": "mnemory",
+        "memory_backend_options": {"mode": "full_auto"},
+    }
+    envelope = {"action": "settings_update", "agent_id": "dobby", "settings": settings}
+    expected = {"tool": "manage_agents", "arguments": envelope} if wrapper else envelope
+    fragments = [
+        '{"action":"settings_update","agent_id":"dobby","settings":',
+        json.dumps(settings),
+        "}",
+    ]
+    if wrapper:
+        fragments = ['{"tool":"manage_agents","arguments":', *fragments, "}"]
+    item = {
+        "type": "function_call",
+        "id": "item_management",
+        "call_id": "call_management",
+        "name": wrapper or "manage_agents",
+        "arguments": "",
+    }
+
+    async def _stream():
+        yield {"type": "response.output_item.added", "item": item}
+        for fragment in fragments:
+            yield {
+                "type": "response.function_call_arguments.delta",
+                "item_id": item["id"],
+                "delta": fragment,
+            }
+        if terminal_snapshot:
+            yield {
+                "type": "response.output_item.done",
+                "item": {**item, "arguments": "".join(fragments)},
+            }
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    acc = StreamAccumulator()
+    async for chunk in bridge(_stream()):
+        acc.feed(chunk)
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].call_id == "call_management"
+    assert calls[0].name == (wrapper or "manage_agents")
+    assert calls[0].arguments == expected
 
 
 @pytest.mark.asyncio
@@ -470,6 +608,58 @@ def test_messages_to_responses_input_keeps_call_id_on_function_call_items() -> N
         {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
     ]
+
+
+@pytest.mark.parametrize("with_raw_snapshot", [False, True])
+@pytest.mark.parametrize("name", ["functions.bash", "tool/with spaces", "x" * 70])
+def test_messages_to_responses_input_repairs_historical_tool_names(
+    with_raw_snapshot: bool, name: str
+) -> None:
+    raw_call = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": name,
+        "arguments": "{}",
+    }
+    assistant: dict[str, Any] = {
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": name, "arguments": "{}"}}
+        ],
+    }
+    if with_raw_snapshot:
+        assistant["_responses_output_items"] = [raw_call]
+    messages = [assistant, {"role": "tool", "tool_call_id": "call_1", "content": "ok"}]
+
+    result = messages_to_responses_input(messages)
+
+    assert result[0]["type"] == "function_call"
+    assert result[0]["name"] != name
+    assert 1 <= len(result[0]["name"]) <= 64
+    assert all(char.isascii() and (char.isalnum() or char in "_-") for char in result[0]["name"])
+    assert result[0]["call_id"] == result[1]["call_id"] == "call_1"
+    assert result[1]["type"] == "function_call_output"
+    assert raw_call["name"] == assistant["tool_calls"][0]["function"]["name"] == name
+    assert messages_to_responses_input(messages) == result
+
+
+def test_messages_to_responses_input_repairs_raw_custom_tool_name() -> None:
+    raw_call = {
+        "type": "custom_tool_call",
+        "call_id": "call_1",
+        "name": "tools.apply.patch",
+        "input": "patch",
+    }
+    result = messages_to_responses_input(
+        [
+            {"role": "assistant", "_responses_output_items": [raw_call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+    )
+
+    assert result[0]["name"].startswith("tools_apply_patch_")
+    assert result[1] == {"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"}
+    assert raw_call["name"] == "tools.apply.patch"
 
 
 def test_messages_to_responses_input_replays_raw_responses_output_items() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -87,6 +88,7 @@ class InferenceRouter:
         executor_labels: dict[str, str] | None = None,
         provider_id: str | None = None,
         owner_email: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Run read-only model discovery from a selected executor."""
 
@@ -117,6 +119,7 @@ class InferenceRouter:
                 api_key=api_key,
                 provider_id=provider_id,
                 owner_email=owner_email,
+                **({"aws_config": aws_config} if aws_config else {}),
             ),
         )
 
@@ -298,7 +301,14 @@ class InferenceRouter:
                     out_chunk["response_message_phase"] = response_message_phase
                 yield out_chunk
         except ExecutorDisconnectedError:
-            yield {"error": "Executor disconnected during inference", "mid_stream_failure": True}
+            yield {
+                "error": "Executor disconnected during inference",
+                "mid_stream_failure": True,
+                "response_error": {
+                    "category": "connection",
+                    "message": "Executor disconnected",
+                },
+            }
 
     async def route_generate(
         self,
@@ -313,6 +323,50 @@ class InferenceRouter:
         owner_email: str | None = None,
         backend_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if (request_kwargs or {}).get("cognis_llm_api") in {"embeddings", "systemone"}:
+            from cognis.providers.llm.recovery import stream_failure
+
+            conn = await self._find_executor(
+                executor_id,
+                executor_labels,
+                model=model,
+                provider_id=provider_id,
+                owner_email=owner_email,
+            )
+            if conn is None:
+                raise RuntimeError("No executor matches the provider selector")
+            request_id = uuid.uuid4().hex
+            try:
+                response = await conn.rpc_call(
+                    method="llm.complete",
+                    params={
+                        "request_id": request_id,
+                        "stream": False,
+                        "messages": messages,
+                        "model": model,
+                        "request_kwargs": request_kwargs or {},
+                        "backend": backend,
+                        "provider_id": provider_id,
+                        "owner_email": owner_email,
+                        "backend_metadata": backend_metadata,
+                    },
+                    timeout=float((request_kwargs or {}).get("timeout", 120)),
+                )
+            except (asyncio.CancelledError, TimeoutError):
+                await conn.cancel_inference(request_id)
+                raise
+            except ExecutorDisconnectedError as exc:
+                from cognis.providers.llm.errors import LLMStreamProviderError
+
+                raise LLMStreamProviderError(
+                    str(exc), payload={"category": "connection", "message": str(exc)}
+                ) from exc
+            failure = stream_failure(response)
+            if failure is not None:
+                raise failure
+            if response.get("status") == "streaming":
+                raise RuntimeError("Executor upgrade required for nonstreaming inference")
+            return cast(dict[str, Any], response)
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         reasoning_summary_parts: list[str] = []
@@ -438,6 +492,22 @@ class InferenceRouter:
         if incomplete_details is not None:
             response["response_incomplete_details"] = incomplete_details
         return response
+
+    async def route_video(
+        self,
+        *,
+        params: dict[str, Any],
+        executor_id: str | None = None,
+        executor_labels: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """One metadata-only provider operation. Never retry a paid submission."""
+        conn = await self._find_executor(executor_id, executor_labels)
+        if conn is None:
+            raise ValueError("No executor matches the video provider")
+        result = await conn.rpc_call(method="llm.video", params=params, timeout=1250)
+        if not isinstance(result, dict):
+            raise ValueError("Invalid executor video response")
+        return result
 
     async def route_image_generate(
         self,

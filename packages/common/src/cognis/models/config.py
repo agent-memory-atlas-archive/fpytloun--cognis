@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 NORMALIZED_REASONING_LEVELS: tuple[str, ...] = (
     "default",
@@ -70,6 +70,12 @@ class LLMProviderConfig(BaseModel):
 
 
 class ModelInfo(BaseModel):
+    @field_validator("model_mode", mode="before")
+    @classmethod
+    def normalize_video_mode(cls, value: Any) -> Any:
+        """Accept persisted/catalog aliases while exposing one canonical video mode."""
+        return "video" if value == "video_generation" else value
+
     """A model exposed by a provider."""
 
     model_id: str
@@ -79,6 +85,8 @@ class ModelInfo(BaseModel):
     max_context_window: int | None = None
     max_output_tokens: int = 16384
     supports_tools: bool = True
+    supports_parallel_tools: bool = False
+    supports_structured_output: bool = False
     supports_streaming: bool = True
     supports_vision: bool = False
     supports_audio_input: bool = False
@@ -86,6 +94,9 @@ class ModelInfo(BaseModel):
     supports_file_input: bool = False
     supports_reasoning: bool = False
     supports_fast_mode: bool = False
+    primary_cache_ttl: Literal["5m", "1h"] = "1h"
+    auxiliary_cache_ttl: Literal["5m", "1h"] = "5m"
+    supported_cache_ttls: list[Literal["5m", "1h"]] = Field(default_factory=list)
     fast_mode_tier: str | None = None
     fast_mode_parameter: Literal["speed", "service_tier"] | None = None
     supported_image_mime_types: list[str] = Field(default_factory=list)
@@ -107,12 +118,19 @@ class ModelInfo(BaseModel):
     supports_openai_apply_patch: bool = False
     openai_apply_patch_tool_type: str | None = None
     supports_image_generation: bool = False
+    supports_video_generation: bool = False
+    supports_video_input: bool = False
+    video_capabilities: dict[str, Any] = Field(default_factory=dict)
     supports_embedding: bool = False
     supported_audio_mime_types: list[str] = Field(default_factory=list)
     supported_openai_params: list[str] = Field(default_factory=list)
     max_tools: int | None = None
     input_cost_per_mtok: float | None = None
     output_cost_per_mtok: float | None = None
+    cache_read_cost_per_mtok: float | None = None
+    cache_write_cost_per_mtok: float | None = None
+    model_mode: str | None = None
+    pricing: dict[str, Any] = Field(default_factory=dict)
     tier: str = "standard"
     provider_metadata: dict[str, Any] = Field(default_factory=dict)
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
@@ -136,6 +154,9 @@ class ModelRoutingPolicy(BaseModel):
     speech_to_text: dict[str, str | None] = Field(default_factory=dict)
     text_to_speech: dict[str, str | None] = Field(default_factory=dict)
     image_generation: dict[str, str | None] = Field(default_factory=dict)
+    video_generation: dict[str, str | None] = Field(default_factory=dict)
+    video_editing: dict[str, str | None] = Field(default_factory=dict)
+    video_analysis: dict[str, str | None] = Field(default_factory=dict)
     attachment_analysis: dict[str, str | None] = Field(default_factory=dict)
 
 

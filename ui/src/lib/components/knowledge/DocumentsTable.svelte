@@ -21,9 +21,9 @@
   } = $props();
 </script>
 
-<div class="overflow-x-auto rounded-2xl border border-slate-800/80">
+<div class="overflow-x-auto rounded-2xl border border-separator/80">
   <table class="w-full min-w-[640px] text-left text-sm" data-testid="knowledge-documents-table">
-    <thead class="border-b border-slate-800/80 text-xs uppercase tracking-wide text-slate-500">
+    <thead class="border-b border-separator/80 text-xs uppercase tracking-wide text-quiet">
       <tr>
         <th class="px-4 py-3">Document</th>
         <th class="px-4 py-3">Status</th>
@@ -33,16 +33,16 @@
         {#if canMutate}<th class="px-4 py-3 text-right">Actions</th>{/if}
       </tr>
     </thead>
-    <tbody class="divide-y divide-slate-800/80">
+    <tbody class="divide-y divide-separator/80">
       {#each documents as doc (doc.doc_id)}
         <tr>
           <td class="max-w-xs px-4 py-3">
-            <span class="block truncate font-medium text-white" title={doc.source_path ?? doc.display_name}>{doc.display_name}</span>
+            <span class="block truncate font-medium text-strong" title={doc.source_path ?? doc.display_name}>{doc.display_name}</span>
             {#if doc.source_path}
-              <span class="block truncate text-xs text-slate-500" title={doc.source_path}>{doc.source_path}</span>
+              <span class="block truncate text-xs text-quiet" title={doc.source_path}>{doc.source_path}</span>
             {/if}
             {#if doc.last_error}
-              <span class="block truncate text-xs text-rose-300" title={doc.last_error}>{doc.last_error}</span>
+              <span class="block truncate text-xs text-danger" title={doc.last_error}>{doc.last_error}</span>
             {/if}
           </td>
           <td class="px-4 py-3">
@@ -50,9 +50,9 @@
               {doc.status}
             </span>
           </td>
-          <td class="px-4 py-3 text-slate-400">{formatBytes(doc.size_bytes)}</td>
-          <td class="px-4 py-3 text-slate-400">{doc.chunk_count}</td>
-          <td class="px-4 py-3 text-slate-400">{formatRelativeOrDate(doc.indexed_at ?? doc.attached_at)}</td>
+          <td class="px-4 py-3 text-muted">{formatBytes(doc.size_bytes)}</td>
+          <td class="px-4 py-3 text-muted">{doc.chunk_count}</td>
+          <td class="px-4 py-3 text-muted">{formatRelativeOrDate(doc.indexed_at ?? doc.attached_at)}</td>
           {#if canMutate}<td class="px-4 py-3 text-right">
             <div class="flex justify-end gap-2">
               <Button
@@ -67,7 +67,7 @@
               <Button
                 size="sm"
                 variant="ghost"
-                class="text-rose-300 hover:text-rose-200"
+                class="text-danger hover:text-danger"
                 disabled={busyIds.has(doc.doc_id)}
                 onclick={() => onDetach(doc)}
                 aria-label={`Detach ${doc.display_name}`}

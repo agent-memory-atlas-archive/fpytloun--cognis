@@ -24,11 +24,20 @@ RUN apt-get update \
 
 COPY packages/common/ ./packages/common/
 COPY packages/executor/ ./packages/executor/
+COPY pyproject.toml uv.lock ./
 
 RUN python -m pip install --no-cache-dir --upgrade pip uv \
+    && uv export --locked --no-dev --no-emit-project --no-emit-workspace \
+        --package cognis-executor --format requirements-txt \
+        --output-file /tmp/executor-base-constraints.txt \
+    && uv export --locked --no-dev --no-emit-project --no-emit-workspace \
+        --package cognis-executor --extra full --format requirements-txt \
+        --output-file /opt/executor-full-constraints.txt \
     && uv venv /opt/cognis \
-    && uv pip install --python /opt/cognis/bin/python --no-cache-dir ./packages/common \
-    && uv pip install --python /opt/cognis/bin/python --no-cache-dir ./packages/executor \
+    && uv pip install --python /opt/cognis/bin/python --no-cache-dir --no-sources \
+        --constraint /tmp/executor-base-constraints.txt \
+        ./packages/common ./packages/executor \
+    && /opt/cognis/bin/python -c "import pathlib, sys; sp = pathlib.Path('/opt/cognis/lib/python3.12/site-packages'); bad = sorted(p.name for p in sp.glob('*.pth') if '/app/' in p.read_text()); sys.exit(f'editable workspace installs leak into runtime: {bad}' if bad else 0)" \
     && rm -rf /root/.cache /tmp/*
 
 
@@ -157,11 +166,22 @@ RUN apt-get update \
         /tmp/*
 
 COPY --from=python-builder /app/packages/executor /tmp/cognis-executor
+COPY --from=python-builder /opt/executor-full-constraints.txt /tmp/executor-full-constraints.txt
 RUN /usr/local/bin/python -m pip install --no-cache-dir uv \
-    && uv pip install --python /opt/cognis/bin/python --no-cache-dir '/tmp/cognis-executor[full]' \
+    && uv pip install --python /opt/cognis/bin/python --no-cache-dir \
+        --constraint /tmp/executor-full-constraints.txt \
+        '/tmp/cognis-executor[full]' \
     && rm -rf /tmp/cognis-executor /root/.cache/uv
 
-RUN /opt/cognis/bin/python -m patchright install --with-deps $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') \
+# Build networks without IPv6 egress hang on the dual-stack Playwright CDN, so
+# prefer IPv4 for the Node-based downloader and retry transient CDN failures.
+RUN for attempt in 1 2 3; do \
+        NODE_OPTIONS=--dns-result-order=ipv4first \
+            /opt/cognis/bin/python -m patchright install --with-deps \
+            $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        echo "patchright install failed (attempt ${attempt}), retrying" >&2; sleep 15; \
+    done \
     && rm -rf \
         /home/cognis/.cache/uv \
         /root/.cache \

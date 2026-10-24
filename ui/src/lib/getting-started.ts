@@ -8,8 +8,6 @@ export interface GettingStartedStep {
   done: boolean;
 }
 
-const STORAGE_KEY = 'cognis-getting-started-dismissed';
-
 export function deriveGettingStartedSteps(diagnostics: SystemDiagnostics): GettingStartedStep[] {
   const readiness = diagnostics.readiness ?? {};
   return [
@@ -23,45 +21,49 @@ export function deriveGettingStartedSteps(diagnostics: SystemDiagnostics): Getti
     {
       id: 'providers',
       label: 'Configure LLM provider',
-      description: 'Add at least one provider and verify connectivity.',
+      description: 'Choose an agent model with tool calling. OpenRouter can also cover companion and image models.',
       href: '/settings?tab=providers',
-      done: Boolean(readiness.llm_provider_configured)
+      done: Boolean(readiness.agent_model_configured)
+    },
+    {
+      id: 'routing',
+      label: 'Configure Intaris and Mnemory models',
+      description: 'Set Lite, Smart, and Embedding models; optionally use Jev for Intaris evaluation.',
+      href: '/settings?tab=routing',
+      done: Boolean(readiness.companion_routes_configured)
+    },
+    {
+      id: 'images',
+      label: 'Enable image generation (recommended)',
+      description: 'Optional: generate an avatar when creating your agent.',
+      href: '/settings?tab=routing',
+      done: Boolean(readiness.image_generation_configured)
     },
     {
       id: 'executor',
-      label: 'Configure executor tools',
-      description: 'Enable tools on the executor so agents can use them.',
+      label: 'Connect an executor',
+      description: 'Install and connect an executor before creating an agent. Check that tools are observed and configuration is applied.',
       href: '/settings?tab=executors',
       done: Boolean(readiness.executor_tools_configured)
     },
     {
       id: 'agents',
       label: 'Create your first agent',
-      description: 'Create an agent with identity, tools, and model settings.',
-      href: '/agents/new',
+      description: 'Start from the XO template to manage Cognis and create specialists through conversation.',
+      href: '/agents/new?template=xo&onboarding=1',
       done: Boolean(readiness.agent_created)
     },
     {
       id: 'chat',
       label: 'Start chatting',
-      description: 'Open chat once providers and agents are ready.',
+      description: 'Verify a tool call, memory recall, and creating a specialist from the XO owner chat.',
       href: '/chat/new',
       done: Boolean(readiness.chat_ready)
     }
   ];
 }
 
-export function isGettingStartedDismissed(): boolean {
-  return typeof window !== 'undefined' && window.localStorage.getItem(STORAGE_KEY) === '1';
-}
-
-export function setGettingStartedDismissed(value: boolean): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-  if (value) {
-    window.localStorage.setItem(STORAGE_KEY, '1');
-    return;
-  }
-  window.localStorage.removeItem(STORAGE_KEY);
+export function shouldOfferOnboarding(diagnostics: SystemDiagnostics): boolean {
+  return diagnostics.readiness.onboarding_pending === true
+    && !diagnostics.readiness.chat_ready;
 }

@@ -125,16 +125,17 @@ def test_audit_events_do_not_change_tool_history(
         dict(item, seq=index)
         for index, item in enumerate((item for event in events for item in (event, audit)), start=1)
     ]
+    expected_events = deepcopy(interleaved[::2])
     original = deepcopy(interleaved)
     cache = object.__new__(SessionCache)
     state = CachedSessionState(session_id="session-replay", intaris_session_id="session-replay")
     cache._replace_from_intaris_events(state, interleaved)
     restored = _deserialize_entry(_serialize_entry(state))
-    assert events_to_messages(restored.events) == events_to_messages(events)
+    assert events_to_messages(restored.events) == events_to_messages(expected_events)
     assert interleaved == original
     if cached:
         interleaved = [SimpleNamespace(**event) for event in interleaved]
-    assert events_to_messages(interleaved) == events_to_messages(events)
+    assert events_to_messages(interleaved) == events_to_messages(expected_events)
     messages = events_to_messages(interleaved)
     assert [m["role"] for m in messages] == ["assistant", "tool", "tool"]
     assert [m["content"] for m in messages] == ["Applying now.", "Applied.", "Verified."]
@@ -276,6 +277,7 @@ def test_partial_native_batch_preserves_text_and_untrusted_results_without_signe
         },
         {"type": "user_message", "data": {"content": "Stop"}},
     ]
+    events = [{**event, "seq": index} for index, event in enumerate(events, start=1)]
     original = deepcopy(events)
     messages = events_to_messages(events)
     assert events == original

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { collectModelOptions, createProviderForm, deriveProviderId, detectProviderPreset, formatTokenCount, presetHasBaseUrl, providerExecutorTargetError, providerFormToPayload, providerRequiresExecutorLocation } from '$lib/providers';
 import { defaultModelEntry, type LLMProvider } from '$lib/types/api';
+import { applyProviderPresetDefaults, isDecisionModel, presetNeedsAuth, PROVIDER_PRESETS } from '$lib/providers';
 
 describe('provider presets', () => {
   const provider: LLMProvider = {
@@ -27,6 +28,83 @@ describe('provider presets', () => {
     expect(form.auth_env_var).toBe('OPENAI_API_KEY');
     expect(form.models).toHaveLength(1);
     expect(form.models[0].model_id).toBe('gpt-4o-mini');
+  });
+
+  it('retains model cache capabilities for editing but persists only policy overrides', () => {
+    const value: LLMProvider = {
+      ...provider,
+      config: { preset: 'anthropic', models: [{ model_id: 'claude-opus-5-5' }] },
+      models: [{ ...defaultModelEntry('claude-opus-5-5'),
+        supported_cache_ttls: ['5m', '1h'], primary_cache_ttl: '1h', auxiliary_cache_ttl: '5m' }]
+    };
+    const form = createProviderForm(value);
+    expect(form.models[0].supported_cache_ttls).toEqual(['5m', '1h']);
+    form.models[0].primary_cache_ttl = '5m';
+    const config = providerFormToPayload(form).config as { models: Record<string, unknown>[] };
+    const models = config.models;
+    expect(models[0].primary_cache_ttl).toBe('5m');
+    expect(models[0]).not.toHaveProperty('supported_cache_ttls');
+  });
+
+  it.each([
+    ['groq', 'GROQ_API_KEY', 'https://api.groq.com/openai/v1'],
+    ['openrouter', 'OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1'],
+    ['gemini', 'GEMINI_API_KEY', 'https://generativelanguage.googleapis.com'],
+    ['systemone', 'TYPESAFE_API_KEY', 'https://api.typesafe.ai/v1']
+  ] as const)('round-trips %s preset and credential defaults', (preset, env, base) => {
+    expect(PROVIDER_PRESETS).toContain(preset);
+    const form = createProviderForm({ ...provider, config: { preset } });
+    expect(form.auth_env_var).toBe(env);
+    expect(form.base_url).toBe(base);
+    const config = providerFormToPayload(form).config as Record<string, unknown>;
+    expect(config.preset).toBe(preset);
+    expect(config.auth_config).toEqual({ mode: 'env', env_var: env });
+  });
+
+  it('uses IAM runtime credentials for Bedrock and preserves region/profile', () => {
+    const form = createProviderForm();
+    form.preset = 'bedrock';
+    applyProviderPresetDefaults(form);
+    form.aws_region_name = 'us-east-1';
+    form.aws_profile_name = 'development';
+    expect(form.auth_mode).toBe('none');
+    expect(presetNeedsAuth('bedrock')).toBe(false);
+    expect(presetHasBaseUrl('bedrock')).toBe(false);
+    const config = providerFormToPayload(form).config as Record<string, unknown>;
+    expect(config.auth_config).toEqual({ mode: 'none' });
+    expect(config.aws_region_name).toBe('us-east-1');
+    expect(config.aws_profile_name).toBe('development');
+    expect(createProviderForm({ ...provider, config }).aws_region_name).toBe('us-east-1');
+  });
+
+  it('excludes Jev from agent model options without excluding other router models', () => {
+    const mixed = { ...provider, config: { preset: 'openrouter', default_model: 'typesafe/jev-1.13' },
+      models: [defaultModelEntry('typesafe/jev-1.13'), defaultModelEntry('openai/gpt-4o')] };
+    expect(collectModelOptions([mixed]).map((o) => o.value)).toEqual(['openai/gpt-4o']);
+  });
+
+  it('keeps Jev Router chat-capable and excludes decision defaults using their metadata', () => {
+    const mixed = { ...provider, config: { preset: 'openrouter', default_model: 'classifier-v2' },
+      models: [
+        { ...defaultModelEntry('classifier-v2'), model_mode: 'systemone' },
+        { ...defaultModelEntry('typesafe/jev-router'), model_mode: 'chat' },
+        { ...defaultModelEntry('~typesafe/jev-latest'), model_mode: 'systemone' }
+      ] };
+    expect(collectModelOptions([mixed]).map((o) => o.value)).toEqual(['typesafe/jev-router']);
+    expect(isDecisionModel({ model_id: 'typesafe/jev-router' })).toBe(false);
+    expect(isDecisionModel({ model_id: 'typesafe/jev-1.13', model_mode: 'chat' })).toBe(false);
+  });
+
+  it('keeps the full catalog available for non-chat routing without leaking it into chat options', () => {
+    const mixed = { ...provider, config: { preset: 'openrouter' }, models: [
+      { ...defaultModelEntry('chat-model'), model_mode: 'chat' },
+      { ...defaultModelEntry('decision-model'), model_mode: 'systemone' },
+      { ...defaultModelEntry('embedding-model'), model_mode: 'embedding', supports_embedding: true },
+      { ...defaultModelEntry('image-model'), model_mode: 'image_generation' },
+      { ...defaultModelEntry('speech-model'), model_mode: 'audio_speech' }
+    ] };
+    expect(collectModelOptions([mixed]).map((o) => o.value)).toEqual(['chat-model']);
+    expect(collectModelOptions([mixed], true).map((o) => o.value)).toEqual(mixed.models.map((m) => m.model_id));
   });
 
   it('maps structured form state back to provider payload', () => {
@@ -260,7 +338,7 @@ describe('provider presets', () => {
         default_model: 'claude-opus-4-7',
         models: [{ model_id: 'claude-opus-4-7', supports_tools: true }],
         auth_config: { mode: 'none' },
-        executor_id: 'maitrea',
+        executor_id: 'exec-linux',
         base_url: 'http://127.0.0.1:8090',
         api_base: 'http://127.0.0.1:8090'
       },
@@ -275,7 +353,7 @@ describe('provider presets', () => {
     expect(detectProviderPreset(meridianProvider)).toBe('anthropic');
     const form = createProviderForm(meridianProvider);
     expect(form.location).toBe('executor');
-    expect(form.executor_id).toBe('maitrea');
+    expect(form.executor_id).toBe('exec-linux');
     expect(form.backend).toBe('litellm');
     expect(form.auth_mode).toBe('none');
     expect(form.base_url).toBe('http://127.0.0.1:8090');
@@ -284,7 +362,7 @@ describe('provider presets', () => {
     expect(payload.backend).toBe('litellm');
     const config = payload.config as Record<string, unknown>;
     expect(config.auth_config).toEqual({ mode: 'none' });
-    expect(config.executor_id).toBe('maitrea');
+    expect(config.executor_id).toBe('exec-linux');
     expect(config.base_url).toBe('http://127.0.0.1:8090');
     expect(config.api_base).toBe('http://127.0.0.1:8090');
   });
@@ -292,12 +370,12 @@ describe('provider presets', () => {
   it('supports explicit executor targets for executor-routed providers', () => {
     const form = createProviderForm(provider);
     form.location = 'executor';
-    form.executor_id = 'maitrea';
+    form.executor_id = 'exec-linux';
     form.executor_selector = 'location=local';
 
     const payload = providerFormToPayload(form);
     const config = payload.config as Record<string, unknown>;
-    expect(config.executor_id).toBe('maitrea');
+    expect(config.executor_id).toBe('exec-linux');
     expect(config.executor_labels).toBeUndefined();
     form.executor_selector = '';
     expect(providerExecutorTargetError(form)).toBeNull();
@@ -311,7 +389,7 @@ describe('provider presets', () => {
     form.executor_selector = 'location=local';
     expect(providerExecutorTargetError(form)).toBeNull();
 
-    form.executor_id = 'maitrea';
+    form.executor_id = 'exec-linux';
     expect(providerExecutorTargetError(form)).toContain('either one executor');
     expect(providerRequiresExecutorLocation('anthropic')).toBe(false);
   });

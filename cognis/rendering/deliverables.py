@@ -38,7 +38,7 @@ from cognis.rendering.rich_visuals import (
 )
 from cognis.ui_assets import resolve_standalone_manifest, standalone_asset_url
 
-RENDERER_VERSION = "standalone-deliverable-v18"
+RENDERER_VERSION = "standalone-deliverable-v23"
 HTML_CACHE_FILENAME = "render.html"
 PDF_CACHE_FILENAME = "render.pdf"
 PDF_INPUT_MAX_BYTES = 20 * 1024 * 1024
@@ -487,12 +487,28 @@ def render_standalone_html(
     stylesheet = _CSS.replace(
         "__EMOJI_FONT_SOURCE__",
         (
-            "url('cognis-asset:emoji-font') format('truetype'), "
-            f"url({_emoji_font_data_url()}) format('truetype')"
+            (
+                "url('cognis-asset:emoji-font') format('truetype'), "
+                if render_target == "pdf"
+                else ""
+            )
+            + f"url({_emoji_font_data_url()}) format('truetype')"
             if 'class="emoji"' in body + intro
             else "local('sans-serif')"
         ),
     )
+    if render_target == "html":
+        for name, filename in (
+            ("archivo", "archivo.woff2"),
+            ("jetbrains-mono", "jetbrains-mono.woff2"),
+        ):
+            stylesheet = stylesheet.replace(
+                f"cognis-asset:{name}",
+                "data:font/woff2;base64,"
+                + base64.b64encode(
+                    (Path(__file__).parent / "assets" / "publication" / filename).read_bytes()
+                ).decode("ascii"),
+            )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -523,7 +539,10 @@ def render_standalone_shell(
     media_base: str,
     standalone_url: str,
     pdf_url: str,
+    html_url: str = "",
+    markdown_url: str = "",
     rich_payload_override: dict[str, Any] | None = None,
+    share_expired: bool = False,
 ) -> str:
     """Render a client-mounted standalone shell backed by same-origin assets.
 
@@ -585,8 +604,11 @@ def render_standalone_shell(
 </head>
 <body>
   <template id="cognis-deliverable-payload"
+    data-share-expired="{"true" if share_expired else "false"}"
     data-media-base="{html.escape(media_base, quote=True)}"
     data-pdf-url="{html.escape(pdf_url, quote=True)}"
+    data-html-url="{html.escape(html_url, quote=True)}"
+    data-markdown-url="{html.escape(markdown_url, quote=True)}"
     data-standalone-url="{html.escape(standalone_url, quote=True)}">{inert_payload}</template>
   <div id="cognis-deliverable-root"></div>
   <noscript><main class="cognis-noscript"><article>{semantic_fallback}</article></main></noscript>

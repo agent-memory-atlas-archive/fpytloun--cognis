@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.channels.inbound import ChannelTurnObserver
-from cognis.channels.source_delivery import pending_sources, record_state
+from cognis.channels.source_delivery import pending_sources, progress_delivery_id, record_state
 from cognis.core.turn_scheduler import TurnError, TurnScheduler
 from cognis.models.channel import ChannelDeliveryDescriptor
 
@@ -133,11 +133,12 @@ async def test_cancelled_source_delivery_includes_only_explicit_user_cancelled_p
         )
     scheduler = object.__new__(TurnScheduler)
     scheduler._direct_turn_store = SimpleNamespace(
+        effective_channel_delivery=AsyncMock(return_value=(None, None)),
         get=AsyncMock(
             return_value=SimpleNamespace(
                 conversation_id="conversation", session_id="session", turn_id="turn", payload={}
             )
-        )
+        ),
     )
     scheduler.channel_pending_sources = lambda *args: pending_sources(stream, ["session"], "turn")
     scheduler._channel_delivery = SimpleNamespace(deliver_fenced_direct_turn=AsyncMock())
@@ -196,6 +197,7 @@ async def test_scheduler_owns_slow_terminal_success_and_exhaustion(error):
     )
     scheduler = object.__new__(TurnScheduler)
     scheduler._direct_turn_store = SimpleNamespace(
+        effective_channel_delivery=AsyncMock(return_value=(None, None)),
         get=AsyncMock(
             return_value=SimpleNamespace(
                 conversation_id="conversation",
@@ -203,7 +205,7 @@ async def test_scheduler_owns_slow_terminal_success_and_exhaustion(error):
                 turn_id="successor",
                 payload={"metadata": {"outbound_attachments": [{"artifact_id": "art_saved"}]}},
             )
-        )
+        ),
     )
     scheduler._channel_delivery = SimpleNamespace(deliver_fenced_direct_turn=AsyncMock())
 
@@ -249,3 +251,86 @@ async def test_scheduler_owns_slow_terminal_success_and_exhaustion(error):
     async with asyncio.timeout(0.1):
         await observer.on_turn_complete(SimpleNamespace(managed_continuation_pending=False))
     scheduler._channel_delivery.deliver_fenced_direct_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_progress_survives_repeated_snapshot_and_continuation():
+    stream = Stream()
+    await record_state(stream, "session", state="tracking", turn_id="parent")
+    stream.add("assistant_message", turn_id="parent", content="Checking now.")
+    _, sources = await pending_sources(stream, ["session"], "parent")
+    queued = {progress_delivery_id(sources[0])}
+
+    async def is_queued(source):
+        return progress_delivery_id(source) in queued
+
+    # A later terminal snapshot has a new event seq but the same source identity.
+    stream.add("assistant_message", turn_id="parent", content="Checking now.")
+    await record_state(stream, "session", state="tracking", turn_id="successor")
+    stream.add(
+        "system_message",
+        event="turn_initiated",
+        origin_kind="continuation",
+        turn_id="successor",
+        source_id="parent",
+    )
+    stream.add("assistant_message", turn_id="successor", content="Done.")
+    content, refs = await pending_sources(stream, ["session"], "successor", is_queued=is_queued)
+    assert content == "Done."
+    assert [ref["turn_id"] for ref in refs] == ["successor"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["immediate", "concatenated", "final_only"])
+async def test_worker_progress_without_admission_observer(mode):
+    stream = Stream()
+    await record_state(stream, "session", state="tracking", turn_id="turn")
+    for cycle, content in ((1, "Checking now."), (2, "Looking deeper.")):
+        stream.add("assistant_message", turn_id="turn", content=content, turn_cycle_index=cycle)
+    queued = set()
+
+    async def is_queued(source):
+        return progress_delivery_id(source) in queued
+
+    async def deliver(**kwargs):
+        if kwargs.get("progress_source") is not None:
+            queued.add(progress_delivery_id(kwargs["progress_source"]))
+
+    scheduler = object.__new__(TurnScheduler)
+    descriptor = ChannelDeliveryDescriptor(
+        channel_type="matrix", account_id="account", chat_id="room"
+    )
+    scheduler._durable_request_by_conversation = {"conversation": "request"}
+    scheduler._durable_fences = {
+        "request": SimpleNamespace(lease=object(), assert_current=AsyncMock())
+    }
+    scheduler._direct_turn_store = SimpleNamespace(
+        effective_channel_delivery=AsyncMock(return_value=(descriptor, mode)),
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                session_id="session",
+                turn_id="turn",
+                payload={
+                    "channel_delivery": descriptor.model_dump(mode="json"),
+                    "metadata": {"channel_assistant_delivery_mode": mode},
+                },
+            )
+        ),
+    )
+    scheduler._channel_delivery = SimpleNamespace(
+        source_is_queued=is_queued, deliver_fenced_direct_turn=AsyncMock(side_effect=deliver)
+    )
+    scheduler.channel_pending_sources = lambda *args, **kwargs: pending_sources(
+        stream, ["session"], "turn", is_queued=is_queued, **kwargs
+    )
+    await scheduler._deliver_durable_channel_progress("conversation")
+    await scheduler._deliver_durable_channel_progress("conversation")
+    calls = scheduler._channel_delivery.deliver_fenced_direct_turn.await_args_list
+    assert [call.kwargs["content"] for call in calls] == (
+        ["Checking now.", "Looking deeper."] if mode == "immediate" else []
+    )
+    stream.add("assistant_message", turn_id="turn", content="Done.", turn_cycle_index=3)
+    terminal, _ = await scheduler.channel_pending_sources("conversation", "session", "turn")
+    assert terminal == (
+        "Done." if mode == "immediate" else "Checking now.\n\nLooking deeper.\n\nDone."
+    )

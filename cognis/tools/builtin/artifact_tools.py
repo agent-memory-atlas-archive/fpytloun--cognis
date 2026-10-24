@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
+import mimetypes
 import socket
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -13,16 +14,22 @@ from urllib.parse import urljoin, urlparse
 
 import httpcore
 import httpx
+from sqlalchemy import select as sa_select
 
 from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.artifacts.preview import supports_artifact_view
+from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.audio.transcription import transcribe_audio_bytes
+from cognis.core.attachment_analysis import (
+    get_attachment_analysis_route as _get_attachment_analysis_route,
+)
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.content_refs import (
     build_deliverable_public_url,
     continuation_scope_task_id,
     deliverable_metadata_item,
+    deliverable_mime_type,
     get_accessible_deliverable_ref,
     is_deliverable_ref,
     record_deliverable_access,
@@ -30,14 +37,16 @@ from cognis.core.content_refs import (
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
+from cognis.models.deliverable import DeliverableRevisionError
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolResult, ToolSource
+from cognis.store.models import DeliverableRow
 from cognis.store.queries import (
     create_artifact_record,
+    discover_task_deliverables,
     find_tool_artifact_record,
     find_tool_output_artifact_record,
     get_artifact_record,
-    get_model_routing,
     list_recent_artifact_records,
     search_artifact_records,
 )
@@ -140,9 +149,11 @@ ARTIFACT_READ_TOOL = ToolDefinition(
 ARTIFACT_LIST_RECENT_TOOL = ToolDefinition(
     name="artifact_list_recent",
     description=(
-        "List your most recent saved Cognis artifacts by metadata. Use this to browse older "
-        "generated files or attachments when you do not know the artifact_id. Call "
-        "artifact_get_url for download links or UI attachments."
+        "List your most recent saved Cognis artifacts and deliverables by metadata, plus "
+        "documents of the current project. Only the latest revision of each document is "
+        "listed; lineage_id is its stable ID. Use this to browse older generated files or "
+        "attachments when you do not know the artifact_id. Call artifact_get_url for download "
+        "links or UI attachments."
     ),
     parameters={
         "type": "object",
@@ -168,6 +179,13 @@ ARTIFACT_LIST_RECENT_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Optional session filter.",
             },
+            "project_id": {
+                "type": "string",
+                "description": (
+                    'Optional project filter. Use "current" for the project of this work. '
+                    "Returns that project's documents you may access, whoever created them."
+                ),
+            },
         },
     },
     source=_SOURCE,
@@ -180,9 +198,11 @@ ARTIFACT_LIST_RECENT_TOOL = ToolDefinition(
 ARTIFACT_SEARCH_TOOL = ToolDefinition(
     name="artifact_search",
     description=(
-        "Search your saved Cognis artifacts by metadata such as filename, artifact_id, purpose, "
-        "kind, conversation, session, and creation time. This is metadata-only search, not file "
-        "content search. Call artifact_get_url for download links or UI attachments."
+        "Search your saved Cognis artifacts and deliverables, plus documents of the current "
+        "project, by metadata such as filename or title, artifact_id, purpose, kind, "
+        "conversation, session, project, and creation time. Only the latest revision of each "
+        "document is returned; lineage_id is its stable ID. This is metadata-only search, not "
+        "file content search. Call artifact_get_url for download links or UI attachments."
     ),
     parameters={
         "type": "object",
@@ -220,6 +240,13 @@ ARTIFACT_SEARCH_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Optional inclusive upper bound ISO timestamp.",
             },
+            "project_id": {
+                "type": "string",
+                "description": (
+                    'Optional project filter. Use "current" for the project of this work. '
+                    "Returns that project's documents you may access, whoever created them."
+                ),
+            },
         },
     },
     source=_SOURCE,
@@ -236,7 +263,9 @@ ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
         "Cognis artifact IDs and authorized task or managed-descendant deliverable IDs (dlv_*). "
         "Use this after artifact_search "
         "or artifact_list_recent when you need full stored metadata before reading a saved "
-        "artifact. Call artifact_get_url when the user asks for a download URL or wants to view the content."
+        "artifact. Call artifact_get_url when the user asks for a download URL or wants to view the content. "
+        "Includes revision facts (lineage_id, revision, latest_artifact_id or "
+        "latest_deliverable_id, is_latest) and the revisions you may read."
     ),
     parameters={
         "type": "object",
@@ -295,6 +324,91 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
     max_result_size=30_000,
 )
 
+ARTIFACT_GET_CONTENT_TOOL = ToolDefinition(
+    name="artifact_get_content",
+    description=(
+        "Read the exact text content of a saved artifact (art_*) or deliverable (dlv_*) with "
+        "its revision facts, without analysis. JSON content is returned parsed. An ID always "
+        "returns that exact revision; set latest=true to read the newest revision of the "
+        "document instead, for example by its stable lineage_id. Use this for configuration, "
+        "state, and checkpoints, including deterministic workflow steps. Binary content needs "
+        "artifact_read."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "description": "art_ or dlv_ ID of any revision of the document.",
+            },
+            "latest": {
+                "type": "boolean",
+                "description": "Return the newest revision of the document (default false).",
+            },
+        },
+        "required": ["artifact_id"],
+        "additionalProperties": False,
+    },
+    source=_SOURCE,
+    category="artifact",
+    read_only=True,
+    timeout_seconds=30,
+    max_result_size=1_100_000,
+)
+
+ARTIFACT_WRITE_MAX_BYTES = 1_000_000
+
+ARTIFACT_WRITE_TOOL = ToolDefinition(
+    name="artifact_write",
+    description=(
+        "Save text content (for example JSON configuration or state) as a persistent Cognis "
+        "artifact without an executor file. To update an existing document, pass the art_ ID "
+        "you last read as supersedes: the write creates the next revision and fails with "
+        "latest_artifact_id when a newer revision exists, so re-read and retry. Writes are "
+        "silent: nothing is attached to the reply or sent anywhere. Documents written in "
+        "shared project work join that project; revisions keep their document's project."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string", "description": "File name, e.g. checkpoint.json."},
+            "content": {
+                "type": "string",
+                "description": "Full text content. JSON MIME types must contain valid JSON.",
+            },
+            "mime_type": {
+                "type": "string",
+                "description": "MIME type (default from filename, else text/plain).",
+            },
+            "supersedes": {
+                "type": "string",
+                "pattern": "^art_[0-9a-zA-Z_-]+$",
+                "description": "art_ ID of the latest revision this write replaces.",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "Optional project for a new document created outside project work.",
+            },
+            "purpose": {
+                "type": "string",
+                "description": "Optional purpose label (default artifact_write).",
+            },
+        },
+        "required": ["filename", "content"],
+        "additionalProperties": False,
+    },
+    source=_SOURCE,
+    category="artifact",
+    read_only=False,
+    mutation_kind="create",
+    side_effects=[
+        "Creates persistent Cognis artifact storage, private or in the document's project.",
+        "Does not attach the artifact to a reply or notify anyone.",
+    ],
+    timeout_seconds=60,
+    max_result_size=20_000,
+)
+
 ARTIFACT_TOOL_NAMES = frozenset(
     {
         ARTIFACT_READ_TOOL.name,
@@ -302,7 +416,33 @@ ARTIFACT_TOOL_NAMES = frozenset(
         ARTIFACT_SEARCH_TOOL.name,
         ARTIFACT_GET_METADATA_TOOL.name,
         ARTIFACT_GET_URL_TOOL.name,
+        ARTIFACT_GET_CONTENT_TOOL.name,
+        ARTIFACT_WRITE_TOOL.name,
     }
+)
+
+
+ARTIFACT_SHARE_TOOL = ToolDefinition(
+    name="artifact_share",
+    description=(
+        "Grant or revoke read access to an artifact or deliverable owned by this agent "
+        "for another agent owned by the same user. Reading shared content does not "
+        "permit resharing, editing, or deleting it. KB and delegated-work access "
+        "remain independent of this explicit grant."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "content_ref": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "action": {"type": "string", "enum": ["grant", "revoke"]},
+        },
+        "required": ["content_ref", "agent_id", "action"],
+        "additionalProperties": False,
+    },
+    source=_SOURCE,
+    category="artifact",
+    read_only=False,
 )
 
 
@@ -315,13 +455,16 @@ def artifact_tools() -> list[ToolDefinition]:
         ARTIFACT_SEARCH_TOOL,
         ARTIFACT_GET_METADATA_TOOL,
         ARTIFACT_GET_URL_TOOL,
+        ARTIFACT_GET_CONTENT_TOOL,
+        ARTIFACT_WRITE_TOOL,
+        ARTIFACT_SHARE_TOOL,
     ]
 
 
 def is_artifact_tool(name: str) -> bool:
     """Return whether a tool belongs to the artifact builtin set."""
 
-    return name in ARTIFACT_TOOL_NAMES
+    return name in ARTIFACT_TOOL_NAMES or name == ARTIFACT_SHARE_TOOL.name
 
 
 def attachment_supports_model(attachment: AttachmentRef, model_info: Any) -> bool:
@@ -376,6 +519,85 @@ async def handle_artifact_tool(
 
     scope_task_id = continuation_scope_task_id(runtime_metadata)
     accessor_conversation_id, accessor_agent_id = _deliverable_accessor(runtime_metadata)
+    # Tools always run as an agent. Human-owner access is reserved for HTTP routes.
+    if (
+        tool_name
+        in ("artifact_read", "artifact_get_metadata", "artifact_get_url", "artifact_get_content")
+        and str(arguments.get("artifact_id", "")).startswith("dlv_")
+        and not accessor_agent_id
+    ):
+        return ToolResult(output=f"Artifact not found: {arguments['artifact_id']}", is_error=True)
+    if tool_name == ARTIFACT_WRITE_TOOL.name:
+        return await _handle_artifact_write(
+            arguments,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=user_email,
+            runtime_metadata=runtime_metadata,
+        )
+    if tool_name == ARTIFACT_SHARE_TOOL.name:
+        from cognis.core.artifact_sharing import set_artifact_share
+
+        if not session_factory or not user_email or not accessor_agent_id:
+            return ToolResult(output="Artifact access context is unavailable.", is_error=True)
+        try:
+            async with session_factory() as db_session:
+                await set_artifact_share(
+                    db_session,
+                    owner_email=user_email,
+                    owner_agent_id=accessor_agent_id,
+                    content_ref=arguments["content_ref"],
+                    grantee_agent_id=arguments["agent_id"],
+                    revoke=arguments["action"] == "revoke",
+                )
+                await db_session.commit()
+        except ValueError as exc:
+            return ToolResult(output=str(exc), is_error=True)
+        return ToolResult(output="Artifact sharing updated.")
+    from cognis.core.artifact_access import artifact_authorized_for_conversation
+
+    accessor_session_id = (runtime_metadata or {}).get("session_id")
+    ref_id = arguments.get("artifact_id")
+    if (
+        session_factory is not None
+        and isinstance(ref_id, str)
+        and not ref_id.startswith(("dlv_", "tool_artifact:"))
+    ):
+        avatar = None
+        async with session_factory() as db_session:
+            row = await get_artifact_record(db_session, ref_id)
+            if (
+                row is None
+                and artifact_store is not None
+                and tool_name in {"artifact_read", "artifact_get_metadata", "artifact_get_url"}
+            ):
+                from cognis.core.avatar_access import resolve_agent_avatar_reference
+
+                avatar = await resolve_agent_avatar_reference(
+                    db_session, artifact_store, ref_id, owner_email or user_email
+                )
+            allowed = await artifact_authorized_for_conversation(
+                db_session,
+                artifact=row,
+                owner_email=owner_email or user_email,
+                conversation_id=accessor_conversation_id,
+                agent_id=accessor_agent_id,
+                session_id=accessor_session_id,
+            )
+        if avatar is not None:
+            return await _handle_avatar_reference(
+                tool_name,
+                arguments,
+                avatar=avatar,
+                artifact_store=artifact_store,
+                session_factory=session_factory,
+                user_email=owner_email or user_email,
+                llm=llm,
+                current_model=current_model,
+                current_provider_id=current_provider_id,
+            )
+        if not allowed:
+            return ToolResult(output=f"Artifact not found: {ref_id}", is_error=True)
     if tool_name == ARTIFACT_READ_TOOL.name:
         return await _handle_artifact_read(
             arguments,
@@ -396,12 +618,14 @@ async def handle_artifact_tool(
             arguments,
             session_factory=session_factory,
             user_email=user_email,
+            runtime_metadata=runtime_metadata,
         )
     if tool_name == ARTIFACT_SEARCH_TOOL.name:
         return await _handle_artifact_search(
             arguments,
             session_factory=session_factory,
             user_email=user_email,
+            runtime_metadata=runtime_metadata,
         )
     if tool_name == ARTIFACT_GET_METADATA_TOOL.name:
         return await _handle_artifact_get_metadata(
@@ -412,6 +636,18 @@ async def handle_artifact_tool(
             scope_task_id=scope_task_id,
             accessor_conversation_id=accessor_conversation_id,
             accessor_agent_id=accessor_agent_id,
+            accessor_session_id=accessor_session_id,
+        )
+    if tool_name == ARTIFACT_GET_CONTENT_TOOL.name:
+        return await _handle_artifact_get_content(
+            arguments,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=user_email,
+            scope_task_id=scope_task_id,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
+            accessor_session_id=accessor_session_id,
         )
     if tool_name == ARTIFACT_GET_URL_TOOL.name:
         return await _handle_artifact_get_url(
@@ -422,6 +658,7 @@ async def handle_artifact_tool(
             scope_task_id=scope_task_id,
             accessor_conversation_id=accessor_conversation_id,
             accessor_agent_id=accessor_agent_id,
+            accessor_session_id=accessor_session_id,
         )
     return ToolResult(output=f"Unknown artifact tool: {tool_name}", is_error=True)
 
@@ -498,6 +735,7 @@ async def _handle_artifact_read(
                 scope_task_id=scope_task_id,
                 accessor_conversation_id=accessor_conversation_id,
                 accessor_agent_id=accessor_agent_id,
+                accessor_session_id=(runtime_metadata or {}).get("session_id"),
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
@@ -519,9 +757,38 @@ async def _handle_artifact_read(
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+    # Access was authorized at dispatch (owner rules or a project document).
+    return await _read_authorized_artifact(
+        row,
+        artifact_store=artifact_store,
+        session_factory=session_factory,
+        user_email=user_email,
+        owner_email=owner_email,
+        llm=llm,
+        current_model=current_model,
+        current_provider_id=current_provider_id,
+        prompt=prompt,
+        offset=offset,
+        limit=limit,
+    )
+
+
+async def _read_authorized_artifact(
+    row: Any,
+    *,
+    artifact_store: Any,
+    session_factory: Any,
+    user_email: str | None,
+    owner_email: str | None,
+    llm: Any,
+    current_model: str | None,
+    current_provider_id: str | None,
+    prompt: str | None,
+    offset: int,
+    limit: int,
+) -> ToolResult:
+    artifact_id = row.artifact_id
     effective_owner_email = owner_email or user_email
-    if row.owner_email and effective_owner_email and row.owner_email != effective_owner_email:
-        return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
 
     try:
         content, content_type = await artifact_store.async_load(
@@ -596,49 +863,78 @@ async def _handle_artifact_read(
     )
 
 
+async def _handle_avatar_reference(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    avatar: Any,
+    artifact_store: Any,
+    session_factory: Any,
+    user_email: str | None,
+    llm: Any,
+    current_model: str | None,
+    current_provider_id: str | None,
+) -> ToolResult:
+    """Use the normal content reader without registering a virtual avatar artifact."""
+    if tool_name == "artifact_read":
+        return await _read_authorized_artifact(
+            avatar,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=user_email,
+            owner_email=user_email,
+            llm=llm,
+            current_model=current_model,
+            current_provider_id=current_provider_id,
+            prompt=_optional_string(arguments.get("prompt")),
+            offset=_coerce_limit(arguments.get("offset"), default=1, maximum=1_000_000),
+            limit=_coerce_limit(
+                arguments.get("limit"), default=_MAX_READ_LINES, maximum=_MAX_READ_LINES
+            ),
+        )
+    item = {
+        "artifact_id": avatar.artifact_id,
+        "source": "agent_avatar",
+        "virtual": True,
+        "filename": avatar.filename,
+        "kind": avatar.kind,
+        "mime_type": avatar.mime_type,
+        "size_bytes": avatar.size_bytes,
+    }
+    if tool_name == "artifact_get_metadata":
+        item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
+    else:
+        mode = str(arguments.get("mode") or "download").strip().lower()
+        if mode not in {"download", "view"}:
+            return ToolResult(output="mode must be 'download' or 'view'.", is_error=True)
+        ttl = max(60, _coerce_limit(arguments.get("ttl_seconds"), default=3600, maximum=604800))
+        item.update(
+            url=await artifact_store.async_get_public_url(
+                avatar.namespace,
+                avatar.object_id,
+                avatar.filename,
+                ttl_seconds=ttl,
+                mode=mode,
+            ),
+            mode=mode,
+            expires_at=(datetime.now(UTC) + timedelta(seconds=ttl)).isoformat(),
+        )
+    return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
+
+
 async def _handle_artifact_list_recent(
     arguments: dict[str, Any],
     *,
     session_factory: Any | None,
     user_email: str | None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> ToolResult:
-    if session_factory is None:
-        return ToolResult(output="Artifact support is not available.", is_error=True)
-    owner_email = _require_user_email(user_email)
-    if owner_email is None:
-        return ToolResult(output="Artifact lookup requires an authenticated user.", is_error=True)
-
-    limit = _coerce_limit(arguments.get("limit"), default=10, maximum=50)
-    kind, error = _coerce_artifact_kind(arguments.get("kind"))
-    if error is not None:
-        return ToolResult(output=error, is_error=True)
-    purpose = _optional_string(arguments.get("purpose"))
-    conversation_id = _optional_string(arguments.get("conversation_id"))
-    session_id = _optional_string(arguments.get("session_id"))
-
-    async with session_factory() as session:
-        rows = await list_recent_artifact_records(
-            session,
-            owner_email=owner_email,
-            limit=limit,
-            kind=kind,
-            purpose=purpose,
-            conversation_id=conversation_id,
-            session_id=session_id,
-        )
-
-    items = [_artifact_list_item(row) for row in rows]
-    if not items:
-        return ToolResult(
-            output="No artifacts found for the requested filters.",
-            metadata={"items": [], "count": 0},
-        )
-    return ToolResult(
-        output=_render_artifact_list(
-            items,
-            heading=f"Found {len(items)} recent artifact(s).",
-        ),
-        metadata={"items": items, "count": len(items)},
+    return await _handle_artifact_discovery(
+        arguments,
+        session_factory=session_factory,
+        user_email=user_email,
+        runtime_metadata=runtime_metadata,
+        search=False,
     )
 
 
@@ -647,6 +943,24 @@ async def _handle_artifact_search(
     *,
     session_factory: Any | None,
     user_email: str | None,
+    runtime_metadata: dict[str, Any] | None = None,
+) -> ToolResult:
+    return await _handle_artifact_discovery(
+        arguments,
+        session_factory=session_factory,
+        user_email=user_email,
+        runtime_metadata=runtime_metadata,
+        search=True,
+    )
+
+
+async def _handle_artifact_discovery(
+    arguments: dict[str, Any],
+    *,
+    session_factory: Any | None,
+    user_email: str | None,
+    runtime_metadata: dict[str, Any] | None,
+    search: bool,
 ) -> ToolResult:
     if session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -654,7 +968,7 @@ async def _handle_artifact_search(
     if owner_email is None:
         return ToolResult(output="Artifact lookup requires an authenticated user.", is_error=True)
 
-    query = _optional_string(arguments.get("query"))
+    query = _optional_string(arguments.get("query")) if search else None
     limit = _coerce_limit(arguments.get("limit"), default=10, maximum=50)
     kind, error = _coerce_artifact_kind(arguments.get("kind"))
     if error is not None:
@@ -662,59 +976,149 @@ async def _handle_artifact_search(
     purpose = _optional_string(arguments.get("purpose"))
     conversation_id = _optional_string(arguments.get("conversation_id"))
     session_id = _optional_string(arguments.get("session_id"))
-    created_after, error = _parse_optional_datetime(arguments.get("created_after"), "created_after")
-    if error is not None:
-        return ToolResult(output=error, is_error=True)
-    created_before, error = _parse_optional_datetime(
-        arguments.get("created_before"), "created_before"
-    )
-    if error is not None:
-        return ToolResult(output=error, is_error=True)
-    if not any(
-        value is not None
-        for value in (
-            query,
-            kind,
-            purpose,
-            conversation_id,
-            session_id,
-            created_after,
-            created_before,
+    requested_project = _optional_string(arguments.get("project_id"))
+    created_after = created_before = None
+    if search:
+        created_after, error = _parse_optional_datetime(
+            arguments.get("created_after"), "created_after"
         )
-    ):
-        return ToolResult(
-            output=(
-                "Provide at least one search filter. Use artifact_list_recent to browse without "
-                "a query."
-            ),
-            is_error=True,
+        if error is not None:
+            return ToolResult(output=error, is_error=True)
+        created_before, error = _parse_optional_datetime(
+            arguments.get("created_before"), "created_before"
         )
+        if error is not None:
+            return ToolResult(output=error, is_error=True)
+        if not any(
+            value is not None
+            for value in (
+                query,
+                kind,
+                purpose,
+                conversation_id,
+                session_id,
+                created_after,
+                created_before,
+                requested_project,
+            )
+        ):
+            return ToolResult(
+                output=(
+                    "Provide at least one search filter. Use artifact_list_recent to browse "
+                    "without a query."
+                ),
+                is_error=True,
+            )
 
+    accessor_conversation_id, accessor_agent_id = _deliverable_accessor(runtime_metadata)
+    accessor_session_id = (runtime_metadata or {}).get("session_id")
     async with session_factory() as session:
-        rows = await search_artifact_records(
+        from cognis.core.artifact_access import content_read_predicate
+        from cognis.core.content_projects import content_project_ids, work_project
+
+        project_ids = await content_project_ids(
+            session,
+            user_email=owner_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+        )
+        project_filter = requested_project
+        if requested_project == "current":
+            context = await work_project(
+                session,
+                user_email=owner_email,
+                agent_id=accessor_agent_id,
+                conversation_id=accessor_conversation_id,
+                session_id=accessor_session_id,
+            )
+            project_filter = context.project_id
+            if project_filter is None:
+                return ToolResult(
+                    output="This work does not belong to a project.",
+                    metadata={"items": [], "count": 0},
+                )
+        if project_filter is not None and project_filter not in project_ids:
+            # Not a readable project for this agent: report nothing, never existence.
+            return ToolResult(
+                output="No artifacts found for the requested filters.",
+                metadata={"items": [], "count": 0},
+            )
+        predicate = await content_read_predicate(
             session,
             owner_email=owner_email,
-            query=query,
-            limit=limit,
-            kind=kind,
-            purpose=purpose,
-            conversation_id=conversation_id,
-            session_id=session_id,
-            created_after=created_after,
-            created_before=created_before,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
         )
+        common = {
+            "owner_email": owner_email,
+            "limit": limit,
+            "kind": kind,
+            "purpose": purpose,
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "access_predicate": predicate,
+            "project_ids": project_ids,
+            "project_id": project_filter,
+        }
+        if search:
+            rows = await search_artifact_records(
+                session,
+                query=query,
+                created_after=created_after,
+                created_before=created_before,
+                **common,
+            )
+        else:
+            rows = await list_recent_artifact_records(session, **common)
+        items = [_artifact_list_item(row) for row in rows]
+        if (
+            kind in (None, "file")
+            and purpose in (None, "workflow_deliverable")
+            and conversation_id is None
+            and session_id is None
+            and accessor_agent_id
+        ):
+            deliverable_predicate = await content_read_predicate(
+                session,
+                owner_email=owner_email,
+                agent_id=accessor_agent_id,
+                conversation_id=accessor_conversation_id,
+                session_id=accessor_session_id,
+                model=DeliverableRow,
+            )
+            deliverables = await discover_task_deliverables(
+                session,
+                owner_email=owner_email,
+                access_predicate=deliverable_predicate,
+                project_ids=project_ids,
+                project_id=project_filter,
+                query=query,
+                created_after=created_after,
+                created_before=created_before,
+                limit=limit,
+            )
+            items.extend(_task_deliverable_list_item(row) for row in deliverables)
+            items.sort(key=lambda item: item["created_at"] or "", reverse=True)
+            items = items[:limit]
 
-    items = [_artifact_list_item(row) for row in rows]
     if not items:
         return ToolResult(
-            output="No artifacts matched the search filters.",
+            output=(
+                "No artifacts matched the search filters."
+                if search
+                else "No artifacts found for the requested filters."
+            ),
             metadata={"items": [], "count": 0},
         )
+    heading = (
+        f"Found {len(items)} artifact(s) matching the search filters."
+        if search
+        else f"Found {len(items)} recent artifact(s)."
+    )
     return ToolResult(
-        output=_render_artifact_list(
-            items,
-            heading=f"Found {len(items)} artifact(s) matching the search filters.",
-        ),
+        output=_render_artifact_list(items, heading=heading),
         metadata={"items": items, "count": len(items)},
     )
 
@@ -728,6 +1132,7 @@ async def _handle_artifact_get_metadata(
     scope_task_id: str | None = None,
     accessor_conversation_id: str | None = None,
     accessor_agent_id: str | None = None,
+    accessor_session_id: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -746,22 +1151,42 @@ async def _handle_artifact_get_metadata(
                 scope_task_id=scope_task_id,
                 accessor_conversation_id=accessor_conversation_id,
                 accessor_agent_id=accessor_agent_id,
+                accessor_session_id=accessor_session_id,
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
         await record_deliverable_access(session_factory, ref)
         item = deliverable_metadata_item(ref)
+        async with session_factory() as session:
+            item.update(
+                await _deliverable_revision_facts(
+                    session,
+                    ref.deliverable,
+                    user_email=user_email,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
+                    accessor_session_id=accessor_session_id,
+                )
+            )
         item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
         return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
-        return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
-    if row.owner_email and user_email and row.owner_email != user_email:
-        return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
-
-    item = _artifact_metadata_item(row)
+        if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
+            return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        # Access was authorized at dispatch (owner rules or a project document).
+        item = _artifact_metadata_item(row)
+        item.update(
+            await _artifact_revision_facts(
+                session,
+                row,
+                user_email=user_email,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
+                accessor_session_id=accessor_session_id,
+            )
+        )
     item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
     return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
 
@@ -775,6 +1200,7 @@ async def _handle_artifact_get_url(
     scope_task_id: str | None = None,
     accessor_conversation_id: str | None = None,
     accessor_agent_id: str | None = None,
+    accessor_session_id: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -798,6 +1224,7 @@ async def _handle_artifact_get_url(
                 scope_task_id=scope_task_id,
                 accessor_conversation_id=accessor_conversation_id,
                 accessor_agent_id=accessor_agent_id,
+                accessor_session_id=accessor_session_id,
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
@@ -842,8 +1269,7 @@ async def _handle_artifact_get_url(
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
-    if row.owner_email and user_email and row.owner_email != user_email:
-        return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
+    # Access was authorized at dispatch (owner rules or a project document).
     if mode == "view" and not supports_artifact_view(row.filename, str(row.mime_type)):
         return ToolResult(
             output=f"Artifact preview is not supported: {artifact_id}",
@@ -1236,24 +1662,6 @@ async def _hydrate_attachment_ref(
         size_bytes=int(getattr(row, "size_bytes", 0) or 0),
         url=url,
     )
-
-
-async def _get_attachment_analysis_route(
-    session_factory: Any, *, owner_email: str | None = None
-) -> tuple[str | None, str | None]:
-    async with session_factory() as session:
-        route = None
-        if owner_email:
-            route = await get_model_routing(session, "attachment_analysis", owner_email=owner_email)
-        if route is None:
-            route = await get_model_routing(session, "attachment_analysis")
-    if route is None:
-        return None, None
-    model = str(getattr(route, "model", "") or "").strip()
-    if not model:
-        return None, None
-    provider_id = getattr(route, "provider_id", None)
-    return model, str(provider_id) if isinstance(provider_id, str) and provider_id else None
 
 
 async def _get_model_info(
@@ -1702,9 +2110,16 @@ async def materialize_tool_artifact_ref(
                     owner_email=owner_email,
                     source_tool_call_id=call_id,
                 )
-            persisted_authorized = (
-                source_row is not None and source_row.conversation_id == conversation_id
-            )
+                from cognis.core.artifact_access import artifact_authorized_for_conversation
+
+                persisted_authorized = await artifact_authorized_for_conversation(
+                    session,
+                    artifact=source_row,
+                    owner_email=owner_email,
+                    conversation_id=conversation_id,
+                    agent_id=(runtime_metadata or {}).get("agent_id"),
+                    session_id=(runtime_metadata or {}).get("session_id"),
+                )
     if not runtime_authorized and not persisted_authorized:
         return ToolResult(output=f"Tool artifact access denied: {tool_artifact_ref}", is_error=True)
     tool_output_store = _runtime_tool_output_store(runtime_metadata)
@@ -1737,7 +2152,17 @@ async def materialize_tool_artifact_ref(
             )
         async with session_factory() as session:
             row = await get_artifact_record(session, artifact_id)
-        if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
+            from cognis.core.artifact_access import artifact_authorized_for_conversation
+
+            allowed = await artifact_authorized_for_conversation(
+                session,
+                artifact=row,
+                owner_email=owner_email,
+                conversation_id=_runtime_conversation_id(runtime_metadata),
+                agent_id=(runtime_metadata or {}).get("agent_id"),
+                session_id=(runtime_metadata or {}).get("session_id"),
+            )
+        if row is None or not allowed:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
         if row.owner_email and row.owner_email != owner_email:
             return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
@@ -1775,6 +2200,20 @@ async def materialize_tool_artifact_ref(
             source_tool_call_id=call_id,
             source_anchor=anchor_name,
         )
+        if existing is not None:
+            from cognis.core.artifact_access import artifact_authorized_for_conversation
+
+            if not await artifact_authorized_for_conversation(
+                session,
+                artifact=existing,
+                owner_email=owner_email,
+                conversation_id=_runtime_conversation_id(runtime_metadata),
+                agent_id=(runtime_metadata or {}).get("agent_id"),
+                session_id=(runtime_metadata or {}).get("session_id"),
+            ):
+                return ToolResult(
+                    output=f"Tool artifact access denied: {tool_artifact_ref}", is_error=True
+                )
     if existing is not None:
         metadata = _artifact_metadata_item(existing)
         metadata.update(
@@ -2048,6 +2487,9 @@ def _runtime_authorized_lazy_artifact_refs(
 def _runtime_conversation_id(runtime_metadata: dict[str, Any] | None) -> str | None:
     if not isinstance(runtime_metadata, dict):
         return None
+    direct = runtime_metadata.get("conversation_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
     access = runtime_metadata.get("runtime_access")
     if not isinstance(access, dict):
         shared = runtime_metadata.get("shared_runtime_metadata")
@@ -2071,6 +2513,9 @@ def _runtime_conversation_id(runtime_metadata: dict[str, Any] | None) -> str | N
 def _runtime_session_id(runtime_metadata: dict[str, Any] | None) -> str | None:
     if not isinstance(runtime_metadata, dict):
         return None
+    direct = runtime_metadata.get("session_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
     access = runtime_metadata.get("runtime_access")
     if not isinstance(access, dict):
         shared = runtime_metadata.get("shared_runtime_metadata")
@@ -2148,6 +2593,27 @@ def _artifact_list_item(row: Any) -> dict[str, Any]:
         "created_at": _serialize_datetime(getattr(row, "created_at", None)),
         "conversation_id": getattr(row, "conversation_id", None),
         "session_id": getattr(row, "session_id", None),
+        "lineage_id": getattr(row, "lineage_id", None) or str(row.artifact_id),
+        "revision": int(getattr(row, "revision", None) or 1),
+        "project_id": getattr(row, "project_id", None),
+    }
+
+
+def _task_deliverable_list_item(row: Any) -> dict[str, Any]:
+    return {
+        "artifact_id": str(row.deliverable_id),
+        "filename": str(row.title or row.deliverable_id),
+        "kind": "file",
+        "mime_type": deliverable_mime_type(row.format),
+        "purpose": "workflow_deliverable",
+        "size_bytes": int(getattr(row, "content_size", None) or 0),
+        "status": str(row.status),
+        "created_at": _serialize_datetime(getattr(row, "created_at", None)),
+        "conversation_id": None,
+        "session_id": None,
+        "lineage_id": row.lineage_id or str(row.deliverable_id),
+        "revision": int(row.revision or 1),
+        "project_id": row.project_id,
     }
 
 
@@ -2169,6 +2635,10 @@ def _artifact_metadata_item(row: Any) -> dict[str, Any]:
         "created_at": _serialize_datetime(getattr(row, "created_at", None)),
         "expires_at": _serialize_datetime(getattr(row, "expires_at", None)),
         "deleted_at": _serialize_datetime(getattr(row, "deleted_at", None)),
+        "lineage_id": getattr(row, "lineage_id", None) or str(row.artifact_id),
+        "revision": int(getattr(row, "revision", None) or 1),
+        "supersedes_artifact_id": getattr(row, "supersedes_artifact_id", None),
+        "project_id": getattr(row, "project_id", None),
     }
 
 
@@ -2213,5 +2683,311 @@ def _render_artifact_list(items: list[dict[str, Any]], *, heading: str) -> str:
             f"purpose={item['purpose']}",
             f"created_at={item['created_at'] or 'unknown'}",
         ]
+        if item.get("revision", 1) > 1:
+            details.append(f"revision={item['revision']}, lineage_id={item['lineage_id']}")
+        if item.get("project_id"):
+            details.append(f"project_id={item['project_id']}")
         lines.append(f"{index}. {item['filename']} ({', '.join(details)})")
     return "\n".join(lines)
+
+
+# --- Revisioned documents: exact/latest content and silent writes ---
+
+
+async def _artifact_revision_facts(
+    session: Any,
+    row: Any,
+    *,
+    user_email: str | None,
+    accessor_conversation_id: str | None,
+    accessor_agent_id: str | None,
+    accessor_session_id: str | None,
+) -> dict[str, Any]:
+    """Lineage facts plus the readable revisions of an artifact document."""
+
+    from cognis.core.artifact_access import content_read_predicate
+    from cognis.core.artifact_revisions import revision_view
+    from cognis.store.queries import list_artifact_lineage
+
+    view = await revision_view(session, row)
+    facts = view.as_dict()
+    if view.revision_count > 1:
+        predicate = await content_read_predicate(
+            session,
+            owner_email=user_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+        )
+        facts["revisions"] = [
+            {
+                "artifact_id": item.artifact_id,
+                "revision": int(item.revision or 1),
+                "created_at": _serialize_datetime(item.created_at),
+                "owner_email": item.owner_email,
+            }
+            for item in await list_artifact_lineage(
+                session, view.lineage_id, access_predicate=predicate
+            )
+        ]
+    return facts
+
+
+async def _deliverable_revision_facts(
+    session: Any,
+    row: Any,
+    *,
+    user_email: str | None,
+    accessor_conversation_id: str | None,
+    accessor_agent_id: str | None,
+    accessor_session_id: str | None,
+) -> dict[str, Any]:
+    """Lineage facts plus the readable revisions of a deliverable document."""
+
+    from cognis.core.artifact_access import content_read_predicate
+    from cognis.store.queries import (
+        get_deliverable_lineage_summary,
+        list_deliverable_lineage,
+    )
+
+    summary = await get_deliverable_lineage_summary(session, row)
+    facts: dict[str, Any] = {
+        "lineage_id": summary.lineage_id,
+        "revision": int(row.revision or 1),
+        "supersedes_deliverable_id": row.supersedes_deliverable_id,
+        "latest_deliverable_id": summary.latest_deliverable_id,
+        "latest_revision": summary.latest_revision,
+        "revision_count": summary.revision_count,
+        "is_latest": summary.latest_deliverable_id == row.deliverable_id,
+        "project_id": row.project_id,
+    }
+    if summary.revision_count > 1 and accessor_agent_id:
+        predicate = await content_read_predicate(
+            session,
+            owner_email=user_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+            model=DeliverableRow,
+        )
+        readable = {
+            item
+            for item in (
+                await session.scalars(
+                    sa_select(DeliverableRow.deliverable_id).where(
+                        DeliverableRow.lineage_id == summary.lineage_id, predicate
+                    )
+                )
+            ).all()
+        }
+        facts["revisions"] = [
+            {
+                "deliverable_id": item.deliverable_id,
+                "revision": int(item.revision or 1),
+                "created_at": _serialize_datetime(item.created_at),
+            }
+            for item in await list_deliverable_lineage(session, summary.lineage_id)
+            if item.deliverable_id in readable
+        ]
+    return facts
+
+
+def _document_content_value(content: bytes, mime_type: str) -> tuple[Any, str | None]:
+    """Decode exact document content; JSON is parsed. Returns (value, error)."""
+
+    from cognis.core.artifact_revisions import is_json_mime_type
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "Artifact content is binary. Use artifact_read to inspect it."
+    if is_json_mime_type(mime_type):
+        try:
+            return json.loads(text), None
+        except ValueError:
+            return text, None
+    return text, None
+
+
+async def _handle_artifact_get_content(
+    arguments: dict[str, Any],
+    *,
+    artifact_store: Any | None,
+    session_factory: Any | None,
+    user_email: str | None,
+    scope_task_id: str | None,
+    accessor_conversation_id: str | None,
+    accessor_agent_id: str | None,
+    accessor_session_id: str | None,
+) -> ToolResult:
+    """Return exact content and revision facts for an art_ or dlv_ reference."""
+
+    if artifact_store is None or session_factory is None:
+        return ToolResult(output="Artifact support is not available.", is_error=True)
+    ref_id = str(arguments.get("artifact_id") or "").strip()
+    latest = arguments.get("latest") is True
+    if not ref_id:
+        return ToolResult(output="artifact_id is required.", is_error=True)
+    not_found = ToolResult(output=f"Artifact not found: {ref_id}", is_error=True)
+
+    if is_deliverable_ref(ref_id):
+        from cognis.store.queries import get_deliverable, get_deliverable_lineage_head
+
+        async with session_factory() as session:
+            target_id = ref_id
+            if latest:
+                start = await get_deliverable(session, ref_id)
+                if start is None:
+                    return not_found
+                head = await get_deliverable_lineage_head(
+                    session, start.lineage_id or start.deliverable_id
+                )
+                target_id = head.deliverable_id if head is not None else ref_id
+            ref = await get_accessible_deliverable_ref(
+                session,
+                artifact_store,
+                target_id,
+                user_email,
+                scope_task_id=scope_task_id,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
+                accessor_session_id=accessor_session_id,
+            )
+            if ref is None:
+                return not_found
+            facts = await _deliverable_revision_facts(
+                session,
+                ref.deliverable,
+                user_email=user_email,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
+                accessor_session_id=accessor_session_id,
+            )
+        await record_deliverable_access(session_factory, ref)
+        value, error = _document_content_value(ref.content_bytes, ref.mime_type)
+        if error is not None:
+            return ToolResult(output=error, is_error=True)
+        payload = {
+            "deliverable_id": ref.deliverable.deliverable_id,
+            **facts,
+            "filename": ref.filename,
+            "mime_type": ref.mime_type,
+            "format": ref.deliverable.format,
+            "content_hash": ref.deliverable.content_hash,
+            "content": value,
+        }
+        return ToolResult(output=json.dumps(payload, ensure_ascii=False), metadata=payload)
+
+    from cognis.core.artifact_access import artifact_authorized_for_conversation
+    from cognis.core.artifact_revisions import resolve_artifact_reference
+
+    async with session_factory() as session:
+        row = await resolve_artifact_reference(session, ref_id, latest=latest)
+        # The resolved revision is authorized on its own, never through the
+        # reference the caller started from.
+        if row is None or not await artifact_authorized_for_conversation(
+            session,
+            artifact=row,
+            owner_email=user_email,
+            conversation_id=accessor_conversation_id,
+            agent_id=accessor_agent_id,
+            session_id=accessor_session_id,
+        ):
+            return not_found
+        facts = await _artifact_revision_facts(
+            session,
+            row,
+            user_email=user_email,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
+            accessor_session_id=accessor_session_id,
+        )
+    try:
+        content, _content_type = await artifact_store.async_load(
+            row.namespace, row.object_id, row.filename
+        )
+    except FileNotFoundError:
+        return ToolResult(
+            output=f"Artifact content is unavailable: {row.artifact_id}", is_error=True
+        )
+    if row.content_hash and hashlib.sha256(content).hexdigest() != row.content_hash:
+        return ToolResult(
+            output=f"Artifact content failed its integrity check: {row.artifact_id}",
+            is_error=True,
+        )
+    value, error = _document_content_value(content, str(row.mime_type))
+    if error is not None:
+        return ToolResult(output=error, is_error=True)
+    payload = {
+        **facts,
+        "filename": row.filename,
+        "mime_type": row.mime_type,
+        "content_hash": row.content_hash,
+        "content": value,
+    }
+    return ToolResult(output=json.dumps(payload, ensure_ascii=False), metadata=payload)
+
+
+async def _handle_artifact_write(
+    arguments: dict[str, Any],
+    *,
+    artifact_store: Any | None,
+    session_factory: Any | None,
+    user_email: str | None,
+    runtime_metadata: dict[str, Any] | None,
+) -> ToolResult:
+    """Create a document or its next revision from inline text, without presenting it."""
+
+    from cognis.core.artifact_revisions import ContentActor, write_artifact_document
+
+    if artifact_store is None or session_factory is None:
+        return ToolResult(output="Artifact support is not available.", is_error=True)
+    owner_email = _require_user_email(user_email)
+    accessor_conversation_id, accessor_agent_id = _deliverable_accessor(runtime_metadata)
+    if owner_email is None or not accessor_agent_id:
+        return ToolResult(output="Artifact access context is unavailable.", is_error=True)
+    filename = sanitize_artifact_filename(str(arguments.get("filename") or "").strip())
+    content_text = arguments.get("content")
+    if not filename or not isinstance(content_text, str):
+        return ToolResult(output="filename and content are required.", is_error=True)
+    content = content_text.encode("utf-8")
+    if len(content) > ARTIFACT_WRITE_MAX_BYTES:
+        return ToolResult(
+            output=f"content exceeds the {ARTIFACT_WRITE_MAX_BYTES} byte limit.", is_error=True
+        )
+    mime_type = (
+        _optional_string(arguments.get("mime_type"))
+        or mimetypes.guess_type(filename)[0]
+        or "text/plain"
+    )
+    try:
+        row, view = await write_artifact_document(
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+            actor=ContentActor(
+                user_email=owner_email,
+                agent_id=accessor_agent_id,
+                conversation_id=accessor_conversation_id,
+                session_id=(runtime_metadata or {}).get("session_id"),
+            ),
+            content=content,
+            filename=filename,
+            mime_type=mime_type,
+            kind=ArtifactKind.FILE.value,
+            purpose=_optional_string(arguments.get("purpose")) or "artifact_write",
+            supersedes=_optional_string(arguments.get("supersedes")),
+            project_id=_optional_string(arguments.get("project_id")),
+        )
+    except DeliverableRevisionError as exc:
+        payload = exc.to_tool_result()
+        return ToolResult(output=json.dumps(payload), is_error=True, metadata=payload)
+    payload = {
+        "status": "saved",
+        **view.as_dict(),
+        "filename": row.filename,
+        "mime_type": row.mime_type,
+        "size_bytes": int(row.size_bytes or 0),
+        "content_hash": row.content_hash,
+    }
+    # No attachments: a silent write is never presented with the reply.
+    return ToolResult(output=json.dumps(payload), metadata=payload)

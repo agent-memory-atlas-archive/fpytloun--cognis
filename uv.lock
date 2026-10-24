@@ -596,7 +596,7 @@ wheels = [
 
 [[package]]
 name = "cognis-common"
-version = "0.17.1"
+version = "0.18.0"
 source = { editable = "packages/common" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -627,7 +627,7 @@ requires-dist = [
 
 [[package]]
 name = "cognis-controller"
-version = "0.17.1"
+version = "0.18.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiolimiter" },
@@ -635,6 +635,7 @@ dependencies = [
     { name = "alembic" },
     { name = "argon2-cffi" },
     { name = "beautifulsoup4" },
+    { name = "boto3" },
     { name = "cognis-common" },
     { name = "croniter" },
     { name = "cryptography" },
@@ -684,6 +685,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "respx" },
     { name = "ruff" },
+    { name = "towncrier" },
     { name = "types-jsonschema" },
     { name = "types-psutil" },
     { name = "types-python-jose" },
@@ -716,6 +718,7 @@ requires-dist = [
     { name = "argon2-cffi", specifier = ">=23.1.0" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29.0" },
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
+    { name = "boto3", specifier = ">=1.34.0" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34.0" },
     { name = "boto3-stubs", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=1.43.83" },
     { name = "cognis-common", editable = "packages/common" },
@@ -758,6 +761,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
     { name = "tiktoken", specifier = ">=0.8.0" },
+    { name = "towncrier", marker = "extra == 'dev'", specifier = ">=25.8,<26" },
     { name = "trafilatura", specifier = ">=2.0.0" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "types-jsonschema", marker = "extra == 'dev'", specifier = ">=4.26.0.20260518" },
@@ -777,12 +781,13 @@ dev = [{ name = "pytest-xdist", specifier = ">=3.8.0" }]
 
 [[package]]
 name = "cognis-executor"
-version = "0.17.1"
+version = "0.18.0"
 source = { editable = "packages/executor" }
 dependencies = [
     { name = "cognis-common" },
     { name = "httpx" },
     { name = "jsonschema" },
+    { name = "packaging" },
     { name = "platformdirs" },
     { name = "prometheus-client" },
     { name = "psutil" },
@@ -807,6 +812,7 @@ documents = [
 full = [
     { name = "aiolimiter" },
     { name = "beautifulsoup4" },
+    { name = "boto3" },
     { name = "ddgs" },
     { name = "extruct" },
     { name = "jinja2" },
@@ -826,6 +832,7 @@ full = [
     { name = "youtube-transcript-api" },
 ]
 inference = [
+    { name = "boto3" },
     { name = "litellm" },
     { name = "tiktoken" },
 ]
@@ -851,6 +858,8 @@ requires-dist = [
     { name = "aiolimiter", marker = "extra == 'web'", specifier = ">=1.2.1" },
     { name = "beautifulsoup4", marker = "extra == 'full'", specifier = ">=4.14.3" },
     { name = "beautifulsoup4", marker = "extra == 'web'", specifier = ">=4.14.3" },
+    { name = "boto3", marker = "extra == 'full'", specifier = ">=1.34.0" },
+    { name = "boto3", marker = "extra == 'inference'", specifier = ">=1.34.0" },
     { name = "cognis-common", editable = "packages/common" },
     { name = "ddgs", marker = "extra == 'full'", specifier = "==9.15.0" },
     { name = "ddgs", marker = "extra == 'web'", specifier = "==9.15.0" },
@@ -868,6 +877,7 @@ requires-dist = [
     { name = "markdownify", marker = "extra == 'documents'", specifier = ">=0.14.0" },
     { name = "markdownify", marker = "extra == 'full'", specifier = ">=0.14.0" },
     { name = "markdownify", marker = "extra == 'web'", specifier = ">=0.14.0" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "patchright", marker = "extra == 'browser'", specifier = ">=1.55.0" },
     { name = "patchright", marker = "extra == 'full'", specifier = ">=1.55.0" },
     { name = "patchright", marker = "extra == 'web'", specifier = ">=1.55.0" },
@@ -3919,6 +3929,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/fd/18/a545c4ea42af3df6effd7d13d250ba77a0a86fb20393143bbb9a92e434d4/tokenizers-0.22.2-cp39-abi3-win32.whl", hash = "sha256:a6bf3f88c554a2b653af81f3204491c818ae2ac6fbc09e76ef4773351292bc92", size = 2502363, upload-time = "2026-01-05T10:45:20.593Z" },
     { url = "https://files.pythonhosted.org/packages/65/71/0670843133a43d43070abeb1949abfdef12a86d490bea9cd9e18e37c5ff7/tokenizers-0.22.2-cp39-abi3-win_amd64.whl", hash = "sha256:c9ea31edff2968b44a88f97d784c2f16dc0729b8b143ed004699ebca91f05c48", size = 2747786, upload-time = "2026-01-05T10:45:18.411Z" },
     { url = "https://files.pythonhosted.org/packages/72/f4/0de46cfa12cdcbcd464cc59fde36912af405696f687e53a091fb432f694c/tokenizers-0.22.2-cp39-abi3-win_arm64.whl", hash = "sha256:9ce725d22864a1e965217204946f830c37876eee3b2ba6fc6255e8e903d5fcbc", size = 2612133, upload-time = "2026-01-05T10:45:17.232Z" },
+]
+
+[[package]]
+name = "towncrier"
+version = "25.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "jinja2" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c2/eb/5bf25a34123698d3bbab39c5bc5375f8f8bcbcc5a136964ade66935b8b9d/towncrier-25.8.0.tar.gz", hash = "sha256:eef16d29f831ad57abb3ae32a0565739866219f1ebfbdd297d32894eb9940eb1", size = 76322, upload-time = "2025-08-30T11:41:55.393Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/06/8ba22ec32c74ac1be3baa26116e3c28bc0e76a5387476921d20b6fdade11/towncrier-25.8.0-py3-none-any.whl", hash = "sha256:b953d133d98f9aeae9084b56a3563fd2519dfc6ec33f61c9cd2c61ff243fb513", size = 65101, upload-time = "2025-08-30T11:41:53.644Z" },
 ]
 
 [[package]]

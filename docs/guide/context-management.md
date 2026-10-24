@@ -33,7 +33,10 @@ the previous projection is reused.
 
 Let `A` be the effective prompt budget. Integer token counts are rounded down:
 
-- Steady: `min(0.88 × A, steady cap)`.
+- Between-turn trigger: `0.75 × effective input limit`; reduction target:
+  `0.35 × effective input limit`. These use the input limit before the
+  serialization margin (204k and 95.2k for a 272k input limit).
+- Within-turn steady: `min(0.88 × A, steady cap)`.
 - Burst: at least steady, otherwise `min(0.95 × A, burst cap)`.
 - Hard: capped at `A`, at least burst, and otherwise the lower of
   `0.98 × A` and `1.1 × burst cap`.
@@ -50,20 +53,131 @@ These are current implementation defaults, not provider pricing boundaries.
 ## Between turns
 
 1. Assemble canonical history and required instructions.
-2. Above steady, try normal then pressure projection toward steady.
+2. At or below 75% of the effective input budget, do not re-project canonical history.
+   Above 75%, shorten the oldest eligible tool groups toward 35%, keeping recent groups.
 3. Preserve instructions and unrecoverable evidence even if steady cannot be met.
 4. Before any model request, run the model-facing projection/budget gate.
 5. Only unresolved hard pressure enters automatic compaction/recovery.
 
-Thus, crossing steady is not a requirement to summarize the conversation.
+History comes from canonical per-message events in Intaris. Small
+`context_projection` events record which tool results or arguments were shortened,
+which complete tool groups were omitted, and which historical events were dropped.
+They contain identifiers and rendering decisions, not copied message content.
+Replay reapplies those decisions after a restart or Redis loss.
+
+Controller notices append when their content changes; earlier notices are not
+rewritten or removed. Executor assignment notices also retain their original
+position across turns and cache loss. An unchanged pool adds no duplicate notice,
+and removal appends a superseding notice.
+
+Routing notices are recorded once per request and retained at their delivered
+position, including after cold-cache recovery. Their text explicitly limits
+them to the associated request; on later requests they are historical context,
+not current operating instructions. Reassembling the same turn does not append
+an identical notice again. Existing audit-only routing records are not replayed.
+
+The `switch_executor` tool uses a stable schema whenever multiple executors are
+assigned, even if some or all are temporarily offline. Current assignment and
+availability are supplied in context and checked again at execution time; they
+are not embedded as changing schema enums. Task-control and delegated-child
+restrictions remain unchanged.
+
+Per-call `target_executor` schemas likewise use assigned executors that advertise
+and enable the tool, even during temporary outages or reconfiguration. Transient
+availability changes therefore do not add/remove that parameter or rewrite its
+enum. Unassigned, disabled, or unavailable execution targets are still rejected
+by normal execution-time validation.
+
+Cached projection retries retain the compact decisions associated with their
+rendered view. If persistence fails, a cached retry must persist those decisions
+before inference; successful decisions are deduplicated through canonical replay.
+This does not trigger new projection below the normal pressure threshold.
+
+Regular executor calls and controller calls persist the same bounded native replay
+fields. Original argument JSON (including whitespace and Unicode) is retained
+when sanitization does not change its values; redacted arguments are reserialized.
+The raw fallback is independently capped by its encoded JSON byte size, so extra
+whitespace cannot bypass the native-envelope limit.
+Existing events without native fields continue to replay from their recorded
+arguments, but cannot retroactively recover discarded provider formatting.
+
+`Context projection decision` logs contain only metadata: session/turn identifiers,
+phase, trigger reason, pressure mode, before/after token estimates, separate entry
+and deciding thresholds, available budget and steady/burst/hard targets. Cached
+reuse and non-numeric reasons have no new deciding threshold. Cross-turn logs
+distinguish the effective-input target from the actual savings target. A `normal` pressure mode alone
+does not mean projection was unnecessary: the 75% projection trigger is separate
+from the 92% within-turn pressure escalation band. Cached pending deltas are
+identified as `cached_rendering`, not a new pressure transition.
+
+Parallel tool batches can contain both compacted and retained results. Only a
+batch whose results are all compacted is treated as a whole-batch demotion;
+pruning one result does not authorize rewriting its siblings on later normal
+cycles. Synthetic interruption markers remain protected evidence. Existing
+persisted projection decisions still replay with their original rendering.
+
+A textual tool result is replaced by a placeholder only when the placeholder is at
+most half its size. Short outputs stay verbatim: replacing them would add tokens and
+rewrite an early cache position for no saving. Fallback pruning counts savings net
+of the placeholder.
+
+Tools from one model response are executed and recorded as call/result pairs, but
+the live request sends them as one assistant turn followed by their results. Cold
+replay regroups calls owned by the same newly recorded native Responses or Anthropic
+response, so the first request of the next turn keeps the batch shape and native
+call bytes. A version marker on the native assistant or tool-call event opts into this behavior.
+Unmarked historical batches keep their original grouping and omission semantics,
+without a migration. Unrelated messages between calls keep the separate replay.
+Explicitly recorded notices and attachment context belonging to those calls retain
+their live positions without splitting the native assistant batch.
+
+Tool discovery and skill loading append results and instructions without promoting
+new direct schemas. The search/describe/call kernel stays present even before any
+hidden tools become eligible; its schema descriptions do not embed the changing
+inventory. Sessions that can load skills use controller discovery from their first
+request, including Anthropic sessions, because native deferred catalogs would still
+rewrite that prefix as skill tools are activated. Sessions without dynamic skill
+loading can retain native Anthropic search.
+
+New skill instructions, activation notices, and artifact reminders are canonical
+per-message events. Tool attachment context is reconstructed from the original
+sanitized attachment references, not copied media payloads. Declared and
+classifier-selected skill-tool eligibility both recover from Intaris after cache
+loss; loading a skill never bypasses current permissions or hard step profiles.
+UI-only skill-loaded notices do not become extra model instructions on replay.
+Reloads append new instructions while retaining earlier exposed instructions;
+only the latest skill state controls current eligibility. This also applies to
+`/skill` reloads. The same discovery policy governs inference fallback candidates.
+Project-exposure notices preserve their source and role before the first request,
+so Anthropic's notice wrappers match canonical replay.
+
+Native Responses assistant-message items retain their structured content, IDs,
+phase, and other wire fields in the original per-message events. Cold replay and
+same-model profile/effort changes therefore do not flatten those items into
+different string-based input messages. This uses the existing bounded native
+envelope, not transcript snapshots. If a message envelope exceeds that cap, normal
+text fallback remains available without discarding reasoning/call items that fit.
+Older events that never recorded a native message envelope cannot recover its
+missing provider fields retroactively.
+
+Output-limit continuations also preserve individual response
+segments and their notices. The chat timeline combines these segments for display,
+including when a sync window starts partway through a response.
+
+New notices and projection decisions must be durable before inference. A failed
+write stops delivery rather than sending a prompt that cannot be reconstructed.
+Unchanged cycles add no projection events or additional event-store reads.
+Crossing the projection threshold does not itself summarize or rotate the session.
+Full-transcript snapshot events remain retained for audit but are ignored during
+replay; new snapshots are never written.
 
 ## During a turn
 
 The controller does not inject percentage-based instructions telling the model
 to wind down its work. Usage telemetry, projection, hard-budget enforcement,
-and compaction recovery remain active. Removing these advisory messages changes
-only the in-memory prompt; no persistence, locking, retry, or cancellation
-contract changes.
+and compaction recovery remain active. Projection decisions use the existing
+Intaris event append boundary and turn cancellation owner; they add no lock,
+database content copy, or separate retry framework.
 
 Context can grow above steady as the agent reads files, runs tools, and reasons.
 The conditional projection pipeline can reconsider projection above steady,
@@ -92,7 +206,28 @@ Projection replaces eligible bulky tool output with compact recovery references.
 The durable source remains available, but reopening it costs another tool call
 and requires the agent to recognize the need. Compaction instead summarizes
 conversation history and continues through session rotation. A failed or
-zero-turn attempt must terminate visibly rather than leave a running card.
+skipped attempt must terminate visibly rather than leave a running card.
+
+### Compaction during one long turn
+
+The recovery limit counts consecutive compaction rotations without a completed
+model cycle, not every compaction during a long turn. A completed model cycle
+resets the counter. The newly compacted session is projected and measured before
+the controller decides whether another recovery is needed. Two recoveries are
+allowed by default; if pressure still requires another, the turn stops with
+`compaction_recursion_exhausted`. Provider overflow also retains its separate
+one-replay limit.
+
+A turn can run for hours through automatic continuations without a new user
+message. Compaction does not need a whole earlier turn to summarize: when the
+current turn alone is larger than the recent-history allowance (about 30% of the
+prompt budget, measured on the full tool output that would be replayed), it
+summarizes the older part of that turn. Your instruction for the turn, and any
+retry link to it, stays word for word, followed by the most recent complete tool
+steps. The card then reads "Earlier work in the current turn summarized".
+
+Compaction is skipped, before anything is recorded, only when the older part
+holds no conversation content to summarize.
 
 ## Worked examples
 

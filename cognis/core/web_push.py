@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -82,6 +83,21 @@ class PushSubscription:
     subscription_id: str
     endpoint: str
     enabled: bool
+    # The push service permanently rejected this endpoint (404/410).
+    gone: bool = False
+
+
+_GONE_ERROR_PREFIX = "gone: "
+_LEGACY_GONE_ERROR = re.compile(r"\b(?:404|410)\b")
+
+
+def _is_gone_row(row: Any) -> bool:
+    """Whether a stored subscription was disabled because its endpoint is gone."""
+
+    if row.enabled:
+        return False
+    error = row.last_error or ""
+    return error.startswith(_GONE_ERROR_PREFIX) or bool(_LEGACY_GONE_ERROR.search(error))
 
 
 def _b64url(data: bytes) -> str:
@@ -486,6 +502,7 @@ class WebPushService:
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_event)
         event_bus.subscribe(EventType.NOTIFICATION_CREATED, self._handle_event)
+        event_bus.subscribe(EventType.INBOX_CREATED, self._handle_event)
         event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_event)
         event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_event)
         if config.enabled:
@@ -540,6 +557,19 @@ class WebPushService:
                     updated_at=now,
                 )
                 session.add(row)
+            elif _is_gone_row(row):
+                # The push service permanently rejected this endpoint. Re-enabling
+                # it would only fail again; the client must create a new one.
+                logger.info(
+                    "web_push: refused re-registration of gone subscription",
+                    extra={"endpoint_host": _endpoint_host(endpoint), "platform": platform},
+                )
+                return PushSubscription(
+                    subscription_id=row.subscription_id,
+                    endpoint=row.endpoint,
+                    enabled=False,
+                    gone=True,
+                )
             else:
                 row.user_email = user_email
                 row.p256dh = p256dh
@@ -671,6 +701,13 @@ class WebPushService:
                 "web_push: event produced no push payload", extra={"event_type": event.type.value}
             )
             return
+        conversation_id = payload.get("conversation_id")
+        if isinstance(conversation_id, str):
+            from cognis.store.hook_visibility import is_internal_hook_conversation
+
+            async with self._session_factory() as session:
+                if await is_internal_hook_conversation(session, conversation_id):
+                    return
         logger.debug("web_push: dispatching event push", extra={"event_type": event.type.value})
         task = asyncio.create_task(self.send_to_user(**payload))
         self._pending_tasks.add(task)
@@ -684,6 +721,22 @@ class WebPushService:
             logger.exception("web_push: background delivery failed")
 
     async def _event_payload(self, event: Event) -> dict[str, Any] | None:
+        if event.type == EventType.INBOX_CREATED:
+            from cognis.store.models import InboxNotificationRow
+
+            async with self._session_factory() as session:
+                item = await session.get(InboxNotificationRow, event.data.get("notification_id"))
+                if item is None or item.user_email != event.data.get("user_email") or item.read_at:
+                    return None
+                return {
+                    "user_email": item.user_email,
+                    "title": item.title,
+                    "body": item.body,
+                    "fallback_body": "You have a new notification.",
+                    "url": "/notifications",
+                    "tag": item.notification_id,
+                    "kind": "inbox",
+                }
         if event.type == EventType.TURN_COMPLETED:
             if event.data.get("managed_continuation_pending") or event.data.get("partial"):
                 return None
@@ -800,23 +853,27 @@ class WebPushService:
             if isinstance(agent_id, str) and agent_id:
                 async with self._session_factory() as session:
                     agent = await get_agent(session, agent_id)
-            title = _agent_notification_title(agent)
-            icon = await self._agent_notification_icon(agent)
             schedule_id = str(event.data.get("schedule_id") or "schedule")
             schedule_name = str(event.data.get("schedule_name") or "Scheduled task")
+            # A schedule failing to start is a system alert, not a message from
+            # the agent: it keeps Cognis branding (title and app icon) and names
+            # the agent in the body instead.
+            agent_label = _agent_notification_title(agent) if agent is not None else ""
+            subject = f'Schedule "{schedule_name}"'
+            if agent_label and agent_label != "Cognis":
+                subject = f"{subject} ({agent_label})"
             if event.type == EventType.SCHEDULE_DISABLED:
-                body = f'Schedule "{schedule_name}" was disabled after repeated failures.'
+                body = f"{subject} was disabled after repeated failures."
             else:
-                body = f'Schedule "{schedule_name}" failed to start.'
+                body = f"{subject} failed to start."
             return {
                 "user_email": schedule_owner_email,
-                "title": title,
+                "title": "Cognis",
                 "body": body,
                 "url": f"/schedules/{schedule_id}",
                 "tag": f"schedule:{schedule_id}",
                 "kind": "schedule",
                 "conversation_id": "",
-                **({"icon": icon} if icon else {}),
             }
 
         if event.type == EventType.NOTIFICATION_CREATED:
@@ -926,6 +983,7 @@ class WebPushService:
             }
             if status == "gone":
                 values["enabled"] = False
+                values["last_error"] = (_GONE_ERROR_PREFIX + (error or ""))[:500]
                 logger.info(
                     "web_push: subscription disabled after push service returned gone",
                     extra={"endpoint_host": _endpoint_host(row.endpoint)},

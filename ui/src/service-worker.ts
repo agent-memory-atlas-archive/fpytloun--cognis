@@ -28,6 +28,8 @@
 
 import { build, files, prerendered, version } from '$service-worker';
 import { PushObservationRegistry } from '$lib/push-observation';
+import { MediaScopes } from '$lib/offline/media-scope';
+const mediaScopes = new MediaScopes();
 
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
@@ -40,17 +42,120 @@ const PUSH_OBSERVATION_DB = 'cognis-push-observations';
 const PUSH_OBSERVATION_STORE = 'observations';
 const PUSH_OBSERVATION_TTL_MS = 24 * 60 * 60 * 1000;
 
+// Install-time precache is limited to what an offline boot needs: code
+// (JS/CSS), prerendered HTML, the manifest, and app icons. Images, fonts,
+// splash screens, docs, fixtures, and lazily loaded workers are cached on
+// first use instead, so an install or update does not pull tens of MB over a
+// cellular link.
+const PRECACHE_BUILD_ASSET = /\.(?:js|css)$/i;
+const PRECACHE_STATIC_FILES = new Set([
+  '/manifest.webmanifest',
+  '/favicon.ico',
+  '/favicon.svg',
+  '/brand/cognis-mark.svg',
+  '/brand/cognis-mark-color.svg',
+  '/pwa/badge-96.png',
+  '/pwa/icon.svg',
+  '/pwa/icon-192.png',
+  '/pwa/icon-512.png',
+  '/pwa/icon-maskable-512.png',
+  '/pwa/apple-touch-icon.png'
+]);
+
 const PRECACHE_URLS = [
-  ...build,
-  ...files.filter((f) => !f.endsWith('.map')),
+  ...build.filter((f) => PRECACHE_BUILD_ASSET.test(f)),
+  ...files.filter((f) => PRECACHE_STATIC_FILES.has(f)),
   ...prerendered
 ];
+const PRECACHE_URL_SET = new Set(PRECACHE_URLS);
+const IMMUTABLE_PREFIX = '/_app/immutable/';
+
+/**
+ * Fill the new precache, reusing content-hashed immutable files from the
+ * previous version's caches. Only files that changed in this deploy are
+ * downloaded, which keeps updates small on slow connections.
+ */
+async function populatePrecache(cache: Cache): Promise<void> {
+  const previousCaches: Cache[] = [];
+  for (const name of await caches.keys()) {
+    if (!name.startsWith(COGNIS_CACHE_PREFIX) || name === PRECACHE) continue;
+    try {
+      previousCaches.push(await openCacheWithTimeout(name));
+    } catch {
+      // A broken old cache only costs a re-download.
+    }
+  }
+  const missing: string[] = [];
+  for (const url of PRECACHE_URLS) {
+    // Already fetched by an earlier, interrupted install of this version.
+    try {
+      if ((await matchCacheWithTimeout(cache, url))?.ok) continue;
+    } catch {
+      // Treat as missing.
+    }
+    let reused = false;
+    if (url.startsWith(IMMUTABLE_PREFIX)) {
+      for (const previous of previousCaches) {
+        try {
+          const response = await matchCacheWithTimeout(previous, url);
+          if (response?.ok) {
+            await cache.put(url, response);
+            reused = true;
+            break;
+          }
+        } catch {
+          // Fall through to a network fetch.
+        }
+      }
+    }
+    if (!reused) missing.push(url);
+  }
+  await downloadIntoCache(cache, missing);
+}
+
+const PRECACHE_FETCH_CONCURRENCY = 4;
+const PRECACHE_FETCH_ATTEMPTS = 3;
+
+/**
+ * Download files one by one (a few in parallel) with retries, keeping every
+ * file that arrives. `cache.addAll` is all-or-nothing: on a weak mobile link
+ * one failed file discarded the whole update and the next attempt started
+ * from zero, so the phone kept running an old build. If anything is still
+ * missing the install fails, and the next attempt resumes from what is
+ * already stored in this version's cache.
+ */
+async function downloadIntoCache(cache: Cache, urls: string[]): Promise<void> {
+  const queue = [...urls];
+  const failed: string[] = [];
+  const worker = async () => {
+    for (let url = queue.shift(); url !== undefined; url = queue.shift()) {
+      let stored = false;
+      for (let attempt = 0; attempt < PRECACHE_FETCH_ATTEMPTS && !stored; attempt += 1) {
+        try {
+          const response = await fetch(url, { cache: 'no-cache', credentials: 'same-origin' });
+          if (response.ok) {
+            await cache.put(url, response);
+            stored = true;
+          }
+        } catch {
+          // Retry after a short backoff.
+        }
+        if (!stored) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+      }
+      if (!stored) failed.push(url);
+    }
+  };
+  await Promise.all(Array.from({ length: PRECACHE_FETCH_CONCURRENCY }, worker));
+  if (failed.length > 0) {
+    throw new Error(`Precache incomplete: ${failed.length} of ${urls.length} files failed`);
+  }
+}
 
 sw.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(PRECACHE);
-      await cache.addAll(PRECACHE_URLS);
+      await populatePrecache(cache);
       await sw.skipWaiting();
     })()
   );
@@ -61,7 +166,13 @@ sw.addEventListener('activate', (event) => {
     (async () => {
       const names = await caches.keys();
       const staleCognisCaches = names
-        .filter((n) => n.startsWith(COGNIS_CACHE_PREFIX) && n !== PRECACHE && n !== RUNTIME);
+        .filter((n) => (
+          n.startsWith(COGNIS_CACHE_PREFIX)
+          && n !== PRECACHE
+          && n !== RUNTIME
+           // Preserve legacy/account media across updates and logout.
+          && !n.startsWith('cognis-media-')
+        ));
       const isUpdate = staleCognisCaches.length > 0;
 
       await sw.clients.claim();
@@ -113,7 +224,9 @@ type ActiveConversationMessage = {
 };
 
 type ServiceWorkerControlMessage = ActiveConversationMessage & {
-  type?: 'GET_VERSION' | 'SKIP_WAITING' | 'ACTIVE_CONVERSATION' | 'CONVERSATION_OBSERVED';
+  type?: 'GET_VERSION' | 'SKIP_WAITING' | 'ACTIVE_CONVERSATION' | 'CONVERSATION_OBSERVED' | 'CLEAR_MEDIA_CACHE' | 'BIND_MEDIA_SCOPE' | 'REVOKE_MEDIA_SCOPE';
+  owner?: string;
+  epoch?: string;
 };
 
 const activeConversationByClient = new Map<string, string>();
@@ -212,9 +325,29 @@ async function restorePushObservations(clientIds: string[]): Promise<void> {
 sw.addEventListener('message', (event) => {
   const data = event.data as ServiceWorkerControlMessage | undefined;
   const replyPort = event.ports?.[0];
+  if (data?.type === 'BIND_MEDIA_SCOPE') {
+    const source = event.source;
+    if (source && 'id' in source && 'url' in source
+      && new URL(source.url).origin === sw.location.origin) {
+      mediaScopes.bind(source.id, data.owner, data.epoch);
+    }
+    return;
+  }
+  if (data?.type === 'REVOKE_MEDIA_SCOPE') {
+    mediaScopes.revoke();
+    return;
+  }
 
   if (data?.type === 'GET_VERSION') {
     replyPort?.postMessage({ type: 'VERSION', version });
+    return;
+  }
+
+  if (data?.type === 'CLEAR_MEDIA_CACHE') {
+    // Logout/clear: invalidate in-flight media writes, then drop the cache.
+    mediaCacheGeneration += 1;
+    mediaScopes.revoke();
+    replyPort?.postMessage({ type: 'CLEAR_MEDIA_CACHE_ACK' });
     return;
   }
 
@@ -324,7 +457,8 @@ async function fetchApplicationServerKey(): Promise<ArrayBuffer | null> {
   }
 }
 
-async function uploadPushSubscription(subscription: PushSubscription): Promise<void> {
+/** Returns true when the server reports the endpoint as permanently gone. */
+async function uploadPushSubscription(subscription: PushSubscription): Promise<boolean> {
   const json = subscription.toJSON() as {
     endpoint?: string;
     expirationTime?: number | null;
@@ -333,7 +467,7 @@ async function uploadPushSubscription(subscription: PushSubscription): Promise<v
   const endpoint = json.endpoint ?? subscription.endpoint;
   const p256dh = json.keys?.p256dh;
   const auth = json.keys?.auth;
-  if (!endpoint || !p256dh || !auth) return;
+  if (!endpoint || !p256dh || !auth) return false;
   const response = await fetch('/api/v1/push/subscriptions', {
     method: 'POST',
     credentials: 'same-origin',
@@ -348,6 +482,8 @@ async function uploadPushSubscription(subscription: PushSubscription): Promise<v
   if (!response.ok) {
     throw new Error('Push subscription upload failed');
   }
+  const payload = await response.json().catch(() => null) as { gone?: boolean } | null;
+  return payload?.gone === true;
 }
 
 sw.addEventListener('pushsubscriptionchange', (event) => {
@@ -359,11 +495,15 @@ sw.addEventListener('pushsubscriptionchange', (event) => {
         ? urlBase64ToArrayBuffer(existingKey)
         : await fetchApplicationServerKey();
       if (!applicationServerKey) return;
-      const subscription = await sw.registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey
-      });
-      await uploadPushSubscription(subscription);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const subscription = await sw.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey
+        });
+        if (!(await uploadPushSubscription(subscription))) return;
+        // The browser handed back an endpoint the push service rejected.
+        await subscription.unsubscribe().catch(() => false);
+      }
     })()
   );
 });
@@ -409,19 +549,45 @@ async function wasPushObserved(
   return pushObservations.wasObserved(clientIds, conversationId, occurredAt);
 }
 
+const SUPPRESSED_NOTIFICATION_TAG = 'cognis-suppressed';
+
+async function showAndDismissSuppressedNotification(title: string): Promise<void> {
+  try {
+    await sw.registration.showNotification(title, {
+      body: '',
+      tag: SUPPRESSED_NOTIFICATION_TAG,
+      silent: true,
+      badge: '/pwa/badge-96.png',
+      data: { kind: 'suppressed' },
+    });
+    const shown = await sw.registration.getNotifications({ tag: SUPPRESSED_NOTIFICATION_TAG });
+    for (const notification of shown) notification.close();
+  } catch {
+    // Best effort; the push event itself still completes.
+  }
+}
+
 sw.addEventListener('push', (event) => {
   const payload = parsePushPayload(event);
   event.waitUntil(
     (async () => {
       const target = new URL(payload.url || '/chat', sw.location.origin);
-      if (await wasPushObserved(payload.conversation_id, payload.occurred_at)) return;
-      if (await hasForegroundClientFor(target, payload.conversation_id)) return;
+      if (
+        await wasPushObserved(payload.conversation_id, payload.occurred_at)
+        || await hasForegroundClientFor(target, payload.conversation_id)
+      ) {
+        // The user is already looking at this. Safari/iOS revokes the push
+        // subscription after a few pushes that display nothing, so show a
+        // silent notification and close it at once instead of skipping it.
+        await showAndDismissSuppressedNotification(payload.title || 'Cognis');
+        return;
+      }
       const notificationOptions: NotificationOptions & {
         actions?: Array<{ action: string; title: string }>;
       } = {
         body: payload.body || 'Cognis needs your attention.',
         icon: notificationIcon(payload.icon),
-        badge: '/pwa/icon-192.png',
+        badge: '/pwa/badge-96.png',
         tag: payload.tag || 'cognis',
         data: {
           url: `${target.pathname}${target.search}${target.hash}`,
@@ -528,7 +694,30 @@ function isPassthrough(request: Request, url: URL): boolean {
 }
 
 function isPrecached(url: URL): boolean {
-  return PRECACHE_URLS.includes(url.pathname);
+  return PRECACHE_URL_SET.has(url.pathname);
+}
+
+/** Content-hashed build output can be cached forever once fetched. */
+function isImmutableAsset(url: URL): boolean {
+  return url.pathname.startsWith(IMMUTABLE_PREFIX) && !url.search;
+}
+
+async function runtimeCacheFirst(request: Request): Promise<Response> {
+  try {
+    const cache = await openCacheWithTimeout(RUNTIME);
+    const cached = await matchCacheWithTimeout(cache, request);
+    if (cached) return cached;
+  } catch {
+    // Treat a wedged CacheStorage as a miss.
+  }
+  const response = await fetch(request);
+  if (response.ok && response.type === 'basic') {
+    const copy = response.clone();
+    void openCacheWithTimeout(RUNTIME)
+      .then((runtime) => runtime.put(request, copy))
+      .catch(() => {});
+  }
+  return response;
 }
 
 function rejectAfter<T>(timeoutMs: number, label: string): Promise<T> {
@@ -593,13 +782,94 @@ async function staleWhileRevalidate(request: Request): Promise<Response> {
   return cached ?? (await fetchPromise) ?? new Response('', { status: 504 });
 }
 
+// Viewed chat media (images, signed artifact files). Content is immutable per
+// object id, so it is cached by path (signatures in the query rotate) for
+// instant and offline re-display. The page wipes this cache on logout.
+const MEDIA_CACHE = 'cognis-media-v1';
+let mediaCacheGeneration = 0;
+const MEDIA_CACHE_MAX_ENTRIES = 200;
+const MEDIA_CACHE_MAX_BYTES = 10 * 1024 * 1024;
+const MEDIA_PATH = /^\/api\/v1\/(?:images\/[^/]+$|artifacts\/(?:content|view)\/)/;
+
+function isCacheableMediaRequest(request: Request, url: URL): boolean {
+  return request.method === 'GET'
+    && url.origin === sw.location.origin
+    && MEDIA_PATH.test(url.pathname)
+    && !request.headers.has('range');
+}
+
+function mediaCacheKey(url: URL): string {
+  return `${url.origin}${url.pathname}`;
+}
+
+async function trimMediaCache(cache: Cache): Promise<void> {
+  const keys = await cache.keys();
+  const excess = keys.length - MEDIA_CACHE_MAX_ENTRIES;
+  // CacheStorage keys are returned in insertion order: drop the oldest.
+  for (let index = 0; index < excess; index += 1) await cache.delete(keys[index]);
+}
+
+async function mediaCacheFirst(request: Request, url: URL, clientId: string): Promise<Response> {
+  const scope = mediaScopes.scope(clientId);
+  // Unknown-owner caches are preserved but never read, including after restart.
+  if (!scope) return fetch(request);
+  const key = new Request(url.href, { method: 'GET' });
+  const cacheName = mediaScopes.cache(scope);
+  const generation = mediaCacheGeneration;
+  try {
+    const cache = await openCacheWithTimeout(cacheName);
+    const cached = await matchCacheWithTimeout(cache, key);
+    if (cached && mediaScopes.current(clientId, scope)) return cached;
+  } catch {
+    // Treat a wedged CacheStorage as a miss.
+  }
+  const response = await fetch(request);
+  const contentType = response.headers.get('content-type') ?? '';
+  const length = Number(response.headers.get('content-length') ?? '0');
+  if (
+    response.status === 200
+    && response.type === 'basic'
+    && /^(?:image|audio)\//.test(contentType)
+    && (!length || length <= MEDIA_CACHE_MAX_BYTES)
+  ) {
+    const copy = response.clone();
+    void (async () => {
+      try {
+        if (generation !== mediaCacheGeneration || !mediaScopes.current(clientId, scope)) return;
+        const cache = await openCacheWithTimeout(cacheName);
+        if (generation !== mediaCacheGeneration || !mediaScopes.current(clientId, scope)) return;
+        await cache.put(key, copy);
+        if (generation !== mediaCacheGeneration || !mediaScopes.current(clientId, scope)) {
+          // A clear raced this write; undo it.
+          await cache.delete(key);
+          return;
+        }
+        await trimMediaCache(cache);
+      } catch {
+        // Quota or storage errors only cost a later re-download.
+      }
+    })();
+  }
+  return response;
+}
+
 sw.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
+  if (isCacheableMediaRequest(event.request, url)) {
+    event.respondWith(mediaCacheFirst(event.request, url, event.clientId));
+    return;
+  }
   if (isPassthrough(event.request, url)) return;
 
   // Precached app shell + build assets.
   if (isPrecached(url)) {
     event.respondWith(cacheFirst(event.request));
+    return;
+  }
+
+  // Other hashed build output (images, fonts, workers): cache on first use.
+  if (isImmutableAsset(url)) {
+    event.respondWith(runtimeCacheFirst(event.request));
     return;
   }
 

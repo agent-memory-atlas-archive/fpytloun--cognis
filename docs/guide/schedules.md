@@ -20,6 +20,19 @@ Each schedule acts as a task factory: when it fires, Cognis creates a normal tas
 
 The Schedules page shows active and recently completed one-shot schedules by default. One-shot schedules with no future run move to `Expired` after a 24-hour grace period.
 
+On the dashboard, open an upcoming schedule and select **Planned steps** to
+understand its workflow before it runs. The preview shows the workflow purpose,
+agent instructions, tool actions, approval choices, decision paths, and possible
+completion outcomes, including silent versus delivered results. Authored phases
+group related steps.
+
+Steps appear in definition order, not a promise that every step will execute.
+Conditions and outcome routes choose the next path. Expand **Instructions and
+technical details** for full prompts, result messages, and supporting
+configuration. Raw tool arguments are intentionally omitted from the preview;
+inspect the workflow definition when you need the exact command or payload.
+Agent work describes intent, not a prediction of every action the agent will take.
+
 ## Creating a schedule
 
 Open `Schedules` and define:

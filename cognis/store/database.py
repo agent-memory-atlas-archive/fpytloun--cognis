@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -14,8 +15,9 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import ConnectionPoolEntry, NullPool
 
+from cognis import json_codec
 from cognis.logging import get_logger
 from cognis.store import work_live_invalidation as _work_live_invalidation  # noqa: F401
 
@@ -60,12 +62,21 @@ def _instrument_pool(engine: AsyncEngine) -> None:
         DB_POOL_CONNECTIONS_CLOSED_TOTAL.inc()
 
     @event.listens_for(engine.sync_engine, "checkout")
-    def _connection_checked_out(_: object, __: object, ___: object) -> None:
-        DB_POOL_CHECKED_OUT.inc()
+    def _connection_checked_out(_: object, record: ConnectionPoolEntry, ___: object) -> None:
+        info = record.record_info
+        assert info is not None  # Pool events always supply an attached connection record.
+        if not info.get("cognis_checked_out", False):
+            info["cognis_checked_out"] = True
+            DB_POOL_CHECKED_OUT.inc()
 
     @event.listens_for(engine.sync_engine, "checkin")
-    def _connection_checked_in(_: object, __: object) -> None:
-        DB_POOL_CHECKED_OUT.dec()
+    def _connection_checked_in(_: object, record: ConnectionPoolEntry) -> None:
+        # Failed acquisition can check in without checkout. record_info survives
+        # invalidation, whose valid checkin may have no DBAPI connection.
+        info = record.record_info
+        assert info is not None
+        if info.pop("cognis_checked_out", False):
+            DB_POOL_CHECKED_OUT.dec()
 
     @event.listens_for(engine.sync_engine, "invalidate")
     def _connection_invalidated(_: object, __: object, ___: object) -> None:
@@ -87,11 +98,16 @@ def create_engine(database_url: str) -> AsyncEngine:
         pool_kwargs["pool_size"] = 5
         pool_kwargs["max_overflow"] = 10
         pool_kwargs["pool_pre_ping"] = True
+        if database_url.startswith("postgresql+asyncpg:"):
+            connect_args["server_settings"] = {
+                "application_name": f"cognis-controller:{os.getpid()}",
+            }
 
     engine = create_async_engine(
         database_url,
         connect_args=connect_args,
         echo=False,
+        json_deserializer=json_codec.decode,
         **pool_kwargs,
     )
     _instrument_pool(engine)
@@ -130,6 +146,25 @@ async def get_session(
         except Exception:
             await session.rollback()
             raise
+
+
+@asynccontextmanager
+async def read_snapshot(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncGenerator[AsyncSession, None]:
+    """Own a short database snapshot; callers must not perform external I/O.
+
+    PostgreSQL READ COMMITTED is not a multi-query snapshot. SQLite's legacy
+    driver does not begin a transaction for SELECT, so explicitly begin there.
+    Closing rolls back and releases the snapshot, including on cancellation.
+    """
+    async with session_factory() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+        else:
+            await session.execute(text("BEGIN"))
+        yield session
 
 
 async def check_connection(engine: AsyncEngine) -> bool:

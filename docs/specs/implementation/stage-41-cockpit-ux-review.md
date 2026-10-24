@@ -10,7 +10,7 @@ coherent redesign that reuses existing primitives and preserves all current
 product semantics. No production UI or backend code is changed by this stage.
 The design worktree contains only `docs/` artifacts.
 
-- Design worktree: `/home/riker/src/cognis-stage41-ux-review`
+- Design worktree: task-owned isolated checkout (private location omitted).
 - Branch: `design/stage41-cockpit-ux-review`
 - Review base/head: `f65280a4`
 - Artifacts: this spec + `docs/wireframes/stage-41/` (SVG + PNG).

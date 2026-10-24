@@ -5,6 +5,13 @@ Cognis artifacts into a configured vector backend and querying them with hybrid
 retrieval. The feature is generic: a knowledgebase belongs to a user, links to
 canonical Cognis artifacts, and stores only disposable derived chunks/vectors.
 
+Owner operational reads (`knowledgebase_status`, `knowledgebase_diagnostics`,
+`knowledgebase_list_jobs`, and `knowledgebase_list_artifacts`) are available
+through an active owner agent assigned to that KB. They do not bypass assignment:
+revoked, unassigned, inactive, or foreign agents remain denied. Shared-agent
+grantees do not gain access to these operational details. Direct owner API
+access and direct document-sharing behavior are unchanged.
+
 ## Enablement
 
 The API is present, but operational endpoints are hidden/unavailable unless both
@@ -69,6 +76,31 @@ PDF and DOCX extraction runs in a small concurrency-limited child-process
 boundary with wall-clock, CPU, memory, page/span/text, and archive expansion
 limits. DOCX archive entry count, entry size, encryption, and compression ratio
 are validated before parsing. Plain text extraction stays in-process.
+
+JPEG, PNG, WebP and GIF images use the existing owner-scoped
+`attachment_analysis` route (with the system route as fallback). The selected
+model must support that image MIME type. No independent OCR service is required.
+Image extraction has a 20 MiB input limit, two concurrent calls per controller,
+a 120-second timeout and bounded structured output. A missing/incompatible
+route, invalid output or an unreadable image fails the job explicitly; queued
+does not mean indexed. Failed jobs can be retried after correcting routing.
+
+Vision-derived evidence separates transcription, visible description and
+uncertainties. Every image chunk is labeled as generated evidence and carries
+the original artifact ID/hash plus extraction version and model provenance.
+This is not a guarantee of accurate OCR: verify important details against the
+original, especially dates, names and partially visible text. Image instructions
+are untrusted data, not indexing instructions.
+Original bytes remain unchanged and non-expiring. Citation and extracted-content
+reads use the published generation rather than running vision again. Reindexing
+uses the existing generation/lease fences and keeps the last good generation
+searchable until its replacement succeeds.
+
+Agent-management discovery and execution share the assignable tool registry and
+workflow catalog, including shipped system workflows. KB choices read current
+caller-agent assignments from the database: a KB created in the same turn is
+available immediately, and revoked assignments are not retained by a stale turn
+snapshot. Ownership and active caller-agent assignment remain required.
 
 Indexing is handled by a background worker backed by persistent
 `knowledgebase_index_jobs`. Jobs move through queued/running/succeeded/failed

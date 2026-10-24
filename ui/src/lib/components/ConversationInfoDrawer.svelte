@@ -124,12 +124,12 @@
     {#if header}
       {@render header()}
     {:else}
-      <h2 id="conversation-info-heading" class="text-sm font-semibold text-slate-100">Context</h2>
+      <h2 id="conversation-info-heading" class="text-sm font-semibold text-foreground">Context</h2>
     {/if}
     <div class="ml-auto flex shrink-0 items-center gap-1">
       {#if presentation === 'pinned' || presentation === 'focus'}
       <button
-        class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800 hover:text-white"
+        class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted transition hover:bg-surface-hover hover:text-strong"
         type="button"
         aria-label={presentation === 'focus' ? 'Exit expanded inspector' : 'Expand inspector'}
         title={presentation === 'focus' ? 'Exit expanded view' : 'Expand'}
@@ -140,7 +140,7 @@
       {/if}
       {#if presentation === 'overlay'}
       <button
-        class="touch-target-compact inline-flex items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800 hover:text-white"
+        class="touch-target-compact inline-flex items-center justify-center rounded-lg text-muted transition hover:bg-surface-hover hover:text-strong"
         type="button"
         aria-label="Close conversation information"
         onclick={onClose}
@@ -160,7 +160,7 @@
     restoreFocusOnClose={false}
     class={presentation === 'focus'
       ? 'app-fullscreen-safe w-screen max-w-none rounded-none border-0'
-      : 'w-[min(30rem,calc(100vw-1rem))] rounded-l-[1.25rem] border border-slate-800/80 bg-slate-950 shadow-card'}
+      : 'w-[min(30rem,calc(100vw-1rem))] rounded-l-[1.25rem] border border-separator bg-elevated shadow-card'}
   >
     {#snippet header()}{@render panelHeader()}{/snippet}
     {@render children()}
@@ -168,7 +168,7 @@
 {:else if presentation === 'pinned'}
   <aside
     id="conversation-info-drawer"
-    class={`relative col-start-2 row-span-3 row-start-1 flex min-h-0 min-w-0 flex-col border-l border-slate-800/60 bg-transparent ${resizing ? 'select-none' : ''}`}
+    class={`relative col-start-2 row-span-3 row-start-1 flex min-h-0 min-w-0 flex-col border-l border-separator bg-transparent ${resizing ? 'select-none' : ''}`}
     style={`width:${width}px`}
     aria-labelledby="conversation-info-heading"
     data-testid="conversation-info-drawer"
@@ -183,12 +183,12 @@
       aria-valuemax={INSPECTOR_MAX_WIDTH}
       aria-valuenow={width}
       aria-valuetext={`${width} pixels wide`}
-      class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-sky-400/40"
+      class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent/40"
       onpointerdown={startResize}
       onkeydown={resizeWithKeyboard}
       data-testid="conversation-info-resizer"
     ></div>
-    <div class="flex min-w-0 shrink-0 items-center border-b border-slate-800/80 px-3 py-2">
+    <div class="flex min-w-0 shrink-0 items-center border-b border-separator px-3 py-2">
       {@render panelHeader()}
     </div>
     <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4 pt-6">

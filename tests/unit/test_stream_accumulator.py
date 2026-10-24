@@ -6,6 +6,10 @@ restarts and split tool calls could silently corrupt arguments.
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from cognis.core.agent_loop import (
     _MAX_TOOL_CALL_ARGUMENT_CHARS,
     StreamAccumulator,
@@ -41,6 +45,34 @@ def test_basic_concatenation_assembles_full_json() -> None:
     calls = acc.get_tool_calls()
     assert len(calls) == 1
     assert calls[0].arguments == {"todos": [{"content": "a", "status": "pending"}]}
+
+
+@pytest.mark.parametrize("wrapper", [None, "call_tool", "validate_tool_call"])
+def test_nested_management_envelope_survives_fragmentation(wrapper: str | None) -> None:
+    acc = StreamAccumulator()
+    settings = {
+        "executor_id": "maitrea_riker",
+        "memory_backend": "mnemory",
+        "memory_backend_options": {"mode": "full_auto"},
+    }
+    envelope = {"action": "settings_update", "agent_id": "dobby", "settings": settings}
+    if wrapper:
+        _feed_tool_delta(acc, '{"tool":"manage_agents","arguments":', name=wrapper)
+    _feed_tool_delta(
+        acc,
+        '{"action":"settings_update","agent_id":"dobby","settings":',
+        name=wrapper or "manage_agents",
+    )
+    _feed_tool_delta(acc, json.dumps(settings), name=wrapper or "manage_agents")
+    _feed_tool_delta(acc, "}", name=wrapper or "manage_agents")
+    if wrapper:
+        _feed_tool_delta(acc, "}", name=wrapper)
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].call_id == "call_1"
+    assert calls[0].arguments == (
+        {"tool": "manage_agents", "arguments": envelope} if wrapper else envelope
+    )
 
 
 def test_duplicate_prefix_is_dropped() -> None:
@@ -264,19 +296,20 @@ def test_oversized_tool_arguments_become_recoverable_failure() -> None:
 
 
 def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
+    """Recover a synthetic Unicode task with fictional external bindings."""
     acc = StreamAccumulator()
     _feed_tool_delta(
         acc,
-        '{"tasks":[content":"Fixnout sizing RDS instance v Terraform",'
+        '{"tasks":[content":"Aktualizovat zkušební katalog",'
         '"description":"","priority":"p4","dueString":"Monday",'
         '"deadlineDate":"","duration":"","labels":[],"'
-        'projectId":"6fMRX3vr2McFxCr7","sectionId":"6fr2pjvJV2M5PFF7",'
+        'projectId":"demoProject000001","sectionId":"demoSection000001",'
         '"parentId":"","order":0,"responsibleUser":"",'
-        '"isUncompletable":false}]}{"tasks":[{"content":"Fixnout sizing RDS '
-        'instance v Terraform","description":"","priority":"p4",'
+        '"isUncompletable":false}]}{"tasks":[{"content":"Aktualizovat zkušební '
+        'katalog","description":"","priority":"p4",'
         '"dueString":"Monday","deadlineDate":"","duration":"",'
-        '"labels":[],"projectId":"6fMRX3vr2McFxCr7",'
-        '"sectionId":"6fr2pjvJV2M5PFF7","parentId":"","order":0,'
+        '"labels":[],"projectId":"demoProject000001",'
+        '"sectionId":"demoSection000001","parentId":"","order":0,'
         '"responsibleUser":"","isUncompletable":false}]}',
         name="mcp__todoist_add_tasks",
     )
@@ -286,15 +319,15 @@ def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
     assert calls[0].arguments == {
         "tasks": [
             {
-                "content": "Fixnout sizing RDS instance v Terraform",
+                "content": "Aktualizovat zkušební katalog",
                 "description": "",
                 "priority": "p4",
                 "dueString": "Monday",
                 "deadlineDate": "",
                 "duration": "",
                 "labels": [],
-                "projectId": "6fMRX3vr2McFxCr7",
-                "sectionId": "6fr2pjvJV2M5PFF7",
+                "projectId": "demoProject000001",
+                "sectionId": "demoSection000001",
                 "parentId": "",
                 "order": 0,
                 "responsibleUser": "",

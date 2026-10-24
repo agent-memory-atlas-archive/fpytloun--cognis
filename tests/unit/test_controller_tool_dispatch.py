@@ -28,6 +28,8 @@ class _Router:
         output_chunk_callback: object = None,
         before_executor_send: object = None,
         after_executor_send: object = None,
+        workflow_step_scope: object = None,
+        workflow_executor_id: str | None = None,
     ) -> ToolResult:
         del output_chunk_callback, before_executor_send, after_executor_send
         self.calls.append((tool_call, executor))
@@ -55,6 +57,7 @@ async def test_dispatch_rejects_incompatible_editor(model_id: str, tool_name: st
     router = _Router()
     loop = object.__new__(AgentLoop)
     loop.tool_router = router
+    loop.session_cache = None
     loop.providers = SimpleNamespace(executor=None)
     loop.session_manager = SimpleNamespace(session_factory=None)
     agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
@@ -106,6 +109,10 @@ async def test_regular_agent_tool_uses_shared_dispatch_and_strips_target_executo
     loop.tool_router = router
     loop.providers = SimpleNamespace(executor=None)
     loop.session_manager = SimpleNamespace(session_factory=None)
+    loop.session_cache = SimpleNamespace(
+        get_loaded_skill_snapshots=lambda _: {},
+        get_events_since_compaction=lambda *_, **__: [],
+    )
     loop._resolve_target_connection = (  # type: ignore[method-assign]
         lambda **kwargs: "connection-b" if kwargs["target_executor_id"] == "executor-b" else None
     )
@@ -163,6 +170,21 @@ async def test_regular_agent_tool_uses_shared_dispatch_and_strips_target_executo
     assert routed_call.runtime_metadata["task_id"] == "task-1"
     assert routed_call.runtime_metadata["step_run_id"] == "step-run-1"
     assert routed_executor == "connection-b"
+    retried = await loop.execute_controller_tool(
+        ctx,
+        ToolCall(
+            call_id="call-1",
+            name="read_file",
+            arguments={"path": "/tmp/input", "target_executor": "executor-b"},
+        ),
+        approval_call_id="approved-evaluation",
+    )
+    assert retried.output == "ok"
+    retry_call, retry_executor = router.calls[1]
+    assert retry_call.arguments == routed_call.arguments
+    assert retry_executor == routed_executor
+    assert retry_call.runtime_metadata["approval_call_id"] == "approved-evaluation"
+    assert "approval_call_id" not in routed_call.runtime_metadata
 
 
 @pytest.mark.asyncio

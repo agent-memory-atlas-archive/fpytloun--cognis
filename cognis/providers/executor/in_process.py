@@ -61,7 +61,13 @@ from cognis.tools.executor.shell import (
     cleanup_shell_manager,
     set_background_shell_completion_callback,
 )
-from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
+from cognis.tools.registry import (
+    RegisteredTool,
+    ToolBackgroundControl,
+    ToolBackgroundRequestOutcome,
+    ToolExecutionContext,
+    ToolRegistry,
+)
 
 _logger = get_logger(__name__)
 
@@ -102,12 +108,20 @@ class InProcessExecutorConnection:
         self.runtime_metadata = runtime_metadata or {}
         self.internal_handlers = dict(internal_handlers or {})
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
+        self._background_controls: dict[str, ToolBackgroundControl] = {}
 
-    async def rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def rpc_call(
+        self, method: str, params: dict[str, Any], timeout: float | None = None
+    ) -> dict[str, Any]:
         """Handle an in-memory JSON-RPC request."""
 
         if method == "tool.list":
             return {"tools": self.registry.export()}
+        if method == "skill.assets.prepare":
+            from cognis.executor.skill_assets import prepare_skill_assets
+
+            async with asyncio.timeout(timeout):
+                return await prepare_skill_assets(params)
         if method == "tool.execute":
             tool_call = ToolCall(
                 call_id=str(params.get("call_id") or uuid.uuid4().hex),
@@ -124,6 +138,14 @@ class InProcessExecutorConnection:
         if method in {"cancel", "tool.cancel"}:
             await self.cancel_call(str(params["call_id"]))
             return {"status": "cancelled"}
+        if method == "tool.background":
+            call_id = str(params["call_id"])
+            outcome = await self.request_background(call_id)
+            return {
+                "call_id": call_id,
+                "accepted": outcome is ToolBackgroundRequestOutcome.ACCEPTED,
+                "outcome": outcome.value,
+            }
         if method in {"heartbeat", "executor.heartbeat"}:
             return {"status": "ok", "active_calls": len(self._active_calls)}
         if method == "shell.background_status":
@@ -208,6 +230,8 @@ class InProcessExecutorConnection:
                     metadata={"code": "invalid_tool_arguments"},
                 )
 
+        background_control = ToolBackgroundControl()
+
         async def invoke_handler() -> ToolResult:
             start = perf_counter()
             context = ToolExecutionContext(
@@ -216,6 +240,7 @@ class InProcessExecutorConnection:
                 shared_runtime_metadata=self.runtime_metadata,
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
                 output_chunk_callback=output_chunk_callback,
+                background_control=background_control,
             )
             try:
                 result = await handler(tool_call.arguments, context)
@@ -230,6 +255,7 @@ class InProcessExecutorConnection:
 
         task = asyncio.create_task(self.breaker.call(invoke_handler))
         self._active_calls[tool_call.call_id] = task
+        self._background_controls[tool_call.call_id] = background_control
         try:
             if timeout_seconds is not None:
                 return await asyncio.wait_for(task, timeout=timeout_seconds)
@@ -252,6 +278,15 @@ class InProcessExecutorConnection:
             return ToolResult(output=f"Tool execution failed: {error_detail}", is_error=True)
         finally:
             self._active_calls.pop(tool_call.call_id, None)
+            self._background_controls.pop(tool_call.call_id, None)
+
+    async def request_background(self, call_id: str) -> ToolBackgroundRequestOutcome:
+        """Ask a running tool call to hand its work off to the background."""
+
+        control = self._background_controls.get(call_id)
+        if control is None:
+            return ToolBackgroundRequestOutcome.UNKNOWN_CALL
+        return control.request()
 
     async def cancel_call(self, call_id: str) -> None:
         """Cancel a running tool execution task."""
@@ -418,6 +453,15 @@ class InProcessExecutorProvider:
         """List active executor handles."""
 
         return [runtime.handle for runtime in self._active.values()]
+
+    async def request_background(self, call_id: str) -> ToolBackgroundRequestOutcome:
+        """Route a background handoff request to the runtime executing ``call_id``."""
+
+        for runtime in list(self._active.values()):
+            outcome = await runtime.connection.request_background(call_id)
+            if outcome is not ToolBackgroundRequestOutcome.UNKNOWN_CALL:
+                return outcome
+        return ToolBackgroundRequestOutcome.UNKNOWN_CALL
 
     def register_background_shell_completed_callback(
         self,

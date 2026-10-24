@@ -17,9 +17,9 @@
   );
 
   function statusDotClass(agent: Agent): string {
-    if (agent.status === 'active') return 'bg-emerald-400';
-    if (agent.status === 'suspended') return 'bg-amber-400';
-    return 'bg-slate-500';
+    if (agent.status === 'active') return 'bg-success';
+    if (agent.status === 'suspended') return 'bg-warning';
+    return 'bg-muted';
   }
 </script>
 
@@ -34,10 +34,10 @@
       onclick={() => onSelectAgent(agent)}
     >
       <span class="relative">
-        <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} class="h-12 w-12 transition group-hover:ring-2 group-hover:ring-sky-400" />
-        <span class={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-slate-950 ${statusDotClass(agent)}`} aria-hidden="true"></span>
+        <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} class="h-12 w-12 transition group-hover:ring-2 group-hover:ring-accent" />
+        <span class={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-separator ${statusDotClass(agent)}`} aria-hidden="true"></span>
       </span>
-      <span class="max-w-[4.5rem] truncate text-[11px] text-slate-300">{agent.display_name ?? agent.name}</span>
+      <span class="max-w-[4.5rem] truncate text-[11px] text-secondary">{agent.display_name ?? agent.name}</span>
     </button>
   {/each}
 </div>

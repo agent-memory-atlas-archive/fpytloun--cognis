@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -13,7 +14,7 @@ from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.commands import CommandDispatcher, is_system_slash_command_message
 from cognis.core.session_cache import SessionCache
-from cognis.models.agent import AgentDefinition, AgentLLMConfig
+from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentRuntimeProfile
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
@@ -78,6 +79,46 @@ class _NotificationService:
             ),
             None,
         )
+
+    async def list_actionable_escalations(
+        self, *, user_email: str, conversation_id: str
+    ) -> list[object]:
+        del user_email
+        return [
+            item
+            for item in self.pending_notifications
+            if getattr(item, "conversation_id", None) == conversation_id
+            and getattr(item, "notification_type", None) == "escalation"
+        ]
+
+    async def find_escalation(
+        self, *, notification_id: str, user_email: str, conversation_id: str
+    ) -> object | None:
+        return next(
+            (
+                item
+                for item in await self.list_actionable_escalations(
+                    user_email=user_email, conversation_id=conversation_id
+                )
+                if item.notification_id == notification_id
+            ),
+            None,
+        )
+
+    async def resolve_escalation(
+        self,
+        notification_id: str,
+        decision: str,
+        data: dict[str, object],
+        *,
+        user_email: str,
+        conversation_id: str,
+        require_unique: bool = False,
+        pre_submit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        if pre_submit_guard is not None and not pre_submit_guard():
+            return False
+        return await self.resolve(notification_id, decision, data, user_email=user_email)
 
 
 class _TurnScheduler:
@@ -761,6 +802,189 @@ async def test_slash_suggestions_include_command_and_dynamic_model_options() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "session",
+        "agent",
+        "profile",
+        "conversation_profile",
+        "routing",
+        "bare_override",
+        "provider_only",
+    ],
+)
+@pytest.mark.parametrize("stale_cache", [False, True])
+async def test_model_current_markers_use_effective_provider_not_cache(
+    source: str, stale_cache: bool
+) -> None:
+    model = "claude-sonnet-4-5"
+    refs = [
+        {
+            "provider_id": provider_id,
+            "provider_display_name": provider_id,
+            "model_id": model,
+            "value": f"{provider_id}/{model}",
+            "is_default_provider": False,
+        }
+        for provider_id in ("anthropic-sub", "anthropic-api")
+    ]
+    llm = _LLMProvider()
+    llm.list_model_references = AsyncMock(return_value=refs)
+    llm.resolve_model_target = AsyncMock(return_value=(model, "anthropic-api"))
+    cache = _SessionCache(
+        usage={"model": model, "provider_id": "anthropic-sub"} if stale_cache else None
+    )
+    if stale_cache:
+        cache.model_override_provider_id = "anthropic-sub"
+    session, agent, conversation = _session(), _agent(), _conversation()
+    if source == "session":
+        session.model_override = model
+        session.model_override_provider_id = "anthropic-api"
+    elif source == "agent":
+        agent.llm_config = AgentLLMConfig(model=model, provider_id="anthropic-api")
+    elif source in {"profile", "conversation_profile"}:
+        agent.agent_profiles = {
+            "api": AgentRuntimeProfile(model=model, provider_id="anthropic-api")
+        }
+        if source == "profile":
+            session.agent_profile_id = "api"
+        else:
+            conversation.agent_profile_id = "api"
+    elif source == "bare_override":
+        session.model_override = model
+    elif source == "provider_only":
+        agent.llm_config = AgentLLMConfig(provider_id="anthropic-api")
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=_SessionManager(),
+        session_cache=cache,
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=llm),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    suggestions = await dispatcher.suggest(
+        "/model cla",
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        user_email=session.user_email,
+    )
+    assert [item.value for item in suggestions if "current" in item.badges] == [
+        f"anthropic-api/{model}"
+    ]
+    listed = await dispatcher.dispatch(
+        "/model",
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        user_email=session.user_email,
+    )
+    assert listed is not None
+    assert f"anthropic-api/{model} *" in listed.text
+    assert f"anthropic-sub/{model} *" not in listed.text
+    assert f"Current: anthropic-api/{model}" in listed.text
+    if source in {"routing", "bare_override", "provider_only"}:
+        llm.resolve_model_target.assert_called_with(
+            explicit_model=model if source == "bare_override" else None,
+            explicit_provider_id="anthropic-api" if source == "provider_only" else None,
+            acting_user_email=session.user_email,
+        )
+    else:
+        llm.resolve_model_target.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_model_suggestions_do_not_mark_all_providers_when_resolution_fails() -> None:
+    model = "claude-sonnet-4-5"
+    llm = _LLMProvider()
+    llm.list_model_references = AsyncMock(
+        return_value=[
+            {"provider_id": provider, "model_id": model, "value": f"{provider}/{model}"}
+            for provider in ("anthropic-sub", "anthropic-api")
+        ]
+    )
+    llm.resolve_model_target = AsyncMock(side_effect=ValueError("Ambiguous provider"))
+    session = _session()
+    session.model_override = model
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=_SessionManager(),
+        session_cache=_SessionCache(),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=llm),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    suggestions = await dispatcher.suggest(
+        "/model cla",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email=session.user_email,
+    )
+    assert len(suggestions) == 2
+    assert not any("current" in item.badges for item in suggestions)
+    listed = await dispatcher.dispatch(
+        "/model",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email=session.user_email,
+    )
+    assert listed is not None
+    assert " *" not in listed.text
+
+
+@pytest.mark.asyncio
+async def test_model_command_switches_provider_for_same_model() -> None:
+    model = "claude-sonnet-4-5"
+    llm = _LLMProvider()
+    original_refs = await llm.list_model_references()
+    llm.list_model_references = AsyncMock(
+        return_value=[
+            *original_refs,
+            {"provider_id": "anthropic-api", "model_id": model, "value": f"anthropic-api/{model}"},
+        ]
+    )
+    session, agent, conversation = _session(), _agent(), _conversation()
+    session.model_override = model
+    session.model_override_provider_id = "anthropic-sub"
+    cache = _SessionCache(usage={"model": model, "provider_id": "anthropic-sub"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=_SessionManager(),
+        session_cache=cache,
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=llm),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        f"/model anthropic-api/{model}",
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        user_email=session.user_email,
+    )
+    assert result is not None
+    assert result.data["runtime_selection"]["provider_id"] == "anthropic-api"
+    assert session.model_override_provider_id == "anthropic-api"
+    assert cache.model_override_provider_id == "anthropic-api"
+    suggestions = await dispatcher.suggest(
+        "/model cla",
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        user_email=session.user_email,
+    )
+    assert [item.value for item in suggestions if "current" in item.badges] == [
+        f"anthropic-api/{model}"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_model_command_uses_provider_qualified_references() -> None:
     cache = _SessionCache(usage={"model": "gpt-5", "provider_id": "openai"})
     dispatcher = CommandDispatcher(
@@ -976,7 +1200,9 @@ async def test_skill_command_loads_skill_by_name_and_is_idempotent(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_skill_command_reload_supersedes_previous_loaded_context(tmp_path) -> None:
+async def test_skill_command_reload_appends_context_and_updates_latest_eligibility(
+    tmp_path,
+) -> None:
     dispatcher, session_factory, session_cache = await _skill_command_dispatcher(tmp_path)
     await _create_skill(
         session_factory,
@@ -1057,10 +1283,11 @@ async def test_skill_command_reload_supersedes_previous_loaded_context(tmp_path)
         and event.data.get("kind") == "loaded_skill"
         and event.data.get("skill_id") == "skill_backend"
     ]
-    assert len(loaded_events) == 1
-    assert loaded_events[0].data["content_hash"] == "hash-skill_backend-v2"
-    assert "Use the new backend runbook." in str(loaded_events[0].data["content"])
-    assert "Use the old backend runbook." not in str(loaded_events[0].data["content"])
+    assert len(loaded_events) == 2
+    assert all(event.data["append_only_loaded_skill_version"] == 1 for event in loaded_events)
+    assert "Use the old backend runbook." in str(loaded_events[0].data["content"])
+    assert loaded_events[1].data["content_hash"] == "hash-skill_backend-v2"
+    assert "Use the new backend runbook." in str(loaded_events[1].data["content"])
     assert "builtin:grep" in session_cache.get_activated_skill_tool_ids("sess-1")
     assert "builtin:read" in session_cache.get_activated_skill_tool_ids("sess-1")
     assert "builtin:bash" not in session_cache.get_activated_skill_tool_ids("sess-1")
@@ -1239,7 +1466,7 @@ async def test_manual_compact_resolves_same_session_model_from_default_route() -
 
 
 @pytest.mark.asyncio
-async def test_manual_zero_turn_compaction_does_not_rotate() -> None:
+async def test_manual_compaction_without_summarized_events_does_not_rotate() -> None:
     strategy = _CompactionStrategy()
     strategy.compact = AsyncMock(
         return_value=SimpleNamespace(
@@ -1247,6 +1474,7 @@ async def test_manual_zero_turn_compaction_does_not_rotate() -> None:
             method="llm",
             summary="No effective history",
             turns_compacted=0,
+            events_compacted=0,
         )
     )
     rotate_session = AsyncMock()
@@ -1295,6 +1523,7 @@ async def test_manual_compact_publishes_first_class_runtime_lifecycle(cancelled:
             method="llm",
             summary="Compacted history",
             turns_compacted=4,
+            events_compacted=32,
             preserved_tail_events=[],
         )
     )
@@ -1366,6 +1595,7 @@ async def test_manual_compact_publishes_first_class_runtime_lifecycle(cancelled:
     assert marker_data == {
         "method": "llm",
         "turns_compacted": 4,
+        "events_compacted": 32,
         "trigger": "manual",
         "status": "compacted",
         "tokens_before": None,
@@ -1622,8 +1852,8 @@ async def test_new_web_conversation_does_not_clone_execution_paths() -> None:
             type="web",
             ref="web:user:user@example.com:default",
             platform_data={
-                "workspace_root": "/home/riker/src/esphome",
-                "working_directory": "/home/riker/src/esphome",
+                "workspace_root": "/home/alice/src/sample-app",
+                "working_directory": "/home/alice/src/sample-app",
                 "draft_id": "draft-1",
             },
             memory_labels={"origin": "chat"},
@@ -2443,8 +2673,8 @@ async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
                 "account_id": "acct-1",
                 "chat_id": "chat-1",
                 "thread_id": None,
-                "workspace_root": "/home/riker/src/esphome",
-                "working_directory": "/home/riker/src/esphome",
+                "workspace_root": "/home/alice/src/sample-app",
+                "working_directory": "/home/alice/src/sample-app",
             },
         ),
     )
@@ -2714,6 +2944,15 @@ async def test_approve_reports_failure_when_notification_service_cannot_resolve(
     )
     notifications = _NotificationService()
     notifications.resolve_result = False
+    notifications.pending_notifications.append(
+        SimpleNamespace(
+            notification_id="esc-1",
+            notification_type="escalation",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            payload={"tool_name": "bash"},
+        )
+    )
     dispatcher = CommandDispatcher(
         session_factory=None,
         session_manager=None,

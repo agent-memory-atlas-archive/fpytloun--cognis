@@ -47,6 +47,7 @@ def signed_deliverable_view_link(
     *,
     base_url: str = "",
     ttl_seconds: int = DEFAULT_DELIVERABLE_SHARE_TTL_SECONDS,
+    expires_at: int | None = None,
 ) -> DeliverableViewLink:
     """Create a stateless signed public standalone view link."""
 
@@ -54,7 +55,10 @@ def signed_deliverable_view_link(
     if not resolved_base_url:
         raise DeliverableShareUnavailable("public base URL is not configured")
     secret = _signing_secret(artifact_store)
-    expires_at = int(time.time()) + max(60, int(ttl_seconds))
+    now = int(time.time())
+    expires_at = expires_at if expires_at is not None else now + max(60, int(ttl_seconds))
+    if expires_at < now:
+        raise DeliverableShareUnavailable("share link has expired")
     token = _sign_share_token(secret, deliverable_id, expires_at)
     short_url = f"{resolved_base_url}/api/v1/deliverables/s/{quote(token, safe='')}"
     return DeliverableViewLink(
@@ -65,7 +69,12 @@ def signed_deliverable_view_link(
     )
 
 
-def verify_deliverable_share_token(artifact_store: Any, token: str) -> tuple[str, int]:
+def verify_deliverable_share_token(
+    artifact_store: Any,
+    token: str,
+    *,
+    allow_expired: bool = False,
+) -> tuple[str, int]:
     """Verify a signed public deliverable share token."""
 
     try:
@@ -75,7 +84,7 @@ def verify_deliverable_share_token(artifact_store: Any, token: str) -> tuple[str
         expires_at = int(expires_raw)
     except Exception as exc:
         raise DeliverableShareUnavailable("share link is invalid") from exc
-    if expires_at < int(time.time()):
+    if not allow_expired and expires_at < int(time.time()):
         raise DeliverableShareUnavailable("share link has expired")
     expected = _sign_share_token(_signing_secret(artifact_store), deliverable_id, expires_at)
     if not hmac.compare_digest(expected, token):

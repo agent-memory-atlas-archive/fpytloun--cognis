@@ -3,11 +3,13 @@
   import { portal } from '$lib/actions/portal';
 
   import { api } from '$lib/api/client';
-  import type { Deliverable, StepRun } from '$lib/types/api';
+  import type { Deliverable, DeliverableRevisionSummary, StepRun } from '$lib/types/api';
   import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
+  import DeliverableRevisionBar from '$lib/components/DeliverableRevisionBar.svelte';
+  import { loadDeliverableRevision } from '$lib/deliverable-revisions';
   import Button from '$lib/components/ui/Button.svelte';
 
   let {
@@ -30,6 +32,24 @@
   let hydratedDeliverable = $state<Deliverable | null>(null);
   let deliverableLoadError = $state('');
   let loadingDeliverable = $state(false);
+  let stepDeliverableId = $state<string | null>(null);
+
+  let revisionGeneration = 0;
+
+  async function openRevision(revision: DeliverableRevisionSummary): Promise<void> {
+    // Only the most recent selection may update the view.
+    const generation = ++revisionGeneration;
+    loadingDeliverable = true;
+    deliverableLoadError = '';
+    try {
+      const result = await loadDeliverableRevision(revision);
+      if (generation === revisionGeneration) hydratedDeliverable = result;
+    } catch {
+      if (generation === revisionGeneration) deliverableLoadError = 'This revision could not be loaded.';
+    } finally {
+      if (generation === revisionGeneration) loadingDeliverable = false;
+    }
+  }
 
   function stepOutputSummary(stepRun: StepRun): string {
     const val = stepRun.output?.summary;
@@ -195,6 +215,7 @@
             throw new Error('The full rich deliverable payload is unavailable or corrupt.');
           }
           hydratedDeliverable = deliverable;
+          stepDeliverableId = deliverable.deliverable_id;
           deliverableLoadError = '';
         })
         .catch(() => {
@@ -223,7 +244,7 @@
 -->
 <div
   use:portal
-  class="app-viewport-overlay app-safe-fullscreen z-[95] items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/85 backdrop-blur sm:items-center"
+  class="app-viewport-overlay app-safe-fullscreen z-[95] items-stretch justify-center overflow-y-auto overscroll-contain bg-scrim/85 backdrop-blur sm:items-center"
   role="presentation"
   data-testid="step-output-overlay"
   data-overlay-id={overlayId}
@@ -231,25 +252,25 @@
   <button class="absolute inset-0" onclick={onclose} type="button" aria-label="Close full output"></button>
   <div
     bind:this={container}
-    class="relative z-10 flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-slate-800 bg-slate-950 shadow-card"
+    class="relative z-10 flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-separator bg-elevated shadow-overlay"
     role="dialog"
     aria-modal="true"
     data-blocking-overlay
     aria-label={`Step output: ${stepRun.step_name}`}
     data-testid="step-output-panel"
   >
-    <div class="shrink-0 border-b border-slate-800 px-5 py-4 sm:px-6">
+    <div class="shrink-0 border-b border-separator px-5 py-4 sm:px-6">
       <div class="flex items-start justify-between gap-4">
         <div class="min-w-0">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Full output</p>
-          <h2 class="mt-2 text-xl font-semibold text-white" id="step-output-title">{stepRun.step_name}</h2>
-          <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-            <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 uppercase tracking-wide">Attempt #{stepRun.attempt}</span>
-            <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 uppercase tracking-wide">{visibleStatus}</span>
+          <p class="text-xs uppercase tracking-[0.25em] text-quiet">Full output</p>
+          <h2 class="mt-2 text-xl font-semibold text-strong" id="step-output-title">{stepRun.step_name}</h2>
+          <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+            <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 uppercase tracking-wide">Attempt #{stepRun.attempt}</span>
+            <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 uppercase tracking-wide">{visibleStatus}</span>
             {#if latestDeliverableVersion}
-              <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 uppercase tracking-wide text-sky-200">Deliverable v{latestDeliverableVersion.version}</span>
+              <span class="rounded-full border border-accent/30 bg-accent-subtle px-2.5 py-1 uppercase tracking-wide text-accent">Deliverable draft {latestDeliverableVersion.version}</span>
             {/if}
-            <span class="inline-flex items-center gap-2 text-slate-300">
+            <span class="inline-flex items-center gap-2 text-secondary">
               <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-5 w-5 rounded-lg" />
               {agentName}
             </span>
@@ -262,14 +283,14 @@
     <div class="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden overscroll-contain px-5 py-5 sm:px-6">
       {#if summary}
         <section>
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Summary</p>
-          <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
+          <p class="text-xs uppercase tracking-[0.25em] text-quiet">Summary</p>
+          <div class="prose prose-sm prose-invert mt-3 max-w-none text-secondary">{@html renderMarkdown(summary)}</div>
         </section>
       {/if}
 
       {#if stepRun.runtime_info?.deterministic_step || stepRun.output?.metadata?.deterministic_step}
-        <section class="rounded-3xl border border-slate-800 bg-slate-950/70 p-4 sm:p-5">
-          <h3 class="text-sm font-medium text-slate-200">Deterministic execution</h3>
+        <section class="rounded-3xl border border-separator bg-canvas/70 p-4 sm:p-5">
+          <h3 class="text-sm font-medium text-foreground">Deterministic execution</h3>
           {#each [
             ['Tool', stepRun.runtime_info?.tool_name],
             ['Arguments', stepRun.runtime_info?.render],
@@ -280,34 +301,39 @@
             ['Outputs', stepRun.output?.outputs],
           ] as [label, value]}
             {#if value !== undefined && value !== null}
-              <h4 class="mt-4 text-xs text-slate-400">{label}</h4>
-              <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-200">{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre>
+              <h4 class="mt-4 text-xs text-muted">{label}</h4>
+              <pre class="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs text-foreground">{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre>
             {/if}
           {/each}
         </section>
       {/if}
 
       {#if deliverables.length > 0}
-        <section class="rounded-3xl border border-sky-500/20 bg-sky-500/5 p-4 sm:p-5">
+        <section class="rounded-3xl border border-accent/20 bg-accent-subtle p-4 sm:p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Deliverable</p>
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Deliverable</p>
               {#if latestDeliverableVersion?.title}
-                <p class="mt-2 text-sm font-medium text-white">{latestDeliverableVersion.title}</p>
+                <p class="mt-2 text-sm font-medium text-strong">{latestDeliverableVersion.title}</p>
               {/if}
             </div>
-            <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
+            <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-secondary">
               {#each deliverables as deliverable}
-                <span class={`rounded-full border px-2.5 py-1 ${deliverable.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : deliverable.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : deliverable.status === 'rejected' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
-                  v{deliverable.version} {deliverable.status}
+                <span class={`rounded-full border px-2.5 py-1 ${deliverable.status === 'delivered' ? 'border-success-border bg-success-subtle text-success' : deliverable.status === 'approved' ? 'border-accent/30 bg-accent-subtle text-accent' : deliverable.status === 'rejected' ? 'border-accent/30 bg-accent-subtle text-accent' : 'border-control-border bg-surface/80 text-secondary'}`}>
+                  Draft {deliverable.version} {deliverable.status}
                 </span>
               {/each}
             </div>
           </div>
+          {#if hydratedDeliverable}
+            <div class="mt-3">
+              <DeliverableRevisionBar current={hydratedDeliverable} anchorId={stepDeliverableId ?? hydratedDeliverable.deliverable_id} onSelect={(revision) => void openRevision(revision)} />
+            </div>
+          {/if}
           {#if loadingDeliverable}
-            <p class="mt-4 text-sm text-slate-400">Loading full deliverable…</p>
+            <p class="mt-4 text-sm text-muted">Loading full deliverable…</p>
           {:else if deliverableLoadError}
-            <p class="mt-4 text-sm text-amber-200">{deliverableLoadError}</p>
+            <p class="mt-4 text-sm text-warning">{deliverableLoadError}</p>
           {/if}
           {#if hasRenderableRichPayload(hydratedDeliverable)}
             <div class="mt-4">
@@ -316,47 +342,47 @@
                 content={hydratedDeliverable?.content}
                 title={hydratedDeliverable?.title ?? 'Deliverable'}
                 instanceId={hydratedDeliverable?.deliverable_id}
-                surface="standalone"
+                surface="embedded"
               />
             </div>
           {:else if deliverableHtml}
-            <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html deliverableHtml}</div>
+            <div class="prose prose-sm prose-invert mt-4 max-w-none text-secondary">{@html deliverableHtml}</div>
           {/if}
           {#if latestDeliverableVersion?.evaluator_feedback}
-            <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-              <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Latest evaluator feedback</p>
+            <div class="mt-4 rounded-2xl border border-accent/20 bg-accent-subtle px-4 py-3 text-sm text-accent">
+              <p class="font-medium uppercase tracking-wide text-[11px] text-accent">Latest evaluator feedback</p>
               <p class="mt-1">{latestDeliverableVersion.evaluator_feedback}</p>
             </div>
           {/if}
         </section>
       {/if}
 
-      <section class="rounded-3xl border border-slate-800 bg-slate-950/70 p-4 sm:p-5">
-        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+      <section class="rounded-3xl border border-separator bg-canvas/70 p-4 sm:p-5">
+        <p class="text-xs uppercase tracking-[0.25em] text-quiet">Runtime</p>
         {#if runtimeRows(stepRun).length > 0}
           <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
             {#each runtimeRows(stepRun) as row}
-              <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
-                <dt class="text-slate-500">{row.label}</dt>
-                <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+              <div class="min-w-0 rounded-lg border border-separator/70 bg-surface/40 px-2.5 py-2">
+                <dt class="text-quiet">{row.label}</dt>
+                <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
               </div>
             {/each}
           </dl>
         {:else}
-          <p class="mt-3 text-sm text-amber-200">Runtime not recorded for this attempt.</p>
+          <p class="mt-3 text-sm text-warning">Runtime not recorded for this attempt.</p>
         {/if}
       </section>
 
-      <section class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4 sm:p-5">
-        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
+      <section class="rounded-3xl border border-separator bg-surface/60 p-4 sm:p-5">
+        <p class="text-xs uppercase tracking-[0.25em] text-quiet">Completion metadata</p>
 
         {#if claims.length > 0}
           <div class="mt-4">
-            <p class="text-sm font-medium text-slate-200">Claims</p>
-            <ul class="mt-2 space-y-1 text-sm text-slate-400">
+            <p class="text-sm font-medium text-foreground">Claims</p>
+            <ul class="mt-2 space-y-1 text-sm text-muted">
               {#each claims as claim}
                 <li class="flex items-start gap-2">
-                  <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                  <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-muted"></span>
                   <span>{claim}</span>
                 </li>
               {/each}
@@ -365,48 +391,48 @@
         {/if}
 
         {#if outcomeStatus !== 'success'}
-          <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-            <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Outcome marker</p>
+          <div class="mt-4 rounded-2xl border border-accent/20 bg-accent-subtle px-4 py-3 text-sm text-accent">
+            <p class="font-medium uppercase tracking-wide text-[11px] text-accent">Outcome marker</p>
             <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
           </div>
         {/if}
 
         {#if stepError}
-          <div class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          <div class="mt-4 rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">
             <p class="font-medium">Error</p>
-            <pre class="mt-2 whitespace-pre-wrap text-xs text-rose-300">{stepError}</pre>
+            <pre class="mt-2 whitespace-pre-wrap text-xs text-danger">{stepError}</pre>
           </div>
         {/if}
 
         {#if stepRun.evaluation}
           {@const evalDecision = String(stepRun.evaluation.decision ?? '')}
           {@const evalReasoning = String(stepRun.evaluation.reasoning ?? '')}
-          {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-sky-400'}
-          <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
-            <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
-            <p class="mt-1 text-sm text-slate-300">
+          {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-success' : evalDecision === 'revise' ? 'text-accent' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-danger' : 'text-accent'}
+          <div class="mt-4 rounded-2xl border border-separator bg-canvas/80 px-4 py-3">
+            <p class="text-xs font-medium uppercase tracking-widest text-quiet">Evaluation</p>
+            <p class="mt-1 text-sm text-secondary">
               <span class="font-medium {evalColor}">{evalDecision}</span>
               {#if evalReasoning} - {evalReasoning}{/if}
             </p>
             {#if feedback}
-              <p class="mt-2 rounded-lg border border-slate-700/50 bg-slate-900/50 px-2 py-1.5 text-xs text-slate-400"><span class="font-medium text-slate-500">Feedback:</span> {feedback}</p>
+              <p class="mt-2 rounded-lg border border-control-border/50 bg-surface/50 px-2 py-1.5 text-xs text-muted"><span class="font-medium text-quiet">Feedback:</span> {feedback}</p>
             {/if}
           </div>
         {/if}
 
         {#if claims.length === 0 && outcomeStatus === 'success' && !stepError && !stepRun.evaluation}
-          <p class="mt-3 text-sm text-slate-400">No additional completion metadata was recorded for this attempt.</p>
+          <p class="mt-3 text-sm text-muted">No additional completion metadata was recorded for this attempt.</p>
         {/if}
       </section>
 
-      <div class="border-t border-dashed border-slate-800"></div>
+      <div class="border-t border-dashed border-separator"></div>
 
       <section>
-        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Reasoning / progress</p>
+        <p class="text-xs uppercase tracking-[0.25em] text-quiet">Reasoning / progress</p>
         {#if reasoningContent}
-          <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(reasoningContent)}</div>
+          <div class="prose prose-sm prose-invert mt-3 max-w-none text-secondary">{@html renderMarkdown(reasoningContent)}</div>
         {:else}
-          <div class="mt-3 rounded-2xl border border-slate-800 bg-slate-900/50 px-4 py-3 text-sm text-slate-400">
+          <div class="mt-3 rounded-2xl border border-separator bg-surface/50 px-4 py-3 text-sm text-muted">
             No separate reasoning text was recorded for this attempt.
           </div>
         {/if}

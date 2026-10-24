@@ -21,16 +21,19 @@ const STATIC_SLASH_COMMANDS: StaticSlashCommand[] = [
   { command: '/yolo', description: 'DANGEROUS: allow evaluated denials in this chat; /yolo off to reset', acceptsArgument: true },
   { command: '/profile', description: 'List or switch agent runtime profile', acceptsArgument: true, parameterSuggestions: true },
   { command: '/skill', description: 'List or load a skill into this session', acceptsArgument: true, parameterSuggestions: true },
+  { command: '/hook', description: 'List or manually run an assigned hook', acceptsArgument: true, parameterSuggestions: true },
   { command: '/executor', description: 'Show or switch active executor', acceptsArgument: true, parameterSuggestions: true },
+  { command: '/project', description: "Show, set, or clear this topic chat's project (none clears)", acceptsArgument: true, parameterSuggestions: true },
   { command: '/context', description: 'Show context usage' },
   { command: '/info', description: 'Show session details' },
   { command: '/benchmark', description: 'Run a local-runtime benchmark', acceptsArgument: true, parameterSuggestions: true },
   { command: '/lsp', description: 'Show LSP diagnostics status' },
-  { command: '/plan', description: 'Plan/read-only mode; add text for one-shot planning', acceptsArgument: true },
+  { command: '/plan', description: 'Planning mode; add text for one-shot planning', acceptsArgument: true },
   { command: '/build', description: 'Build/implementation mode; add text for one-shot build', acceptsArgument: true },
   { command: '/default', description: 'Return to agent default mode; add text for one-shot default', acceptsArgument: true },
   { command: '/compact', description: 'Compact conversation' },
   { command: '/recap', description: 'Summarize work in this conversation' },
+  { command: '/handoff', description: 'Prepare a handoff for another conversation or agent', acceptsArgument: true },
   { command: '/summarize', description: 'Alias for /compact' },
   { command: '/fork', description: 'Fork conversation; add text to start the fork', acceptsArgument: true },
   { command: '/task', description: 'Create a background task', acceptsArgument: true },
@@ -44,8 +47,8 @@ const STATIC_SLASH_COMMANDS: StaticSlashCommand[] = [
   { command: '/clear', description: 'Alias for /new' },
   { command: '/stop', description: 'Stop current work' },
   { command: '/cancel', description: 'Alias for /stop' },
-  { command: '/approve', description: 'Approve tool escalation', acceptsArgument: true },
-  { command: '/deny', description: 'Deny tool escalation', acceptsArgument: true },
+  { command: '/approve', description: 'Approve one action: --id <approval-id> [note]', acceptsArgument: true },
+  { command: '/deny', description: 'Deny one action: --id <approval-id> [note]', acceptsArgument: true },
   { command: '/retry', description: 'Retry paused workflow gate', acceptsArgument: true },
   { command: '/continue', description: 'Continue paused workflow gate', acceptsArgument: true }
 ];
@@ -56,6 +59,7 @@ const PARAMETER_SUGGESTION_COMMANDS = new Set(
   STATIC_SLASH_COMMANDS.filter((item) => item.parameterSuggestions).map((item) => item.command)
 );
 const PREFIX_SYSTEM_COMMANDS = new Set([
+  '/handoff',
   '/fork',
   '/model',
   '/thinking',
@@ -63,7 +67,9 @@ const PREFIX_SYSTEM_COMMANDS = new Set([
   '/yolo',
   '/profile',
   '/skill',
+  '/hook',
   '/executor',
+  '/project',
   '/task',
   '/research',
   '/implement',
@@ -136,7 +142,7 @@ export function slashParameterSuggestionCommand(input: string): string | null {
   const command = normalized.slice(0, firstSpace);
   if (!PARAMETER_SUGGESTION_COMMANDS.has(command)) return null;
   const partial = normalized.slice(firstSpace + 1).trim();
-  if (partial.includes(' ')) return null;
+  if (command !== '/hook' && partial.includes(' ')) return null;
   return command;
 }
 

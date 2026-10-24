@@ -276,8 +276,9 @@ async def resolve_executor_pool(
 ) -> ExecutorPool:
     """Resolve the agent's primary + additional executor pool.
 
-    Reads from the executors table once and partitions matching rows into
-    primary and additional buckets. Primary membership wins on overlap.
+    Read eligible configurations once and partition into primary and additional
+    buckets. Explicit-only pools do not decode unrelated executors' tool schemas.
+    Primary membership wins on overlap.
     """
 
     from cognis.store.queries import list_executors
@@ -286,6 +287,21 @@ async def resolve_executor_pool(
     primary_explicit = execution.get("executor_id")
     primary_selector = execution.get("executor_selector")
     additional_entries = parse_additional_executors(execution)
+    explicit_primary = isinstance(primary_explicit, str) and bool(primary_explicit.strip())
+    needs_selector_scan = (
+        not explicit_primary and isinstance(primary_selector, dict) and bool(primary_selector)
+    ) or any(
+        not entry.get("executor_id") and bool(entry.get("executor_selector"))
+        for entry in additional_entries
+    )
+    candidate_ids = (
+        None
+        if needs_selector_scan
+        else [
+            *([primary_explicit] if explicit_primary else []),
+            *(entry["executor_id"] for entry in additional_entries if entry.get("executor_id")),
+        ]
+    )
 
     primary_targets: list[ResolvedExecutorTarget] = []
     additional_targets: list[ResolvedExecutorTarget] = []
@@ -293,7 +309,10 @@ async def resolve_executor_pool(
 
     async with session_factory() as session:
         all_rows: list[Any] = await list_executors(
-            session, owner_email=executor_owner_email, include_shared=True
+            session,
+            owner_email=executor_owner_email,
+            include_shared=True,
+            executor_ids=candidate_ids,
         )
         rows_by_id = {row.executor_id: row for row in all_rows}
 
@@ -439,13 +458,15 @@ def is_assigned(pool: ExecutorPool, executor_id: str) -> bool:
     return pool.is_assigned(executor_id)
 
 
-def tool_observed_on(target: ResolvedExecutorTarget, tool_name: str) -> bool:
-    """Return whether ``tool_name`` is observed on ``target`` and enabled."""
+def tool_observed_on(
+    target: ResolvedExecutorTarget, tool_name: str, *, require_usable: bool = True
+) -> bool:
+    """Check observed/enabled tools, optionally including unavailable schema targets."""
 
     from cognis.core.executor_resolution import is_tool_enabled
     from cognis.models.tool import NativeToolDefinition, ToolSource
 
-    if not target.usable:
+    if require_usable and not target.usable:
         return False
     # Build a minimal stub for is_tool_enabled which just needs name + category
     stub = NativeToolDefinition(

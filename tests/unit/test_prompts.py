@@ -274,6 +274,21 @@ def test_chat_prompt_defers_orchestration_routing_to_mutable_guidance() -> None:
     assert "managed conversation" not in instructions
 
 
+def test_chat_and_delegated_prompts_bound_exploration_without_prohibiting_analysis() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "Match the delegated task to the specialist's stated role" in instructions
+    assert "handle straightforward lookups directly" in instructions
+    assert "When delegating exploration, keep complex diagnosis" in instructions
+    assert "final decisions with the owning agent" in instructions
+    assert "delegating supporting evidence gathering when useful" in instructions
+
+    delegated = build_system_instructions(PromptContext.DELEGATION)
+    assert delegated is not None
+    assert "specific task within your specialist role" in delegated
+    assert "source references, and evidence-backed conclusions within your role" in delegated
+
+
 def test_chat_prompt_defines_non_overridable_routing_precedence() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
@@ -406,9 +421,26 @@ def test_chat_prompt_prefers_structured_tools_for_file_inspection() -> None:
 def test_prompt_does_not_assume_patch_is_visible() -> None:
     instructions = build_system_instructions(PromptContext.CHAT, model_id="gpt-5.4")
     assert instructions is not None
+    assert "Invoke a tool directly only when its schema is visible in the current request" in (
+        instructions
+    )
+    assert "every tool name mentioned in these instructions and loaded skill guidance" in (
+        instructions
+    )
+    assert "discover it with `search_tools`" in instructions
     assert "actually visible" in instructions
     assert "Do not call edit tools that are not visible" in instructions
     assert "Prefer `apply_patch` over `write`, `edit`, or `multiedit`" not in instructions
+
+
+def test_coding_skill_makes_named_tools_conditional_on_current_visibility() -> None:
+    skill = get_system_skill_default("cognis-coding")
+    assert skill is not None
+    content = str(skill["instructions"])
+    assert "Invoke a tool directly only when its schema is visible in the current request" in (
+        content
+    )
+    assert "every tool name mentioned in these instructions and loaded skill guidance" in content
 
 
 def test_visible_edit_guidance_prefers_patch_when_only_patch_is_visible() -> None:

@@ -1,0 +1,415 @@
+@import './palettes.css';
+@import './classic.css';
+
+/* Assistant reading measure. Registered so it resolves to a length where it
+   is set (the message, at the message font size) and inherits as that same
+   length to headings, prose and the metadata row. */
+@property --chat-assistant-measure {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 0px;
+}
+
+/* Classic is the complete fallback palette. Family blocks override it at
+   higher specificity, including locally scoped embedded reader palettes. */
+:where(:root, [data-theme-family][data-resolved-theme]) {
+  --compaction-info-bg: initial;
+  --compaction-info-border: initial;
+  --compaction-info-fg: initial;
+  --compaction-error-bg: initial;
+  --compaction-error-border: initial;
+  --compaction-error-fg: initial;
+  --helper-managed-bg: initial;
+  --helper-managed-border: initial;
+  --helper-managed-header-border: initial;
+  --helper-error-bg: initial;
+  --helper-error-border: initial;
+  --helper-error-header-border: initial;
+  --recap-bg: initial;
+  --recap-border: initial;
+  --primitive-card-bg: initial;
+  --primitive-card-border: initial;
+  --primitive-badge-bg: initial;
+  --primitive-badge-fg: initial;
+  --primitive-danger-bg: initial;
+  --primitive-danger-hover: initial;
+  --primitive-danger-fg: initial;
+  --primitive-focus: initial;
+  --link-fg: initial;
+  --link-hover-fg: initial;
+  --inline-code-fg: initial;
+  --prose-strong-fg: initial;
+  --prose-emphasis-fg: initial;
+  --user-link-fg: initial;
+  --user-inline-code-fg: initial;
+  --user-code-fg: initial;
+  --quiet-control-fg: initial;
+  --json-number-fg: initial;
+  --json-literal-fg: initial;
+  --syntax-variable-fg: initial;
+  --primitive-control-hover: initial;
+  --primitive-ghost-hover-fg: initial;
+  --tool-group-label-fg: initial;
+  /* Optional per-palette text shades and tint opacities (see tailwind.config.ts).
+     Reset at every palette boundary so nested scopes never inherit them. */
+  --text-accent: initial;
+  --text-accent-hover: initial;
+  --text-success: initial;
+  --text-warning: initial;
+  --text-danger: initial;
+  --text-info: initial;
+  --alpha-accent-subtle: initial;
+  --alpha-success-subtle: initial;
+  --alpha-success-border: initial;
+  --alpha-warning-subtle: initial;
+  --alpha-warning-border: initial;
+  --alpha-danger-subtle: initial;
+  --alpha-danger-border: initial;
+  --alpha-info-subtle: initial;
+  --alpha-info-border: initial;
+  --alpha-violet-subtle: initial;
+  --alpha-violet-border: initial;
+  --alpha-cyan-subtle: initial;
+  --alpha-cyan-border: initial;
+  --alpha-pink-subtle: initial;
+  --alpha-pink-border: initial;
+  --alpha-orange-subtle: initial;
+  --alpha-orange-border: initial;
+  --alpha-indigo-subtle: initial;
+  --alpha-indigo-border: initial;
+  --alpha-teal-subtle: initial;
+  --alpha-teal-border: initial;
+  --alpha-lime-subtle: initial;
+  --alpha-lime-border: initial;
+  --alpha-purple-subtle: initial;
+  --alpha-purple-border: initial;
+  --alpha-blue-subtle: initial;
+  --alpha-blue-border: initial;
+  --alpha-fuchsia-subtle: initial;
+  --alpha-fuchsia-border: initial;
+  color-scheme: light;
+  --app-chrome-bg: #edf2f5;
+  --color-canvas: 244 247 249;
+  --color-chrome: 237 242 245;
+  --color-surface: 255 255 255;
+  --color-inset: 232 238 242;
+  --color-elevated: 255 255 255;
+  --color-surface-hover: 225 233 239;
+  --color-foreground: 20 40 50;
+  --color-secondary: 82 99 109;
+  --color-muted: 86 104 115;
+  --color-separator: 214 224 230;
+  --color-control-border: 129 147 159;
+  --color-border-strong: 94 112 123;
+  --color-accent: 3 111 159;
+  --color-accent-hover: 3 90 130;
+  --color-on-accent: 255 255 255;
+  --color-accent-subtle: 224 242 254;
+  --color-success: 4 115 82;
+  --color-success-subtle: 209 250 229;
+  --color-success-border: 52 143 110;
+  --color-warning: 146 64 14;
+  --color-warning-subtle: 254 243 199;
+  --color-warning-border: 180 113 15;
+  --color-danger: 185 28 28;
+  --color-danger-subtle: 254 226 226;
+  --color-danger-border: 211 73 73;
+  --color-info: 3 105 161;
+  --color-info-subtle: 224 242 254;
+  --color-info-border: 40 132 180;
+  --color-violet-tone: 109 40 217;
+  --color-violet-subtle: 237 233 254;
+  --color-violet-border: 139 92 246;
+  --color-cyan-tone: 14 110 138;
+  --color-cyan-subtle: 207 250 254;
+  --color-cyan-border: 8 145 178;
+  --color-pink-tone: 190 24 93;
+  --color-pink-subtle: 252 231 243;
+  --color-pink-border: 219 39 119;
+  --color-orange-tone: 154 52 18;
+  --color-orange-subtle: 255 237 213;
+  --color-orange-border: 194 65 12;
+  --color-indigo-tone: 67 56 202;
+  --color-indigo-subtle: 224 231 255;
+  --color-indigo-border: 99 102 241;
+  --color-teal-tone: 15 112 104;
+  --color-teal-subtle: 204 251 241;
+  --color-teal-border: 13 148 136;
+  --color-lime-tone: 63 98 18;
+  --color-lime-subtle: 236 252 203;
+  --color-lime-border: 101 139 20;
+  --color-purple-tone: 126 34 206;
+  --color-purple-subtle: 243 232 255;
+  --color-purple-border: 168 85 247;
+  --color-blue-tone: 29 78 216;
+  --color-blue-subtle: 219 234 254;
+  --color-blue-border: 59 130 246;
+  --color-fuchsia-tone: 162 28 175;
+  --color-fuchsia-subtle: 250 232 255;
+  --color-fuchsia-border: 192 38 211;
+  --color-syntax-keyword: var(--color-violet-tone);
+  --color-syntax-string: var(--color-success);
+  --color-syntax-number: var(--color-cyan-tone);
+  --color-syntax-comment: var(--color-muted);
+  --color-syntax-title: var(--color-accent);
+  --color-syntax-punctuation: var(--color-secondary);
+  --color-scrim: 2 6 23;
+  --shadow-card: 0 12px 32px -20px rgb(20 40 50 / 0.22), 0 0 0 1px rgb(20 40 50 / 0.05);
+  --shadow-overlay: 0 20px 60px -20px rgb(20 40 50 / 0.28);
+  --theme-void: rgb(var(--color-canvas));
+  --theme-obsidian: rgb(var(--color-chrome));
+  --theme-ink: rgb(var(--color-inset));
+  --theme-line: rgb(var(--color-separator));
+  --theme-accent: rgb(var(--color-accent));
+  --theme-accent-strong: rgb(var(--color-accent-hover));
+  --theme-accent-soft: rgb(var(--color-cyan-tone));
+}
+
+:where([data-theme-family])[data-resolved-theme='dark'] {
+  color-scheme: dark;
+  --app-chrome-bg: #07111a;
+  --color-canvas: 2 6 23;
+  --color-chrome: 7 17 26;
+  --color-surface: 15 23 42;
+  --color-inset: 18 42 53;
+  --color-elevated: 30 41 59;
+  --color-surface-hover: 30 51 64;
+  --color-foreground: 241 245 249;
+  --color-secondary: 203 213 225;
+  --color-muted: 148 163 184;
+  --color-separator: 31 53 64;
+  --color-control-border: 100 116 139;
+  --color-border-strong: 148 163 184;
+  --color-accent: 56 189 248;
+  --color-accent-hover: 125 211 252;
+  --color-on-accent: 7 17 26;
+  --color-accent-subtle: 8 47 73;
+  --color-success: 110 231 183;
+  --color-success-subtle: 6 50 40;
+  --color-success-border: 52 143 110;
+  --color-warning: 252 211 77;
+  --color-warning-subtle: 69 40 14;
+  --color-warning-border: 180 113 15;
+  --color-danger: 252 165 165;
+  --color-danger-subtle: 69 20 28;
+  --color-danger-border: 211 73 73;
+  --color-info: 125 211 252;
+  --color-info-subtle: 8 47 73;
+  --color-info-border: 40 132 180;
+  --color-violet-tone: 196 181 253;
+  --color-violet-subtle: 46 25 80;
+  --color-violet-border: 139 92 246;
+  --color-cyan-tone: 103 232 249;
+  --color-cyan-subtle: 8 51 68;
+  --color-cyan-border: 8 145 178;
+  --color-pink-tone: 249 168 212;
+  --color-pink-subtle: 67 20 48;
+  --color-pink-border: 219 39 119;
+  --color-orange-tone: 253 186 116;
+  --color-orange-subtle: 67 30 13;
+  --color-orange-border: 194 65 12;
+  --color-indigo-tone: 165 180 252;
+  --color-indigo-subtle: 30 27 75;
+  --color-indigo-border: 99 102 241;
+  --color-teal-tone: 94 234 212;
+  --color-teal-subtle: 4 47 46;
+  --color-teal-border: 13 148 136;
+  --color-lime-tone: 190 242 100;
+  --color-lime-subtle: 26 46 5;
+  --color-lime-border: 101 139 20;
+  --color-purple-tone: 216 180 254;
+  --color-purple-subtle: 59 7 100;
+  --color-purple-border: 168 85 247;
+  --color-blue-tone: 147 197 253;
+  --color-blue-subtle: 23 37 84;
+  --color-blue-border: 59 130 246;
+  --color-fuchsia-tone: 240 171 252;
+  --color-fuchsia-subtle: 74 4 78;
+  --color-fuchsia-border: 192 38 211;
+  --shadow-card: 0 18px 48px -24px rgb(2 6 23 / 0.6), 0 0 0 1px rgb(56 189 248 / 0.05);
+  --shadow-overlay: 0 24px 64px -20px rgb(0 0 0 / 0.65);
+}
+
+/* Resolve dependent roles at each palette boundary, not at an ancestor. */
+:where(:root, [data-theme-family][data-resolved-theme]) {
+  /* Finer shades the original Classic Dark distinguished. Other palettes
+     alias the coarser role, so they render unchanged. */
+  --color-quiet: var(--color-muted);
+  --color-strong: var(--color-foreground);
+  --color-raised: var(--color-inset);
+  --color-syntax-keyword: var(--color-violet-tone);
+  --color-syntax-string: var(--color-success);
+  --color-syntax-number: var(--color-cyan-tone);
+  --color-syntax-comment: var(--color-muted);
+  --color-syntax-title: var(--color-accent);
+  --color-syntax-punctuation: var(--color-secondary);
+  --theme-void: rgb(var(--color-canvas));
+  --theme-obsidian: rgb(var(--color-chrome));
+  --theme-ink: rgb(var(--color-inset));
+  --theme-line: rgb(var(--color-separator));
+  --theme-accent: rgb(var(--color-accent));
+  --theme-accent-strong: rgb(var(--color-accent-hover));
+  --theme-accent-soft: rgb(var(--color-cyan-tone));
+  --message-user-bg: rgb(var(--color-accent));
+  --message-user-fg: rgb(var(--color-on-accent));
+  --message-user-border: rgb(var(--color-accent));
+  --message-assistant-bg: rgb(var(--color-surface));
+  --message-assistant-fg: rgb(var(--color-foreground));
+  --message-assistant-border: rgb(var(--color-separator));
+  --chat-prose-font: inherit;
+  --tool-group-border: 1px;
+  --tool-group-background: rgb(var(--color-inset) / .2);
+  --chat-message-font-size: 14px;
+  /* Unset: the message sizes its bubble to the measure plus padding (the
+     calc must resolve on the message, so it lives in ChatMessage). */
+  --chat-assistant-bubble-max-width: initial;
+  --chat-assistant-radius: initial;
+  --chat-composer-bg: initial;
+  --chat-composer-radius: initial;
+  --chat-composer-shadow: 0 0 #0000;
+}
+
+:root[data-theme-family='paper'], [data-theme-family='paper'][data-resolved-theme] {
+  --chat-message-font-size: 15px;
+  --message-user-bg: rgb(var(--color-accent-subtle));
+  --message-user-fg: rgb(var(--color-foreground));
+  --message-user-border: rgb(var(--color-separator));
+  --message-assistant-bg: transparent;
+  --message-assistant-border: transparent;
+  --chat-prose-font: Georgia, 'Times New Roman', serif;
+  /* No bubble: prose keeps the measure, tables and code use the full column. */
+  --chat-assistant-bubble-max-width: none;
+  --chat-assistant-radius: 0;
+  --chat-composer-bg: rgb(var(--color-surface));
+  --chat-composer-radius: 1.5rem;
+  --chat-composer-shadow: 0 2px 8px rgb(var(--color-scrim) / .04);
+}
+
+/* Action identity is not a large message surface. */
+[data-theme-family='porcelain'][data-resolved-theme],
+[data-theme-family='gruvbox'][data-resolved-theme] {
+  --message-user-bg: rgb(var(--color-elevated));
+  --message-user-fg: rgb(var(--color-foreground));
+  --message-user-border: rgb(var(--color-separator));
+}
+
+/* Light modes separate layers by fill, not outlines. Status and category
+   color marks text, icons and dots; containers stay neutral. Inputs keep
+   control borders, and focus rings use the accent. */
+[data-theme-family][data-resolved-theme='light'] {
+  --color-success-border: var(--color-separator);
+  --color-info-border: var(--color-separator);
+  --color-warning-border: var(--color-separator);
+  --color-danger-border: var(--color-separator);
+  --color-violet-border: var(--color-separator);
+  --color-cyan-border: var(--color-separator);
+  --color-pink-border: var(--color-separator);
+  --color-orange-border: var(--color-separator);
+  --color-indigo-border: var(--color-separator);
+  --color-teal-border: var(--color-separator);
+  --color-lime-border: var(--color-separator);
+  --color-purple-border: var(--color-separator);
+  --color-blue-border: var(--color-separator);
+  --color-fuchsia-border: var(--color-separator);
+  --color-violet-subtle: var(--color-inset);
+  --color-cyan-subtle: var(--color-inset);
+  --color-pink-subtle: var(--color-inset);
+  --color-orange-subtle: var(--color-inset);
+  --color-indigo-subtle: var(--color-inset);
+  --color-teal-subtle: var(--color-inset);
+  --color-lime-subtle: var(--color-inset);
+  --color-purple-subtle: var(--color-inset);
+  --color-blue-subtle: var(--color-inset);
+  --color-fuchsia-subtle: var(--color-inset);
+  --tool-group-border: 0px;
+  --tool-group-background: transparent;
+  --tool-group-label-fg: rgb(var(--color-secondary));
+  --shadow-card: none;
+  --message-assistant-bg: transparent;
+  --message-assistant-border: transparent;
+  --message-user-bg: rgb(var(--color-accent-subtle));
+  --message-user-fg: rgb(var(--color-foreground));
+  --message-user-border: transparent;
+}
+
+[data-theme-family='porcelain'][data-resolved-theme='light'],
+[data-theme-family='gruvbox'][data-resolved-theme='light'] {
+  --message-user-bg: rgb(var(--color-inset));
+}
+
+/* Letter-spaced uppercase labels are a dark-console idiom; light themes use
+   sentence-case labels in the secondary ink (Apple/Claude style). The brand
+   wordmark opts out with data-wordmark. */
+[data-resolved-theme='light'] .uppercase[class*='tracking-[']:not([data-wordmark]) {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 600;
+}
+
+/* Higher specificity than legacy prose-invert utilities. */
+html .prose, html .prose-invert {
+  --tw-prose-body: rgb(var(--color-secondary));
+  --tw-prose-headings: rgb(var(--color-foreground));
+  --tw-prose-lead: rgb(var(--color-secondary));
+  --tw-prose-links: rgb(var(--color-accent));
+  --tw-prose-bold: rgb(var(--color-foreground));
+  --tw-prose-counters: rgb(var(--color-muted));
+  --tw-prose-bullets: rgb(var(--color-muted));
+  --tw-prose-hr: rgb(var(--color-separator));
+  --tw-prose-quotes: rgb(var(--color-foreground));
+  --tw-prose-quote-borders: rgb(var(--color-control-border));
+  --tw-prose-captions: rgb(var(--color-muted));
+  --tw-prose-kbd: var(--color-foreground);
+  --tw-prose-kbd-shadows: var(--color-control-border);
+  --tw-prose-code: rgb(var(--color-accent));
+  --tw-prose-pre-code: rgb(var(--color-foreground));
+  --tw-prose-pre-bg: rgb(var(--color-inset));
+  --tw-prose-th-borders: rgb(var(--color-control-border));
+  --tw-prose-td-borders: rgb(var(--color-separator));
+}
+
+/* Outgoing prose inherits the foreground paired with its bubble's actual fill. */
+html .prose.prose-user {
+  --tw-prose-body: currentColor;
+  --tw-prose-headings: currentColor;
+  --tw-prose-links: currentColor;
+  --tw-prose-bold: currentColor;
+  --tw-prose-counters: currentColor;
+  --tw-prose-bullets: currentColor;
+  --tw-prose-quotes: currentColor;
+  --tw-prose-captions: currentColor;
+  --tw-prose-code: currentColor;
+}
+
+.material-chrome { background: rgb(var(--color-chrome)); }
+@supports (backdrop-filter: blur(12px)) {
+  .material-chrome {
+    background: rgb(var(--color-chrome) / 0.94);
+    backdrop-filter: blur(12px);
+  }
+}
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .material-chrome {
+    background: rgb(var(--color-chrome));
+    backdrop-filter: none;
+  }
+}
+@media (prefers-contrast: more) {
+  :root, [data-theme-family][data-resolved-theme] {
+    --color-separator: var(--color-border-strong);
+    --color-control-border: var(--color-border-strong);
+  }
+}
+@media (forced-colors: active) {
+  html, body, .material-chrome {
+    background: Canvas !important;
+    color: CanvasText;
+  }
+  *, *::before, *::after {
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+  html a { color: LinkText; }
+  :focus-visible { outline: 2px solid Highlight !important; outline-offset: 2px; }
+  button, input, select, textarea { border-color: ButtonText; }
+}

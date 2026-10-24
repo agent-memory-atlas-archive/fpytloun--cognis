@@ -69,7 +69,7 @@ describe('mobile chat header contract', () => {
     const label = pageSource.indexOf('aria-label="New conversation"');
     const button = pageSource.slice(pageSource.lastIndexOf('<button', label), pageSource.indexOf('</button>', label));
     expect(button).toContain('h-9 w-9');
-    expect(button).toContain('bg-sky-400/15 text-sky-300');
+    expect(button).toContain('bg-accent-subtle text-accent');
     expect(button).toContain('<Plus class="h-4 w-4" strokeWidth={2.5}');
     expect(button).toContain('focus-visible:ring-2');
     expect(button).toContain('disabled={newChatCreating}');
@@ -92,8 +92,8 @@ describe('mobile chat header contract', () => {
   it('shows subtle right-aligned counts for active and waiting conversations', () => {
     expect(pageSource).toContain('visibleConversationLanes.active.length} active conversations');
     expect(pageSource).toContain('visibleConversationLanes.waiting.length} waiting conversations');
-    expect(pageSource).toContain('bg-sky-400/10');
-    expect(pageSource).toContain('bg-amber-400/10');
+    expect(pageSource).toContain('bg-info-subtle');
+    expect(pageSource).toContain('bg-warning-subtle');
     expect(pageSource).toContain('justify-between');
     expect(pageSource).toContain('tabular-nums');
   });
@@ -121,8 +121,8 @@ describe('mobile chat header contract', () => {
     const dateLabel = pageSource.match(/id=\{`history-section-\$\{section\.key\}`\} class="([^"]+)"/)?.[1] ?? '';
     expect(dateLabel).toContain('text-right');
     expect(dateLabel).toContain('italic');
-    expect(dateLabel).toContain('text-slate-400');
-    expect(dateLabel).not.toContain('bg-slate-950');
+    expect(dateLabel).toContain('text-muted');
+    expect(dateLabel).not.toContain('bg-canvas');
     expect(dateLabel).not.toContain('rounded-lg');
   });
 });

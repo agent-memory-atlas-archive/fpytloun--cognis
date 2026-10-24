@@ -14,6 +14,24 @@
 - **The UI loads but setup still looks incomplete**
   - Open the onboarding guide or system diagnostics and check which readiness step is still pending.
   - Confirm that a provider and at least one agent already exist.
+- **Opening an older chat times out after 15 seconds**
+  - The initial timeline request has a 15-second browser deadline. A snapshot
+    cache hit does not bypass fresh attachment authorization or URL hydration.
+  - Compare `cognis_chat_snapshot_request_latency_seconds` with
+    `cognis_chat_snapshot_request_stage_latency_seconds` at `/api/metrics`.
+    The stage labels are `context` (metadata and runtime context), `immutable`
+    (cache lookup or projection build, including shared rebuild waits), and
+    `attachments` (request-time attachment authorization and URL hydration).
+    Context timings include successful context loads; immutable and attachment
+    timings also include failed or cancelled operations.
+  - Snapshot and history reads batch attachments within each source-session
+    authority. Exact artifact reads resolve ownership and explicit grants before
+    falling back to recursive work provenance; they do not cache access decisions.
+  - PostgreSQL attachment hydration disables JIT only within its short database
+    transaction. This avoids expensive compilation of overestimated recursive
+    access plans without changing server defaults or leaving pooled connections
+    modified. The transaction closes before URL generation.
+  - Investigate the slow stage before extending deadlines or flushing caches.
 
 ## Provider problems
 

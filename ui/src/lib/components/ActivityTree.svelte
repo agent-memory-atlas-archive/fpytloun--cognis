@@ -146,7 +146,7 @@
     {@const focused = nodeMatchesFocus(node, focusedSessionId)}
     <li class="min-w-0" data-testid={`activity-node-${node.key}`}>
       <div
-        class={`activity-tree-node relative min-w-0 rounded-lg border px-2 py-2 text-xs ${focused ? 'border-sky-400/60 bg-sky-500/10 text-sky-100 shadow-[inset_0_0_0_1px_rgb(56_189_248_/_0.12)]' : 'border-transparent text-slate-400'}`}
+        class={`activity-tree-node relative min-w-0 rounded-lg border px-2 py-2 text-xs ${focused ? 'border-accent bg-accent-subtle text-foreground shadow-[inset_0_0_0_1px_rgb(var(--color-accent)/0.12)]' : 'border-transparent text-muted'}`}
         class:activity-tree-root={depth === 0}
         style={`--tree-depth:${depth}`}
         data-testid="activity-tree-row"
@@ -170,10 +170,10 @@
                 {#if open}<ChevronDown class="h-3.5 w-3.5" />{:else}<ChevronRight class="h-3.5 w-3.5" />{/if}
               </button>
             {:else}<span class="activity-tree-caret block shrink-0" aria-hidden="true"></span>{/if}
-            <button type="button" class="scrollbar-hidden-x block min-w-0 flex-1 text-left font-medium text-slate-100" onclick={() => onViewSession?.(node.session_id, node)} aria-label={`View session ${node.title}`}>{node.title}</button>
+            <button type="button" class="scrollbar-hidden-x block min-w-0 flex-1 text-left font-medium text-foreground" onclick={() => onViewSession?.(node.session_id, node)} aria-label={`View session ${node.title}`}>{node.title}</button>
             {#if node.key !== node.root_key && (node.kind === 'managed' || node.kind === 'managed_agent') && node.conversation_id}
               <a
-                class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-slate-500 transition hover:bg-slate-800 hover:text-sky-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+                class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-quiet transition hover:bg-surface-hover hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
                 href={`/chat/${encodeURIComponent(node.conversation_id)}`}
                 target="_blank"
                 rel="noopener noreferrer"
@@ -191,7 +191,7 @@
                 <WorkstreamTodoProgress progress={node.todo_progress} />
               {/if}
               {#if summary && hasFileChanges(node)}
-                <button type="button" class="rounded border border-slate-700 px-1.5 py-0.5 text-sky-200" onclick={() => onViewWork?.(node.session_id, 'files')} aria-label={`View Work for ${node.title}`}><DiffStat files={summary.changed_files} additions={summary.additions} deletions={summary.deletions} compact /></button>
+                <button type="button" class="rounded border border-control-border px-1.5 py-0.5 text-accent hover:text-accent-hover" onclick={() => onViewWork?.(node.session_id, 'files')} aria-label={`View Work for ${node.title}`}><DiffStat files={summary.changed_files} additions={summary.additions} deletions={summary.deletions} compact /></button>
               {/if}
             </div>
           </div>
@@ -208,12 +208,12 @@
   {/each}
 {/snippet}
 <div class="mb-2 flex justify-end gap-3">
-  <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
-    <input type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-400" checked={hideClosed} onchange={toggleClosed} data-testid="activity-tree-hide-closed" />
+  <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-muted">
+    <input type="checkbox" class="h-4 w-4 rounded border-control-border bg-surface text-accent accent-accent" checked={hideClosed} onchange={toggleClosed} data-testid="activity-tree-hide-closed" />
     Hide closed
   </label>
-  <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
-    <input type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-400" checked={hideReadOnly} onchange={toggleReadOnly} data-testid="activity-tree-hide-read-only" />
+  <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-muted">
+    <input type="checkbox" class="h-4 w-4 rounded border-control-border bg-surface text-accent accent-accent" checked={hideReadOnly} onchange={toggleReadOnly} data-testid="activity-tree-hide-read-only" />
     Hide read-only
   </label>
 </div>
@@ -239,20 +239,20 @@
     top: -0.25rem;
     bottom: -0.25rem;
     left: calc(0.94rem + var(--guide-depth) * 9px);
-    border-left: 1px solid rgb(71 85 105 / 0.45);
+    border-left: 1px solid rgb(var(--color-border-strong) / 0.45);
   }
   .activity-tree-branch {
     position: absolute;
     top: 1.05rem;
     left: calc(0.94rem + (var(--tree-depth) - 1) * 9px);
     width: 9px;
-    border-top: 1px solid rgb(71 85 105 / 0.55);
+    border-top: 1px solid rgb(var(--color-border-strong) / 0.55);
   }
   .activity-tree-parent-trunk,
   .activity-tree-child-trunk {
     position: absolute;
     left: calc(0.94rem + (var(--tree-depth) - 1) * 9px);
-    border-left: 1px solid rgb(71 85 105 / 0.55);
+    border-left: 1px solid rgb(var(--color-border-strong) / 0.55);
   }
   .activity-tree-parent-trunk-before {
     top: -0.25rem;

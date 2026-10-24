@@ -90,12 +90,12 @@
 
 <div bind:this={root} class={`relative ${className}`}>
   {#if label}
-    <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-slate-500" for={triggerId}>{label}</label>
+    <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-quiet" for={triggerId}>{label}</label>
   {/if}
   <button
     aria-expanded={open}
     aria-haspopup="listbox"
-    class="flex w-full items-center justify-between gap-2 rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-left text-sm text-slate-100 transition hover:border-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
+    class="flex w-full items-center justify-between gap-2 rounded-xl border border-control-border bg-surface px-3 py-2 text-left text-sm text-foreground transition hover:border-border-strong focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-60"
     {disabled}
     id={triggerId}
     onclick={toggle}
@@ -108,10 +108,10 @@
       {:else if allowAll && value === allValue}
         <span class="truncate">{allLabel}</span>
       {:else}
-        <span class="truncate text-slate-400">{agents.length === 0 ? emptyLabel : placeholder}</span>
+        <span class="truncate text-muted">{agents.length === 0 ? emptyLabel : placeholder}</span>
       {/if}
     </span>
-    <ChevronDown class="h-4 w-4 shrink-0 text-slate-400" />
+    <ChevronDown class="h-4 w-4 shrink-0 text-muted" />
   </button>
 
   {#if open}
@@ -119,7 +119,7 @@
     <ul
       role="listbox"
       aria-labelledby={triggerId}
-      class="absolute left-0 right-0 z-50 mt-1 max-h-72 overflow-auto rounded-xl border border-slate-700 bg-slate-950 p-1 shadow-xl"
+      class="absolute left-0 right-0 z-50 mt-1 max-h-72 overflow-auto rounded-xl border border-control-border bg-elevated p-1 shadow-xl"
     >
       {#if allowAll}
         {@const selected = value === allValue}
@@ -127,21 +127,21 @@
           <button
             aria-selected={selected}
             role="option"
-            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
+            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-accent-subtle text-strong' : 'text-foreground hover:bg-surface-hover'}`}
             onclick={() => selectValue(allValue)}
             type="button"
           >
-            <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-[11px] font-semibold text-slate-300">All</span>
+            <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-control-border bg-surface text-[11px] font-semibold text-secondary">All</span>
             <span class="flex-1 truncate">{allLabel}</span>
             {#if selected}
-              <Check class="h-4 w-4 text-sky-300" />
+              <Check class="h-4 w-4 text-accent" />
             {/if}
           </button>
         </li>
       {/if}
 
       {#if agents.length === 0 && !allowAll}
-        <li class="px-2 py-2 text-sm text-slate-400" role="option" aria-disabled="true" aria-selected="false">{emptyLabel}</li>
+        <li class="px-2 py-2 text-sm text-muted" role="option" aria-disabled="true" aria-selected="false">{emptyLabel}</li>
       {/if}
 
       {#each agents as agent (agent.agent_id)}
@@ -150,14 +150,14 @@
           <button
             aria-selected={selected}
             role="option"
-            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
+            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-accent-subtle text-strong' : 'text-foreground hover:bg-surface-hover'}`}
             onclick={() => selectValue(agent.agent_id)}
             type="button"
           >
             <AgentAvatar name={agentLabel(agent)} avatarUrl={agent.avatar_url ?? null} class="h-7 w-7 rounded-lg text-[11px]" />
             <span class="flex-1 truncate">{agentLabel(agent)}</span>
             {#if selected}
-              <Check class="h-4 w-4 text-sky-300" />
+              <Check class="h-4 w-4 text-accent" />
             {/if}
           </button>
         </li>

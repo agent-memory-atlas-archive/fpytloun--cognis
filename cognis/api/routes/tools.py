@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -352,18 +353,24 @@ async def preview_effective_tools(
         execution=payload.execution,
         agent_type=payload.agent_type,
     )
-    return await _resolve_effective_tools_response(
-        request,
-        agent,
-        acting_user_email=user.email,
-        executor_owner_email=user.email,
-        access_context=RuntimeAccessContext(
-            user_email=user.email,
-            agent_id=agent.agent_id,
-            agent_owner_email=user.email,
-            agent_type=agent.agent_type,
+    gate = request.app.state.effective_tools_preview_gate
+    key = (user.email, json.dumps(payload.model_dump(mode="json"), sort_keys=True))
+    response: EffectiveToolsResponse = await gate.run(
+        key,
+        lambda: _resolve_effective_tools_response(
+            request,
+            agent,
+            acting_user_email=user.email,
+            executor_owner_email=user.email,
+            access_context=RuntimeAccessContext(
+                user_email=user.email,
+                agent_id=agent.agent_id,
+                agent_owner_email=user.email,
+                agent_type=agent.agent_type,
+            ),
         ),
     )
+    return response
 
 
 @router.get("/api/v1/executor/status", response_model=ExecutorStatusResponse)

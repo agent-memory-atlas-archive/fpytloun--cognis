@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -27,10 +28,13 @@ from cognis.api.common import (
     require_current_user,
     require_resource_owner,
 )
+from cognis.api.conversation_identity import enrich_conversation_identity
 from cognis.api.models import (
     AgentDirectChatResponse,
+    BackgroundCommandDetailResponse,
     BackgroundWorkItemResponse,
     BackgroundWorkProjectionResponse,
+    BackgroundWorkReadResponse,
     ConversationCreateRequest,
     ConversationOpenRequest,
     ConversationResolveRequest,
@@ -38,6 +42,8 @@ from cognis.api.models import (
     ConversationTitleSuggestionResponse,
     ConversationUpdateRequest,
     CursorPage,
+    HandoffLinkRequest,
+    HandoffLinkResponse,
     ManagedConversationActionRequest,
     ManagedConversationActionResponse,
     QueuedMessageResponse,
@@ -47,6 +53,7 @@ from cognis.api.models import (
     SlashCommandSuggestionResponse,
     SlashCommandSuggestionsResponse,
     UpdateQueuedMessageRequest,
+    WaitingConversationPage,
 )
 from cognis.api.serializers import (
     agent_to_response,
@@ -65,11 +72,20 @@ from cognis.core.managed_conversations import (
     new_managed_turn_id,
     project_managed_conversation_state,
 )
+from cognis.core.project_access import (
+    ProjectAssignmentError,
+    can_read_conversation,
+    change_conversation_project,
+    change_conversation_visibility,
+    default_project_id_for_new_topic,
+    project_assignment_refusal,
+)
 from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, SessionEvent, SessionModel
+from cognis.store.database import read_snapshot
 from cognis.store.queries import (
     admit_managed_conversation_turn,
     create_managed_conversation_link,
@@ -302,32 +318,60 @@ async def _background_work_projection(
     )
 
 
-async def _active_background_shells(request: Request, *, user_email: str) -> list[dict[str, Any]]:
+async def _active_background_shells(
+    request: Request,
+    *,
+    user_email: str,
+    include_completed: bool = False,
+    require_complete: bool = False,
+) -> list[dict[str, Any]]:
     """Return active shell jobs that belong to the current user."""
 
     executor = request.app.state.providers.executor
     try:
-        handles = await executor.list_active()
-    except Exception:
-        logger.debug("sidebar: failed to list executors for background work", exc_info=True)
+        handles = await asyncio.wait_for(executor.list_active(), timeout=2.0)
+    except Exception as exc:
+        logger.debug(
+            "sidebar: failed to list executors for background work",
+            extra={"extra_data": {"error_type": type(exc).__name__}},
+        )
+        if require_complete:
+            raise
         return []
 
     async def _statuses(handle: Any) -> list[dict[str, Any]]:
         try:
-            connection = await executor.get_executor(handle)
-            payload = await asyncio.wait_for(
-                connection.background_shell_status(include_completed=False),
-                timeout=2.0,
-            )
-        except Exception:
+            async with asyncio.timeout(2.0):
+                connection = await executor.get_executor(handle)
+                payload = await connection.background_shell_status(
+                    include_completed=include_completed
+                )
+        except Exception as exc:
             logger.debug(
                 "sidebar: failed to read executor background work",
-                extra={"extra_data": {"executor_id": getattr(handle, "executor_id", None)}},
-                exc_info=True,
+                extra={
+                    "extra_data": {
+                        "executor_id": getattr(handle, "executor_id", None),
+                        "error_type": type(exc).__name__,
+                    }
+                },
             )
+            if require_complete:
+                raise
             return []
         shells = payload.get("shells") if isinstance(payload, dict) else None
         if not isinstance(shells, list):
+            if require_complete:
+                logger.debug(
+                    "sidebar: malformed executor background work",
+                    extra={
+                        "extra_data": {
+                            "executor_id": getattr(handle, "executor_id", None),
+                            "error_type": "invalid_shell_list",
+                        }
+                    },
+                )
+                raise ValueError("Executor background shell response has no shell list")
             return []
         normalized: list[dict[str, Any]] = []
         for shell in shells:
@@ -443,6 +487,21 @@ def _require_visible_conversation(request: Request, row: Any) -> Any:
     return row
 
 
+async def _require_readable_conversation(request: Request, row: Any) -> Any:
+    """Allow the author, or project readers of a project-visible conversation."""
+
+    if row is None or getattr(row, "status", None) == "deleted":
+        raise api_exception(404, "not_found", "Conversation not found")
+    user = require_current_user(request)
+    if row.user_email == user.email:
+        return row
+    async with request.app.state.session_factory() as session:
+        readable = await can_read_conversation(session, row, user.email)
+    if not readable:
+        raise api_exception(403, "forbidden", "Resource access denied")
+    return row
+
+
 async def _conversation_attention_context(
     session: Any,
     rows: list[Any],
@@ -533,7 +592,7 @@ async def _conversation_response(
             if include_state
             else None
         )
-    return conversation_to_response(
+    response = conversation_to_response(
         row,
         has_active_turn=resolved_has_active_turn,
         active_turn_state=active_turn_state,
@@ -544,6 +603,13 @@ async def _conversation_response(
         managed_link=managed_link,
         root_controller_conversation_id=root_controller_conversation_id,
     )
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        return (
+            await enrich_conversation_identity(
+                session, [response], user_email=user.email, can_mutate=user.role != "viewer"
+            )
+        )[0]
 
 
 async def _validated_root_controller_conversation_id(
@@ -573,6 +639,71 @@ async def _validated_root_controller_conversation_id(
     return str(root_id)
 
 
+async def sidebar_active_conversation_ids(
+    request: Request,
+    session: AsyncSession,
+    *,
+    user_email: str,
+    conversation_ids: list[str],
+    background_shells: list[dict[str, Any]],
+) -> set[str]:
+    """Resolve activity using the same runtime owners as the sidebar projection."""
+    from cognis.core.managed_conversations import project_managed_conversation_state
+
+    scheduler = getattr(request.app.state, "turn_scheduler", None)
+    durable_running_many = getattr(scheduler, "durable_running_turn_states", None)
+
+    async def running_states(ids: list[str]) -> dict[str, dict[str, Any]]:
+        if callable(durable_running_many):
+            result = await durable_running_many(ids, session=session)
+            return result if isinstance(result, dict) else {}
+        return {
+            conversation_id: state
+            for conversation_id in ids
+            if scheduler is not None
+            and (state := scheduler.running_turn_state(conversation_id)) is not None
+        }
+
+    states = await running_states(conversation_ids)
+    active_ids = {conversation_id for conversation_id, state in states.items() if state is not None}
+    links = await list_managed_conversation_links_for_targets(
+        session, conversation_ids, user_email=user_email
+    )
+    for conversation_id, link in links.items():
+        projection = project_managed_conversation_state(
+            link, scheduler_active_turn_id=(states.get(conversation_id) or {}).get("turn_id")
+        )
+        if projection.turn_state in {"running", "queued", "waiting"}:
+            active_ids.add(conversation_id)
+
+    background = await _background_work_projection(
+        session,
+        user_email=user_email,
+        generated_at=datetime.now(UTC),
+        scheduler_running_turn_states=running_states,
+        background_shells=background_shells,
+    )
+    for item in background.items:
+        if item.kind == "task":
+            running = item.status in {"queued", "ready", "running"}
+        elif item.kind == "managed_conversation":
+            running = item.status in {"running", "queued"}
+        else:
+            running = item.status not in {
+                "complete",
+                "completed",
+                "error",
+                "failed",
+                "cancelled",
+                "killed",
+                "interrupted",
+                "idle",
+            }
+        if running:
+            active_ids.add(item.controller_conversation_id)
+    return active_ids.intersection(conversation_ids)
+
+
 async def _require_mutable_conversation(
     request: Request,
     conversation_id: str,
@@ -598,7 +729,7 @@ async def _require_mutable_conversation(
         agent = await get_agent(session, row.agent_id)
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
-    await check_agent_access(request, agent, required="use")
+    await check_agent_access(request, agent, required="use", project_id=row.project_id)
     return user
 
 
@@ -632,7 +763,12 @@ async def _conversation_page_projection(
     changed_since: datetime | None = None,
     title_query: str | None = None,
     include_attention_actions: bool = False,
+    waiting_candidates: bool = False,
+    topic_only: bool = False,
+    include_shared: bool = False,
+    session: AsyncSession | None = None,
 ) -> CursorPage[ConversationResponse]:
+    supplied_session = session
     cursor_payload = decode_cursor(cursor)
     cursor_scope = {
         "q": (title_query or "").strip().casefold(),
@@ -642,12 +778,17 @@ async def _conversation_page_projection(
         "agent_ids": sorted(agent_ids or ([agent_id] if agent_id else [])),
         "include_agent_direct": include_agent_direct,
         "include_attention_actions": include_attention_actions,
+        **({"waiting_candidates": True} if waiting_candidates else {}),
+        **({"topic_only": True} if topic_only else {}),
+        **({"include_shared": True} if include_shared else {}),
     }
     if cursor_payload is not None and cursor_payload.get("scope") != cursor_scope:
         raise api_exception(400, "invalid_cursor", "Cursor does not match the current filters")
     cursor_id = str(cursor_payload.get("id", "")) if cursor_payload is not None else None
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    async with request.app.state.session_factory() as session:
+    async with (
+        nullcontext(session) if session is not None else request.app.state.session_factory()
+    ) as session:
         rows = await list_conversations(
             session,
             user_email,
@@ -661,20 +802,24 @@ async def _conversation_page_projection(
             cursor_id=cursor_id,
             changed_since=changed_since,
             title_query=title_query,
+            waiting_candidates=waiting_candidates,
+            topic_only=topic_only,
+            include_shared=include_shared,
             limit=limit + 1,
         )
         has_more = len(rows) > limit
         page_rows = rows[:limit]
+        own_rows = [row for row in page_rows if row.user_email == user_email]
         active_sessions, pending_notifications = await _conversation_attention_context(
             session,
-            page_rows,
+            own_rows,
             user_email,
         )
         attention_rows = (
             await list_attention_rows_by_conversation(
                 session,
                 owner_email=user_email,
-                conversation_ids=[row.conversation_id for row in page_rows],
+                conversation_ids=[row.conversation_id for row in own_rows],
             )
             if include_attention_actions
             else {}
@@ -686,13 +831,13 @@ async def _conversation_page_projection(
         )
         if callable(durable_running_many):
             active_turn_states = await durable_running_many(
-                [row.conversation_id for row in page_rows],
+                [row.conversation_id for row in own_rows],
                 session=session,
             )
         elif turn_scheduler is not None:
             active_turn_states = {
                 row.conversation_id: turn_scheduler.running_turn_state(row.conversation_id)
-                for row in page_rows
+                for row in own_rows
             }
         else:
             active_turn_states = {row.conversation_id: None for row in page_rows}
@@ -727,6 +872,7 @@ async def _conversation_page_projection(
         items.append(
             conversation_to_response(
                 row,
+                viewer_email=user_email,
                 has_active_turn=active_turn_state is not None,
                 active_session=(
                     active_sessions.get(row.active_session_id) if row.active_session_id else None
@@ -743,6 +889,17 @@ async def _conversation_page_projection(
                 conversation_state=conversation_states.get(row.conversation_id),
                 managed_link=managed_links.get(row.conversation_id),
             )
+        )
+    async with (
+        nullcontext(supplied_session)
+        if supplied_session is not None
+        else request.app.state.session_factory()
+    ) as identity_session:
+        await enrich_conversation_identity(
+            identity_session,
+            items,
+            user_email=user_email,
+            can_mutate=require_current_user(request).role != "viewer",
         )
     next_cursor = (
         encode_cursor({"id": items[-1].conversation_id, "scope": cursor_scope})
@@ -923,9 +1080,12 @@ async def _agent_direct_chat_projection(
     agent_ids: list[str] | None = None,
     status: str = "active",
     changed_since: datetime | None = None,
+    session: AsyncSession | None = None,
 ) -> list[AgentDirectChatResponse]:
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    async with request.app.state.session_factory() as session:
+    async with (
+        nullcontext(session) if session is not None else request.app.state.session_factory()
+    ) as session:
         rows = await list_agent_direct_chat_rows(
             session,
             user_email,
@@ -1039,6 +1199,30 @@ async def _hydrate_event_attachments(
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
 
+@router.get(
+    "/{conversation_id}/background-commands/{shell_id}",
+    response_model=BackgroundCommandDetailResponse,
+)
+async def background_command_detail(
+    request: Request, conversation_id: str, shell_id: str
+) -> BackgroundCommandDetailResponse:
+    """Read bounded executor-owned command details for the conversation author."""
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+    row = _require_visible_conversation(request, row)
+    shells = await _active_background_shells(
+        request, user_email=row.user_email, include_completed=True
+    )
+    for shell in shells:
+        if (
+            shell.get("shell_id") == shell_id
+            and shell.get("conversation_id") == conversation_id
+            and shell.get("executor_id") == row.active_executor_id
+        ):
+            return BackgroundCommandDetailResponse.model_validate(shell)
+    raise api_exception(404, "not_found", "Background command is no longer available")
+
+
 @router.get("", response_model=CursorPage[ConversationResponse])
 async def conversation_list(
     request: Request,
@@ -1052,6 +1236,7 @@ async def conversation_list(
     status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
     include_agent_direct: bool = Query(default=False),
     q: str | None = Query(default=None, max_length=200),
+    include_shared: bool = Query(default=False),
     include_attention_actions: bool = Query(default=False),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
@@ -1068,7 +1253,67 @@ async def conversation_list(
         status=status,
         include_agent_direct=include_agent_direct,
         title_query=q,
+        include_shared=include_shared,
         include_attention_actions=include_attention_actions,
+    )
+
+
+@router.get("/waiting", response_model=WaitingConversationPage)
+async def waiting_conversations(
+    request: Request,
+    cursor: str | None = None,
+    limit: int = Query(default=100, ge=1, le=100),
+    context_type: str | None = Query(default=None),
+    context_types: list[str] | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    agent_ids: list[str] | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=200),
+) -> WaitingConversationPage:
+    """Page Waiting candidates independently of ordinary conversation history."""
+    user = require_current_user(request)
+    selected_contexts = _filter_values(context_type, context_types)
+    topic_only = not selected_contexts or set(selected_contexts) == {"web"}
+    activity_complete = True
+    try:
+        background_shells = await _active_background_shells(
+            request, user_email=user.email, require_complete=True
+        )
+    except Exception as exc:
+        # Optional executor telemetry cannot invalidate unread/attention data.
+        # Keep the uncertainty explicit so clients retain last-known activity.
+        background_shells = []
+        activity_complete = False
+        logger.debug(
+            "waiting: executor activity unavailable",
+            extra={"extra_data": {"error_type": type(exc).__name__}},
+        )
+    page = await _conversation_page_projection(
+        request,
+        user_email=user.email,
+        cursor=cursor,
+        limit=limit,
+        context_types=selected_contexts,
+        agent_ids=_filter_values(agent_id, agent_ids),
+        project_id=project_id,
+        include_agent_direct=False,
+        include_attention_actions=True,
+        title_query=q,
+        waiting_candidates=True,
+        topic_only=topic_only,
+    )
+    async with request.app.state.session_factory() as session:
+        active_ids = await sidebar_active_conversation_ids(
+            request,
+            session,
+            user_email=user.email,
+            conversation_ids=[item.conversation_id for item in page.items],
+            background_shells=background_shells,
+        )
+    return WaitingConversationPage(
+        conversations=page,
+        active_conversation_ids=sorted(active_ids),
+        activity_complete=activity_complete,
     )
 
 
@@ -1107,6 +1352,73 @@ async def agent_direct_chats(
     )
 
 
+async def _request_background_work(
+    request: Request,
+    session: AsyncSession,
+    *,
+    user_email: str,
+    generated_at: datetime,
+    background_shells: list[dict[str, Any]],
+) -> BackgroundWorkProjectionResponse:
+    scheduler = request.app.state.turn_scheduler
+    durable_running_many = getattr(scheduler, "durable_running_turn_states", None)
+
+    async def running_states(conversation_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if callable(durable_running_many):
+            result = await durable_running_many(conversation_ids, session=session)
+            return result if isinstance(result, dict) else {}
+        return {
+            conversation_id: state
+            for conversation_id in conversation_ids
+            if (state := scheduler.running_turn_state(conversation_id)) is not None
+        }
+
+    return await _background_work_projection(
+        session,
+        user_email=user_email,
+        generated_at=generated_at,
+        scheduler_running_turn_states=running_states,
+        background_shells=background_shells,
+    )
+
+
+@router.get("/background-work", response_model=BackgroundWorkReadResponse)
+async def background_work_read(
+    request: Request,
+    include_agent_direct: bool = Query(default=False),
+) -> BackgroundWorkReadResponse:
+    """Read current-user work and optional authorized homes, never history."""
+    user = require_current_user(request)
+    generated_at = datetime.now(UTC)
+    complete = True
+    try:
+        shells = await _active_background_shells(
+            request, user_email=user.email, require_complete=True
+        )
+    except Exception:
+        shells = []
+        complete = False
+        logger.debug("background work: executor activity unavailable", exc_info=True)
+    async with read_snapshot(request.app.state.session_factory) as session:
+        work = await _request_background_work(
+            request,
+            session,
+            user_email=user.email,
+            generated_at=generated_at,
+            background_shells=shells,
+        )
+        homes = (
+            await _agent_direct_chat_projection(request, user_email=user.email, session=session)
+            if include_agent_direct
+            else []
+        )
+    return BackgroundWorkReadResponse(
+        background_work=work,
+        background_work_changed=complete,
+        agent_direct_chats=homes,
+    )
+
+
 async def _build_sidebar_projection(
     request: Request,
     *,
@@ -1120,58 +1432,79 @@ async def _build_sidebar_projection(
     project_id: str | None = None,
     status: str = "active",
     sidebar_revision: str | None = None,
+    include_shared: bool = False,
 ) -> SidebarProjectionResponse:
     user = require_current_user(request)
     sync_timestamp = datetime.now(UTC)
     context_filter = _filter_values(context_type, context_types)
     agent_filter = _filter_values(agent_id, agent_ids)
-    async with request.app.state.session_factory() as session:
+    # Executor-local state is not revision-governed. Do not hold a database
+    # snapshot across RPC or require activity to stop to finish a read.
+    background_work_changed = True
+    try:
+        background_shells = await _active_background_shells(
+            request, user_email=user.email, require_complete=True
+        )
+    except Exception:
+        logger.debug("sidebar: background work unavailable", exc_info=True)
+        background_shells = []
+        background_work_changed = False
+    async with read_snapshot(request.app.state.session_factory) as session:
         current_revision = await read_live_work_revision(session, user.email)
-    requested_revision = (
-        int(sidebar_revision)
-        if sidebar_revision is not None and sidebar_revision.isdecimal()
-        else None
-    )
-    is_delta = changed_since is not None and requested_revision == current_revision
-    effective_changed_since = changed_since if is_delta else None
-    agents = (
-        []
-        if is_delta
-        else [
-            agent_to_response(agent)
-            for agent in await request.app.state.agent_registry.list_all(
-                owner_email=user.email,
-                include_hidden=False,
-                include_system=True,
-                include_disabled=False,
-            )
-        ]
-    )
-    conversations = await _conversation_page_projection(
-        request,
-        user_email=user.email,
-        cursor=cursor,
-        limit=limit,
-        context_types=context_filter,
-        agent_ids=agent_filter,
-        project_id=project_id,
-        status=status,
-        include_agent_direct=False,
-        changed_since=effective_changed_since,
-    )
-    direct_chats = (
-        await _agent_direct_chat_projection(
+        requested_revision = (
+            int(sidebar_revision)
+            if sidebar_revision is not None and sidebar_revision.isdecimal()
+            else None
+        )
+        # Other owners' membership/visibility changes are not covered by our
+        # revision. Shared listings always replace their authorized snapshot.
+        is_delta = (
+            not include_shared
+            and changed_since is not None
+            and requested_revision == current_revision
+        )
+        effective_changed_since = changed_since if is_delta else None
+        agents = (
+            []
+            if is_delta
+            else [
+                agent_to_response(agent)
+                for agent in await request.app.state.agent_registry.list_all(
+                    owner_email=user.email,
+                    include_hidden=False,
+                    include_system=True,
+                    include_disabled=False,
+                    include_project_shared=True,
+                    session=session,
+                )
+            ]
+        )
+        conversations = await _conversation_page_projection(
             request,
             user_email=user.email,
+            cursor=cursor,
+            limit=limit,
+            context_types=context_filter,
             agent_ids=agent_filter,
-            status="active",
+            project_id=project_id,
+            status=status,
+            include_agent_direct=False,
             changed_since=effective_changed_since,
+            include_shared=include_shared,
+            session=session,
         )
-        if context_filter is None or "web" in context_filter
-        else []
-    )
-    background_shells = await _active_background_shells(request, user_email=user.email)
-    async with request.app.state.session_factory() as session:
+        direct_chats = (
+            await _agent_direct_chat_projection(
+                request,
+                user_email=user.email,
+                agent_ids=agent_filter,
+                status="active",
+                changed_since=effective_changed_since,
+                session=session,
+            )
+            if not project_id and (context_filter is None or "web" in context_filter)
+            else []
+        )
         resolved_context_types = (
             []
             if is_delta
@@ -1196,27 +1529,13 @@ async def _build_sidebar_projection(
             if effective_changed_since is not None
             else []
         )
-        scheduler = request.app.state.turn_scheduler
-        durable_running_many = getattr(scheduler, "durable_running_turn_states", None)
-
-        async def _running_turn_states(conversation_ids: list[str]) -> dict[str, dict[str, Any]]:
-            if callable(durable_running_many):
-                result = await durable_running_many(conversation_ids, session=session)
-                return result if isinstance(result, dict) else {}
-            return {
-                conversation_id: state
-                for conversation_id in conversation_ids
-                if (state := scheduler.running_turn_state(conversation_id)) is not None
-            }
-
         # Executor-local shell state has no durable revision. Always replace
         # this projection so a transition to zero active shells clears stale UI.
-        background_work_changed = True
-        background_work = await _background_work_projection(
+        background_work = await _request_background_work(
+            request,
             session,
             user_email=user.email,
             generated_at=sync_timestamp,
-            scheduler_running_turn_states=_running_turn_states,
             background_shells=background_shells,
         )
         metadata_changed = (
@@ -1229,13 +1548,6 @@ async def _build_sidebar_projection(
             if effective_changed_since is not None
             else False
         )
-        completed_revision = await read_live_work_revision(session, user.email)
-    if completed_revision != current_revision:
-        raise api_exception(
-            409,
-            "sidebar_projection_changed",
-            "Sidebar state changed during projection",
-        )
     return SidebarProjectionResponse(
         agents=[] if is_delta else agents,
         agent_direct_chats=direct_chats,
@@ -1245,7 +1557,7 @@ async def _build_sidebar_projection(
         full_resync_required=is_delta and (conversations.has_more or metadata_changed),
         is_delta=is_delta,
         sync_timestamp=sync_timestamp,
-        sidebar_revision=str(completed_revision),
+        sidebar_revision=str(current_revision),
         background_work=background_work,
         background_work_changed=background_work_changed,
     )
@@ -1255,6 +1567,7 @@ async def _build_sidebar_projection(
 async def sidebar_projection(
     request: Request,
     cursor: str | None = None,
+    include_shared: bool = Query(default=False),
     limit: int = Query(default=50, ge=1, le=100),
     changed_since: datetime | None = Query(default=None),
     sidebar_revision: str | None = Query(default=None, pattern=r"^\d+$"),
@@ -1265,38 +1578,21 @@ async def sidebar_projection(
     project_id: str | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
 ) -> SidebarProjectionResponse:
-    """Return one revision-consistent UI-shaped sidebar projection."""
-
-    for attempt in range(2):
-        try:
-            return await _build_sidebar_projection(
-                request,
-                cursor=cursor,
-                limit=limit,
-                changed_since=changed_since,
-                sidebar_revision=sidebar_revision,
-                context_type=context_type,
-                context_types=context_types,
-                agent_id=agent_id,
-                agent_ids=agent_ids,
-                project_id=project_id,
-                status=status,
-            )
-        except Exception as exc:
-            projection_changed = (
-                getattr(exc, "status_code", None) == 409
-                and getattr(exc, "detail", {}).get("code") == "sidebar_projection_changed"
-            )
-            if projection_changed:
-                if attempt == 0:
-                    continue
-                raise api_exception(
-                    503,
-                    "sidebar_projection_changed",
-                    "Sidebar state changed during projection",
-                ) from exc
-            raise
-    raise AssertionError("unreachable")
+    """Return a database snapshot without waiting for owner-wide quiescence."""
+    return await _build_sidebar_projection(
+        request,
+        cursor=cursor,
+        include_shared=include_shared,
+        limit=limit,
+        changed_since=changed_since,
+        sidebar_revision=sidebar_revision,
+        context_type=context_type,
+        context_types=context_types,
+        agent_id=agent_id,
+        agent_ids=agent_ids,
+        project_id=project_id,
+        status=status,
+    )
 
 
 @router.post("/open", response_model=ConversationResponse)
@@ -1543,13 +1839,26 @@ async def create_conversation(
         agent = await get_agent(session, payload.agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        context_probe = ConversationContext(
+            type=payload.context.type,
+            ref=payload.context.ref,
+            platform_data=payload.context.platform_data,
+        )
+        refusal = project_assignment_refusal(context_probe)
+        project_id = payload.project_id
+        if project_id is not None and refusal is not None:
+            raise api_exception(409, "project_not_assignable", refusal)
+        if project_id is None and refusal is None:
+            project_id = await default_project_id_for_new_topic(
+                session, agent_id=payload.agent_id, user_email=user.email
+            )
+        await check_agent_access(request, agent, required="use", project_id=project_id)
         agent_definition = _agent_definition_from_row(agent)
         try:
             resolve_agent_profile(agent_definition, payload.agent_profile_id, source="api")
         except ValueError as exc:
             raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
-    await _validate_project_access(request, payload.project_id)
+    await _validate_project_access(request, project_id)
     conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
@@ -1562,10 +1871,46 @@ async def create_conversation(
         ),
         title=payload.title,
         title_source="manual" if payload.title else "unset",
-        project_id=payload.project_id,
+        project_id=project_id,
+        visibility=payload.visibility or "project",
     )
     await _emit_sidebar_conversation_upsert(request, conversation.conversation_id)
     return await _conversation_response(request, conversation)
+
+
+@router.post("/{conversation_id}/handoff-links", response_model=HandoffLinkResponse)
+async def link_handoff_recipient(
+    request: Request,
+    conversation_id: str,
+    payload: HandoffLinkRequest,
+) -> HandoffLinkResponse:
+    """Persist a source-card link only after the recipient actually exists."""
+    await _require_mutable_conversation(request, conversation_id)
+    async with request.app.state.session_factory() as db:
+        source = await get_conversation(db, conversation_id)
+        recipient = await get_conversation(db, payload.recipient_conversation_id)
+        session = await get_session_row(db, payload.source_session_id)
+        source_agent = await get_agent(db, source.agent_id) if source else None
+    source = _require_visible_conversation(request, source)
+    recipient = _require_visible_conversation(request, recipient)
+    require_resource_owner(request, recipient.user_email)
+    if session is None or session.conversation_id != conversation_id:
+        raise api_exception(404, "not_found", "Handoff session not found")
+    if source_agent is None:
+        raise api_exception(404, "not_found", "Handoff agent not found")
+    from cognis.core.session import _to_conversation_model, _to_session_model
+
+    try:
+        await request.app.state.handoff_service.link_recipient(
+            _to_conversation_model(source),
+            _to_session_model(session),
+            event_seq=payload.source_event_seq,
+            recipient_id=recipient.conversation_id,
+            agent_owner_email=source_agent.owner_email,
+        )
+    except ValueError as exc:
+        raise api_exception(404, "not_found", "Completed handoff not found") from exc
+    return HandoffLinkResponse(ok=True)
 
 
 @router.get("/{conversation_id}", response_model=ConversationResponse)
@@ -1586,7 +1931,20 @@ async def conversation_detail(
 ) -> ConversationResponse:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-    row = _require_visible_conversation(request, row)
+    row = await _require_readable_conversation(request, row)
+    if row.user_email != require_current_user(request).email:
+        # Project readers get the shared conversation, never the author's
+        # private runtime state, notifications, or pending actions.
+        user = require_current_user(request)
+        async with request.app.state.session_factory() as session:
+            return (
+                await enrich_conversation_identity(
+                    session,
+                    [conversation_to_response(row, viewer_email=user.email)],
+                    user_email=user.email,
+                    can_mutate=user.role != "viewer",
+                )
+            )[0]
     return await _conversation_response(
         request,
         row,
@@ -1603,7 +1961,16 @@ async def remember_opened_conversation(
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        row = _require_visible_conversation(request, row)
+        row = await _require_readable_conversation(request, row)
+        if row.user_email != user.email:
+            return (
+                await enrich_conversation_identity(
+                    session,
+                    [conversation_to_response(row, viewer_email=user.email)],
+                    user_email=user.email,
+                    can_mutate=user.role != "viewer",
+                )
+            )[0]
         if user.role != "viewer" and _is_openable_chat_conversation(
             row,
             user_email=user.email,
@@ -1698,9 +2065,13 @@ async def update_conversation(
         if payload.title is not None:
             row.title = payload.title
             row.title_source = "manual" if payload.title.strip() else "unset"
-        if payload.project_id is not None:
-            await _validate_project_access(request, payload.project_id)
-            row.project_id = payload.project_id
+        if "project_id" in payload.model_fields_set and payload.project_id != row.project_id:
+            # Project and visibility apply together so documents move only once.
+            await _apply_conversation_project_change(
+                request, session, row, payload.project_id, visibility=payload.visibility
+            )
+        elif payload.visibility is not None and payload.visibility != row.visibility:
+            await change_conversation_visibility(session, row, visibility=payload.visibility)
         if "starred_at" in payload.model_fields_set:
             row.starred_at = payload.starred_at
         await session.commit()
@@ -1722,6 +2093,10 @@ async def update_conversation(
             active_turn_state=active_turn_state,
             active_session=active_session,
             pending_notification_types=pending_notifications,
+        )
+        user = require_current_user(request)
+        await enrich_conversation_identity(
+            session, [response], user_email=user.email, can_mutate=user.role != "viewer"
         )
     await _emit_sidebar_conversation_upsert(request, conversation_id)
     return response
@@ -1766,6 +2141,28 @@ async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
                     exc_info=True,
                 )
     return {"ok": True}
+
+
+async def _apply_conversation_project_change(
+    request: Request,
+    session: Any,
+    row: Any,
+    project_id: str | None,
+    *,
+    visibility: str | None = None,
+) -> None:
+    """Validate and apply an explicit project assignment change on ``row``."""
+
+    try:
+        await change_conversation_project(
+            session,
+            row,
+            project_id=project_id,
+            user_email=require_current_user(request).email,
+            visibility=visibility,
+        )
+    except ProjectAssignmentError as exc:
+        raise api_exception(exc.status_code, exc.code, str(exc)) from exc
 
 
 async def _validate_project_access(request: Request, project_id: str | None) -> None:
@@ -1913,7 +2310,9 @@ async def slash_command_suggestions(
         agent_row = await get_agent(session, conversation_row.agent_id)
         if agent_row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        await check_agent_access(request, agent_row, required="use")
+        await check_agent_access(
+            request, agent_row, required="use", project_id=conversation_row.project_id
+        )
         session_row = (
             await get_session_row(session, conversation_row.active_session_id)
             if conversation_row.active_session_id
@@ -2616,7 +3015,11 @@ async def conversation_sessions(
 ) -> list[SessionResponse]:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        row = _require_visible_conversation(request, row)
+    row = await _require_readable_conversation(request, row)
+    if row.user_email != require_current_user(request).email:
+        # Project readers see the shared timeline only, never session runtime metadata.
+        return []
+    async with request.app.state.session_factory() as session:
         sessions = await list_conversation_sessions(
             session,
             conversation_id,

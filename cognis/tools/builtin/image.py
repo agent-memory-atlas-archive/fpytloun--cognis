@@ -218,6 +218,7 @@ async def handle_image_tool(
             quality=quality,
             images=images_b64,
             mask=mask_b64,
+            acting_user_email=user_email,
         )
     except Exception as exc:
         return ToolResult(output=f"Image generation failed: {exc}", is_error=True)
@@ -246,7 +247,7 @@ async def handle_image_tool(
                     "image",
                     image_bytes,
                     img.content_type,
-                    owner_email=current_user_email.get(),
+                    owner_email=user_email or current_user_email.get(),
                 )
                 if session_factory is not None:
                     try:
@@ -257,7 +258,9 @@ async def handle_image_tool(
                                 namespace="images",
                                 object_id=image_id,
                                 filename="image",
-                                owner_email=current_user_email.get(),
+                                owner_email=user_email or current_user_email.get(),
+                                conversation_id=(runtime_metadata or {}).get("conversation_id"),
+                                session_id=(runtime_metadata or {}).get("session_id"),
                                 purpose="tool_output",
                                 kind="image",
                                 mime_type=img.content_type,
@@ -276,6 +279,7 @@ async def handle_image_tool(
                 output_images.append(
                     {
                         "image_id": image_id,
+                        "artifact_id": image_id,
                         "url": signed_url or f"/api/v1/images/{image_id}",
                         "content_type": img.content_type,
                         "revised_prompt": img.revised_prompt,
@@ -431,23 +435,41 @@ async def _resolve_image_artifact_to_b64(
         if not resolved_artifact_id:
             raise ImageSourceError(f"{argument_name} could not resolve {artifact_id}.")
         artifact_id = resolved_artifact_id
-    if artifact_id.startswith("img_"):
-        try:
-            content, content_type = await artifact_store.async_load("images", artifact_id, "image")
-        except FileNotFoundError as exc:
-            raise ImageSourceError(f"{argument_name} image {artifact_id} not found.") from exc
-        if not content_type.startswith("image/"):
-            raise ImageSourceError(f"{argument_name} must be an image artifact ID.")
-        return ImageInput(b64_json=_encode_b64(content), content_type=content_type)
     if session_factory is None:
         raise ImageSourceError(
             f"{argument_name} requires database access for non-image artifact IDs."
         )
     from cognis.store.queries import get_artifact_record
 
+    avatar = None
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted":
+        from cognis.core.artifact_access import artifact_authorized_for_conversation
+
+        metadata = runtime_metadata or {}
+        allowed = await artifact_authorized_for_conversation(
+            session,
+            artifact=row,
+            owner_email=user_email,
+            conversation_id=metadata.get("conversation_id"),
+            agent_id=metadata.get("agent_id"),
+            session_id=metadata.get("session_id"),
+        )
+        if row is None:
+            from cognis.core.avatar_access import resolve_agent_avatar_reference
+
+            avatar = await resolve_agent_avatar_reference(
+                session, artifact_store, artifact_id, user_email
+            )
+    if avatar is not None:
+        try:
+            content, content_type = await artifact_store.async_load(
+                avatar.namespace, avatar.object_id, avatar.filename
+            )
+        except FileNotFoundError:
+            raise ImageSourceError(f"{argument_name} artifact {artifact_id} not found.") from None
+        return ImageInput(b64_json=_encode_b64(content), content_type=content_type)
+    if row is None or not allowed:
         raise ImageSourceError(f"{argument_name} artifact {artifact_id} not found.")
     content, content_type = await artifact_store.async_load(
         row.namespace, row.object_id, row.filename

@@ -169,6 +169,21 @@ def test_missing_model_page_metadata_is_not_a_noop() -> None:
         )
 
 
+def test_openai_reasoning_efforts_include_values_wrapped_across_lines() -> None:
+    markdown = OPENAI_PAGE.replace(
+        "`reasoning.effort` supports `low`, `medium`, and `high`.",
+        "`reasoning.effort` supports `low`, `medium`, `high`,\n`xhigh`, and `max`.",
+    )
+
+    assert preflight.openai_model_details(markdown, "gpt-6-sol")["reasoning_efforts"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+
+
 def test_read_from_ref_does_not_change_working_tree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

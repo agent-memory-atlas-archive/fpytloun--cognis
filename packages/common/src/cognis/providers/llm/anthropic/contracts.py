@@ -24,7 +24,7 @@ MAX_ENVELOPE_BLOCKS = 256
 # `cognis.providers.llm.anthropic_subscription.CLAUDE_CODE_VERSION`;
 # `tests/unit/providers/llm/anthropic/test_integration.py` enforces that both
 # produce the same user agent.
-CLAUDE_CODE_VERSION = "2.1.281"
+CLAUDE_CODE_VERSION = "2.1.293"
 
 
 class AnthropicProtocol(StrEnum):
@@ -628,6 +628,7 @@ class AnthropicNativeEnvelope:
     thinking_fingerprint: str
     continuation_status: AnthropicContinuationStatus = AnthropicContinuationStatus.CONTINUABLE
     contract_version: int = CONTRACT_VERSION
+    thinking_prefix_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         blocks = tuple(_validate_assistant_block(block) for block in self.native_blocks)
@@ -643,6 +644,19 @@ class AnthropicNativeEnvelope:
         ):
             raise ValueError("Anthropic continuation fingerprints must be non-empty")
         object.__setattr__(self, "native_blocks", blocks)
+        fingerprints = tuple(self.thinking_prefix_fingerprints)
+        if any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in fingerprints
+        ):
+            raise ValueError("Invalid Anthropic thinking prefix fingerprint")
+        if fingerprints and len(fingerprints) != sum(
+            block.get("type") in {"thinking", "redacted_thinking"} for block in blocks
+        ):
+            raise ValueError("Incomplete Anthropic thinking prefix fingerprints")
+        object.__setattr__(self, "thinking_prefix_fingerprints", fingerprints)
         client_ids = tuple(str(block["id"]) for block in blocks if block.get("type") == "tool_use")
         server_ids = tuple(
             str(block["id"]) for block in blocks if block.get("type") == "server_tool_use"
@@ -668,6 +682,11 @@ class AnthropicNativeEnvelope:
             "model_fingerprint": self.model_fingerprint,
             "thinking_fingerprint": self.thinking_fingerprint,
             "continuation_status": self.continuation_status.value,
+            **(
+                {"thinking_prefix_fingerprints": list(self.thinking_prefix_fingerprints)}
+                if self.thinking_prefix_fingerprints
+                else {}
+            ),
         }
 
     def to_json(self) -> str:
@@ -692,6 +711,16 @@ class AnthropicNativeEnvelope:
                 payload.get("continuation_status", AnthropicContinuationStatus.CONTINUABLE)
             ),
             contract_version=CONTRACT_VERSION,
+            thinking_prefix_fingerprints=tuple(payload.get("thinking_prefix_fingerprints", ())),
+        )
+
+    @property
+    def thinking_prefix_fingerprints_or_unknown(self) -> tuple[str | None, ...]:
+        """Keep positional alignment for older envelopes without local proof."""
+        return self.thinking_prefix_fingerprints or tuple(
+            None
+            for block in self.native_blocks
+            if block.get("type") in {"thinking", "redacted_thinking"}
         )
 
     @property

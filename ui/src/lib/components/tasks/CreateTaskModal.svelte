@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
@@ -6,7 +7,7 @@
   import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import { api } from '$lib/api/client';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
-  import { policyFromText } from '$lib/session-policy';
+  import { DEFAULT_INTARIS_EVALUATION, policyFromText } from '$lib/session-policy';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
   import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
 
@@ -63,7 +64,7 @@
   let form = $state({
     title: '',
     description: '',
-    agent_id: '',
+    agent_id: untrack(() => defaultAgentId),
     agent_profile_id: '',
     workflow_source: '',
     project_id: '',
@@ -76,8 +77,10 @@
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
     escalation_timeout_seconds: '',
     allow_policy_text: '',
+    intaris_evaluation: '' as '' | 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy',
     deny_policy_text: ''
   });
+  let initialForm = $state(untrack(() => JSON.stringify(form)));
 
   function handleSubmit(): void {
     if (!form.title.trim() || !form.agent_id) return;
@@ -100,7 +103,7 @@
       escalation_timeout_seconds: form.escalation_timeout_seconds
         ? Number(form.escalation_timeout_seconds)
         : null,
-      session_policy: policyFromText(form.allow_policy_text, form.deny_policy_text),
+      session_policy: policyFromText(form.allow_policy_text, form.deny_policy_text, form.intaris_evaluation),
       status: 'draft'
     });
   }
@@ -132,12 +135,19 @@
 
   $effect(() => {
     if (!form.agent_id && defaultAgentId) {
+      const pristine = JSON.stringify(form) === initialForm;
       form.agent_id = defaultAgentId;
+      if (pristine) initialForm = JSON.stringify(form);
     }
   });
 
   $effect(() => {
-    form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
+    const normalized = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
+    if (normalized !== form.agent_profile_id) {
+      const pristine = JSON.stringify(form) === initialForm;
+      form.agent_profile_id = normalized;
+      if (pristine) initialForm = JSON.stringify(form);
+    }
   });
 
   $effect(() => {
@@ -148,44 +158,45 @@
     void loadWorkflowsForProject(form.project_id);
   });
 </script>
-<BlockingDialog label="Create task" onClose={onclose} titleId="create-task-title">
+<BlockingDialog label="Create task" onClose={onclose} titleId="create-task-title" dismissible={!creating} backdropDismissible={JSON.stringify(form) === initialForm}>
   {#snippet header()}
     <div class="flex items-center justify-between gap-3">
-      <h2 class="text-lg font-semibold text-white" id="create-task-title">Create task</h2>
-      <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close" type="button">&times;</button>
+      <h2 class="text-lg font-semibold text-strong" id="create-task-title">Create task</h2>
+      <button class="text-muted hover:text-strong" onclick={onclose} aria-label="Close" type="button">&times;</button>
     </div>
   {/snippet}
 
   {#snippet children()}
     <div class="space-y-4">
       <div class="space-y-1">
-        <label for="task-title" class="text-xs font-medium uppercase tracking-widest text-slate-400">Title</label>
+        <label for="task-title" class="text-xs font-medium uppercase tracking-widest text-muted">Title</label>
         <Input id="task-title" bind:value={form.title} placeholder="Task title" />
       </div>
       <div class="space-y-1">
-        <label for="task-desc" class="text-xs font-medium uppercase tracking-widest text-slate-400">Description</label>
+        <label for="task-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Description</label>
         <textarea
           id="task-desc"
           bind:value={form.description}
-          class="min-h-[100px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+          class="min-h-[100px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
           placeholder="Describe the work item"
         ></textarea>
       </div>
 
       <div class="space-y-1">
-        <label for="task-expected" class="text-xs font-medium uppercase tracking-widest text-slate-400">Expected output</label>
+        <label for="task-expected" class="text-xs font-medium uppercase tracking-widest text-muted">Expected output</label>
         <textarea
           id="task-expected"
           bind:value={form.expected_output}
-          class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+          class="min-h-[60px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
           placeholder="Describe the expected format or content of the result (optional)"
         ></textarea>
       </div>
 
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1">
-          <label for="task-agent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Agent</label>
-          <select id="task-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <label for="task-agent" class="text-xs font-medium uppercase tracking-widest text-muted">Agent</label>
+          <select id="task-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
+            <option value="" disabled>Select an agent</option>
             {#each primaryAgents as agent}
               <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
             {/each}
@@ -193,8 +204,8 @@
         </div>
 
         <div class="space-y-1">
-          <label for="task-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
-          <select id="task-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <label for="task-workflow" class="text-xs font-medium uppercase tracking-widest text-muted">Workflow</label>
+          <select id="task-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
             {#each workflowSourceOptions as option}
               <option value={option.value}>{option.label}</option>
@@ -207,8 +218,8 @@
           bind:value={form.agent_profile_id}
         />
         <div class="space-y-1">
-          <label for="task-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
-          <select id="task-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <label for="task-project" class="text-xs font-medium uppercase tracking-widest text-muted">Project</label>
+          <select id="task-project" bind:value={form.project_id} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">None</option>
             {#each projects as project}
               <option value={project.project_id}>{project.name}</option>
@@ -219,13 +230,13 @@
 
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1">
-          <label for="task-priority" class="text-xs font-medium uppercase tracking-widest text-slate-400">Priority</label>
+          <label for="task-priority" class="text-xs font-medium uppercase tracking-widest text-muted">Priority</label>
           <Input id="task-priority" bind:value={form.priority} type="number" />
         </div>
 
         <div class="space-y-1">
-          <label for="task-delivery" class="text-xs font-medium uppercase tracking-widest text-slate-400">Delivery</label>
-          <select id="task-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <label for="task-delivery" class="text-xs font-medium uppercase tracking-widest text-muted">Delivery</label>
+          <select id="task-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="preferred_channel">Preferred channel</option>
             <option value="specific_conversation">Specific conversation</option>
             <option value="latest_active_for_agent">Latest active</option>
@@ -235,8 +246,8 @@
 
       {#if form.delivery_mode === 'specific_conversation'}
         <div class="space-y-1">
-          <label for="task-target" class="text-xs font-medium uppercase tracking-widest text-slate-400">Target conversation</label>
-          <select id="task-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <label for="task-target" class="text-xs font-medium uppercase tracking-widest text-muted">Target conversation</label>
+          <select id="task-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">Select conversation</option>
             {#each conversations as conversation}
               <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
@@ -246,32 +257,32 @@
       {/if}
 
       <div class="space-y-1">
-        <label for="task-completion-family" class="text-xs font-medium uppercase tracking-widest text-slate-400">Completion notification behavior</label>
+        <label for="task-completion-family" class="text-xs font-medium uppercase tracking-widest text-muted">Completion notification behavior</label>
         <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-          <select id="task-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select id="task-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="default">Default delivery</option>
             <option value="direct">Direct channel delivery</option>
           </select>
-          <label class="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-            <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-slate-600 bg-slate-800" />
+          <label class="inline-flex items-center gap-2 rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground">
+            <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-control-border bg-raised" />
             <span>Allow silent completion</span>
           </label>
         </div>
-        <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+        <p class="text-xs text-quiet">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
       </div>
 
       <div class="space-y-1">
-        <label for="task-interaction" class="text-xs font-medium uppercase tracking-widest text-slate-400">Interaction policy</label>
-        <select id="task-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+        <label for="task-interaction" class="text-xs font-medium uppercase tracking-widest text-muted">Interaction policy</label>
+        <select id="task-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
           <option value="">Workflow default</option>
           <option value="step_requests">Allow planning questions</option>
           <option value="explicit_gates">Gates only</option>
           <option value="none">Fully autonomous</option>
         </select>
-        <p class="text-xs text-slate-500">Workflow default allows clarification in selected planning steps. Fully autonomous disables dynamic questions.</p>
+        <p class="text-xs text-quiet">Workflow default allows clarification in selected planning steps. Fully autonomous disables dynamic questions.</p>
       </div>
 
-      <label class="block space-y-1 text-sm text-slate-200" for="task-escalation-timeout">
+      <label class="block space-y-1 text-sm text-foreground" for="task-escalation-timeout">
         <span>Escalation timeout (seconds)</span>
         <input
           id="task-escalation-timeout"
@@ -281,12 +292,15 @@
           step="1"
           bind:value={form.escalation_timeout_seconds}
           placeholder="Inherit agent or global timeout"
-          class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+          class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
         />
-        <span class="block text-xs text-slate-500">Pending escalations are denied when this time elapses. Fully autonomous tasks deny immediately.</span>
+        <span class="block text-xs text-quiet">Pending escalations are denied when this time elapses. Fully autonomous tasks deny immediately.</span>
       </label>
 
       <SessionPolicyEditor
+        showEvaluation
+        bind:evaluation={form.intaris_evaluation}
+        inheritedEvaluation={selectedAgent?.capabilities?.intaris_evaluation ?? DEFAULT_INTARIS_EVALUATION}
         bind:allowText={form.allow_policy_text}
         bind:denyText={form.deny_policy_text}
         title="Intaris session policies"

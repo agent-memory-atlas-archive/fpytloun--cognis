@@ -1,12 +1,14 @@
 <script lang="ts">
-  import Download from 'lucide-svelte/icons/download';
   import Eye from 'lucide-svelte/icons/eye';
   import FileText from 'lucide-svelte/icons/file-text';
 
   import { api } from '$lib/api/client';
+  import { resolveHtmlPreviewUrl, type SignedHtmlPreview } from '$lib/attachments/html-preview';
+  import { onDestroy } from 'svelte';
   import { previewKind } from '$lib/attachments/preview';
-  import AttachmentPreviewModal from '$lib/components/AttachmentPreviewModal.svelte';
+  import { attachmentUploads } from '$lib/chat-v2/attachment-uploads';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
+  import AttachmentSaveButton from './AttachmentSaveButton.svelte';
   import type { AttachmentRef } from '$lib/types/api';
 
   /**
@@ -15,21 +17,66 @@
    * - Image attachments collapse to a row of square thumbnails (96px on
    *   mobile, 112px on sm+). Tapping a thumbnail opens a full-screen
    *   lightbox with a download button.
-   * - Non-image attachments render as compact one-line file pills with a
-   *   filename, size hint, and an explicit download icon. The whole pill
-   *   is also a link, so a regular tap opens the file in a new tab.
+    * - Non-image attachments offer in-app preview and a shared file-save control.
    *
    * The component contains its own lightbox state so it can be dropped
    * anywhere a chat message renders attachments without callers needing
    * to wire popover state.
    */
 
-  let { attachments } = $props<{ attachments: AttachmentRef[] }>();
+  let { attachments: rawAttachments } = $props<{ attachments: AttachmentRef[] }>();
+
+  // A sent-but-not-yet-admitted message holds the attachment references as
+  // they were at send time. Overlay the live background-upload state so the
+  // bubble keeps showing progress (and failures) until the upload finishes.
+  type UploadPatch = Pick<AttachmentRef, 'upload_state' | 'upload_progress' | 'upload_error'>;
+  let livePatches = $state<Record<string, UploadPatch>>({});
+
+  $effect(() => {
+    const tracked = new Set<string>();
+    for (const attachment of rawAttachments as AttachmentRef[]) {
+      if (attachment.local_id) tracked.add(attachment.local_id);
+    }
+    if (tracked.size === 0) return;
+    const initial: Record<string, UploadPatch> = {};
+    for (const id of tracked) {
+      const state = attachmentUploads.uploadState(id);
+      if (state) initial[id] = state;
+    }
+    livePatches = initial;
+    return attachmentUploads.onChange((localId, patch) => {
+      if (!tracked.has(localId)) return;
+      livePatches = { ...livePatches, [localId]: { ...livePatches[localId], ...patch } };
+    });
+  });
+
+  const attachments = $derived(
+    rawAttachments.map((attachment: AttachmentRef) => (
+      attachment.local_id && livePatches[attachment.local_id]
+        ? { ...attachment, ...livePatches[attachment.local_id] }
+        : attachment
+    )),
+  );
+
+  function uploadPercent(attachment: AttachmentRef): number {
+    return Math.round(Math.max(0, Math.min(1, attachment.upload_progress ?? 0)) * 100);
+  }
+
+  function isUploading(attachment: AttachmentRef): boolean {
+    return Boolean(attachment.local_id) && attachment.upload_state === 'uploading';
+  }
+
+  function uploadFailed(attachment: AttachmentRef): boolean {
+    return Boolean(attachment.local_id) && attachment.upload_state === 'failed';
+  }
 
   let lightboxIndex = $state<number | null>(null);
   let previewAttachment = $state<AttachmentRef | null>(null);
   let previewMediaUrl = $state<string | null>(null);
+  let previewHtmlSource = $state<SignedHtmlPreview | null>(null);
   let previewRequest = 0;
+  let previewController: AbortController | null = null;
+  onDestroy(() => { previewRequest += 1; previewController?.abort(); });
   let resolvedUrls = $state<Record<string, string>>({});
 
   function urlKey(attachment: AttachmentRef, mode: 'download' | 'view'): string {
@@ -60,12 +107,15 @@
       src: resolvedUrl(image, 'download') ?? '',
       alt: image.filename,
       filename: image.filename,
+      artifact_id: image.local_id ? undefined : image.artifact_id,
     })),
   );
 
   async function resolveAttachmentUrl(attachment: AttachmentRef, mode: 'download' | 'view' = 'download'): Promise<string | null> {
     const existing = resolvedUrl(attachment, mode);
     if (existing) return existing;
+    // Still uploading in the background: there is no server artifact yet.
+    if (attachment.local_id || attachment.artifact_id.startsWith('local:')) return null;
     try {
       const result = await api.artifacts.signedUrl(attachment.artifact_id, 3600, mode);
       resolvedUrls = { ...resolvedUrls, [urlKey(attachment, mode)]: result.url };
@@ -96,23 +146,21 @@
     lightboxIndex = null;
   }
 
-  async function openDownloadAttachment(attachment: AttachmentRef): Promise<void> {
-    const url = await resolveAttachmentUrl(attachment, 'download');
-    if (url) window.open(url, '_blank', 'noopener,noreferrer');
-  }
-
   async function openPreview(attachment: AttachmentRef): Promise<void> {
     const request = ++previewRequest;
+    previewController?.abort();
+    previewController = new AbortController();
     const kind = previewKind(attachment);
-    if (kind === 'html' || kind === 'pdf') {
-      previewMediaUrl = await resolveAttachmentUrl(attachment, 'view');
-      if (request !== previewRequest) return;
-    } else if (kind === 'video') {
-      previewMediaUrl = await resolveAttachmentUrl(attachment, 'download');
-      if (request !== previewRequest) return;
-    } else {
-      previewMediaUrl = null;
-    }
+    previewAttachment = null;
+    const htmlSource = kind === 'html'
+      ? await resolveHtmlPreviewUrl(attachment.artifact_id, previewController.signal).catch(() => null)
+      : null;
+    const mediaUrl = ['pdf', 'video', 'audio'].includes(kind ?? '')
+        ? await resolveAttachmentUrl(attachment, 'download')
+        : null;
+    if (request !== previewRequest) return;
+    previewHtmlSource = htmlSource;
+    previewMediaUrl = mediaUrl;
     previewAttachment = attachment;
   }
 
@@ -130,7 +178,7 @@
     {#each imageAttachments as image, index (image.artifact_id)}
       <button
         type="button"
-        class="group relative h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-slate-800/60 bg-slate-950/60 transition hover:border-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:h-28 sm:w-28"
+        class="group relative h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-separator bg-inset transition hover:border-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:h-28 sm:w-28"
         onclick={() => openLightbox(index)}
         aria-label={`View ${image.filename}`}
       >
@@ -140,6 +188,25 @@
           class="h-full w-full object-cover transition group-hover:scale-105"
           loading="lazy"
         />
+        {#if isUploading(image)}
+          <span
+            class="pointer-events-none absolute inset-x-0 bottom-0 bg-scrim/70 px-1 py-0.5 text-center text-[10px] font-medium tabular-nums text-white"
+            role="status"
+            aria-label={`Uploading ${uploadPercent(image)}%`}
+          >
+            {uploadPercent(image)}%
+            <span class="mt-0.5 block h-0.5 w-full overflow-hidden rounded bg-white/25">
+              <span class="block h-full bg-white transition-[width]" style={`width: ${uploadPercent(image)}%`}></span>
+            </span>
+          </span>
+        {:else if uploadFailed(image)}
+          <span
+            class="pointer-events-none absolute inset-x-0 bottom-0 bg-danger-subtle py-0.5 text-center text-[10px] font-medium text-danger"
+            title={image.upload_error ?? 'Upload failed'}
+          >
+            Upload paused
+          </span>
+        {/if}
       </button>
     {/each}
   </div>
@@ -150,33 +217,42 @@
     {#each otherAttachments as attachment (attachment.artifact_id)}
       {@const sizeText = formatBytes(attachment.size_bytes)}
       {@const kind = previewKind(attachment)}
-      <div class="flex items-center gap-3 rounded-xl border border-slate-800/60 bg-slate-950/40 px-3 py-2">
-        <span class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800/60 text-slate-300">
+      <div class="flex items-center gap-3 rounded-xl border border-separator bg-surface px-3 py-2 text-foreground">
+        <span class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-raised text-secondary">
           <FileText class="h-4 w-4" />
         </span>
         <div class="min-w-0 flex-1">
-          {#if resolvedUrl(attachment, 'download')}
-            <a
-              href={resolvedUrl(attachment, 'download') ?? ''}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="block truncate text-sm font-medium text-slate-100 hover:text-sky-300"
+          {#if kind}
+            <button
+              type="button"
+              onclick={() => { void openPreview(attachment); }}
+              class="block truncate text-sm font-medium text-accent hover:text-accent-hover"
             >
               {attachment.filename}
-            </a>
+            </button>
           {:else}
-            <p class="truncate text-sm font-medium text-slate-100">{attachment.filename}</p>
+            <p class="truncate text-sm font-medium text-foreground">{attachment.filename}</p>
           {/if}
-          <p class="truncate text-xs text-slate-500">
+          <p class="truncate text-xs text-secondary">
             {attachment.mime_type ?? 'file'}{sizeText ? ` · ${sizeText}` : ''}
+            {#if isUploading(attachment)}
+              <span class="tabular-nums text-info" role="status"> · Uploading {uploadPercent(attachment)}%</span>
+            {:else if uploadFailed(attachment)}
+              <span class="text-danger" title={attachment.upload_error ?? 'Upload failed'}> · Upload paused</span>
+            {/if}
           </p>
+          {#if isUploading(attachment)}
+            <span class="mt-1 block h-0.5 w-full overflow-hidden rounded bg-raised">
+              <span class="block h-full bg-info transition-[width]" style={`width: ${uploadPercent(attachment)}%`}></span>
+            </span>
+          {/if}
         </div>
         {#if attachment.mime_type?.startsWith('audio/')}
           {@const audioUrl = resolvedUrl(attachment, 'download')}
           {#if audioUrl}
             <audio class="h-9 max-w-48" src={audioUrl} controls preload="none"></audio>
           {:else}
-            <button type="button" onclick={() => { void resolveAttachmentUrl(attachment, 'download'); }} class="text-xs text-sky-300">Load player</button>
+            <button type="button" onclick={() => { void resolveAttachmentUrl(attachment, 'download'); }} class="text-xs text-accent hover:text-accent-hover">Load player</button>
           {/if}
         {/if}
         {#if kind}
@@ -184,32 +260,16 @@
             type="button"
             onclick={() => { void openPreview(attachment); }}
             aria-label={`Preview ${attachment.filename}`}
-            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted transition hover:bg-surface-hover hover:text-foreground"
           >
             <Eye class="h-4 w-4" />
           </button>
         {/if}
-        {#if resolvedUrl(attachment, 'download')}
-          <a
-            href={resolvedUrl(attachment, 'download') ?? ''}
-            download={attachment.filename}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={`Download ${attachment.filename}`}
-            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
-          >
-            <Download class="h-4 w-4" />
-          </a>
-        {:else}
-          <button
-            type="button"
-            onclick={() => { void openDownloadAttachment(attachment); }}
-            aria-label={`Download ${attachment.filename}`}
-            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
-          >
-            <Download class="h-4 w-4" />
-          </button>
-        {/if}
+        <AttachmentSaveButton
+          filename={attachment.filename}
+          resolveUrl={() => resolveAttachmentUrl(attachment, 'download')}
+          class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-muted hover:bg-surface-hover hover:text-foreground"
+        />
       </div>
     {/each}
   </div>
@@ -218,13 +278,16 @@
 {#if previewAttachment}
   {@const activePreviewKind = previewKind(previewAttachment)}
   {#if activePreviewKind}
+    {#await import('$lib/components/AttachmentPreviewModal.svelte') then { default: AttachmentPreviewModal }}
     <AttachmentPreviewModal
       attachment={previewAttachment}
       kind={activePreviewKind}
       mediaUrl={previewMediaUrl}
-      onClose={() => { previewRequest += 1; previewAttachment = null; previewMediaUrl = null; }}
-      onDownload={() => { if (previewAttachment) void openDownloadAttachment(previewAttachment); }}
+      htmlSource={previewHtmlSource}
+      onClose={() => { previewRequest += 1; previewController?.abort(); previewAttachment = null; previewMediaUrl = null; previewHtmlSource = null; }}
+      resolveDownloadUrl={() => previewAttachment ? resolveAttachmentUrl(previewAttachment, 'download') : Promise.resolve(null)}
     />
+    {/await}
   {/if}
 {/if}
 

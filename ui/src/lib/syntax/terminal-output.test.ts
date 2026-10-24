@@ -7,8 +7,18 @@ describe('terminal output rendering', () => {
     const html = renderTerminalOutput('\x1b[0m\x1b[0;38;5;240m\x1b[0m\x1b[0;37m[i] Code: TNXS-LGZP\x1b[0m');
 
     expect(html).toContain('[i] Code: TNXS-LGZP');
-    expect(html).toContain('color: #e5e7eb');
+    expect(html).toContain('color: rgb(var(--color-foreground, 229 231 235))');
     expect(html).not.toContain('\x1b');
+  });
+
+  it('themes normal, bright and indexed ANSI foregrounds without changing truecolor fidelity', () => {
+    const html = renderTerminalOutput('normal \x1b[37mwhite\x1b[97mbright\x1b[38;5;7mindexed\x1b[38;5;15mindexed bright\x1b[31merror\x1b[0m reset');
+    expect(html).toContain('normal ');
+    expect(html.match(/--color-foreground/g)).toHaveLength(4);
+    expect(html).toContain('--color-danger');
+    expect(html).toContain(' reset');
+    expect(html).not.toContain('#e5e7eb');
+    expect(html).not.toContain('#f9fafb');
   });
 
   it('supports truecolor and escapes unsafe HTML', () => {
@@ -19,10 +29,33 @@ describe('terminal output rendering', () => {
     expect(html).not.toContain('<script>');
   });
 
-  it('linkifies bare http and https URLs in terminal output', () => {
-    const html = renderTerminalOutput('Open https://lumilens.awsapps.com/start, then continue.');
+  it.each([
+    ['30;47', '#111827', '#e5e7eb'],
+    ['37;40', '#e5e7eb', '#111827'],
+    ['38;5;0;48;5;7', '#111827', '#e5e7eb'],
+    ['38;5;7;48;5;0', '#e5e7eb', '#111827'],
+    ['47', '#111827', '#e5e7eb'],
+    ['40', '#f9fafb', '#111827'],
+    ['48;5;7', '#111827', '#e5e7eb'],
+    ['48;5;0', '#f9fafb', '#111827'],
+    ['30;47;7', '#e5e7eb', '#111827'],
+  ])('preserves readable explicit ANSI pairs for %s', (codes, fg, bg) => {
+    const html = renderTerminalOutput(`\x1b[${codes}mtext\x1b[0m reset`);
+    expect(html).toContain(`color: ${fg}; background-color: ${bg}`);
+    expect(html).toMatch(/<\/span> reset$/);
+  });
 
-    expect(html).toContain('<a href="https://lumilens.awsapps.com/start"');
+  it('restores theme foregrounds after background and inverse resets', () => {
+    const html = renderTerminalOutput('\x1b[37;40;7mreverse\x1b[27;49mtheme\x1b[0m reset');
+    expect(html).toContain('color: #111827; background-color: #e5e7eb');
+    expect(html).toContain('color: rgb(var(--color-foreground, 229 231 235))');
+    expect(html).toMatch(/<\/span> reset$/);
+  });
+
+  it('linkifies bare http and https URLs in terminal output', () => {
+    const html = renderTerminalOutput('Open https://sso.example.test/start, then continue.');
+
+    expect(html).toContain('<a href="https://sso.example.test/start"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');
     expect(html).toContain('</a>, then continue.');

@@ -616,10 +616,10 @@ async def test_attachment_post_processor_refreshes_each_sync_and_backfill_read(
 ) -> None:
     revisions = iter(("url-v1", "url-v2"))
 
-    async def hydrate(_session, _store, attachments, **_kwargs):
-        return [{**attachments[0], "url": next(revisions)}]
+    async def hydrate(_session, _store, groups, **_kwargs):
+        return [[{**groups[0][0], "url": next(revisions)}]]
 
-    monkeypatch.setattr(coordinator, "hydrate_attachment_refs", hydrate)
+    monkeypatch.setattr(coordinator, "hydrate_attachment_ref_groups", hydrate)
 
     class SessionContext:
         async def __aenter__(self):
@@ -656,6 +656,133 @@ async def test_attachment_post_processor_refreshes_each_sync_and_backfill_read(
     assert first[0].data["attachments"][0]["url"] == "url-v1"
     assert second[0].data["attachments"][0]["url"] == "url-v2"
     assert event.data["attachments"] == [{"artifact_id": "art-a"}]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cached", [False, True])
+async def test_snapshot_batches_attachments_by_source_session_without_mutating_cache(
+    monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    from cognis.api.chat_v2.schemas import AttachmentRef, MessageTimelineItem, SourceRef
+
+    clock = FakeClock()
+    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
+    context = _context(bound, "session-a")
+    context.session_refs.append(
+        context.session_refs[0].model_copy(
+            update={
+                "session_id": "session-b",
+                "event_store_session_id": "event-session-b",
+                "ordinal": 1,
+            }
+        )
+    )
+    items = [
+        MessageTimelineItem(
+            id=f"message-{index}",
+            message_id=f"message-{index}",
+            role="assistant",
+            content="An attachment",
+            sort_key=f"{index:04}",
+            source_refs=[
+                SourceRef(
+                    store="intaris",
+                    session_id="session-a" if index % 2 == 0 else "event-session-b",
+                    seq=index + 1,
+                    event_type="assistant_message",
+                )
+            ],
+            attachments=[
+                AttachmentRef(
+                    artifact_id="art-a",
+                    filename="report.txt",
+                    kind="file",
+                    mime_type="text/plain",
+                    size_bytes=10,
+                )
+            ],
+        )
+        for index in range(40)
+    ]
+    base = await build_test_snapshot(bound)
+    base = base.model_copy(update={"timeline": base.timeline.model_copy(update={"items": items})})
+    hydrate = AsyncMock(
+        side_effect=lambda _factory, _store, groups, **kwargs: [
+            [{**group[0], "url": f"https://files.test/{kwargs['session_id']}"}] for group in groups
+        ]
+    )
+    monkeypatch.setattr(coordinator, "hydrate_attachment_ref_groups", hydrate)
+    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", AsyncMock(return_value=base))
+    monkeypatch.setattr(
+        coordinator, "load_conversation_snapshot_context", AsyncMock(return_value=context)
+    )
+
+    class Cache:
+        async def get_or_build_result(self, **kwargs):
+            snapshot = base if cached else await kwargs["build"]()
+            return SnapshotCacheResult(snapshot, "l1" if cached else "build")
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            shared_chat_snapshot_cache=Cache(),
+            cached_event_store=bound._cache,
+            session_factory=object(),
+            artifact_store=object(),
+        )
+    )
+    result = await coordinator.build_chat_snapshot_coordinated(app, context)
+
+    assert hydrate.await_count == 2
+    assert [call.kwargs["session_id"] for call in hydrate.await_args_list] == [
+        "session-a",
+        "session-b",
+    ]
+    assert [len(call.args[2]) for call in hydrate.await_args_list] == [20, 20]
+    assert [item.id for item in result.timeline.items] == [item.id for item in items]
+    assert all(item.attachments[0].url is None for item in items)
+    assert [item.attachments[0].url for item in result.timeline.items] == [
+        f"https://files.test/session-{'a' if index % 2 == 0 else 'b'}" for index in range(40)
+    ]
+
+
+@pytest.mark.anyio
+async def test_event_attachment_processor_batches_without_crossing_source_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="event-session",
+            seq=index + 1,
+            type="assistant_message",
+            data={
+                "cognis_session_id": "session-a" if index % 2 == 0 else "session-b",
+                "attachments": [{"artifact_id": "art-a"}],
+            },
+        )
+        for index in range(30)
+    ]
+    hydrate = AsyncMock(
+        side_effect=lambda _factory, _store, groups, **kwargs: [
+            # The other authority is intentionally denied access to the same ref.
+            [] if kwargs["session_id"] == "session-b" else [{**group[0], "url": "fresh-url"}]
+            for group in groups
+        ]
+    )
+    monkeypatch.setattr(coordinator, "hydrate_attachment_ref_groups", hydrate)
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=object(), artifact_store=object()))
+    processor = coordinator.event_attachment_post_processor(
+        app, owner_email="user@example.com", conversation_id="conversation-a"
+    )
+    result = await processor(events)
+
+    assert hydrate.await_count == 2
+    assert [event.seq for event in result] == list(range(1, 31))
+    assert all(event.data["attachments"] == [{"artifact_id": "art-a"}] for event in events)
+    for index, event in enumerate(result):
+        assert event.data["attachments"] == (
+            [{"artifact_id": "art-a", "url": "fresh-url"}] if index % 2 == 0 else []
+        )
 
 
 def test_conversation_authority_is_stable_across_session_agent_lineage() -> None:

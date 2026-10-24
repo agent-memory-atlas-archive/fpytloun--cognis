@@ -30,6 +30,8 @@ class NativeValidationContext:
     task_title: str = ""
     task_description: str = ""
     task_expected_output: str | None = None
+    daily_brief_task_output: bool | None = None
+    deliverable_step_run_id: str | None = None
     loaded_skill_names: frozenset[str] = frozenset()
     loaded_skill_snapshots: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] = ()
     executed_tool_names: tuple[str, ...] = ()
@@ -111,6 +113,10 @@ def write_deliverable_validation_state_fingerprint(
         "conversation_id": context.conversation_id,
         "conversation_agent_id": context.conversation_agent_id,
         "write_deliverable_available": context.write_deliverable_available,
+        "daily_brief_task_output": context.daily_brief_task_output,
+        "deliverable_step_run_id": context.deliverable_step_run_id,
+        "actor_email": context.actor_email,
+        "current_agent_id": context.current_agent_id,
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode()).hexdigest()

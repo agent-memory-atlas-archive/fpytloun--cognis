@@ -1,28 +1,42 @@
 <script lang="ts">
+  import CognisLogo from '$lib/components/CognisLogo.svelte';
+  import PaletteHost from '$lib/components/palette/PaletteHost.svelte';
+  import Search from 'lucide-svelte/icons/search';
+  let commandPalette = $state<PaletteHost>();
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import type { Snippet } from 'svelte';
-  import { onMount } from 'svelte';
-  import Bot from 'lucide-svelte/icons/bot';
-import Box from 'lucide-svelte/icons/box';
-import BookOpen from 'lucide-svelte/icons/book-open';
+  import { onMount, tick } from 'svelte';
+  import { navigationItems } from '$lib/navigation';
 import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
-import Clock from 'lucide-svelte/icons/clock';
-import FolderKanban from 'lucide-svelte/icons/folder-kanban';
-import Library from 'lucide-svelte/icons/library';
-import LayoutDashboard from 'lucide-svelte/icons/layout-dashboard';
-import ListTodo from 'lucide-svelte/icons/list-todo';
 import Menu from 'lucide-svelte/icons/menu';
-import MessageSquareText from 'lucide-svelte/icons/message-square-text';
-import Radio from 'lucide-svelte/icons/radio';
 import RefreshCw from 'lucide-svelte/icons/refresh-cw';
-import Settings from 'lucide-svelte/icons/settings';
-import Workflow from 'lucide-svelte/icons/workflow';
-import Wrench from 'lucide-svelte/icons/wrench';
 import X from 'lucide-svelte/icons/x';
 
   import ToastViewport from '$lib/components/ToastViewport.svelte';
+  import InboxBell from '$lib/components/InboxBell.svelte';
+  import { startInbox } from '$lib/stores/inbox';
+  import NavigationAttentionBadge from '$lib/components/NavigationAttentionBadge.svelte';
+  import { navigationBadges, startNavigationAttention } from '$lib/stores/navigationAttention';
+  import { startConversationWorkspace } from '$lib/dashboard/conversation-workspace-runtime';
+  import { conversationWorkspace } from '$lib/dashboard/conversation-workspace';
+  import { isNativeHost, isWorkspaceReplica } from '$lib/native/host';
+  import type { Component } from 'svelte';
+  let PinnedDock = $state<Component | null>(null);
+  let dockLoading = false;
+  $effect(() => {
+    if (isNativeHost() || !$conversationWorkspace.agents.length || PinnedDock || dockLoading || typeof window === 'undefined') return;
+    dockLoading = true;
+    void import('$lib/components/chat/PinnedConversationDock.svelte').then((module) => {
+      PinnedDock = module.default;
+    }).finally(() => { dockLoading = false; });
+  });
+  import ConnectionBanner from '$lib/components/ConnectionBanner.svelte';
+  import { deviceDataReady, deviceDataError, installOfflineSession } from '$lib/offline/session';
+
+  // Before child pages mount: they read the per-user offline cache on open.
+  installOfflineSession();
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -40,22 +54,6 @@ import X from 'lucide-svelte/icons/x';
   import { invalidateAllWorkScopes, invalidateWorkFromSocket } from '$lib/work/workViewState';
 
   let { children }: { children: Snippet } = $props();
-
-  const navigationItems = [
-    { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-    { href: '/chat', label: 'Chat', icon: MessageSquareText },
-    { href: '/agents', label: 'Agents', icon: Bot },
-    { href: '/projects', label: 'Projects', icon: FolderKanban },
-    { href: '/tasks', label: 'Tasks', icon: ListTodo },
-    { href: '/workflows', label: 'Workflows', icon: Workflow },
-    { href: '/schedules', label: 'Schedules', icon: Clock },
-    { href: '/docs', label: 'Docs', icon: BookOpen },
-    { href: '/tools', label: 'Tools', icon: Wrench },
-    { href: '/channels', label: 'Channels', icon: Radio },
-    { href: '/local-models', label: 'Local Models', icon: Box },
-    { href: '/knowledge', label: 'Knowledge', icon: Library },
-    { href: '/settings', label: 'Settings', icon: Settings }
-  ];
 
   function navigationItemActive(href: string, pathname: string): boolean {
     return href === '/' ? pathname === '/' : pathname.startsWith(href);
@@ -75,6 +73,13 @@ import X from 'lucide-svelte/icons/x';
 
   function closeMobileNav(): void {
     mobileNavOpen = false;
+  }
+
+  async function openMobileSearch(): Promise<void> {
+    closeMobileNav();
+    // Release the drawer's focus trap before opening the palette.
+    await tick();
+    await commandPalette?.show();
   }
 
   // Mirror the local mobileNavOpen state into the shared store so
@@ -130,7 +135,7 @@ import X from 'lucide-svelte/icons/x';
 
   function currentTitle(pathname: string): string {
     if (pathname === '/') return 'Control Center';
-    return navigationItems.find((item) => pathname.startsWith(item.href))?.label ?? 'Workspace';
+    return navigationItems.find((item) => navigationItemActive(item.href, pathname))?.label ?? 'Workspace';
   }
 
   function setShellOffsetVariable(name: string, value: number): void {
@@ -202,6 +207,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   function startWorkspace(): void {
+    if (isNativeHost()) return;
     if (workspaceRunning) return;
     workspaceRunning = true;
     wsClient.connect();
@@ -209,6 +215,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function stopWorkspace(): void {
+    if (isNativeHost()) return;
     if (!workspaceRunning) return;
     workspaceRunning = false;
     wsClient.disconnect();
@@ -237,19 +244,23 @@ import X from 'lucide-svelte/icons/x';
 
   function websocketStatusLabel(): string {
     if ($wsState.status === 'connected') return 'Connected';
+    if ($wsState.offline) return 'Offline';
     if ($wsState.status === 'stalled') return 'Disconnected';
-    if ($wsState.status === 'reconnecting') return `Reconnecting (${$wsState.attempts}/10)`;
+    if ($wsState.status === 'reconnecting') return `Reconnecting (${$wsState.attempts})`;
     if ($wsState.status === 'connecting') return 'Connecting';
     return 'Idle';
   }
 
   function websocketStatusTone(): string {
-    if ($wsState.status === 'connected') return 'bg-emerald-400';
-    if ($wsState.status === 'stalled') return 'bg-rose-400';
-    return 'bg-sky-400';
+    if ($wsState.status === 'connected') return 'bg-success';
+    if ($wsState.status === 'stalled') return 'bg-danger';
+    return 'bg-accent';
   }
 
   onMount(() => {
+    const stopConversations = isNativeHost() ? () => {} : startConversationWorkspace();
+    const stopInbox = isNativeHost() ? () => {} : startInbox();
+    const stopNavigationAttention = isWorkspaceReplica() ? () => {} : startNavigationAttention();
     restoreSidebarState();
     startAuthBootstrap();
 
@@ -278,13 +289,16 @@ import X from 'lucide-svelte/icons/x';
     });
     let previousWsStatus = $wsState.status;
     const unsubscribeWsState = wsState.subscribe((state) => {
-      if (state.status === 'connected' && previousWsStatus === 'reconnecting') {
+      if (state.status === 'connected' && (previousWsStatus === 'reconnecting' || previousWsStatus === 'stalled')) {
         invalidateAllWorkScopes();
       }
       previousWsStatus = state.status;
     });
 
     return () => {
+      stopConversations();
+      stopInbox();
+      stopNavigationAttention();
       resetOverlayState();
        window.removeEventListener('resize', syncMobileHeaderOffset);
       navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage);
@@ -341,9 +355,9 @@ import X from 'lucide-svelte/icons/x';
 {#if !bootstrapped || $auth.status === 'loading'}
   <div class="app-fullscreen-safe mx-auto flex max-w-5xl items-center justify-center">
     {#if workspaceLoadingSlow}
-      <section class="mx-4 max-w-md rounded-3xl border border-sky-500/30 bg-sky-500/10 px-6 py-8 text-center text-sm text-sky-100 shadow-card">
+      <section class="mx-4 max-w-md rounded-3xl border border-accent/30 bg-accent-subtle px-6 py-8 text-center text-sm text-accent shadow-card">
         <p class="font-medium">Workspace is still loading.</p>
-        <p class="mt-2 text-sky-50/80">The app shell is taking longer than expected to restore your session.</p>
+        <p class="mt-2 text-accent/80">The app shell is taking longer than expected to restore your session.</p>
         <div class="mt-5 flex justify-center">
           <Button variant="secondary" onclick={retryWorkspaceLoad}>Retry</Button>
         </div>
@@ -356,33 +370,31 @@ import X from 'lucide-svelte/icons/x';
   <a class="skip-link" href="#main-content">Skip to content</a>
   <ToastViewport />
   <ConfirmDialog />
-  <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-slate-950">
+  <PaletteHost bind:this={commandPalette} />
+  {#if PinnedDock && $auth.status === 'authenticated' && $deviceDataReady}<PinnedDock />{/if}
+  {#if $auth.status === 'authenticated'}
+    <ConnectionBanner />
+  {/if}
+  <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-chrome">
     <div class={`flex h-full w-full min-w-0 overflow-hidden ${shellSpacingClass}`}>
       {#if !isChatWindowMode}
       <aside
-        class={`mb-3 hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
+        class={`mb-3 hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-separator/80 bg-chrome shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
-          {#if sidebarExpanded}
+          <div class="border-b border-separator/80 pb-4">
             <a
-              class="flex items-center gap-3 border-b border-slate-800/80 pb-5 rounded-xl transition hover:bg-slate-800/60"
+              class={`group flex w-full min-w-0 items-center rounded-xl transition-colors hover:bg-raised/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent ${sidebarExpanded ? 'gap-3 px-2 py-2' : 'justify-center py-1'}`}
               href="/"
               aria-label="Open Control Center"
               data-testid="sidebar-logo-link"
             >
-              <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
-              <div class="min-w-0 space-y-1">
-                <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
-                <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
-              </div>
+              <CognisLogo class={sidebarExpanded ? 'h-10 w-10' : 'h-8 w-8'} />
+              {#if sidebarExpanded}
+                <span data-wordmark class="min-w-0 truncate text-sm font-semibold uppercase tracking-[0.25em] text-accent group-hover:text-accent-hover">Cognis</span>
+              {/if}
             </a>
-          {:else}
-            <div class="flex justify-center border-b border-slate-800/80 pb-4">
-              <a href="/" aria-label="Open Control Center" data-testid="sidebar-logo-link" class="rounded-xl transition hover:opacity-80">
-                <img alt="Cognis" class="h-9 w-9 rounded-xl shadow-card" src="/pwa/icon-192.png" />
-              </a>
-            </div>
-          {/if}
+          </div>
 
           <!--
             Nav links. When the sidebar is collapsed each link uses the
@@ -398,55 +410,62 @@ import X from 'lucide-svelte/icons/x';
               {#if sidebarExpanded}
                 <a
                   aria-label={`Open ${item.label}`}
-                   class={`flex items-center rounded-2xl text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                   class={`flex items-center rounded-2xl text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-accent-subtle text-strong' : 'text-secondary hover:bg-raised hover:text-strong'} gap-3 px-4 py-3`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
                   <span>{item.label}</span>
+                  <NavigationAttentionBadge badge={$navigationBadges[item.href]} />
                 </a>
               {:else}
                 <a
                   use:sidebarTooltip={item.label}
                   aria-label={`Open ${item.label}`}
-                   class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                   class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-accent-subtle text-strong' : 'text-secondary hover:bg-raised hover:text-strong'}`}
                   href={item.href}
                 >
-                  <item.icon class="h-4 w-4 shrink-0" />
+                  <span class="relative">
+                    <item.icon class="h-4 w-4 shrink-0" />
+                    <NavigationAttentionBadge badge={$navigationBadges[item.href]} collapsed />
+                  </span>
                 </a>
               {/if}
             {/each}
           </nav>
         </div>
 
-        <div class={`shrink-0 space-y-4 border-t border-slate-800/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
+        <div class={`shrink-0 space-y-4 border-t border-separator/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
+          <div class="space-y-1" data-testid="pinned-search-and-notifications">
+            <button type="button" aria-label="Search Cognis" title="Search Cognis (⌘K / Ctrl+K)"
+              class={`flex min-h-10 w-full items-center rounded-xl text-muted hover:bg-raised hover:text-strong ${sidebarExpanded ? 'gap-3 px-3 text-xs' : 'justify-center'}`}
+              onclick={() => void commandPalette?.show()}>
+              <Search class="h-4 w-4 shrink-0" />
+              {#if sidebarExpanded}<span>Search anything</span><kbd class="ml-auto text-[10px] opacity-60">⌘K</kbd>{/if}
+            </button>
+            <InboxBell expanded={sidebarExpanded} />
+          </div>
           {#if sidebarExpanded}
             <div class="space-y-1">
-              <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>
-              <p class="text-xs text-slate-400">{$auth.user?.email}</p>
+              <p class="text-sm font-medium text-strong">{$auth.user?.name ?? $auth.user?.email}</p>
+              <p class="text-xs text-muted">{$auth.user?.email}</p>
             </div>
-            <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+            <div class="space-y-2 rounded-2xl border border-separator/80 bg-chrome/60 px-3 py-3 text-sm text-secondary">
               <div class="flex items-center justify-between gap-3">
-                <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
+                <span class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Workspace</span>
                 <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
               </div>
-              <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
+              <div class="flex items-center justify-between gap-3 text-xs text-muted">
                 <span>WebSocket</span>
                 <span class="text-right">{websocketStatusLabel()}</span>
               </div>
               <div class="flex gap-2">
                 {#if $wsState.status === 'stalled'}
-                  <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => wsClient.connect()}>
+                  <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => wsClient.reconnectNow()}>
                     <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
                     Reconnect
                   </Button>
                 {/if}
               </div>
-              {#if $auth.user?.role === 'admin'}
-                <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => goto('/getting-started')}>
-                  <BookOpen class="mr-1.5 h-3.5 w-3.5" />
-                  Getting started
-                </Button>
-              {/if}
             </div>
             <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
           {:else}
@@ -462,16 +481,9 @@ import X from 'lucide-svelte/icons/x';
                 class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`}
                 aria-label={`WebSocket ${$wsState.status}`}
               ></span>
-              {#if $auth.user?.role === 'admin'}
-                <div use:sidebarTooltip={'Getting started'} class="inline-flex">
-                  <Button aria-label="Open getting started guide" class="h-9 w-9" size="icon" variant="ghost" onclick={() => goto('/getting-started')}>
-                    <BookOpen class="h-4 w-4" />
-                  </Button>
-                </div>
-              {/if}
               {#if $wsState.status === 'stalled'}
                 <div use:sidebarTooltip={'Reconnect WebSocket'} class="inline-flex">
-                  <Button aria-label="Reconnect WebSocket" class="h-9 w-9" size="icon" variant="ghost" onclick={() => wsClient.connect()}>
+                  <Button aria-label="Reconnect WebSocket" class="h-9 w-9" size="icon" variant="ghost" onclick={() => wsClient.reconnectNow()}>
                     <RefreshCw class="h-4 w-4" />
                   </Button>
                 </div>
@@ -481,7 +493,7 @@ import X from 'lucide-svelte/icons/x';
           {#if sidebarCollapsed}
             <button
               use:sidebarTooltip={'Expand sidebar'}
-              class="flex w-full items-center justify-center rounded-xl py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              class="flex w-full items-center justify-center rounded-xl py-2 text-xs text-muted transition hover:bg-raised hover:text-strong"
               onclick={toggleSidebar}
               type="button"
               aria-label="Expand sidebar"
@@ -490,7 +502,7 @@ import X from 'lucide-svelte/icons/x';
             </button>
           {:else}
             <button
-              class="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              class="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs text-muted transition hover:bg-raised hover:text-strong"
               onclick={toggleSidebar}
               type="button"
               aria-label="Collapse sidebar"
@@ -515,19 +527,20 @@ import X from 'lucide-svelte/icons/x';
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent" id="main-content">
         {#if showMobileHeader}
         <!-- The iOS-managed viewport already starts below the status area. -->
-        <header bind:this={mobileHeaderEl} class="app-keyboard-stable-header fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950 px-3 py-1 sm:gap-3 sm:px-4 sm:py-1 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
+        <header bind:this={mobileHeaderEl} class="app-keyboard-stable-header fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-separator/80 bg-chrome px-3 py-1 sm:gap-3 sm:px-4 sm:py-1 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-10 w-10 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
-              <h2 class="truncate text-base font-semibold text-white sm:text-lg">{currentTitle($page.url.pathname)}</h2>
+              <h2 class="truncate text-base font-semibold text-strong sm:text-lg">{currentTitle($page.url.pathname)}</h2>
             </div>
           </div>
 
           <div class="flex shrink-0 items-center gap-2">
+            <InboxBell />
             <span
-              class={`inline-flex h-2.5 w-2.5 rounded-full ${$wsState.status === 'connected' ? 'bg-emerald-400' : $wsState.status === 'stalled' ? 'bg-rose-400' : 'bg-sky-400'}`}
+              class={`inline-flex h-2.5 w-2.5 rounded-full ${$wsState.status === 'connected' ? 'bg-success' : $wsState.status === 'stalled' ? 'bg-danger' : 'bg-accent'}`}
               aria-label={`WebSocket ${$wsState.status}`}
               title={`WebSocket ${$wsState.status}${$wsState.status === 'reconnecting' || $wsState.status === 'stalled' ? ` (attempt ${$wsState.attempts}/10)` : ''}`}
             ></span>
@@ -537,7 +550,7 @@ import X from 'lucide-svelte/icons/x';
                 class="h-10 w-10 md:h-9 md:w-9"
                 size="icon"
                 variant="secondary"
-                onclick={() => wsClient.connect()}
+                onclick={() => wsClient.reconnectNow()}
                 title="Reconnect"
               >
                 <RefreshCw class="h-4 w-4" />
@@ -563,7 +576,13 @@ import X from 'lucide-svelte/icons/x';
           use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen || isChatWindowMode }}
           use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: !mobileNavOpen }}
         >
-            {@render children()}
+            {#if $deviceDataReady}
+              {@render children()}
+             {:else if $deviceDataError}
+               <p class="p-6 text-sm text-warning" role="alert">{$deviceDataError} Local data remains preserved; sending is disabled.</p>
+             {:else}
+               <LoadingState label="Preparing workspace" description="Binding verified account storage." />
+            {/if}
         </div>
       </main>
     </div>
@@ -581,55 +600,55 @@ import X from 'lucide-svelte/icons/x';
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
         <div class="flex min-w-0 items-center gap-3">
-          <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
+          <CognisLogo class="h-11 w-11" />
           <div class="min-w-0">
-            <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
-            <p class="mt-1 truncate text-sm text-slate-400">{$auth.user?.email}</p>
+            <p data-wordmark class="text-sm uppercase tracking-[0.25em] text-accent">Cognis</p>
+            <p class="mt-1 truncate text-sm text-muted">{$auth.user?.email}</p>
           </div>
         </div>
-        <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
-          <X class="h-4 w-4" />
-        </Button>
+        <div class="flex shrink-0 items-center gap-2">
+          <Button aria-label="Search Cognis" title="Search Cognis" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileSearch}>
+            <Search class="h-4 w-4" />
+          </Button>
+          <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
       </div>
     {/snippet}
 
     <nav class="space-y-2">
       {#each navigationItems as item}
         <a
-           class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+           class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-accent-subtle text-strong' : 'text-secondary hover:bg-surface hover:text-strong'}`}
           href={item.href}
           onclick={closeMobileNav}
         >
            <item.icon class="h-5 w-5" />
           <span>{item.label}</span>
+          <NavigationAttentionBadge badge={$navigationBadges[item.href]} />
         </a>
       {/each}
     </nav>
 
-    <div class="mt-6 space-y-3 border-t border-slate-800 pt-5">
-      <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+    <div class="mt-6 space-y-3 border-t border-separator pt-5">
+      <div class="space-y-2 rounded-2xl border border-separator/80 bg-chrome/60 px-3 py-3 text-sm text-secondary">
         <div class="flex items-center justify-between gap-3">
-          <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
+          <span class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Workspace</span>
           <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
         </div>
-        <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
+        <div class="flex items-center justify-between gap-3 text-xs text-muted">
           <span>WebSocket</span>
           <span class="text-right">{websocketStatusLabel()}</span>
         </div>
         <div class="flex gap-2">
           {#if $wsState.status === 'stalled'}
-            <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); wsClient.connect(); }}>
+            <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); wsClient.reconnectNow(); }}>
               <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
               Reconnect
             </Button>
           {/if}
         </div>
-        {#if $auth.user?.role === 'admin'}
-          <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); void goto('/getting-started'); }}>
-            <BookOpen class="mr-1.5 h-3.5 w-3.5" />
-            Getting started
-          </Button>
-        {/if}
       </div>
       <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
     </div>

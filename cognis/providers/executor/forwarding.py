@@ -24,6 +24,11 @@ from cognis.models.local_models import (
 )
 from cognis.models.tool import ExecutorCapabilities, ToolCall, ToolResult
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
+from cognis.tools.registry import (
+    TOOL_BACKGROUND_RPC_TIMEOUT_SECONDS,
+    ToolBackgroundRequestOutcome,
+    parse_tool_background_rpc_result,
+)
 
 _logger = get_logger(__name__)
 
@@ -916,6 +921,14 @@ class ForwardedExecutorConnection:
         if pending is not None and not pending.future.done():
             pending.future.cancel()
 
+    async def request_background(
+        self, call_id: str, *, timeout: float = TOOL_BACKGROUND_RPC_TIMEOUT_SECONDS
+    ) -> ToolBackgroundRequestOutcome:
+        """Ask the owning replica's executor to move a running tool call to background."""
+
+        result = await self.rpc_call("tool.background", {"call_id": call_id}, timeout=timeout)
+        return parse_tool_background_rpc_result(result)
+
     async def llm_complete_stream(
         self,
         request_id: str,
@@ -1036,11 +1049,14 @@ class ForwardedExecutorConnection:
                     task.cancel()
 
     async def background_shell_status(self, *, include_completed: bool = False) -> dict[str, Any]:
-        return await self.rpc_call(
+        from cognis.providers.executor.shell_status import bind_shell_status
+
+        result = await self.rpc_call(
             "shell.background_status",
             {"include_completed": include_completed},
             replay_safe=True,
         )
+        return bind_shell_status(result, self.executor_id)
 
     async def lsp_status(self) -> dict[str, Any]:
         return await self.rpc_call(
@@ -1066,6 +1082,7 @@ class ForwardedExecutorConnection:
         api_key: str = "",
         provider_id: str | None = None,
         owner_email: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         result = await self.rpc_call(
             "llm.discover_models",
@@ -1075,6 +1092,7 @@ class ForwardedExecutorConnection:
                 "api_key": api_key,
                 "provider_id": provider_id,
                 "owner_email": owner_email,
+                **({"aws_config": aws_config} if aws_config else {}),
             },
             timeout=30,
         )

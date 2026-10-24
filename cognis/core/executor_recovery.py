@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 
 EXECUTOR_RECOVERY_WINDOW_SECONDS = 900
@@ -54,6 +55,7 @@ async def begin_executor_recovery(
     task_id: str | None,
     executor_id: str,
     observed_at: datetime | None = None,
+    notice_dispatcher: Any = None,
 ) -> ExecutorRecoveryWindow:
     """Persist and return the first unavailable observation for active work."""
 
@@ -63,6 +65,7 @@ async def begin_executor_recovery(
         from cognis.store.coordination import database_now
 
         database_current = await database_now(session)
+        sampled_at = monotonic()
         row = (
             await get_task(session, task_id)
             if task_id
@@ -85,17 +88,37 @@ async def begin_executor_recovery(
                 observed_at=observed_at,
             )
             unavailable_since = persisted or database_current
-            await session.commit()
+            # A failed projection rolls back a savepoint and expires the task.
+            # Revalidate the pin asynchronously before deciding whether to queue feedback.
+            await session.refresh(row, attribute_names=["active_executor_id"])
         if unavailable_since is None:
             unavailable_since = database_current
+        if (
+            notice_dispatcher is not None
+            and row is not None
+            and getattr(row, "active_executor_id", None) == executor_id
+        ):
+            await notice_dispatcher.queue_recovery_notice(
+                session,
+                conversation_id=conversation_id,
+                executor_id=executor_id,
+                unavailable_since=unavailable_since,
+                recovered=False,
+            )
+        await session.commit()
     if unavailable_since.tzinfo is None:
         unavailable_since = unavailable_since.replace(tzinfo=UTC)
     deadline = unavailable_since + timedelta(seconds=EXECUTOR_RECOVERY_WINDOW_SECONDS)
+    if notice_dispatcher is not None:
+        await notice_dispatcher.flush_recovery_notices()
+    elapsed = monotonic() - sampled_at if notice_dispatcher is not None else 0
     return ExecutorRecoveryWindow(
         executor_id=executor_id,
         unavailable_since=unavailable_since,
         deadline=deadline,
-        database_remaining_seconds=max(0.0, (deadline - database_current).total_seconds()),
+        database_remaining_seconds=max(
+            0.0, (deadline - database_current).total_seconds() - elapsed
+        ),
     )
 
 
@@ -105,6 +128,7 @@ async def clear_executor_recovery(
     conversation_id: str | None,
     task_id: str | None,
     executor_id: str,
+    notice_dispatcher: Any = None,
 ) -> None:
     """Clear the outage marker after the same executor becomes ready."""
 
@@ -120,11 +144,22 @@ async def clear_executor_recovery(
         )
         if row is None or getattr(row, "active_executor_id", None) != executor_id:
             return
-        await clear_executor_unavailable(
+        unavailable_since = getattr(row, "active_executor_unavailable_since", None)
+        cleared = await clear_executor_unavailable(
             session,
             conversation_id=conversation_id,
             task_id=task_id,
             expected_executor_id=executor_id,
             expected_generation=int(getattr(row, "active_executor_generation", 0) or 0),
         )
+        if cleared and unavailable_since is not None and notice_dispatcher is not None:
+            await notice_dispatcher.queue_recovery_notice(
+                session,
+                conversation_id=conversation_id,
+                executor_id=executor_id,
+                unavailable_since=unavailable_since,
+                recovered=True,
+            )
         await session.commit()
+    if cleared and unavailable_since is not None and notice_dispatcher is not None:
+        await notice_dispatcher.flush_recovery_notices()

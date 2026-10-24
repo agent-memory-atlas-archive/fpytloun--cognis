@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -29,8 +30,14 @@ from cognis.core.agent_profiles import (
 from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
 from cognis.core.compaction import CompactionModelContext
 from cognis.core.events import Event, EventType
+from cognis.core.legacy_approvals import escalation_call_id, resolve_legacy_approval
 from cognis.core.long_lived_chat import is_channel_context_type
 from cognis.core.notifications import NotificationType
+from cognis.core.project_access import (
+    ProjectAssignmentError,
+    change_conversation_project,
+    project_assignment_refusal,
+)
 from cognis.core.runtime_selection import (
     RuntimeSelectionPlan,
     persist_runtime_selection,
@@ -77,6 +84,7 @@ _EXACT_SYSTEM_SLASH_COMMANDS = frozenset(
 )
 _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
     {
+        "/handoff",
         "/fork",
         "/model",
         "/thinking",
@@ -84,7 +92,9 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/yolo",
         "/profile",
         "/skill",
+        "/hook",
         "/executor",
+        "/project",
         "/task",
         "/research",
         "/implement",
@@ -207,7 +217,11 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
     ),
     _SlashCommandMetadata("/profile", "List or switch agent runtime profile", True, True),
     _SlashCommandMetadata("/skill", "List or load a skill into this session", True, True),
+    _SlashCommandMetadata("/hook", "List or manually run an assigned hook", True, True),
     _SlashCommandMetadata("/executor", "Show or switch active executor", True, True),
+    _SlashCommandMetadata(
+        "/project", "Show, set, or clear this topic chat's project (none clears)", True, True
+    ),
     _SlashCommandMetadata("/context", "Show context usage"),
     _SlashCommandMetadata("/info", "Show session details"),
     _SlashCommandMetadata(
@@ -217,7 +231,7 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
         True,
     ),
     _SlashCommandMetadata("/lsp", "Show LSP diagnostics status"),
-    _SlashCommandMetadata("/plan", "Plan/read-only mode; add text for one-shot planning", True),
+    _SlashCommandMetadata("/plan", "Planning mode; add text for one-shot planning", True),
     _SlashCommandMetadata("/build", "Build/implementation mode; add text for one-shot build", True),
     _SlashCommandMetadata(
         "/default",
@@ -226,6 +240,7 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
     ),
     _SlashCommandMetadata("/compact", "Compact conversation"),
     _SlashCommandMetadata("/recap", "Summarize work in this conversation"),
+    _SlashCommandMetadata("/handoff", "Prepare a handoff for another conversation or agent", True),
     _SlashCommandMetadata("/summarize", "Alias for /compact"),
     _SlashCommandMetadata("/fork", "Fork conversation; add text to start the fork", True),
     _SlashCommandMetadata("/task", "Create a background task", True),
@@ -268,9 +283,13 @@ def _parse_slash_suggestion_input(value: str) -> tuple[str, str, str] | None:
     return ("parameter", command.lower(), partial.strip())
 
 
-def _suggest_commands(partial: str, *, limit: int) -> list[SlashCommandSuggestion]:
+def _suggest_commands(
+    partial: str, *, limit: int, hidden: frozenset[str] = frozenset()
+) -> list[SlashCommandSuggestion]:
     suggestions: list[SlashCommandSuggestion] = []
     for metadata in _SLASH_COMMAND_METADATA:
+        if metadata.command in hidden:
+            continue
         if partial and not metadata.command.startswith(partial):
             continue
         suffix = "space" if metadata.accepts_argument else "none"
@@ -347,6 +366,10 @@ class CommandDispatcher:
         notification_service: Any,
         turn_scheduler: Any | None = None,
         recap_service: Any | None = None,
+        handoff_service: Any | None = None,
+        skill_runtime_factory: Any | None = None,
+        artifact_store: Any | None = None,
+        hook_runtime: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._session_manager = session_manager
@@ -357,10 +380,49 @@ class CommandDispatcher:
         self._notification_service = notification_service
         self._turn_scheduler = turn_scheduler
         self._recap_service = recap_service
+        self._handoff_service = handoff_service
+        self._skill_runtime_factory = skill_runtime_factory
+        self._artifact_store = artifact_store
+        self._hook_runtime = hook_runtime
 
     @property
     def _task_queue(self) -> Any | None:
         return getattr(self._turn_scheduler, "_task_queue", None)
+
+    async def _handle_hook(
+        self, selector: str, conversation: Any, session: Any, user_email: str, busy: bool
+    ) -> CommandResult:
+        from cognis.core.hooks import HookError
+
+        if self._hook_runtime is None:
+            return CommandResult(type="error", text="Hooks are unavailable.")
+        try:
+            if not selector:
+                hooks = await self._hook_runtime.manual_hooks(conversation, user_email)
+                lines = [
+                    "Assigned hooks — run `/hook <name or id>` (bypasses timer and condition):"
+                ]
+                for hook_id, definition, enabled in hooks:
+                    status = "enabled" if enabled else "disabled — manual only"
+                    lines.append(
+                        f"- **{definition.name}** ({status}) — {definition.description}\n"
+                        f"  `/hook {definition.name}` (ID: `{hook_id}`)"
+                    )
+                return CommandResult(
+                    type="system_message",
+                    text="\n".join(lines)
+                    if hooks
+                    else "No assigned hooks support manual execution.",
+                )
+            if await self._has_busy_turn(conversation.conversation_id, fallback=busy):
+                raise HookError("Wait for the current turn to finish.")
+            run = await self._hook_runtime.run_manual(conversation, session, user_email, selector)
+            return CommandResult(
+                type="hook_started",
+                data={"hook_run_id": run.run_id},
+            )
+        except HookError as exc:
+            return CommandResult(type="error", text=str(exc))
 
     def _agent_loop(self) -> Any | None:
         return getattr(self._turn_scheduler, "_agent_loop", None)
@@ -456,15 +518,47 @@ class CommandDispatcher:
         mode, command, partial = parsed
         bounded_limit = max(1, min(limit, 50))
         if mode == "command":
-            return _suggest_commands(partial, limit=bounded_limit)
+            hidden = (
+                frozenset({"/project"})
+                if project_assignment_refusal(conversation) is not None
+                else frozenset()
+            )
+            return _suggest_commands(partial, limit=bounded_limit, hidden=hidden)
         if command not in _PARAMETER_SUGGESTION_COMMANDS:
             return []
-        if partial and any(char.isspace() for char in partial.strip()):
+        if command != "/hook" and partial and any(char.isspace() for char in partial.strip()):
             return []
+        if command == "/hook":
+            from cognis.core.hooks import HookError
+
+            if self._hook_runtime is None:
+                return []
+            try:
+                hooks = await self._hook_runtime.manual_hooks(conversation, user_email)
+            except HookError:
+                return []
+            return [
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/hook",
+                    value=definition.name,
+                    label=definition.name + (" (disabled)" if not enabled else ""),
+                    description=("Enabled" if enabled else "Disabled — manual only")
+                    + ": "
+                    + definition.description,
+                    insert_text=f"/hook {definition.name}"
+                    if sum(h[1].name.casefold() == definition.name.casefold() for h in hooks) == 1
+                    else f"/hook {hook_id}",
+                )
+                for hook_id, definition, enabled in hooks
+                if _matches_suggestion(partial, hook_id, definition.name, definition.description)
+            ][:bounded_limit]
         if command == "/model":
             return await self._suggest_models(
                 session,
                 partial,
+                conversation=conversation,
+                agent=agent,
                 user_email=user_email,
                 limit=bounded_limit,
             )
@@ -506,6 +600,10 @@ class CommandDispatcher:
                 partial,
                 limit=bounded_limit,
             )
+        if command == "/project":
+            return await self._suggest_projects(
+                conversation, user_email, partial, limit=bounded_limit
+            )
         if command == "/executor":
             return await self._suggest_executors(
                 conversation,
@@ -537,6 +635,8 @@ class CommandDispatcher:
         session: SessionModel | None,
         partial: str,
         *,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
         user_email: str,
         limit: int,
     ) -> list[SlashCommandSuggestion]:
@@ -552,11 +652,8 @@ class CommandDispatcher:
                 ]
         except Exception:
             model_refs = []
-        current_model = self._current_model_id(session)
-        current_provider = (
-            self._session_cache.get_model_override_provider_id(session.session_id)
-            if session is not None
-            else None
+        current_model, current_provider = await self._current_model_target(
+            session, conversation=conversation, agent=agent, user_email=user_email
         )
         matches = [
             ref
@@ -578,9 +675,7 @@ class CommandDispatcher:
             badges: list[str] = []
             if provider_id and bool(ref.get("is_default_provider")):
                 badges.append("default provider")
-            if model_id == current_model and (
-                current_provider is None or current_provider == provider_id
-            ):
+            if model_id == current_model and current_provider == provider_id:
                 badges.insert(0, "current")
             suggestions.append(
                 SlashCommandSuggestion(
@@ -820,16 +915,31 @@ class CommandDispatcher:
             )
         return suggestions
 
-    def _current_model_id(self, session: SessionModel | None) -> str | None:
+    async def _current_model_target(
+        self,
+        session: SessionModel | None,
+        *,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+    ) -> tuple[str | None, str | None]:
+        """Resolve the selected target, never a historical call or cache override."""
         if session is None:
-            return None
-        current = session.model_override
-        if current:
-            return str(current)
-        usage = self._session_cache.get_context_usage(session.session_id)
-        if usage and usage.get("model"):
-            return str(usage["model"])
-        return None
+            return None, None
+        selection = resolve_runtime_selection(agent, session, conversation)
+        if selection.model and selection.provider_id:
+            return selection.model, selection.provider_id
+        try:
+            model, provider_id = await self._providers.llm.resolve_model_target(
+                explicit_model=selection.model,
+                explicit_provider_id=selection.provider_id,
+                acting_user_email=session.user_email or user_email,
+            )
+            return model, provider_id
+        except Exception:
+            # Listing remains available when routing cannot resolve a target.
+            # A missing provider is not a wildcard for provider-qualified models.
+            return selection.model, selection.provider_id
 
     async def dispatch(
         self,
@@ -849,6 +959,26 @@ class CommandDispatcher:
         if not stripped.startswith("/"):
             return None
         has_busy_turn = has_active_turn if has_busy_turn is None else has_busy_turn
+        if stripped == "/handoff" or stripped.startswith("/handoff "):
+            if self._handoff_service is None:
+                result = CommandResult(type="error", text="Handoff is not available.")
+            else:
+                await self._handoff_service.generate(
+                    conversation, session, agent, focus=stripped[len("/handoff") :].strip()
+                )
+                result = CommandResult(type="handoff")
+            return self._mark_command_result(result, "/handoff")
+        if stripped == "/hook" or stripped.startswith("/hook "):
+            if admission_lock_held:
+                result = await self._handle_hook(
+                    stripped[5:].strip(), conversation, session, user_email, has_busy_turn
+                )
+            else:
+                async with self._hold_turn_admission_lock(conversation.conversation_id):
+                    result = await self._handle_hook(
+                        stripped[5:].strip(), conversation, session, user_email, has_busy_turn
+                    )
+            return self._mark_command_result(result, "/hook")
         if stripped == "/recap":
             if self._recap_service is None:
                 return CommandResult(type="error", text="Recap is unavailable.")
@@ -1035,6 +1165,14 @@ class CommandDispatcher:
         if stripped == "/lsp":
             return await self._handle_lsp(user_email=user_email)
 
+        # /project [name|id|none]
+        if stripped == "/project" or stripped.startswith("/project "):
+            return await self._handle_project(
+                conversation=conversation,
+                user_email=user_email,
+                argument=stripped[len("/project") :].strip(),
+            )
+
         # /executor [executor_id]
         if stripped == "/executor" or stripped.startswith("/executor "):
             arg = stripped[len("/executor") :].strip() or ""
@@ -1063,12 +1201,30 @@ class CommandDispatcher:
                 user_email=user_email,
             )
 
-        # /approve [note] or /deny [note]
+        # An explicit UUID or --id selects one action; other text stays a note.
         if stripped in ("/approve", "/deny") or stripped.startswith(("/approve ", "/deny ")):
             is_approve = stripped.startswith("/approve")
             cmd_word = "/approve" if is_approve else "/deny"
-            note = stripped[len(cmd_word) :].strip() or None
-            return await self._handle_approve_deny(conversation, is_approve, note, user_email)
+            argument = stripped[len(cmd_word) :].strip()
+            target_id = None
+            note = argument or None
+            first, _, rest = argument.partition(" ")
+            if first == "--id":
+                target_id, _, remaining = rest.strip().partition(" ")
+                if not target_id:
+                    return CommandResult(
+                        type="error", text=f"Usage: {cmd_word} --id <approval-id> [note]"
+                    )
+                note = remaining.strip() or None
+            elif re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                first,
+            ):
+                target_id = first.lower()
+                note = rest.strip() or None
+            return await self._handle_approve_deny(
+                conversation, is_approve, note, user_email, target_id=target_id
+            )
 
         # /retry [note]
         if stripped == "/retry" or stripped.startswith("/retry "):
@@ -1235,7 +1391,7 @@ class CommandDispatcher:
                         data={"code": "compaction_failed"},
                     )
 
-                if not compaction_result.compacted or compaction_result.turns_compacted <= 0:
+                if not compaction_result.compacted or compaction_result.events_compacted <= 0:
                     await self._publish_compaction_event(
                         EventType.SESSION_COMPACTION_FINISHED,
                         {
@@ -1273,6 +1429,7 @@ class CommandDispatcher:
                         compaction_summary_event_data={
                             "method": compaction_result.method,
                             "turns_compacted": compaction_result.turns_compacted,
+                            "events_compacted": compaction_result.events_compacted,
                             "trigger": "manual",
                             "status": "compacted",
                             "tokens_before": getattr(compaction_result, "tokens_before", None),
@@ -1321,6 +1478,7 @@ class CommandDispatcher:
                         "method": compaction_result.method,
                         "compaction_id": compaction_id,
                         "turns_compacted": compaction_result.turns_compacted,
+                        "events_compacted": compaction_result.events_compacted,
                         "trigger": "manual",
                         "status": "compacted",
                     },
@@ -1335,6 +1493,7 @@ class CommandDispatcher:
                         "summary_preview": summary_preview,
                         "method": compaction_result.method,
                         "turns_compacted": compaction_result.turns_compacted,
+                        "events_compacted": compaction_result.events_compacted,
                     },
                 )
 
@@ -2338,13 +2497,9 @@ class CommandDispatcher:
             except Exception:
                 model_refs = []
 
-            selection = resolve_runtime_selection(agent, session, conversation)
-            current = selection.model
-            current_provider = selection.provider_id
-            if not current:
-                usage = self._session_cache.get_context_usage(session.session_id)
-                current = str((usage or {}).get("model") or "") or None
-                current_provider = str((usage or {}).get("provider_id") or "") or None
+            current, current_provider = await self._current_model_target(
+                session, conversation=conversation, agent=agent, user_email=user_email
+            )
 
             if not model_refs:
                 return CommandResult(
@@ -2357,12 +2512,7 @@ class CommandDispatcher:
                 model_id = str(ref.get("model_id") or ref.get("value") or "")
                 provider_id = ref.get("provider_id")
                 value = str(ref.get("value") or model_id)
-                marker = (
-                    " *"
-                    if model_id == current
-                    and (current_provider is None or current_provider == provider_id)
-                    else ""
-                )
+                marker = " *" if model_id == current and current_provider == provider_id else ""
                 default_marker = " [default provider]" if ref.get("is_default_provider") else ""
                 lines.append(f"  {value}{marker}{default_marker}")
             current_ref = (
@@ -2831,7 +2981,38 @@ class CommandDispatcher:
         user_email: str,
         skill: Any,
     ) -> CommandResult:
+        from cognis.core.skill_assets import PreparedSkillAssets, prepare_loaded_skill_assets
+        from cognis.runtime_context import current_runtime_access_context
         from cognis.tools.builtin.skill_management import materialize_loaded_skill_context
+
+        preparation = PreparedSkillAssets()
+        if skill.asset_manifest:
+            runtime = None
+            try:
+                if self._skill_runtime_factory is None:
+                    raise ValueError("Skill asset preparation runtime is unavailable")
+                runtime = await self._skill_runtime_factory(
+                    agent.model_copy(deep=True),
+                    user_email,
+                    conversation_id=session.conversation_id,
+                    access_context=current_runtime_access_context.get(),
+                )
+                preparation = await prepare_loaded_skill_assets(
+                    skill_id=skill.skill_id,
+                    version_id=skill.version_id,
+                    asset_refs=skill.asset_manifest,
+                    owner_email=user_email,
+                    executor=runtime.executor_connection,
+                    artifact_store=self._artifact_store,
+                )
+            except Exception as exc:
+                preparation = PreparedSkillAssets(
+                    warning=f"Asset/environment preparation incomplete: {type(exc).__name__}: "
+                    f"{exc}. Assets might not be runnable. Correct the executor and reload."
+                )
+            finally:
+                if runtime is not None:
+                    await runtime.cleanup()
 
         tool_payloads = [tool.model_dump(mode="json") for tool in skill.tools]
         _, metadata = materialize_loaded_skill_context(
@@ -2849,6 +3030,11 @@ class CommandDispatcher:
             version_id=skill.version_id,
             version_number=skill.version_number,
             content_hash=skill.content_hash,
+            prepared_assets=preparation.assets
+            if not preparation.warning or preparation.assets
+            else None,
+            python_environment=preparation.python_environment,
+            preparation_warning=preparation.warning,
         )
         protected_context = str(metadata.get("protected_context") or "")
         content_hash = (
@@ -2860,7 +3046,7 @@ class CommandDispatcher:
             if isinstance(item, str) and item.strip()
         ]
         loaded_hash = self._get_loaded_skill_context_hash(session.session_id, skill.skill_id)
-        already_loaded = loaded_hash == content_hash
+        already_loaded = loaded_hash == content_hash and not skill.asset_manifest
 
         if not already_loaded:
             guardrails = getattr(self._providers, "guardrails", None)
@@ -2886,6 +3072,7 @@ class CommandDispatcher:
                     "model_role": "system",
                     "trust": "trusted",
                     "kind": "loaded_skill",
+                    "append_only_loaded_skill_version": 1,
                     "skill_id": skill.skill_id,
                     "skill_name": skill.name,
                     "version_id": skill.version_id,
@@ -2906,6 +3093,7 @@ class CommandDispatcher:
                     source="cognis_command",
                     idempotency_key=(
                         f"slash-skill:{session.session_id}:{skill.skill_id}:{content_hash}"
+                        + (f":{uuid.uuid4().hex}" if skill.asset_manifest else "")
                     ),
                     retry_missing_session=True,
                     user_email=user_email,
@@ -2945,6 +3133,8 @@ class CommandDispatcher:
             activate_skill_tools(session.session_id, skill.skill_id, set(declared_tool_ids))
 
         lines = [f"Loaded skill: {skill.name} ({skill.skill_id})"]
+        if preparation.warning:
+            lines.append(f"Warning: {preparation.warning}")
         if already_loaded:
             lines.append("Status: already loaded for this session.")
         if declared_tool_ids:
@@ -2961,6 +3151,7 @@ class CommandDispatcher:
                 "skill_name": skill.name,
                 "already_loaded": already_loaded,
                 "activated_tool_ids": declared_tool_ids,
+                "preparation_warning": preparation.warning,
             },
         )
 
@@ -3137,6 +3328,131 @@ class CommandDispatcher:
             type="system_message", text="\n".join(line for line in lines if line is not None)
         )
 
+    async def _handle_project(
+        self,
+        *,
+        conversation: ConversationModel,
+        user_email: str,
+        argument: str,
+    ) -> CommandResult:
+        """Handle /project [name|id|none] for topic conversations only."""
+
+        refusal = project_assignment_refusal(conversation)
+        if refusal is not None:
+            return CommandResult(
+                type="error",
+                text=f"/project is available only in topic chats. {refusal}",
+                data={"code": "project_not_assignable"},
+            )
+        from cognis.store.queries import get_conversation, get_project, list_projects_for_user
+
+        async with self._session_factory() as db:
+            row = await get_conversation(db, conversation.conversation_id)
+            if row is None:
+                return CommandResult(type="error", text="Conversation not found.")
+            if not argument:
+                current = await get_project(db, row.project_id) if row.project_id else None
+                if current is None:
+                    text = "This chat is not assigned to a project. Use /project <name> to set one."
+                else:
+                    text = (
+                        f"Project: {current.name} ({current.project_id}). "
+                        "Use /project <name> to change or /project none to clear."
+                    )
+                return CommandResult(
+                    type="system_message",
+                    text=text,
+                    data={"code": "project_status", "project_id": row.project_id},
+                )
+            target_id: str | None = None
+            target_name: str | None = None
+            if argument.lower() not in {"none", "clear", "off"}:
+                projects = await list_projects_for_user(db, user_email)
+                needle = argument.casefold()
+                exact = [
+                    item
+                    for item in projects
+                    if item.project_id == argument or item.name.casefold() == needle
+                ]
+                matches = exact or [item for item in projects if needle in item.name.casefold()]
+                if not matches:
+                    return CommandResult(
+                        type="error",
+                        text=f"No active project matches '{argument}'.",
+                        data={"code": "project_not_found"},
+                    )
+                if len(matches) > 1:
+                    names = ", ".join(item.name for item in matches[:5])
+                    return CommandResult(
+                        type="error",
+                        text=f"'{argument}' matches several projects: {names}. Be more specific.",
+                        data={"code": "project_ambiguous"},
+                    )
+                target_id = matches[0].project_id
+                target_name = matches[0].name
+            try:
+                await change_conversation_project(
+                    db, row, project_id=target_id, user_email=user_email
+                )
+            except ProjectAssignmentError as exc:
+                return CommandResult(type="error", text=str(exc), data={"code": exc.code})
+            await db.commit()
+        text = (
+            f"Project set to {target_name}. Project context applies from the next message."
+            if target_id
+            else "Project cleared. This chat is no longer part of a project."
+        )
+        return CommandResult(
+            type="system_message",
+            text=text,
+            data={
+                "code": "conversation_project_changed",
+                "conversation_id": conversation.conversation_id,
+                "project_id": target_id,
+            },
+        )
+
+    async def _suggest_projects(
+        self,
+        conversation: ConversationModel,
+        user_email: str,
+        partial: str,
+        *,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        if project_assignment_refusal(conversation) is not None:
+            return []
+        from cognis.store.queries import list_projects_for_user
+
+        async with self._session_factory() as db:
+            projects = await list_projects_for_user(db, user_email)
+        current = getattr(conversation, "project_id", None)
+        suggestions = [
+            SlashCommandSuggestion(
+                kind="parameter",
+                command="/project",
+                value=project.name,
+                label=project.name,
+                description=project.description,
+                insert_text=f"/project {project.name}",
+                badges=["current"] if project.project_id == current else [],
+            )
+            for project in projects
+            if _matches_suggestion(partial, project.name, project.description)
+        ][:limit]
+        if current and _matches_suggestion(partial, "none"):
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/project",
+                    value="none",
+                    label="none",
+                    description="Remove this chat from its project",
+                    insert_text="/project none",
+                )
+            )
+        return suggestions[:limit]
+
     def _handle_help(self) -> CommandResult:
         """Handle /help — show available slash commands."""
         return CommandResult(type="system_message", text=_HELP_TEXT)
@@ -3301,49 +3617,112 @@ class CommandDispatcher:
         is_approve: bool,
         note: str | None,
         user_email: str,
+        *,
+        target_id: str | None = None,
     ) -> CommandResult:
-        """Handle /approve [note] or /deny [note]."""
+        """Resolve a specific approval, or the only actionable approval."""
         conversation_id = conversation.conversation_id
         esc_decision = "approve" if is_approve else "deny"
 
-        pending = self._pause_waiter.find_pending(
-            pause_type="escalation",
-            conversation_id=conversation_id,
-        )
-        find_durable = getattr(
-            self._notification_service,
-            "find_oldest_pending_escalation",
-            None,
-        )
-        if pending is None and callable(find_durable):
-            durable = await find_durable(user_email=user_email, conversation_id=conversation_id)
-            if durable is not None:
-                pending = PendingPause(
-                    pause_id=durable.notification_id,
-                    pause_type="escalation",
-                    session_id=durable.session_id,
-                    conversation_id=durable.conversation_id,
-                    context={
-                        "call_id": durable.payload.get("call_id"),
-                        "tool_call_id": durable.payload.get("tool_call_id"),
-                        "tool_name": durable.payload.get("tool_name"),
-                    },
+        durable_rows = []
+        durable = None
+        if self._notification_service is not None:
+            durable_rows = await self._notification_service.list_actionable_escalations(
+                user_email=user_email, conversation_id=conversation_id
+            )
+            if target_id:
+                durable = await self._notification_service.find_escalation(
+                    notification_id=target_id,
+                    user_email=user_email,
+                    conversation_id=conversation_id,
                 )
+        # Read local state after awaited durable lookups. A mirror and its
+        # durable row count once; a local-only registration blocks ambiguity.
+        local_rows = (
+            self._pause_waiter.list_pending(
+                pause_type="escalation", conversation_id=conversation_id
+            )
+            if self._pause_waiter is not None
+            else []
+        )
+        candidates = {escalation_call_id(row): row for row in local_rows}
+        for row in durable_rows:
+            candidates[row.notification_id] = PendingPause(
+                pause_id=row.notification_id,
+                pause_type="escalation",
+                session_id=row.session_id,
+                conversation_id=row.conversation_id,
+                context={"tool_name": row.payload.get("tool_name")},
+            )
+        if not target_id and len(candidates) == 1:
+            target = next(iter(candidates))
+            durable = next((row for row in durable_rows if row.notification_id == target), None)
+            pending = candidates[target]
+        elif target_id and durable is not None:
+            pending = PendingPause(
+                pause_id=durable.notification_id,
+                pause_type="escalation",
+                session_id=durable.session_id,
+                conversation_id=durable.conversation_id,
+                context={"tool_name": durable.payload.get("tool_name")},
+            )
+        else:
+            pending = candidates.get(target_id) if target_id else None
+        if not target_id and len(candidates) > 1:
+            lines = [
+                "Multiple approvals are pending. Specify the approval ID; nothing was resolved."
+            ]
+            for identifier, candidate in list(candidates.items())[:10]:
+                tool = (candidate.context or {}).get("tool_name", "tool call")
+                lines.append(
+                    f"- {identifier}: {tool} — /approve --id {identifier} "
+                    f"or /deny --id {identifier}"
+                )
+            lines.append(
+                "Use /approve --id <approval-id> [note] or /deny --id <approval-id> [note]."
+            )
+            return CommandResult(
+                type="error", text="\n".join(lines), data={"code": "escalation_ambiguous"}
+            )
         if pending is None:
             return CommandResult(
                 type="system_message",
-                text="No pending escalation to resolve.",
+                text="No matching actionable approval in this conversation."
+                if target_id
+                else "No pending escalation to resolve.",
             )
 
         tool_name = (pending.context or {}).get("tool_name", "tool call")
 
         # Use the unified notification service
         if self._notification_service is not None:
-            resolved = await self._notification_service.resolve(
+            if durable is None:
+                return CommandResult(
+                    type="error",
+                    text="This approval is expired, unavailable, or not durably registered yet. Nothing was submitted.",
+                    data={"code": "escalation_not_actionable"},
+                )
+
+            def local_selection_valid() -> bool:
+                return target_id is not None or not any(
+                    escalation_call_id(row) != pending.pause_id
+                    for row in (
+                        self._pause_waiter.list_pending(
+                            pause_type="escalation", conversation_id=conversation_id
+                        )
+                        if self._pause_waiter is not None
+                        else []
+                    )
+                )
+
+            resolved = await self._notification_service.resolve_escalation(
                 pending.pause_id,
                 esc_decision,
                 {"note": note or ""},
                 user_email=user_email,
+                conversation_id=conversation_id,
+                require_unique=target_id is None,
+                pre_submit_guard=local_selection_valid,
             )
             if not resolved:
                 return CommandResult(
@@ -3353,26 +3732,32 @@ class CommandDispatcher:
                 )
         else:
             # Legacy fallback
-            self._pause_waiter.resolve(
-                pending.pause_id,
-                PauseResolution(
+            try:
+                resolved = await resolve_legacy_approval(
+                    self._pause_waiter,
+                    pending.pause_id,
+                    conversation_id=conversation_id,
                     decision=esc_decision,
-                    data={"note": note or ""},
-                ),
-            )
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                intaris_call_id = (pending.context or {}).get("call_id", pending.pause_id)
-                await self._providers.guardrails.submit_decision(
-                    intaris_call_id, esc_decision, note
+                    note=note,
+                    submit=self._providers.guardrails.submit_decision,
+                    require_unique=target_id is None,
+                )
+            except Exception:
+                return CommandResult(
+                    type="error",
+                    text="Approval submission failed or is uncertain; nothing was resumed.",
+                )
+            if not resolved:
+                return CommandResult(
+                    type="error",
+                    text="Approval expired, closed, or is already being resolved; nothing was resumed.",
                 )
 
         verb = "approved" if is_approve else "denied"
         note_suffix = f": {note}" if note else ""
         return CommandResult(
             type="system_message",
-            text=f"User {verb} {tool_name}{note_suffix}",
+            text=f"User {verb} {tool_name} ({pending.pause_id}){note_suffix}",
         )
 
     async def _handle_gate_resolution(
@@ -3602,6 +3987,7 @@ Available commands:
   /help              Show this help message
   /lsp               Show LSP diagnostics status
   /executor [id]     Show active executor + assigned pool, or switch active
+  /project [name]    Show, set, or clear (none) this topic chat's project
   /model [name]      List available models or switch model
    /thinking [level]  Show or set reasoning effort
     /fast [on|off]     Enable or disable fast model mode
@@ -3622,8 +4008,9 @@ Available commands:
   /clear             Alias for /new
   /stop              Stop the current work immediately
   /cancel            Alias for /stop
-  /approve [note]    Approve pending tool escalation
-  /deny [note]       Deny pending tool escalation
+  /approve --id <approval-id> [note]   Approve that action
+  /deny --id <approval-id> [note]      Deny that action
+  /approve [note] / /deny [note]      Only when one approval is pending
   /retry [note]      Retry paused workflow gate using its revise action
   /continue [note]   Continue paused workflow gate
   /cancel [note]     Cancel paused workflow gate, or stop active work"""

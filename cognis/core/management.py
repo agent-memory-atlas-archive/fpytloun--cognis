@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from cognis.api.models import PendingPauseResponse, WorkflowRunResponse
@@ -18,6 +17,7 @@ from cognis.core.question_sets import (
     normalize_questions,
     validate_reply_for_questions,
 )
+from cognis.core.questions import AGENT_QUESTION
 from cognis.models.task import TaskModel
 from cognis.models.workflow import WorkflowState
 from cognis.store.queries import get_task, get_workflow, update_task_workflow_state
@@ -28,15 +28,39 @@ _ACTIVE_WORKFLOW_TASK_STATUSES = {"queued", "ready", "running", "paused"}
 def task_pending_pause_response(pause_waiter: Any, task: TaskModel) -> PendingPauseResponse | None:
     """Return the live or recovered pending pause for a task."""
 
-    live_pause = pause_waiter.find_pending(task_id=task.task_id)
+    if task.status not in _ACTIVE_WORKFLOW_TASK_STATUSES:
+        return None
+    state = task.workflow_state
+    payload = (state.pending_pause_payload or {}) if state else {}
+    live_pause = next(
+        (
+            pause
+            for pause in pause_waiter.list_pending(task_id=task.task_id)
+            if pause.pause_type != AGENT_QUESTION
+            and (
+                pause.pause_type != "gate"
+                or (
+                    state is not None
+                    and state.pending_pause_type == "gate"
+                    and payload.get("pause_id") == pause.pause_id
+                )
+            )
+        ),
+        None,
+    )
     if live_pause is not None:
         return pending_pause_to_response(live_pause)
-    if task.workflow_state is None or task.workflow_state.pending_pause_type is None:
+    if task.workflow_state is None or task.workflow_state.pending_pause_type in {
+        None,
+        AGENT_QUESTION,
+    }:
         return None
 
     payload = task.workflow_state.pending_pause_payload or {}
+    if not isinstance(payload.get("pause_id"), str) or not payload["pause_id"]:
+        return None
     recovered_pause = PendingPause(
-        pause_id=str(payload.get("pause_id", f"recovered_{uuid.uuid4().hex[:8]}")),
+        pause_id=payload["pause_id"],
         pause_type=task.workflow_state.pending_pause_type or "unknown",
         task_id=task.task_id,
         step_name=payload.get("step_name"),
@@ -155,13 +179,9 @@ async def resolve_task_pause_action(
 
     resolved = False
     if notification_service is not None:
-        notif = (
-            await notification_service.get(notification_id)
-            if notification_id is not None
-            else await notification_service.find_by_task(
-                task.task_id, notification_type="gate", status="pending"
-            )
-        )
+        notif = await notification_service.get(pause.pause_id)
+        if notif is None:
+            raise RuntimeError("Gate is awaiting recovery; refresh the task before retrying")
         if notif is not None:
             if (
                 notif.notification_type != "gate"
@@ -180,10 +200,10 @@ async def resolve_task_pause_action(
                 expected_revision=expected_revision,
             )
             if not resolved:
-                raise RuntimeError("Gate has already been resolved")
+                raise RuntimeError("Gate is no longer actionable; refresh the task")
 
     if not resolved:
-        raw_pause = pause_waiter.find_pending(task_id=task.task_id, pause_type="gate")
+        raw_pause = pause_waiter.get(pause.pause_id)
         if raw_pause is None:
             raise ValueError("No pending gate for task")
         ok = pause_waiter.resolve(
@@ -193,13 +213,8 @@ async def resolve_task_pause_action(
         if not ok:
             raise RuntimeError("Pause has already been resolved")
 
-    if should_store_operator_instruction(decision, note):
-        await update_operator_instruction(
-            session_factory,
-            task_id=task.task_id,
-            workflow_state=task.workflow_state,
-            instruction=note,
-        )
+    # The fenced workflow owner applies notes with the decision transition.
+    # Ingress must not overwrite workflow state with this preflight snapshot.
 
     if decision == "cancel":
         return {
@@ -232,6 +247,7 @@ async def respond_task_input(
     notification_id: str | None = None,
     expected_revision: int | None = None,
     submission_id: str | None = None,
+    human_answer: bool = False,
 ) -> dict[str, Any]:
     """Answer a paused step question and resume the task when needed."""
 
@@ -275,6 +291,7 @@ async def respond_task_input(
                 resolution_data,
                 user_email=user_email,
                 expected_revision=expected_revision,
+                human_answer=human_answer,
             )
             if not resolved:
                 raise RuntimeError("Step question has already been resolved")

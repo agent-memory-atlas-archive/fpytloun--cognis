@@ -26,6 +26,7 @@ from cognis.executor.providers.llm.responses_bridge import (
 from cognis.logging import get_logger
 from cognis.models.config import ImageInput
 from cognis.providers.llm.errors import build_mid_stream_error_chunk
+from cognis.providers.llm.systemone import SystemOneRequest, request_systemone
 from cognis.providers.llm.terminal import (
     LLMStreamTerminal,
     ResponseIncompleteDetails,
@@ -72,6 +73,8 @@ class LiteLLMExecutorBackend:
         messages = request.messages
         request_kwargs = dict(request.request_kwargs)
         llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
+        if llm_api == "systemone":
+            raise ValueError("System One does not support streaming")
         performance = (
             LocalGenerationPerformanceObserver(
                 model=model,
@@ -260,6 +263,16 @@ class LiteLLMExecutorBackend:
         messages = request.messages
         request_kwargs = dict(request.request_kwargs)
         llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
+        if llm_api == "systemone":
+            payload = SystemOneRequest.model_validate(request_kwargs.pop("payload"))
+            request_kwargs.pop("num_retries", None)
+            request_kwargs.pop("max_retries", None)
+            return await request_systemone(payload, **request_kwargs)
+        if llm_api == "embeddings":
+            response = await litellm.aembedding(
+                model=model, input=request_kwargs.pop("input"), **request_kwargs
+            )
+            return cast(dict[str, Any], response.model_dump())
         if llm_api == "responses":
             response = await litellm.aresponses(
                 model=model,
@@ -293,6 +306,11 @@ class LiteLLMExecutorBackend:
     ) -> dict[str, Any]:
         """Generate an image through LiteLLM on the executor side."""
         gen_kwargs: dict[str, Any] = {}
+        gen_kwargs.update(
+            timeout=request_kwargs.get("timeout", 120),
+            num_retries=0,
+            max_retries=0,
+        )
         if request_kwargs.get("api_key"):
             gen_kwargs["api_key"] = request_kwargs["api_key"]
         if request_kwargs.get("api_base"):
@@ -320,6 +338,11 @@ class LiteLLMExecutorBackend:
                     "Masked image editing is not supported by Gemini image generation."
                 )
             messages = [{"role": "user", "content": content}]
+            from cognis.providers.llm.image_config import gemini_image_config
+
+            image_config = gemini_image_config(size, model)
+            if image_config is not None:
+                gen_kwargs["imageConfig"] = image_config
             response = await litellm.acompletion(
                 model=model,
                 messages=messages,

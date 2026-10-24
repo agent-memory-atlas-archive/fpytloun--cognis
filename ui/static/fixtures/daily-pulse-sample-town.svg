@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">Fictional museum specimen</title>
+  <desc id="desc">Constructed geometric museum illustration. No real town, building or personal location is represented.</desc>
+  <rect width="1200" height="675" fill="#e5edf4"/>
+  <rect y="500" width="1200" height="175" fill="#c2d3df"/>
+  <circle cx="940" cy="145" r="62" fill="#f2d49a"/>
+  <path d="M0 385 240 320 460 390 720 310 950 390 1200 330V500H0Z" fill="#9bb9ce"/>
+  <rect x="300" y="260" width="600" height="270" rx="12" fill="#31536e"/>
+  <path d="M270 260 600 125 930 260Z" fill="#416b88"/>
+  <g fill="#b7d8e9">
+    <rect x="355" y="310" width="85" height="115" rx="5"/>
+    <rect x="485" y="310" width="85" height="115" rx="5"/>
+    <rect x="630" y="310" width="85" height="115" rx="5"/>
+    <rect x="760" y="310" width="85" height="115" rx="5"/>
+  </g>
+  <rect x="555" y="455" width="90" height="75" fill="#172f43"/>
+  <path d="M465 675 560 530H640L735 675Z" fill="#e7eef3"/>
+  <text x="48" y="620" fill="#29465b" font-family="system-ui, sans-serif" font-size="24" letter-spacing="3">SYNTETICKÁ MUZEJNÍ ILUSTRACE</text>
+</svg>

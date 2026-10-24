@@ -459,6 +459,7 @@ async def list_attention_rows_by_conversation(
         .where(NotificationRow.user_email == owner_email)
         .where(NotificationRow.conversation_id.in_(ids))
         .where(NotificationRow.status.in_(_VISIBLE_STATUSES))
+        .where(NotificationRow.notification_type != "agent_question")
         .order_by(NotificationRow.created_at.asc(), NotificationRow.notification_id.asc())
     )
     grouped: dict[str, list[NotificationRow]] = {}
@@ -483,6 +484,7 @@ async def list_attention_rows_by_task(
         .where(NotificationRow.user_email == owner_email)
         .where(NotificationRow.task_id.in_(ids))
         .where(NotificationRow.status.in_(_VISIBLE_STATUSES))
+        .where(NotificationRow.notification_type != "agent_question")
         .order_by(
             NotificationRow.task_id.asc(),
             NotificationRow.created_at.asc(),
@@ -508,6 +510,7 @@ async def get_attention_row(
         select(NotificationRow).where(
             NotificationRow.notification_id == action_id,
             NotificationRow.user_email == owner_email,
+            NotificationRow.notification_type != "agent_question",
         )
     )
     return result.scalar_one_or_none()

@@ -1,5 +1,26 @@
-import type { ContextUsage, GenerationPerformanceSnapshot } from '$lib/types/api';
+import type { ContextUsage, GenerationPerformanceSnapshot, RuntimeSelection } from '$lib/types/api';
 import type { SessionInfoData } from '$lib/sessionInfoCache';
+
+/** A future selection must not be shown beside the previous model's effort. */
+export function runtimeModelPresentation(
+  usage: ContextUsage | null,
+  selection: RuntimeSelection | null,
+): { model: string | null; providerId: string | null; effort: string | null; selected: boolean } {
+  const pending = selection != null && (
+    !usage || selection.revision > (usage.runtime_selection_revision ?? -1)
+  );
+  return pending ? {
+    model: selection.model ?? null,
+    providerId: selection.provider_id ?? null,
+    effort: selection.reasoning_effort ?? null,
+    selected: true,
+  } : {
+    model: usage?.model ?? null,
+    providerId: usage?.provider_id ?? null,
+    effort: usage?.reasoning_effort ?? null,
+    selected: false,
+  };
+}
 
 export interface SessionDiagnostics {
   ownerSessionId: string | null;

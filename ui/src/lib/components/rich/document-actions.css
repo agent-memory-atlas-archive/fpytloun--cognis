@@ -1,0 +1,22 @@
+/* Shared by rich documents and plain previews (Library, attachments). Outside a
+   rich palette scope the --rich-* variables are unset, so fall back to the
+   active app theme rather than fixed Classic Dark colors. */
+.document-icon-action {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: var(--rich-action-size, 2.75rem); height: var(--rich-action-size, 2.75rem);
+  border: 1px solid var(--rich-line, rgb(var(--color-separator)));
+  border-radius: var(--rich-action-radius, .65rem);
+  color: var(--rich-text-secondary, rgb(var(--color-secondary)));
+  background: var(--rich-surface-raised, rgb(var(--color-surface-hover) / .4));
+  cursor: pointer; transition: color 120ms, background 120ms, border-color 120ms;
+}
+.document-icon-action:hover:not(:disabled) {
+  color: var(--rich-text, rgb(var(--color-foreground)));
+  background: var(--rich-control-active, rgb(var(--color-surface-hover)));
+  border-color: var(--rich-accent, rgb(var(--color-accent)));
+}
+.document-icon-action:focus-visible { outline: 2px solid var(--rich-accent, rgb(var(--color-accent))); outline-offset: 2px; }
+.document-icon-action:disabled { opacity: .45; cursor: default; }
+.document-icon-action svg { width: 18px; height: 18px; }
+.document-icon-action span { display: inline-flex; }
+@media (prefers-reduced-motion: reduce) { .document-icon-action { transition: none; } }

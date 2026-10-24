@@ -47,6 +47,10 @@ class DeliverablePayloadIntegrityError(ValueError):
     """Raised when stored deliverable bytes do not match their database metadata."""
 
 
+class DeliverableStoreUnavailable(ValueError):
+    """Raised when controller-owned payload storage was not configured."""
+
+
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
         "utf-8"
@@ -176,7 +180,7 @@ async def hydrate_deliverable_payload(row: Any, artifact_store: Any) -> Any:
     if row is None:
         return row
     if artifact_store is None:
-        raise ValueError("deliverable hydration requires an artifact store")
+        raise DeliverableStoreUnavailable("deliverable hydration requires an artifact store")
     namespace = getattr(row, "storage_namespace", None) or DELIVERABLE_STORAGE_NAMESPACE
     object_id = getattr(row, "storage_object_id", None) or getattr(row, "deliverable_id", None)
     if not isinstance(object_id, str) or not object_id:

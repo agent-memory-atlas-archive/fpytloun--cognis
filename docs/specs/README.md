@@ -4,6 +4,9 @@ These documents are internal design references, architecture notes, and implemen
 
 Some specs describe future or partially shipped work. Treat current code and user guides as product truth when they differ from older planning documents.
 
+Spec 35 documents canonical post-append invalidation, equivalent-scope acquisition,
+and immutable API-provider ownership for shared browser timelines.
+
 | File | Content |
 |---|---|
 | `00-vision.md` | Project vision, design principles, phased delivery |

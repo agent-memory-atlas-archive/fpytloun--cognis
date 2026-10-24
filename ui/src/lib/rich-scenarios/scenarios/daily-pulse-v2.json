@@ -2,17 +2,17 @@
   "schema_version": 1,
   "id": "daily-pulse-v2",
   "title": "Ranní Pulse v2",
-  "description": "Integrated Pulse v2 acceptance fixture with media, point agenda, citations, accordions, and SVG chart.",
+  "description": "Wholly fictional museum-day specimen for media, point agenda, citations, accordions and SVG chart acceptance. No personal brief or observed calendar is represented.",
   "group": "pulse",
   "sort_key": 1400,
-  "content": "Ranní Pulse v2 — přístupná textová alternativa.",
+  "content": "Ranní Pulse v2 — fiktivní den v ukázkovém muzeu.",
   "payload": {
     "metadata": {
       "presentation": "pulse",
       "pulse_variant": "daily",
       "pulse_version": 2,
-      "eyebrow": "Úterý · Lovosice",
-      "subtitle": "14. července 2026 · integrovaná vizuální akceptace",
+      "eyebrow": "Ukázkové město · fiktivní agenda",
+      "subtitle": "16. dubna 2030 · syntetický muzejní den",
       "toc": false,
       "references": {
         "dedicated_page": false
@@ -21,9 +21,9 @@
     "blocks": [
       {
         "type": "hero",
-        "eyebrow": "Osobní intelligence · 08:20",
+        "eyebrow": "Fiktivní muzejní přehled · 08:20",
         "title": "Ranní Pulse",
-        "subtitle": "Jeden klidný blok, jeden bod v kalendáři a počasí vhodné pro dopolední přesun."
+        "subtitle": "Ukázková příprava katalogu, bodová kontrola a demonstrace návštěvy expozice."
       },
       {
         "type": "dashboard",
@@ -33,64 +33,64 @@
             "icon": "calendar",
             "label": "Agenda",
             "value": "3 body",
-            "delta": "Bodová událost v 09:00"
+            "delta": "Ukázková kontrola v 09:00"
           },
           {
             "type": "metric",
             "icon": "info",
             "label": "Podmínky",
-            "value": "18 °C",
-            "delta": "Suché ráno"
+            "value": "11 °C",
+            "delta": "Syntetická hodnota"
           },
           {
             "type": "metric",
             "icon": "activity",
-            "label": "Trh",
-            "value": "Stabilní",
-            "delta": "Bez tlaku na změnu"
+            "label": "Katalog",
+            "value": "Ukázka",
+            "delta": "Žádné skutečné záznamy"
           },
           {
             "type": "metric",
             "icon": "check",
             "label": "Priorita",
-            "value": "Focus",
-            "delta": "Dokončit do 09:00"
+            "value": "Popisky",
+            "delta": "Demonstrační kontrola"
           }
         ]
       },
       {
         "type": "day_agenda",
         "eyebrow": "Dnešní rytmus",
-        "title": "Úterý 14. července",
-        "now": "2026-07-14T08:20:00+02:00",
+        "title": "Ukázkový den 16. dubna",
+        "now": "2030-04-16T08:20:00+02:00",
         "timezone": "Europe/Prague",
         "compact": true,
         "items": [
           {
-            "start": "2026-07-14T07:30:00+02:00",
-            "end": "2026-07-14T08:45:00+02:00",
-            "title": "Soustředěná práce",
+            "start": "2030-04-16T07:30:00+02:00",
+            "end": "2030-04-16T08:45:00+02:00",
+            "title": "Příprava ukázkového katalogu",
             "kind": "free"
           },
           {
-            "start": "2026-07-14T09:00:00+02:00",
-            "end": "2026-07-14T09:00:00+02:00",
-            "title": "Odeslat rozhodnutí",
+            "start": "2030-04-16T09:00:00+02:00",
+            "end": "2030-04-16T09:00:00+02:00",
+            "title": "Kontrola demonstračních popisků",
             "description": "Bodová událost bez umělého konce."
           },
           {
-            "start": "2026-07-14T10:30:00+02:00",
-            "end": "2026-07-14T11:15:00+02:00",
-            "title": "Pochůzky",
-            "location": "Lovosice"
+            "start": "2030-04-16T10:30:00+02:00",
+            "end": "2030-04-16T11:15:00+02:00",
+            "title": "Návštěva fiktivní expozice",
+            "location": "Ukázkové muzeum"
           }
         ],
         "tasks": [
           {
-            "title": "Potvrdit prioritu"
+            "title": "Vybrat demonstrační popisek"
           },
           {
-            "title": "Zkontrolovat trasu"
+            "title": "Ověřit ukázkovou navigaci"
           }
         ]
       },
@@ -102,18 +102,18 @@
             "variant": "visual",
             "icon": "activity",
             "eyebrow": "Hlavní signál",
-            "title": "Nejcennější okno končí v 09:00",
-            "summary": "Dokončit jednu rozhodovací věc před bodovou událostí.",
-            "content": "Kalendář a podmínky ukazují stejné praktické okno. [Kontext](https://example.org/pulse/context).",
+            "title": "Ukázkový katalog čeká kontrola",
+            "summary": "Fiktivní den předvádí přípravu a jednu bodovou kontrolu.",
+            "content": "Veškeré události a podmínky jsou syntetické. [Kontext](https://example.org/pulse/context).",
             "citations": [
               "context"
             ],
             "href": "https://example.org/pulse/context",
             "media": {
-              "artifact_id": "fixture-daily-pulse-lovosice",
-              "src": "/fixtures/daily-pulse-lovosice.svg",
-              "alt": "Lovosice a České středohoří v ranním světle",
-              "credit": "Cognis acceptance fixture · editorial media",
+              "artifact_id": "fixture-daily-pulse-sample-town",
+              "src": "/fixtures/daily-pulse-sample-town.svg",
+              "alt": "Abstraktní ilustrace fiktivního města",
+              "credit": "Cognis synthetic acceptance specimen",
               "source_url": "https://example.org/pulse/context",
               "width": 1600,
               "height": 900
@@ -127,15 +127,15 @@
                 "type": "card",
                 "variant": "action",
                 "icon": "check",
-                "title": "Uzavřít rozhodnutí",
-                "content": "Neotevírat před 09:00 vedlejší fronty."
+                "title": "Zkontrolovat ukázkové popisky",
+                "content": "Použít jen syntetické katalogové záznamy."
               },
               {
                 "type": "card",
                 "variant": "status",
                 "icon": "clock",
-                "title": "Připravit přesun",
-                "content": "Pochůzky držet v chladnějším dopoledni."
+                "title": "Otevřít demonstrační expozici",
+                "content": "Nevstupovat do žádného skutečného pracovního prostoru."
               }
             ]
           }
@@ -152,9 +152,9 @@
               {
                 "type": "card",
                 "variant": "editorial",
-                "title": "Dopravní omezení se mění",
-                "summary": "Před delší cestou stačí ověřit jedinou trasu.",
-                "content": "Praktický dopad je omezený na plánovaný přesun. [Zdroj](https://example.org/pulse/news).",
+                "title": "Fiktivní muzeum otevírá ukázkový katalog",
+                "summary": "Demonstrační zpráva bez vztahu ke skutečné instituci.",
+                "content": "Ukázka slouží jen pro ověření vykreslení. [Zdroj](https://example.org/pulse/news).",
                 "citations": [
                   "news"
                 ],
@@ -164,9 +164,9 @@
               {
                 "type": "card",
                 "variant": "editorial",
-                "title": "Trhy zůstávají klidné",
-                "summary": "Žádný signál nevyžaduje okamžitou změnu plánu.",
-                "content": "Pohyb je v běžném rozsahu. [Zdroj](https://example.org/pulse/world).",
+                "title": "Ukázková galerie předvádí přístupné popisky",
+                "summary": "Vymyšlený příklad práce s demonstračními záznamy.",
+                "content": "Nejde o skutečný provozní přehled. [Zdroj](https://example.org/pulse/world).",
                 "citations": [
                   "world"
                 ],
@@ -183,9 +183,9 @@
                 "type": "card",
                 "variant": "editorial",
                 "icon": "info",
-                "title": "Guardraily přecházejí do provozu",
-                "summary": "Audit a oprávnění jsou důležitější než další demo.",
-                "content": "Relevantní změna patří do pracovního backlogu. [Zdroj](https://example.org/pulse/ai).",
+                "title": "Syntetický nástroj třídí demonstrační záznamy",
+                "summary": "Fiktivní scénář ověřuje zobrazení citované zprávy.",
+                "content": "Žádný skutečný model ani služba nebyly spuštěny. [Zdroj](https://example.org/pulse/ai).",
                 "citations": [
                   "ai"
                 ],
@@ -202,8 +202,8 @@
         "blocks": [
           {
             "type": "chart",
-            "title": "Lovosice po hodinách",
-            "description": "Teplota roste od klidného rána k teplejšímu odpoledni.",
+            "title": "Ukázkové teploty po hodinách",
+            "description": "Syntetická řada pro ověření grafu, nikoli skutečná předpověď.",
             "spec_version": "cognis.chart.v1",
             "chart_type": "line",
             "series": [
@@ -213,23 +213,23 @@
                 "points": [
                   {
                     "x": "07",
-                    "y": 17
+                    "y": 10
                   },
                   {
                     "x": "09",
-                    "y": 19
+                    "y": 12
                   },
                   {
                     "x": "12",
-                    "y": 23
+                    "y": 15
                   },
                   {
                     "x": "15",
-                    "y": 25
+                    "y": 16
                   },
                   {
                     "x": "18",
-                    "y": 22
+                    "y": 13
                   }
                 ]
               }
@@ -240,16 +240,16 @@
             "y_axis": {
               "type": "linear"
             },
-            "source": "Lovosice po hodinách",
+            "source": "Syntetický průběh teplot",
             "source_url": "https://example.org/pulse/weather",
-            "observed_at": "2026-07-14T08:00:00+02:00"
+            "observed_at": "2030-04-16T08:00:00+02:00"
           }
         ]
       },
       {
         "type": "callout",
         "title": "Dnešní kurz",
-        "content": "Jedno dokončené rozhodnutí před 09:00, potom praktické věci."
+        "content": "Ověřit ukázkový katalog a pak pokračovat ve fiktivní expozici."
       },
       {
         "type": "source_list",
@@ -261,35 +261,35 @@
       {
         "id": "context",
         "number": 1,
-        "title": "Ranní kontext",
+        "title": "Syntetický muzejní kontext",
         "url": "https://example.org/pulse/context",
         "publisher": "Cognis fixture"
       },
       {
         "id": "news",
         "number": 2,
-        "title": "Dopravní přehled",
+        "title": "Fiktivní katalogová zpráva",
         "url": "https://example.org/pulse/news",
         "publisher": "Cognis fixture"
       },
       {
         "id": "world",
         "number": 3,
-        "title": "Tržní přehled",
+        "title": "Fiktivní galerie",
         "url": "https://example.org/pulse/world",
         "publisher": "Cognis fixture"
       },
       {
         "id": "ai",
         "number": 4,
-        "title": "AI provozní přehled",
+        "title": "Syntetická ukázka třídění",
         "url": "https://example.org/pulse/ai",
         "publisher": "Cognis fixture"
       },
       {
         "id": "weather",
         "number": 5,
-        "title": "Lovosice po hodinách",
+        "title": "Syntetický průběh teplot",
         "url": "https://example.org/pulse/weather",
         "publisher": "Cognis fixture"
       }

@@ -41,6 +41,22 @@ def test_deterministic_encoding_sorts_mapping_keys() -> None:
     assert rendered == '{"a":{"b":2,"d":4},"z":1}'
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"z": "Příliš 🐈", "a": [{"d": 4, "b": 2}]},
+        {"z": 1e-7, "a": -0.0},
+        {"z": float("nan"), "a": float("inf")},
+        {2: "two", 1: "one"},
+    ],
+)
+def test_sorted_bytes_preserve_existing_canonical_result(value: object) -> None:
+    expected = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    assert json_codec.encode(value, sort_keys=True) == expected
+
+
 def test_default_str_uses_msgspec_hook() -> None:
     class Value:
         def __str__(self) -> str:

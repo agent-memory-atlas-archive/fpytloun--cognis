@@ -16,8 +16,13 @@ from fastapi.responses import JSONResponse
 from cognis import json_codec as json
 from cognis.api.authentication import AuthenticatedUser
 from cognis.api.models import ErrorBody, ErrorResponse
+from cognis.core.project_access import (
+    resolve_agent_use_grant,
+    resolve_any_project_agent_view_grant,
+    resolve_project_role,
+    role_satisfies,
+)
 from cognis.ownership import normalize_executor_scope
-from cognis.store.queries import get_active_agent_grant, get_active_project_grant
 
 
 def api_exception(
@@ -123,12 +128,20 @@ class AgentAccess:
         )
 
 
-async def check_agent_access(request: Request, agent: Any, *, required: str) -> AgentAccess:
+async def check_agent_access(
+    request: Request,
+    agent: Any,
+    *,
+    required: str,
+    project_id: str | None = None,
+) -> AgentAccess:
     """Resolve agent access for the caller.
 
     ``required`` may be ``view``, ``use``, ``edit``, ``delete``, or ``share``.
     Ownership is the only write path; active ``use`` grants permit only
-    ``view`` and ``use``. Admin role is intentionally ignored here.
+    ``view`` and ``use``. When ``project_id`` is given, an assignment of the
+    agent to that project also confers ``view``/``use`` for work inside the
+    project. Admin role is intentionally ignored here.
     """
 
     user = require_current_user(request)
@@ -149,7 +162,15 @@ async def check_agent_access(request: Request, agent: Any, *, required: str) -> 
     if session_factory is None:
         raise api_exception(500, "internal_error", "Session factory unavailable")
     async with session_factory() as session:
-        grant = await get_active_agent_grant(session, str(agent.agent_id), user.email)
+        grant = await resolve_agent_use_grant(
+            session, agent_id=str(agent.agent_id), user_email=user.email, project_id=project_id
+        )
+        if grant is None and required == "view" and project_id is None:
+            # Project members may read the configuration of agents assigned to
+            # any of their projects; using them stays project-scoped.
+            grant = await resolve_any_project_agent_view_grant(
+                session, agent_id=str(agent.agent_id), user_email=user.email
+            )
     if grant is None:
         raise api_exception(403, "forbidden", "Resource access denied")
     return AgentAccess(user=user, owner_email=owner_email, is_owner=False, grant=grant)
@@ -173,42 +194,49 @@ class ProjectAccess:
     user: AuthenticatedUser
     owner_email: str
     is_owner: bool
+    role: str
     grant: Any | None = None
 
     @property
     def granted_permission(self) -> str | None:
-        return str(self.grant.permission) if self.grant is not None else None
+        return self.role if self.grant is not None else None
 
 
 async def check_project_access(request: Request, project: Any, *, required: str) -> ProjectAccess:
     """Resolve project access with no admin bypass.
 
-    ``required`` may be ``view``, ``use``, or ``manage``. Ownership is the
-    only mutation path; active ``use`` grants permit only ``view`` and ``use``.
+    ``required`` may be ``view`` (viewer+), ``use`` (member+), ``manage``
+    (manager+), or ``share`` (owner only). Roles come from ownership or an
+    active project grant; see :mod:`cognis.core.project_access`.
     """
 
     user = require_current_user(request)
     owner_email = str(getattr(project, "owner_email", "") or "")
     if not owner_email:
         raise api_exception(500, "internal_error", "Project owner is missing")
-    if user.email == owner_email:
-        return ProjectAccess(user=user, owner_email=owner_email, is_owner=True)
-
-    if required not in {"view", "use", "manage"}:
+    if required not in {"view", "use", "manage", "share"}:
         raise api_exception(
             500, "internal_error", f"Unsupported project access requirement: {required}"
         )
-    if required not in {"view", "use"}:
-        raise api_exception(403, "forbidden", "Resource access denied")
+    if user.email == owner_email:
+        return ProjectAccess(user=user, owner_email=owner_email, is_owner=True, role="owner")
 
     session_factory = getattr(request.app.state, "session_factory", None)
     if session_factory is None:
         raise api_exception(500, "internal_error", "Session factory unavailable")
     async with session_factory() as session:
-        grant = await get_active_project_grant(session, str(project.project_id), user.email)
-    if grant is None:
+        resolution = await resolve_project_role(session, project, user.email)
+    if resolution.role is None:
         raise api_exception(403, "forbidden", "Resource access denied")
-    return ProjectAccess(user=user, owner_email=owner_email, is_owner=False, grant=grant)
+    if not role_satisfies(resolution.role, required):
+        raise api_exception(403, "forbidden", "Project role does not allow this action")
+    return ProjectAccess(
+        user=user,
+        owner_email=owner_email,
+        is_owner=False,
+        role=resolution.role,
+        grant=resolution.grant,
+    )
 
 
 def apply_project_access_metadata(project: Any, access: ProjectAccess) -> Any:
@@ -217,7 +245,8 @@ def apply_project_access_metadata(project: Any, access: ProjectAccess) -> Any:
     project.is_shared_with_me = not access.is_owner
     project.shared_by_email = None if access.is_owner else access.owner_email
     project.granted_permission = access.granted_permission
-    project.is_readonly_for_caller = not access.is_owner
+    project.caller_role = access.role
+    project.is_readonly_for_caller = not role_satisfies(access.role, "manage")
     return project
 
 

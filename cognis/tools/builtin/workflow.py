@@ -416,6 +416,26 @@ _PAYLOAD_ARTIFACT_SCHEMA = {
     "additionalProperties": False,
 }
 
+_SUPERSEDES_SCHEMA = {
+    "type": "string",
+    "pattern": "^dlv_[0-9a-f]{32}$",
+    "description": (
+        "Optional dlv_ ID of the latest revision of an existing deliverable that this "
+        "write replaces. The new deliverable becomes the next revision of the same "
+        "document; older revisions stay readable in its revision history. Omit to "
+        "create an independent deliverable."
+    ),
+}
+
+_PROJECT_ID_SCHEMA = {
+    "type": "string",
+    "description": (
+        "Optional project for a new document created outside project work. Deliverables "
+        "written in shared project chats or tasks join that project automatically, and "
+        "revisions keep the project of the document they supersede."
+    ),
+}
+
 _TEXT_WRITE_DELIVERABLE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -444,6 +464,8 @@ _TEXT_WRITE_DELIVERABLE_SCHEMA = {
             "type": "object",
             "description": "Optional structured sidecar data for evaluators or later steps.",
         },
+        "supersedes": _SUPERSEDES_SCHEMA,
+        "project_id": _PROJECT_ID_SCHEMA,
     },
     "required": ["content"],
     "additionalProperties": False,
@@ -533,6 +555,8 @@ _RICH_WRITE_DELIVERABLE_SCHEMA: dict[str, Any] = {
         "action": {"type": "string", "const": "rich"},
         "payload": _GENERIC_RICH_PAYLOAD_SCHEMA,
         "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+        "supersedes": _SUPERSEDES_SCHEMA,
+        "project_id": _PROJECT_ID_SCHEMA,
     },
     "required": ["action"],
     "oneOf": [{"required": ["payload"]}, {"required": ["payload_artifact"]}],
@@ -566,6 +590,8 @@ _PULSE_AUTHORING_SCHEMA = {
         "action": {"type": "string", "const": "rich:pulse"},
         "payload": _PULSE_PAYLOAD_SCHEMA,
         "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+        "supersedes": _SUPERSEDES_SCHEMA,
+        "project_id": _PROJECT_ID_SCHEMA,
     },
     "required": ["action"],
     "oneOf": [{"required": ["payload"]}, {"required": ["payload_artifact"]}],
@@ -578,11 +604,14 @@ _WRITE_DELIVERABLE_DESCRIPTION = (
     "durable output boundary and may be evaluator/reviewer input, downstream "
     "step input, a handoff artifact, or final user delivery. If the step "
     "expects a deliverable, write it after validation/review and before "
-    "step_complete. Workflow/task deliverables remain scoped to that task. "
-    "In direct chat, the deliverable is published for the owner, so other "
-    "conversations owned by the same user can search and use it. Each direct-chat "
+    "step_complete. Deliverables belong to the persistent owning agent; task and "
+    "conversation references preserve their provenance. Other agents require explicit "
+    "sharing, knowledgebase access, or a delegated-work entitlement. Each direct-chat "
     "call creates an independent output; all are presented at turn completion. "
-    "Repeated workflow-step calls instead revise the canonical step output. Use this only "
+    "Repeated workflow-step calls instead revise the canonical step output. To revise "
+    "an existing deliverable (edit or replace it), pass its latest dlv_ ID as "
+    "supersedes: the result is a new revision of the same document, and older "
+    "revisions stay in its history. Use this only "
     "when the turn should produce "
     "a durable/rendered/shareable artifact such as a report, spec, dashboard, "
     "or rich document; do not use it for normal answers, intermediate progress, "
@@ -789,6 +818,8 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
                 ),
             },
             "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+            "supersedes": _SUPERSEDES_SCHEMA,
+            "project_id": _PROJECT_ID_SCHEMA,
         },
         "additionalProperties": False,
     },
@@ -824,6 +855,7 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
                 }
             ],
             side_effects=["Persists a durable deliverable after validation succeeds."],
+            validator_ids=["write_deliverable.text"],
         ),
         NativeToolOperation(
             operation="rich",
@@ -1027,8 +1059,9 @@ ATTACH_ARTIFACT_TOOL = ToolDefinition(
 STEP_REQUEST_QUESTIONS_TOOL = ToolDefinition(
     name="step_request_questions",
     description=(
-        "Request a structured set of questions from the caller while staying in the same step. "
-        "Use when clarification, design choices, or planning decisions are needed before proceeding."
+        "Request structured clarification while staying in this execution. Questions from "
+        "children and tasks go to the responsible conversation agent, which can answer "
+        "or forward to the user; direct-chat questions go to the user."
     ),
     parameters={
         "type": "object",
@@ -1075,6 +1108,58 @@ STEP_REQUEST_QUESTIONS_TOOL = ToolDefinition(
             },
         },
         "required": ["questions"],
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=False,
+)
+
+ANSWER_QUESTION_TOOL = ToolDefinition(
+    name="answer_question",
+    description=(
+        "Answer a pending question assigned to this conversation, from a task or another "
+        "execution. Use context and the user's preferences; if unsure, forward_question "
+        "to the user rather than guess. This does not resolve approvals or auth requests."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "question_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "answers": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question_id": {"type": "string", "minLength": 1},
+                        "selected_option_ids": {"type": "array", "items": {"type": "string"}},
+                        "custom_answer": {"type": "string"},
+                    },
+                    "required": ["question_id"],
+                },
+            },
+        },
+        "required": ["question_id", "expected_revision", "answers"],
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=False,
+)
+
+FORWARD_QUESTION_TOOL = ToolDefinition(
+    name="forward_question",
+    description=(
+        "Pass a pending question assigned to this conversation to the user when their input "
+        "is needed. Keeps the original questions, origin, expiry, and paused execution."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "question_id": {"type": "string", "minLength": 1},
+            "expected_revision": {"type": "integer", "minimum": 1},
+        },
+        "required": ["question_id", "expected_revision"],
     },
     source=_SOURCE,
     category="workflow",
@@ -1313,6 +1398,8 @@ def workflow_tools() -> list[BaseToolDefinition]:
         ATTACH_ARTIFACT_TOOL,
         STEP_COMPLETE_TOOL,
         STEP_REQUEST_QUESTIONS_TOOL,
+        ANSWER_QUESTION_TOOL,
+        FORWARD_QUESTION_TOOL,
         REQUEST_CREDENTIAL_TOOL,
         REQUEST_AUTH_CHALLENGE_TOOL,
         LIST_CREDENTIALS_TOOL,

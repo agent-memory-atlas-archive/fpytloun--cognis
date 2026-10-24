@@ -16,6 +16,7 @@
     bodyClass?: string;
     viewportStyle?: string;
     dismissible?: boolean;
+    backdropDismissible?: boolean;
     onEscape?: (() => boolean) | undefined;
     children: Snippet;
     header?: Snippet;
@@ -33,6 +34,7 @@
     bodyClass = '',
     viewportStyle = '',
     dismissible = true,
+    backdropDismissible = true,
     onEscape,
     children,
     header,
@@ -93,7 +95,7 @@
   }
 
   function closeFromBackdrop(): void {
-    if (!dismissible || !isTopOverlay(overlayId)) return;
+    if (!dismissible || !backdropDismissible || !isTopOverlay(overlayId)) return;
     onClose();
   }
 
@@ -103,14 +105,15 @@
       unregisterOverlay = null;
       overlayId = null;
       if (previousFocus) {
-        queueMicrotask(() => previousFocus?.focus());
+        const restoreFocus = previousFocus;
+        queueMicrotask(() => { if (restoreFocus.isConnected) restoreFocus.focus(); });
         previousFocus = null;
       }
       return;
     }
 
     previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const handle = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    const handle = registerOverlay({ kind: 'blocking', blocksChrome: true, root: () => panelEl });
     overlayId = handle.id;
     unregisterOverlay = handle.unregister;
     queueMicrotask(() => focusPanel());
@@ -119,7 +122,8 @@
       handle.unregister();
       unregisterOverlay = null;
       overlayId = null;
-      queueMicrotask(() => previousFocus?.focus());
+      const restoreFocus = previousFocus;
+      queueMicrotask(() => { if (restoreFocus?.isConnected) restoreFocus.focus(); });
       previousFocus = null;
     };
   });
@@ -135,7 +139,7 @@
   >
     <button
       aria-label={`Dismiss ${label}`}
-      class="absolute inset-0 bg-slate-950/80 backdrop-blur"
+      class="absolute inset-0 bg-scrim/80 backdrop-blur"
       onclick={closeFromBackdrop}
       tabindex="-1"
       type="button"
@@ -143,7 +147,7 @@
 
     <div
       class={cn(
-        'relative z-10 flex h-full w-full items-center justify-center px-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]',
+        'pointer-events-none relative z-10 flex h-full w-full items-center justify-center px-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]',
         viewportClass
       )}
       style={viewportStyle || `padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + 1rem); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + 1rem);`}
@@ -155,14 +159,14 @@
         aria-modal="true"
         data-blocking-overlay
         class={cn(
-          'relative flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-card',
+          'pointer-events-auto relative flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-separator bg-elevated shadow-overlay',
           panelClass
         )}
         role="dialog"
         tabindex="-1"
       >
         {#if header}
-          <div class="shrink-0 border-b border-slate-800/80 px-5 py-4 sm:px-6">
+          <div class="shrink-0 border-b border-separator/80 px-5 py-4 sm:px-6">
             {@render header()}
           </div>
         {/if}
@@ -175,7 +179,7 @@
         </div>
 
         {#if footer}
-          <div class="shrink-0 border-t border-slate-800/80 px-5 py-4 sm:px-6">
+          <div class="shrink-0 border-t border-separator/80 px-5 py-4 sm:px-6">
             {@render footer()}
           </div>
         {/if}

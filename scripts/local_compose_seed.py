@@ -99,7 +99,7 @@ def _local_config() -> LocalSeedConfig:
         provider_name=_env("COGNIS_LOCAL_PROVIDER_NAME", "Local OpenAI-Compatible"),
         llm_base_url=llm_base_url,
         llm_api_key_env=llm_api_key_env,
-        chat_model=_env("COGNIS_LOCAL_CHAT_MODEL", "gpt-oss-120b"),
+        chat_model=_env("COGNIS_LOCAL_CHAT_MODEL", "openai/gpt-oss-120b"),
         executor_token_dir=Path(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_DIR", "/run/cognis-local")),
         executor_token_uid=int(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_UID", "1000")),
         executor_token_gid=int(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_GID", "1000")),

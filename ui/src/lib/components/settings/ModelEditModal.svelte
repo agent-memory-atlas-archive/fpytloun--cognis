@@ -17,6 +17,10 @@
     return {
       ...JSON.parse(JSON.stringify(source)),
       display_name: source.display_name ?? '',
+      primary_cache_ttl: source.supported_cache_ttls?.includes(source.primary_cache_ttl ?? '1h')
+        ? (source.primary_cache_ttl ?? '1h') : '5m',
+      auxiliary_cache_ttl: source.supported_cache_ttls?.includes(source.auxiliary_cache_ttl ?? '5m')
+        ? (source.auxiliary_cache_ttl ?? '5m') : '5m',
     };
   }
 
@@ -80,7 +84,9 @@
     { key: 'supports_defer_loading', label: 'Defer loading' },
     { key: 'supports_openai_namespace_tools', label: 'Namespace tools' },
     { key: 'supports_openai_allowed_tools', label: 'Allowed tools' },
-    { key: 'supports_image_generation', label: 'Image generation' }
+    { key: 'supports_image_generation', label: 'Image generation' },
+    { key: 'supports_video_generation', label: 'Video generation (native adapter required)' },
+    { key: 'supports_video_input', label: 'Native video input (verify account support first)' }
   ];
 
   function handleSave(): void {
@@ -103,13 +109,21 @@
     const obj = draft as any;
     obj[key] = !obj[key];
     draft._configuredFields = [...new Set([...(draft._configuredFields || []), key])];
+    const sources = draft.provider_metadata?.field_sources;
+    draft.provider_metadata = {
+      ...draft.provider_metadata,
+      field_sources: {
+        ...(sources && typeof sources === 'object' && !Array.isArray(sources) ? sources : {}),
+        [key]: 'configured'
+      }
+    };
   }
 </script>
 
-<BlockingDialog label="Edit model" onClose={onclose} titleId="model-edit-title">
+<BlockingDialog label="Edit model" onClose={onclose} titleId="model-edit-title" backdropDismissible={JSON.stringify(draft) === JSON.stringify(cloneModel(model)) && maxInputTokens === String(model.max_input_tokens ?? '') && inputCost === String(model.input_cost_per_mtok ?? '') && outputCost === String(model.output_cost_per_mtok ?? '')}>
   {#snippet header()}
     <div class="flex items-center justify-between gap-3">
-      <h2 class="text-lg font-semibold text-white" id="model-edit-title">Edit model: {model.model_id}</h2>
+      <h2 class="text-lg font-semibold text-strong" id="model-edit-title">Edit model: {model.model_id}</h2>
       <Button aria-label="Close model editor" size="icon" variant="secondary" onclick={onclose}>&times;</Button>
     </div>
   {/snippet}
@@ -121,34 +135,52 @@
       {/if}
       <!-- Display name -->
       <div class="space-y-1">
-        <label for="model-display-name" class="text-sm font-medium text-slate-200">Display name</label>
+        <label for="model-display-name" class="text-sm font-medium text-foreground">Display name</label>
         <Input id="model-display-name" bind:value={draft.display_name} placeholder={draft.model_id} />
-        <p class="text-xs text-slate-400">Optional friendly name shown in the UI</p>
+        <p class="text-xs text-muted">Optional friendly name shown in the UI</p>
       </div>
 
       <!-- Limits section -->
+      {#if draft.supported_cache_ttls?.length}
+        <section class="space-y-3" aria-label="Claude prompt caching">
+          <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Prompt cache lifetime</h3>
+          <label class="block text-sm">
+            Primary conversations
+            <select class="mt-1 block w-full rounded border border-control-border bg-surface p-2 text-foreground" bind:value={draft.primary_cache_ttl}>
+              {#each draft.supported_cache_ttls as ttl}<option value={ttl}>{ttl === '1h' ? '1 hour' : '5 minutes'}</option>{/each}
+            </select>
+          </label>
+          <label class="block text-sm">
+            Auxiliary requests
+            <select class="mt-1 block w-full rounded border border-control-border bg-surface p-2 text-foreground" bind:value={draft.auxiliary_cache_ttl}>
+              {#each draft.supported_cache_ttls as ttl}<option value={ttl}>{ttl === '1h' ? '1 hour' : '5 minutes'}</option>{/each}
+            </select>
+          </label>
+          <p class="text-xs text-muted">Primary includes managed conversations. Task steps (including primary agents), delegates, compaction, background jobs, and hooks use auxiliary settings. Unsupported extended TTL falls back to 5 minutes.</p>
+        </section>
+      {/if}
       <div class="space-y-3">
-        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Limits</h3>
+        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Limits</h3>
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div class="space-y-1">
-            <label for="model-context" class="text-sm font-medium text-slate-200">Total context</label>
+            <label for="model-context" class="text-sm font-medium text-foreground">Total context</label>
             <Input id="model-context" type="number" bind:value={draft.context_window} />
           </div>
           <div class="space-y-1">
-            <label for="model-input" class="text-sm font-medium text-slate-200">Max input</label>
+            <label for="model-input" class="text-sm font-medium text-foreground">Max input</label>
             <Input id="model-input" type="number" bind:value={maxInputTokens} placeholder="same as total" />
           </div>
           <div class="space-y-1">
-            <label for="model-output" class="text-sm font-medium text-slate-200">Max output</label>
+            <label for="model-output" class="text-sm font-medium text-foreground">Max output</label>
             <Input id="model-output" type="number" bind:value={draft.max_output_tokens} />
           </div>
         </div>
         <div class="space-y-1">
-          <label for="model-tier" class="text-sm font-medium text-slate-200">Tier</label>
+          <label for="model-tier" class="text-sm font-medium text-foreground">Tier</label>
           <select
             id="model-tier"
             bind:value={draft.tier}
-            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+            class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
           >
             {#each tiers as tier}
               <option value={tier}>{tier}</option>
@@ -159,15 +191,15 @@
 
       <!-- Capabilities section -->
       <div class="space-y-3">
-        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Capabilities</h3>
+        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Capabilities</h3>
         <div class="grid grid-cols-2 gap-x-4 gap-y-2">
           {#each capabilities as cap}
-            <label class="flex items-center gap-2 text-sm text-slate-200">
+            <label class="flex items-center gap-2 text-sm text-foreground">
               <input
                 type="checkbox"
                 checked={draft[cap.key] === true}
                 onchange={() => toggleCapability(cap.key)}
-                class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300"
+                class="rounded border-control-border bg-canvas text-accent focus:ring-accent"
               />
               {cap.label}
             </label>
@@ -177,14 +209,14 @@
 
       <!-- Pricing section -->
       <div class="space-y-3">
-        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Pricing (per 1M tokens)</h3>
+        <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Pricing (per 1M tokens)</h3>
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-1">
-            <label for="model-input-cost" class="text-sm font-medium text-slate-200">Input</label>
+            <label for="model-input-cost" class="text-sm font-medium text-foreground">Input</label>
             <Input id="model-input-cost" bind:value={inputCost} placeholder="0.00" />
           </div>
           <div class="space-y-1">
-            <label for="model-output-cost" class="text-sm font-medium text-slate-200">Output</label>
+            <label for="model-output-cost" class="text-sm font-medium text-foreground">Output</label>
             <Input id="model-output-cost" bind:value={outputCost} placeholder="0.00" />
           </div>
         </div>

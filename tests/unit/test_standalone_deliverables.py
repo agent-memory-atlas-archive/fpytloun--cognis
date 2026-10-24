@@ -200,6 +200,35 @@ def test_standalone_manifest_resolution_and_asset_confinement(
     )
 
 
+def test_offline_manifest_requires_confined_script_and_styles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("cognis.ui_assets.resolve_standalone_build_dir", lambda: tmp_path)
+    offline = tmp_path / "offline"
+    (offline / ".vite").mkdir(parents=True)
+    (offline / "assets").mkdir()
+    script = "assets/standalone-12345678.js"
+    style = "assets/style-12345678.css"
+    (offline / script).write_text("window.ready = true;", encoding="utf-8")
+    (offline / style).write_text("body{}", encoding="utf-8")
+    manifest = {
+        "src/standalone.ts": {"file": script, "isEntry": True},
+        "style.css": {"file": style},
+    }
+    manifest_path = offline / ".vite" / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resolved = resolve_standalone_manifest(offline=True)
+    assert resolved is not None
+    assert resolved.directory == offline
+    assert resolved.styles == (style,)
+    manifest["style.css"]["file"] = "../outside.css"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert resolve_standalone_manifest(offline=True) is None
+    manifest.pop("style.css")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert resolve_standalone_manifest(offline=True) is None
+
+
 def test_standalone_asset_is_pre_auth_and_immutable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

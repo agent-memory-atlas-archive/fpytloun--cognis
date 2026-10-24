@@ -65,17 +65,17 @@
             aria-expanded={expanded.has(node.path)}
             aria-selected={selectedPath === node.path}
             tabindex="0"
-            class="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-sm text-slate-300 hover:bg-slate-800/70"
+            class="flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-sm text-secondary hover:bg-raised/70"
             onclick={() => onToggle(node.path)}
             onkeydown={(event) => handleKeydown(event, node)}
             data-testid="knowledge-tree-folder"
           >
             {#if expanded.has(node.path)}
-              <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-              <FolderOpen class="h-4 w-4 shrink-0 text-amber-300" />
+              <ChevronDown class="h-3.5 w-3.5 shrink-0 text-quiet" />
+              <FolderOpen class="h-4 w-4 shrink-0 text-warning" />
             {:else}
-              <ChevronRight class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-              <Folder class="h-4 w-4 shrink-0 text-amber-300" />
+              <ChevronRight class="h-3.5 w-3.5 shrink-0 text-quiet" />
+              <Folder class="h-4 w-4 shrink-0 text-warning" />
             {/if}
             <span class="truncate">{node.name}</span>
           </button>
@@ -91,14 +91,14 @@
             aria-selected={selectedPath === node.path}
             tabindex="0"
             class={cn(
-              'flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-sm hover:bg-slate-800/70',
-              selectedPath === node.path ? 'bg-sky-500/15 text-sky-200' : 'text-slate-300'
+              'flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-sm hover:bg-raised/70',
+              selectedPath === node.path ? 'bg-accent-subtle text-accent' : 'text-secondary'
             )}
             onclick={() => onSelect(node)}
             onkeydown={(event) => handleKeydown(event, node)}
             data-testid="knowledge-tree-file"
           >
-            <FileText class="h-4 w-4 shrink-0 text-slate-500" />
+            <FileText class="h-4 w-4 shrink-0 text-quiet" />
             <span class="truncate">{node.name}</span>
           </button>
         </div>

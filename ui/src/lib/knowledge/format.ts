@@ -44,13 +44,13 @@ export function jobStatusTone(status: string): StatusTone {
 export function statusToneClass(tone: StatusTone): string {
   switch (tone) {
     case 'positive':
-      return 'border-emerald-700/60 bg-emerald-950/60 text-emerald-300';
+      return 'border-success-border bg-success-subtle text-success';
     case 'warning':
-      return 'border-amber-700/60 bg-amber-950/60 text-amber-300';
+      return 'border-warning-border bg-warning-subtle text-warning';
     case 'danger':
-      return 'border-rose-700/60 bg-rose-950/60 text-rose-300';
+      return 'border-danger-border bg-danger-subtle text-danger';
     default:
-      return 'border-slate-700 bg-slate-800/80 text-slate-200';
+      return 'border-control-border bg-raised/80 text-foreground';
   }
 }
 

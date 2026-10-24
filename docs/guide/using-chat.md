@@ -2,9 +2,58 @@
 
 The chat workspace is where you talk to an agent, watch responses stream in real time, and follow tool usage or delegated work without leaving the conversation.
 
-![Cognis chat workspace with web research tools](../assets/screenshots/chat-desktop.webp)
-
 ## Starting a conversation
+
+The main menu shows a colored dot when collapsed and an exact numeric badge
+when expanded (including the mobile menu). Zero counts are hidden:
+
+- **Chat:** active topic conversations with unread activity or unresolved attention,
+  counted once each. Rose takes priority over amber, then blue, using the same
+  attention rules as conversation rows.
+  Channels, workflow/task chats, managed conversations, and sticky agent-direct
+  chats are excluded, matching the default Dashboard topic scope.
+  Eligibility uses the same
+  Waiting predicate as the sidebar: a pending actionable request, or unread
+  activity in a conversation that is not currently running (including attached
+  background work). Session outcomes alone affect color, not eligibility.
+- **Dashboard:** unresolved, non-dismissed operational issues and unread inbox
+  notifications, including companion-service outage notices.
+- **Schedules:** schedules with unresolved latest-run failures, including
+  schedules automatically disabled after repeated failures. Recovery or
+  dismissal clears the indicator; historical failed runs are not counted.
+- **Tasks:** paused tasks waiting for input, approval, or manual resumption.
+
+Counts are available throughout the workspace, independent of list pagination.
+Expired authentication challenges are not actionable and cannot keep a yellow
+badge or Waiting entry alive. New challenges store a deadline; legacy challenges
+without one use their original timeout (default three minutes, at most ten).
+Startup reconciliation retires expired requests without submitting an OTP or
+retrying the original tool. Unread messages remain independently visible.
+Chat and Dashboard load topic Waiting separately from recent history, including old
+unread topics. You do not need to scroll through
+history to discover them. Reading a conversation clears unread-only Waiting;
+an unresolved actionable request remains visible. Explicit Chat channel/agent
+filters can explicitly request channel Waiting; channels never contribute to
+the main-menu topic badge. Dashboard project/search filters narrow its topic set;
+the main-menu count remains workspace-wide within topics.
+They refresh after relevant live events, reconnect, focus, and periodically
+while visible. A temporary connection failure retains the last successful count.
+
+The Chat sidebar and its complete Waiting list refresh independently. A failure
+in one does not prevent the other from recovering. Refresh bursts are coalesced;
+rate-limit and service-unavailable responses pause refreshes instead of starting
+an immediate full reload. After bounded automatic recovery, use **Retry** in the
+Waiting status or refresh conversation history to try again. Waiting's Retry
+refreshes only Waiting and preserves its last successful snapshot until success.
+Temporary executor-status failures do not block unread or attention updates.
+Last-known activity is retained until a complete activity lookup succeeds.
+Compact and pinned chat work summaries use a narrow work projection rather than
+loading conversation history. A reconnect or restored page requests prompt
+reconciliation while respecting rate limits and any refresh already in flight.
+An accepted live sidebar update cannot be overwritten by an older device-cache read.
+Transient Waiting refresh failures are silent in Chat and Dashboard. Only after
+a full minute of continuous failure does a quiet **Waiting updates are delayed**
+status appear, without an alert or toast. A successful refresh clears it.
 
 Open `Chat`, create a new conversation, and select an agent.
 Web conversations can exist before they have an active session; Cognis creates the root session when you send the first real message.
@@ -21,6 +70,48 @@ Depending on what the agent is doing, the conversation can display:
 - delegation status cards for background work
 - queued messages when you send another message during an active turn
 - reconnection status for the WebSocket session
+
+Previously viewed conversations can show cached content immediately. Dashboard
+and pinned chats reconcile silently without inserting a refresh row above the
+messages. Refresh failures still offer recovery. Live invalidations received
+during a load retain a trailing refresh.
+
+Full chat, dashboard windows, and pinned chats share one composer for each
+conversation: text, attachments, and message mode stay in sync. Opening an empty
+view does not change the draft. Sending from any view clears only the submitted
+input in the other views; newer edits remain. Other browser windows adopt saved
+draft changes when they have no pending local edit. Conflicting concurrent edits
+are retained instead of overwriting one another.
+
+If browser storage stops responding after the app resumes, account coordination
+times out rather than leaving later chat loads waiting indefinitely. The app
+revokes the local identity and returns to login for verification; retained local
+data is not deleted. Session verification also has a deadline while reading the
+server response, so a stalled response does not block all subsequent attempts.
+
+Settings → Offline data → Loading diagnostics includes bounded send-phase
+durations for local outbox locking, attachments, server admission and local receipt
+persistence. It records durations and outcomes, not message text.
+
+New response text fades in briefly as chunks arrive, without an artificial
+typing delay. Incomplete image and link syntax is withheld until it can be
+rendered; the completed response always uses the original Markdown.
+
+Chat preferences also apply to pinned chats and native tray chats, including
+when the tray opens before the full chat. Changes made in another window refresh
+automatically or when the chat window returns to the foreground.
+**Keep assistant messages separate** prevents assistant text from folding into
+activity groups; it does not ungroup tool or thinking activity. **Group tool calls**
+controls grouping itself. Hidden internal calls still show failures.
+**Automatically recap web chats** controls server-side generation, not the
+visibility of existing recap cards. **Enter to send** does not override
+Shift+Enter, input-method composition, or the software keyboard's newline behavior.
+
+The current tool group's label has a left-to-right brightness sweep. It remains
+active through thinking and between tool cycles within the same turn, rather
+than stopping after every tool result. It stops when activity moves to another
+group or a visible response, or the runtime reports completion, waiting, or
+cancellation. These animations respect the system's reduced-motion setting.
 
 “Sending” means the client has not yet received admission confirmation. A
 server-admitted message stops showing that label even while the agent is still
@@ -42,6 +133,37 @@ previously completed calls.
 `/model`, `/thinking`, and `/fast` select session overrides for the next message.
 `/profile` selects an agent profile and clears those overrides.
 Session details and `/info` show the selected values separately from the last model call.
+
+### Streaming replies
+
+Chat motion uses a 1.6-second group-activity sweep, a one-time 280ms small rise
+for new live messages, 320ms fades for newly arriving prose words, 180ms
+height-and-opacity disclosure, and 240ms color-only state handoffs. History
+loads and regrouping do not replay message entrances. Code is not word-animated,
+and system reduced-motion preferences disable movement.
+Tool-group colors identify the activity category even after completion or
+failure. Status remains in the existing details and delivery badges; sent
+messages do not display a persistent success dot.
+
+Live replies preview Markdown as it arrives: a clear bold opener or code fence
+can be formatted before its closing syntax arrives. Preview-only syntax never
+changes the saved text; code contents and escaped punctuation remain literal.
+Typing dots mean that this message is receiving text, not that the whole turn is
+still working. They stop while native tool input is being prepared; the message
+stays visible, and later text can resume under the same identity.
+
+### Switching away from an unavailable provider
+
+The yellow rate-limit wait bar and the current red model-failure card can show
+a subtle **Switch to provider** link. If several providers offer the exact same
+model, the action becomes a dropdown. Cognis only lists providers you can use,
+excluding known active retry waits and fresh reports of exhausted quota.
+Unknown capacity is not a guarantee that the next request will succeed.
+
+The action uses `/model provider/model` and keeps the model unchanged. A waiting
+provider retry is expedited automatically. If the turn has already failed,
+send a message to continue with the newly selected provider. Historical failure
+cards do not offer switching once another turn has superseded them.
 
 Thinking selections have distinct meanings:
 
@@ -101,6 +223,22 @@ and compaction. A session reset or renewal clears the overrides.
 Chat command retries return the original selection result without applying the
 change again. Timeline feedback can arrive later if Intaris is unavailable.
 
+## Attachment previews and saving
+
+The preview icon opens supported attachments inside a fullscreen app viewer.
+The top toolbar stays available while the document scrolls. Use **Close** to
+return to chat. PDF previews provide **Previous**, **Next**, zoom, and **Fit
+width** controls; every page is accessible without opening the system PDF viewer.
+HTML remains sandboxed. Images use the fullscreen image viewer.
+
+Download controls save the original file, not the preview. On desktop and
+non-Apple mobile browsers they download a named file. On iPhone and iPad, the
+first tap prepares the file; tap **Save/share** when it is ready, then choose
+**Save to Files** in the native share sheet. This second tap is required to
+preserve the browser's user-activation permission after loading the file.
+If the browser cannot share a file, Cognis shows an error rather than navigating
+away from chat. Directly opened signed URLs retain their existing browser behavior.
+
 ## Queued messages
 
 If you send a message while the agent is still processing the previous turn,
@@ -115,8 +253,18 @@ you need to review the full text.
 From the queued-message panel you can:
 
 - expand a queued row to review the exact message text waiting to run
-- edit the queued text before Cognis starts processing it
+- edit the queued text when the row offers Edit
 - delete a queued message to cancel it
+
+Messages admitted as trusted evidence are bound to their exact text and
+attachments, even while queued. These rows do not offer Edit; delete the queued
+message and send a replacement instead.
+
+At the next safe execution boundary, Cognis takes eligible queued messages
+together in order. This also happens before the next chat turn's first model
+call. Stop cancels the active turn but preserves queued messages; you do not
+need to stop each queued message to make the remaining batch available.
+Managed agent requests that require separate turns remain separate.
 
 Queued attachment changes are handled by deleting the queued message and sending
 a replacement, because attachments are already uploaded and referenced by the
@@ -127,6 +275,18 @@ turn runs later.
 ## Approvals and escalations
 
 If Intaris escalates a tool call, the chat UI shows an approval prompt. From there you can approve or deny the requested action.
+
+An Intaris admission conflict returns a tool error with its conflict code, not
+a failed agent turn. Cognis retries transient admission races once. If the
+session changes after approval, the old approval expires and Cognis requests
+approval again for the same action. No conflict authorizes tool execution.
+
+If Intaris rejects approval because of a read-only ceiling or mandatory denial,
+Cognis closes the approval as denied and explains the policy restriction.
+The agent continues with the denial instead of waiting for the approval timeout.
+Legacy Intaris string details are mapped only for recognized codes and known
+resolution messages; unrecognized text gets a generic rejection without
+exposing upstream content or assuming approval authority.
 
 This is how Cognis keeps risky or sensitive actions visible to the user instead of silently executing them.
 
@@ -150,6 +310,16 @@ Some work is better handled through delegated or structured execution instead of
 - final completion or failure updates
 
 The main conversation stays responsive while the sub-session or workflow continues.
+The **Ongoing work** drawer lists tasks, managed conversations, delegated
+sub-sessions, and background commands. Tap a task or session title to open it.
+Tap a command title to expand its command, working directory, executor, process,
+runtime, status, and latest output tail. **Refresh details** fetches a new
+snapshot; **Open source session** opens the command's originating session.
+Command output is a bounded tail, not the full historical log. Details are
+available to the conversation author while the assigned executor retains the
+job, including shortly after it finishes. A preview server left running after
+an agent turn still counts as background work and keeps the purple indicator on.
+
 Completed delegated work keeps its recoverable output with the sub-session. If a
 sub-session produced several assistant messages, Cognis keeps them in order and
 labels them as separate sections so the full report is not lost when a later
@@ -208,6 +378,11 @@ the original conversation; do not use a partially created fork as a recovery
 shortcut. Intentional fork activity filtering and compaction summaries still
 apply.
 
+The fork icon beside an assistant message asks for confirmation before creating
+a separate conversation. The original conversation keeps running; forking does
+not transfer or duplicate its execution. Newly forked history retains the
+original message times, including after reload.
+
 Use `/compact` to compact the current conversation manually. Manual compaction
 runs immediately and rotates to the new active session before the next user
 message is recorded.
@@ -221,14 +396,39 @@ deterministic activity counts and links.
 Deliverables, artifacts, and file changes cover the same recent window. Unlike
 compaction, a recap is a timeline card only: it does not enter the agent's
 context or rotate the session. Its work evidence opens existing detail views.
-In web chat, you can enable
-**Automatically recap web chats** in chat preferences. Automatic recaps run
+In web chat, **Automatically recap web chats** is enabled by default and can be
+disabled in chat preferences. Explicit opt-outs are preserved. Automatic recaps run
 quietly after five idle minutes only when new activity since the last published
 recap contains completed, meaningful work. They are limited to one published
 recap per 30 minutes and do not run in tasks or channels or send notifications.
+Automatic recaps wait while associated managed conversations, delegated sessions,
+tasks, or background commands are still running or queued. Background work is
+checked both before generation and before publication; an unavailable background
+status defers the recap rather than treating unfinished work as complete.
 Recently due recaps are recovered after controller restarts for up to two hours;
 older conversations are not backfilled, and enabling the preference does not
 recap conversations that were already idle.
+
+Use `/handoff` or `/handoff <subject or instruction>` to prepare a self-contained
+brief for another conversation or agent. Unlike the lightweight recap, it uses
+the current agent/profile model and effective context, including retained tool
+results and compaction context. It does not recover history already lost through
+compaction. You can run it mid-turn: the source keeps running, while the brief
+uses committed history at a fixed cutoff and treats unfinished actions as pending.
+No tools are executed and no new session is created for generation.
+
+The handoff card appears immediately with **Preparing handoff…**, then updates
+live to the collapsed result or a visible error. These states are saved as
+lifecycle events in the source session and survive reload. **Copy handoff**
+copies the complete Markdown.
+
+**New conversation from handoff** offers only a profile picker, defaulting to
+the source conversation's profile. The agent and project stay the same. The new
+composer contains a normal unsent draft, without legacy-recovery confirmation.
+Review and send it yourself; creating the conversation never sends it.
+After successful creation, the source card replaces its create action with
+**Open conversation**. This link is persisted and remains available after reload;
+opening or cancelling the picker does not create a link.
 
 Long-lived ambient chats, such as web direct chats with an agent and external
 channel conversations, can also checkpoint after an idle gap. By default, if the
@@ -292,8 +492,6 @@ When installed:
 
 ## Mobile-specific behavior
 
-![Cognis iOS PWA chat with tool activity](../assets/screenshots/pwa-chat.webp)
-
 - Primary navigation on mobile is a bottom tab bar (Chat / Tasks / Agents / Settings). Inside a chat conversation the bar hides so the composer owns the bottom safe-area.
 - Tapping the hamburger button in the header opens a right-side sheet drawer with the full navigation. The sheet supports swipe-down-to-dismiss.
 - The composer uses 16 px text on mobile so iOS Safari does not zoom the viewport when you focus it.
@@ -316,3 +514,18 @@ When installed:
 
 - The 9-tab section strip becomes a horizontally scrollable pill row instead of wrapping to three lines.
 - On the Executors tab, the per-executor "Individual tools" picker is now a searchable Sheet (tap "Configure" on the executor card) so you can find and toggle a tool without scanning a grid of 30+ chips.
+
+## Diagnosing device-specific history ordering
+
+If one device shows old messages or activity after recent history, open the
+conversation information panel (**ⓘ**), expand **Chat diagnostics**, and select
+**Download chat diagnostics** while the problem is visible.
+
+The JSON file records that device's frontend build, projection version, item
+identities, source references, and sort keys. Canonical history, local fallbacks,
+runtime items, and visible ordering are listed separately. It excludes message
+text, tool arguments and results, compaction summaries, and credentials.
+
+Exporting does not refresh, clear, or modify the conversation or its cache. The
+file remains on your device unless you share it. It still contains private
+conversation and session IDs; share it only with someone investigating the issue.

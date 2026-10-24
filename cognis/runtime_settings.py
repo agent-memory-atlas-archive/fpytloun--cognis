@@ -10,7 +10,7 @@ HOT_APPLIED_SETTING_KEYS: Final[frozenset[str]] = frozenset(
         "session.step_timeout_seconds",
         "session.llm_stream_idle_timeout_seconds",
         "session.llm_stream_max_retries",
-        "session.anthropic_cache_ttl",
+        "session.route_failback_idle_seconds",
         "session.memory_instructions_max_tokens",
         "session.core_memories_max_tokens",
         "session.immutable_prefix_repair_cooldown_seconds",
@@ -45,8 +45,9 @@ async def apply_runtime_setting(app: Any, key: str, value: object) -> None:
         state.agent_loop.default_llm_stream_idle_timeout_seconds = max(1, int(raw))
     elif key == "session.llm_stream_max_retries":
         state.agent_loop.default_llm_stream_max_retries = max(0, int(raw))
-    elif key == "session.anthropic_cache_ttl":
-        state.agent_loop.default_anthropic_cache_ttl = str(raw)
+    elif key == "session.route_failback_idle_seconds":
+        # LLMService reads the committed value at each routed request admission.
+        pass
     elif key == "session.memory_instructions_max_tokens":
         state.context_assembler.memory_instructions_max_tokens = max(1, int(raw))
         await state.session_cache.mark_all_prefix_repairs_needed()

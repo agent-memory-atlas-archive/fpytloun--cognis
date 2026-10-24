@@ -35,7 +35,10 @@ vi.mock('$lib/ws/client', () => ({
     acquireChatV2: vi.fn(),
     updateChatV2Cursor: vi.fn(),
     releaseChatV2: vi.fn(),
+    consumeCatchUp: vi.fn(() => null),
+    reconnectNow: vi.fn(),
   },
+  wsState: { subscribe: (run: (value: unknown) => void) => { run({ status: 'connected', attempts: 0, lastError: null }); return () => undefined; } },
 }));
 
 import TaskAgentDock from './TaskAgentDock.svelte';

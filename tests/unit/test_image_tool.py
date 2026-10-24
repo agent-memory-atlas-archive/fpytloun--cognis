@@ -12,6 +12,39 @@ from cognis.runtime_context import scoped_runtime_context
 from cognis.tools.builtin.image import handle_image_tool
 
 
+@pytest.fixture
+def authorized_image_inputs(monkeypatch):
+    """Mock the registry/policy boundary for provider payload tests only.
+
+    Real SQL permission checks (including revoked KB images and system sessions)
+    are covered in test_artifact_agent_access.
+    """
+    from types import SimpleNamespace
+
+    @asynccontextmanager
+    async def factory():
+        yield SimpleNamespace(commit=AsyncMock())
+
+    monkeypatch.setattr(
+        "cognis.core.artifact_access.artifact_authorized_for_conversation",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                status="attached",
+                owner_email=None,
+                namespace="images",
+                object_id="img_reference",
+                filename="image",
+            )
+        ),
+    )
+    monkeypatch.setattr("cognis.tools.builtin.image.create_artifact_record", AsyncMock())
+    return factory
+
+
 @pytest.mark.asyncio
 async def test_handle_image_tool_strips_empty_optional_args() -> None:
     provider = MagicMock()
@@ -44,6 +77,7 @@ async def test_handle_image_tool_strips_empty_optional_args() -> None:
         quality=None,
         images=None,
         mask=None,
+        acting_user_email=None,
     )
 
 
@@ -191,7 +225,7 @@ async def test_handle_image_tool_returns_error_when_artifact_registration_fails(
 
 
 @pytest.mark.asyncio
-async def test_image_edit_resolves_ordered_artifacts_and_mask() -> None:
+async def test_image_edit_resolves_ordered_artifacts_and_mask(authorized_image_inputs) -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
         return_value=ImageGenerationResult(
@@ -248,7 +282,7 @@ async def test_image_edit_resolves_ordered_artifacts_and_mask() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_generate_resolves_ordered_references() -> None:
+async def test_image_generate_resolves_ordered_references(authorized_image_inputs) -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
         return_value=ImageGenerationResult(
@@ -266,6 +300,7 @@ async def test_image_generate_resolves_ordered_references() -> None:
         {"prompt": "Combine the references.", "references": ["img_first", "img_second"]},
         provider,
         artifact_store=artifact_store,
+        session_factory=authorized_image_inputs,
     )
 
     assert not result.is_error
@@ -277,7 +312,9 @@ async def test_image_generate_resolves_ordered_references() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_generate_materializes_lazy_reference_before_resolution() -> None:
+async def test_image_generate_materializes_lazy_reference_before_resolution(
+    authorized_image_inputs,
+) -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
         return_value=ImageGenerationResult(
@@ -345,7 +382,7 @@ async def test_image_generate_materializes_lazy_reference_before_resolution() ->
 
 
 @pytest.mark.asyncio
-async def test_image_generate_rejects_non_image_reference() -> None:
+async def test_image_generate_rejects_non_image_reference(authorized_image_inputs) -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock()
     artifact_store = MagicMock()
@@ -356,6 +393,7 @@ async def test_image_generate_rejects_non_image_reference() -> None:
         {"prompt": "Use the reference.", "references": ["img_not_an_image"]},
         provider,
         artifact_store=artifact_store,
+        session_factory=authorized_image_inputs,
     )
 
     assert result.is_error

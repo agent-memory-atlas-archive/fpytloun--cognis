@@ -23,6 +23,9 @@ from cognis.store.queries import (
     get_conversation,
     get_session_row,
     get_user_ui_state,
+    list_active_delegation_sessions,
+    list_active_tasks_by_source_conversation,
+    list_open_managed_conversation_links,
     list_pending_notification_types_by_conversation,
     list_recent_web_recap_candidates,
 )
@@ -614,12 +617,72 @@ class RecapService:
                 latest_message = latest_message.replace(tzinfo=UTC)
             if snapshot_message is not None and snapshot_message.tzinfo is None:
                 snapshot_message = snapshot_message.replace(tzinfo=UTC)
-            return (
+            idle = (
                 current is not None
                 and current.status == "active"
                 and current.active_session_id == session.session_id
                 and latest_message == snapshot_message
             )
+        return idle and not await self._has_ongoing_work(conversation)
+
+    async def _has_ongoing_work(self, conversation: ConversationModel) -> bool:
+        """Use the ongoing-work lifecycle sources, not just the parent turn."""
+        conversation_id = conversation.conversation_id
+        async with self._session_factory() as db:
+            if await list_active_delegation_sessions(
+                db,
+                user_email=conversation.user_email,
+                controller_conversation_id=conversation_id,
+                limit=1,
+            ) or await list_active_tasks_by_source_conversation(
+                db,
+                created_by=conversation.user_email,
+                controller_conversation_id=conversation_id,
+                limit=1,
+            ):
+                return True
+            links = await list_open_managed_conversation_links(
+                db,
+                user_email=conversation.user_email,
+                controller_conversation_id=conversation_id,
+                limit=501,
+            )
+        # A full bounded page cannot prove that the remainder is idle.
+        if len(links) == 501:
+            return True
+        for link in links:
+            if (
+                link.turn_state in {"queued", "running"}
+                or await self._scheduler.durable_running_turn_state(link.target_conversation_id)
+                is not None
+                or await self._scheduler.get_queued_messages(link.target_conversation_id)
+            ):
+                return True
+        # Shell jobs can survive their turn and controller session. Query all
+        # connected executors, and filter by owner plus conversation, not session.
+        try:
+            handles = await self._providers.executor.list_active()
+
+            async def has_shell(handle: Any) -> bool:
+                connection = await self._providers.executor.get_executor(handle)
+                payload = await asyncio.wait_for(
+                    connection.background_shell_status(include_completed=False), timeout=2.0
+                )
+                if not isinstance(payload, dict) or not isinstance(payload.get("shells"), list):
+                    return True
+                return any(
+                    isinstance(shell, dict)
+                    and shell.get("user_email") == conversation.user_email
+                    and shell.get("conversation_id") == conversation_id
+                    and shell.get("status", "running") in {"running", "queued"}
+                    for shell in payload["shells"]
+                )
+
+            return any(await asyncio.gather(*(has_shell(handle) for handle in handles)))
+        except Exception:
+            # Unknown background state must not publish a premature automatic recap.
+            logger.debug("Automatic recap deferred: background status unavailable", exc_info=True)
+            return True
 
     async def _generate_in_context(
         self,
@@ -632,6 +695,8 @@ class RecapService:
     ) -> str:
         lock = self._locks.setdefault(conversation.conversation_id, asyncio.Lock())
         async with lock:
+            if auto and not await self._auto_still_idle(conversation, session):
+                return "Conversation is busy."
             if self._scheduler.has_active_turn(conversation.conversation_id):
                 return "Wait for the current turn to finish before recapping."
             streams: list[tuple[str, list[dict[str, Any]]]] = []

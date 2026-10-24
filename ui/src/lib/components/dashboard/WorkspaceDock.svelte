@@ -436,7 +436,7 @@
   <nav
     use:measureDock
     aria-label="Workspace windows"
-    class="workspace-dock pointer-events-auto fixed bottom-[calc(var(--app-shell-bottom-offset,0px)+0.75rem)] right-3 z-[78] flex max-w-[calc(100vw-1.5rem)] gap-1.5 overflow-hidden rounded-xl border border-slate-700 bg-slate-950/95 p-1.5 shadow-2xl backdrop-blur motion-safe:transition-[left] motion-safe:duration-220"
+    class="workspace-dock pointer-events-auto fixed bottom-[calc(var(--app-shell-bottom-offset,0px)+0.75rem)] right-3 z-[78] flex max-w-[calc(100vw-1.5rem)] gap-1.5 overflow-hidden rounded-xl border border-control-border bg-chrome/95 p-1.5 shadow-overlay material-chrome motion-safe:transition-[left] motion-safe:duration-220"
     data-testid="workspace-dock"
     bind:this={dock}
     style={`left:${left}px`}
@@ -456,8 +456,8 @@
         <div
         class={`workspace-dock-item flex shrink-0 items-center gap-0.5 rounded-lg border px-1 py-0.5 ${
           window.key === activeWindowKey
-            ? 'border-sky-400 bg-sky-500/15'
-            : 'border-slate-800 bg-slate-900'
+            ? 'border-accent bg-accent-subtle'
+            : 'border-separator bg-surface'
         } ${window.minimized ? 'opacity-60' : ''} ${
           draggedKey === window.key ? 'workspace-dock-item--placeholder' : ''
         } ${keyboardMotionKey === window.key ? 'workspace-dock-item--keyboard-move' : ''}`}
@@ -471,7 +471,7 @@
           aria-current={window.key === activeWindowKey ? 'true' : undefined}
           aria-label={`${window.minimized ? 'Restore' : 'Focus'} ${title}. Alt plus left or right arrow moves this item.`}
           aria-grabbed={draggedKey === window.key ? 'true' : undefined}
-          class={`flex min-h-8 min-w-0 cursor-grab items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 active:cursor-grabbing ${draggedKey === window.key ? 'cursor-grabbing opacity-80' : ''}`}
+          class={`flex min-h-8 min-w-0 cursor-grab items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent active:cursor-grabbing ${draggedKey === window.key ? 'cursor-grabbing opacity-80' : ''}`}
           data-testid={`workspace-dock-restore-${window.key}`}
           type="button"
           onclick={() => activate(window.key)}
@@ -484,11 +484,11 @@
             class="h-5 w-5"
             state={workspaceWindowActivityState(window, conversation)}
           />
-          <span class="max-w-36 truncate text-[11px] leading-4 text-slate-100">{title}</span>
+          <span class="max-w-36 truncate text-[11px] leading-4 text-foreground">{title}</span>
         </button>
         <button
           aria-label={`Close ${title}`}
-          class="grid h-8 w-8 place-items-center rounded-md text-slate-400 hover:bg-rose-500/10 hover:text-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+          class="grid h-8 w-8 place-items-center rounded-md text-muted hover:bg-danger-subtle hover:text-danger focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           data-testid={`workspace-dock-close-${window.key}`}
           type="button"
           onclick={() => manager.close(window.key)}
@@ -508,7 +508,7 @@
     <button
       aria-label={dashboardSnapshotActive ? 'Restore windows' : 'Show dashboard'}
       aria-pressed={dashboardSnapshotActive ? 'true' : 'false'}
-      class="grid h-8 w-8 shrink-0 place-items-center rounded-md text-slate-300 hover:bg-slate-800 hover:text-sky-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:cursor-not-allowed disabled:opacity-45"
+      class="grid h-8 w-8 shrink-0 place-items-center rounded-md text-secondary hover:bg-raised hover:text-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-45"
       data-testid="workspace-dock-dashboard"
       disabled={!dashboardSnapshotActive && visibleWindowCount === 0}
       onclick={toggleDashboard}
@@ -523,7 +523,7 @@
         data-testid="workspace-dock-drag-ghost"
         style={ghostStyle()}
       >
-        <span class="truncate px-2 text-[11px] leading-4 text-slate-100">{drag.title}</span>
+        <span class="truncate px-2 text-[11px] leading-4 text-foreground">{drag.title}</span>
       </div>
     {/if}
   </nav>
@@ -533,7 +533,7 @@
 <style>
   .workspace-dock {
     user-select: none;
-    scrollbar-color: rgb(71 85 105) transparent;
+    scrollbar-color: rgb(var(--color-border-strong)) transparent;
     scrollbar-width: thin;
   }
 
@@ -552,8 +552,8 @@
   }
 
   .workspace-dock-item--placeholder {
-    border-color: rgb(56 189 248 / 0.9);
-    box-shadow: inset 0 0 0 1px rgb(56 189 248 / 0.35);
+    border-color: rgb(var(--color-accent) / 0.9);
+    box-shadow: inset 0 0 0 1px rgb(var(--color-accent) / 0.35);
     opacity: 0.28;
   }
 
@@ -563,10 +563,10 @@
     display: flex;
     align-items: center;
     overflow: hidden;
-    border: 1px solid rgb(56 189 248 / 0.9);
+    border: 1px solid rgb(var(--color-accent) / 0.9);
     border-radius: 0.5rem;
-    background: rgb(15 23 42 / 0.98);
-    box-shadow: 0 10px 22px rgb(2 6 23 / 0.55), 0 0 0 2px rgb(56 189 248 / 0.35);
+    background: rgb(var(--color-elevated) / 0.98);
+    box-shadow: var(--shadow-overlay), 0 0 0 2px rgb(var(--color-accent) / 0.35);
     cursor: grabbing;
     opacity: 0.94;
     pointer-events: none;
@@ -580,8 +580,8 @@
     width: 4px;
     height: 70%;
     border-radius: 999px;
-    background: rgb(56 189 248);
-    box-shadow: 0 0 0 2px rgb(56 189 248 / 0.2), 0 0 12px rgb(56 189 248 / 0.8);
+    background: rgb(var(--color-accent));
+    box-shadow: 0 0 0 2px rgb(var(--color-accent) / 0.2), 0 0 12px rgb(var(--color-accent) / 0.8);
     pointer-events: none;
     transform: translateY(-50%);
   }

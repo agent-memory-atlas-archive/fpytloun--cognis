@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { confirmAction } from '$lib/stores/confirm';
@@ -19,6 +20,11 @@
   let loadingShares = $state(true);
   let searching = $state(false);
   let error = $state('');
+  // `error` is shared by load, search, grant and revoke. Only a failed share
+  // load is hidden while the global connection banner applies (and reloads
+  // on restore); search and mutation errors always show.
+  let loadFailed = $state(false);
+  const net = useSectionConnectivity({ hasError: () => loadFailed, retry: () => loadShares() });
   let pendingEmails = $state(new Set<string>());
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let searchGeneration = 0;
@@ -27,10 +33,12 @@
   async function loadShares(): Promise<void> {
     loadingShares = true;
     error = '';
+    loadFailed = false;
     try {
       shares = await api.knowledgebases.shares(kb.knowledgebase_id);
     } catch (err) {
       error = asApiError(err).message;
+      loadFailed = true;
     } finally {
       loadingShares = false;
     }
@@ -70,6 +78,7 @@
       } catch (err) {
         if (generation === searchGeneration && (err as { name?: string }).name !== 'AbortError') {
           error = asApiError(err).message;
+          loadFailed = false;
         }
       } finally {
         if (generation === searchGeneration) {
@@ -90,6 +99,7 @@
   async function grant(candidate: KnowledgebaseShareCandidate): Promise<void> {
     setPending(candidate.email, true);
     error = '';
+    loadFailed = false;
     try {
       const share = await api.knowledgebases.grantShare(kb.knowledgebase_id, {
         user_email: candidate.email,
@@ -114,6 +124,7 @@
     if (!confirmed) return;
     setPending(share.user_email, true);
     error = '';
+    loadFailed = false;
     try {
       await api.knowledgebases.revokeShare(kb.knowledgebase_id, share.user_email);
       shares = shares.filter((item) => item.user_email !== share.user_email);
@@ -127,33 +138,33 @@
 
 <section class="flex flex-col gap-4" aria-labelledby="people-access-heading">
   <div>
-    <h3 id="people-access-heading" class="text-sm font-semibold text-white">People</h3>
-    <p class="mt-1 text-sm text-slate-400">
+    <h3 id="people-access-heading" class="text-sm font-semibold text-strong">People</h3>
+    <p class="mt-1 text-sm text-muted">
       Shared people can browse documents and use Search or Ask. They cannot upload, edit,
       reindex, manage jobs, change settings, assign agents, share onward, archive, or delete.
     </p>
   </div>
 
   {#if disabled}
-    <p class="rounded-xl border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">
+    <p class="rounded-xl border border-warning-border bg-warning-subtle px-3 py-2 text-sm text-warning">
       Sharing changes are unavailable while this knowledgebase is archived.
     </p>
   {:else}
-    <label class="flex flex-col gap-1 text-sm text-slate-300">
+    <label class="flex flex-col gap-1 text-sm text-secondary">
       Find a Cognis user
-      <Input bind:value={query} oninput={scheduleSearch} placeholder="Type at least 2 characters…" data-testid="knowledge-share-search" />
+      <Input find bind:value={query} oninput={scheduleSearch} placeholder="Type at least 2 characters…" data-testid="knowledge-share-search" />
     </label>
     {#if query.trim().length > 0 && query.trim().length < 2}
-      <p class="text-xs text-slate-500">Enter at least 2 characters to search.</p>
+      <p class="text-xs text-quiet">Enter at least 2 characters to search.</p>
     {:else if searching}
-      <p class="text-sm text-slate-400" aria-live="polite">Searching users…</p>
+      <p class="text-sm text-muted" aria-live="polite">Searching users…</p>
     {:else if query.trim().length >= 2 && candidates.length === 0}
-      <p class="text-sm text-slate-400">No eligible users found.</p>
+      <p class="text-sm text-muted">No eligible users found.</p>
     {:else if candidates.length > 0}
       <ul class="flex flex-col gap-2" data-testid="knowledge-share-candidates">
         {#each candidates as candidate (candidate.email)}
-          <li class="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-            <div><p class="text-sm font-medium text-white">{candidate.name ?? candidate.email}</p><p class="text-xs text-slate-500">{candidate.email}</p></div>
+          <li class="flex items-center justify-between gap-3 rounded-xl border border-separator bg-surface/60 px-4 py-3">
+            <div><p class="text-sm font-medium text-strong">{candidate.name ?? candidate.email}</p><p class="text-xs text-quiet">{candidate.email}</p></div>
             <Button
               size="sm"
               aria-label={`Grant access to ${candidate.name ?? candidate.email}`}
@@ -166,19 +177,19 @@
     {/if}
   {/if}
 
-  {#if error}<div role="alert" class="rounded-xl border border-rose-800/60 bg-rose-950/30 px-3 py-2 text-sm text-rose-300">{error}</div>{/if}
+  {#if error && !(loadFailed && net.hideErrors)}<div role="alert" class="rounded-xl border border-danger-border bg-danger-subtle px-3 py-2 text-sm text-danger">{error}</div>{/if}
 
   <div>
-    <h4 class="text-sm font-medium text-slate-300">Current shares</h4>
+    <h4 class="text-sm font-medium text-secondary">Current shares</h4>
     {#if loadingShares}
-      <p class="mt-2 text-sm text-slate-400">Loading shared access…</p>
+      <p class="mt-2 text-sm text-muted">Loading shared access…</p>
     {:else if shares.length === 0}
-      <p class="mt-2 rounded-xl border border-dashed border-slate-800 px-4 py-5 text-center text-sm text-slate-400">Not shared with anyone yet.</p>
+      <p class="mt-2 rounded-xl border border-dashed border-separator px-4 py-5 text-center text-sm text-muted">Not shared with anyone yet.</p>
     {:else}
       <ul class="mt-2 flex flex-col gap-2">
         {#each shares as share (share.grant_id)}
-          <li class="flex items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-            <div><p class="text-sm font-medium text-white">{share.user_name ?? share.user_email}</p><p class="text-xs text-slate-500">{share.user_email} · Read/query</p></div>
+          <li class="flex items-center justify-between gap-3 rounded-xl border border-separator bg-surface/60 px-4 py-3">
+            <div><p class="text-sm font-medium text-strong">{share.user_name ?? share.user_email}</p><p class="text-xs text-quiet">{share.user_email} · Read/query</p></div>
             <Button
               size="sm"
               variant="ghost"

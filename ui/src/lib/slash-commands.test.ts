@@ -53,6 +53,7 @@ describe('slash command helpers', () => {
       '/yolo',
       '/profile',
       '/skill',
+      '/hook',
       '/executor',
       '/task',
       '/research',
@@ -110,6 +111,10 @@ describe('slash command helpers', () => {
   });
 
   it('requests dynamic parameter suggestions only for structured parameter commands', () => {
+    expect(slashParameterSuggestionCommand('/hook Manual learning')).toBe('/hook');
+    expect(localSlashCommandSuggestions('/hoo')[0]).toMatchObject({
+      command: '/hook', insert_text: '/hook ', suffix: 'space'
+    });
     expect(slashParameterSuggestionCommand('/skill cog')).toBe('/skill');
     expect(slashParameterSuggestionCommand('/thinking ')).toBe('/thinking');
     expect(slashParameterSuggestionCommand('/fast ')).toBe('/fast');
@@ -133,5 +138,14 @@ describe('slash command helpers', () => {
     };
 
     expect(applySlashSuggestion(suggestion)).toBe('/skill cognis-coding');
+  });
+});
+
+describe('project slash command', () => {
+  it('is dispatched as a system command with arguments', () => {
+    expect(isSystemSlashCommand('/project')).toBe(true);
+    expect(isSystemSlashCommand('/project Home')).toBe(true);
+    expect(isSystemSlashCommand('/project none')).toBe(true);
+    expect(isSystemSlashCommand('/projects')).toBe(false);
   });
 });

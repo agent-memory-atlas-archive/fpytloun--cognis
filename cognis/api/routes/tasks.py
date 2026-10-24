@@ -75,7 +75,9 @@ from cognis.core.management import (
     task_pending_pause_response,
     task_workflow_run_response,
 )
+from cognis.core.project_access import can_read_task
 from cognis.core.question_sets import plain_text_reply_for_questions
+from cognis.core.questions import user_visible_workflow_state
 from cognis.core.session import _to_conversation_model, _to_session_model
 from cognis.core.workflow_management import (
     delete_materialized_workflow,
@@ -107,6 +109,7 @@ from cognis.store.queries import (
     get_agent,
     get_conversation,
     get_deliverable,
+    get_deliverable_lineage_summary,
     get_project,
     get_session_row,
     get_step_run,
@@ -271,6 +274,8 @@ def _task_board_item_response(
         if row.status == "paused"
         else None
     )
+    if attention_type == "agent_question":
+        attention_type = None
     return TaskBoardItemResponse(
         task_id=row.task_id,
         title=row.title,
@@ -670,6 +675,7 @@ async def _fetch_task_page(
     )
     if require_attention:
         conditions.append(Task.workflow_state["pending_pause_type"].as_string().is_not(None))
+        conditions.append(Task.workflow_state["pending_pause_type"].as_string() != "agent_question")
     cursor_scope = {
         "statuses": list(statuses or ()),
         "status": status or "",
@@ -1289,7 +1295,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         source_type=payload.source_type,
         source_ref=payload.source_ref,
     )
-    await _validate_agent_access(request, payload.agent_id)
+    await _validate_agent_access(request, payload.agent_id, payload.project_id)
     if payload.agent_profile_id is not None:
         agent = await request.app.state.agent_registry.get(payload.agent_id, owner_email=user.email)
         if agent is None:
@@ -1355,6 +1361,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         if create_status == "draft":
             task = await queue.create_draft(
                 created_by=user.email,
+                creation_origin="owner_configured",
                 agent_id=payload.agent_id,
                 agent_profile_id=payload.agent_profile_id,
                 title=payload.title,
@@ -1376,6 +1383,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         else:
             task = await queue.submit(
                 created_by=user.email,
+                creation_origin="owner_configured",
                 agent_id=payload.agent_id,
                 agent_profile_id=payload.agent_profile_id,
                 title=payload.title,
@@ -1407,7 +1415,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
 
 @router.get("/api/v1/tasks/{task_id}", response_model=TaskDetailResponse)
 async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
-    task = await _require_task(request, task_id)
+    task = await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task(session, task_id)
@@ -1478,7 +1486,7 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
 async def task_summary(request: Request, task_id: str) -> TaskDetailResponse:
     """Return task detail metadata without step-run payloads."""
 
-    task = await _require_task(request, task_id)
+    task = await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task_projection(session, task_id)
@@ -1883,7 +1891,13 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 "Task agent and profile cannot change after its control chat is created",
             )
     if payload.agent_id is not None:
-        await _validate_agent_access(request, payload.agent_id)
+        await _validate_agent_access(
+            request,
+            payload.agent_id,
+            payload.project_id
+            if "project_id" in payload.model_fields_set
+            else existing_row.project_id,
+        )
     if "agent_profile_id" in payload.model_fields_set and payload.agent_profile_id is not None:
         effective_agent_id = payload.agent_id or existing_row.agent_id
         async with request.app.state.session_factory() as session:
@@ -2083,7 +2097,7 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
 
 @router.get("/api/v1/tasks/{task_id}/comments", response_model=list[TaskCommentResponse])
 async def task_comments(request: Request, task_id: str) -> list[TaskCommentResponse]:
-    await _require_task(request, task_id)
+    await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         rows = await list_task_comments(session, task_id)
     return [task_comment_to_response(row) for row in rows]
@@ -2185,7 +2199,7 @@ async def task_delete(request: Request, task_id: str) -> TaskActionResponse:
 async def task_submit(request: Request, task_id: str) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
-    await _validate_agent_access(request, task.agent_id)
+    await _validate_agent_access(request, task.agent_id, task.project_id)
     task = await request.app.state.task_queue.submit_existing(task_id)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
@@ -2202,7 +2216,7 @@ async def task_pause(request: Request, task_id: str) -> TaskActionResponse:
 async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
-    await _validate_agent_access(request, task.agent_id)
+    await _validate_agent_access(request, task.agent_id, task.project_id)
     task = await request.app.state.task_queue.resume_task(task_id)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
@@ -2211,7 +2225,7 @@ async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
 async def task_rerun(request: Request, task_id: str) -> TaskRerunResponse:
     forbid_mutation_for_viewer(request)
     task = await _require_task(request, task_id)
-    await _validate_agent_access(request, task.agent_id)
+    await _validate_agent_access(request, task.agent_id, task.project_id)
     result = await request.app.state.task_queue.rerun_task(task_id)
     return TaskRerunResponse(
         ok=True,
@@ -2244,6 +2258,8 @@ async def gate_response(
             task=task,
             requested_action=payload.action,
             note=note,
+            notification_id=payload.pause_id,
+            expected_revision=payload.expected_revision,
             pause_waiter=request.app.state.pause_waiter,
             notification_service=getattr(request.app.state, "notification_service", None),
             task_queue=request.app.state.task_queue,
@@ -2286,6 +2302,7 @@ async def step_response(
             task_queue=request.app.state.task_queue,
             session_factory=request.app.state.session_factory,
             user_email=task.created_by,
+            human_answer=True,
         )
     except ValueError as exc:
         message = str(exc)
@@ -2300,16 +2317,16 @@ async def step_response(
 @router.post("/api/v1/tasks/batch-submit", response_model=BatchSubmitResponse)
 async def task_batch_submit(request: Request, payload: BatchSubmitRequest) -> BatchSubmitResponse:
     forbid_mutation_for_viewer(request)
-    agent_ids: set[str] = set()
+    agent_ids: set[tuple[str, str | None]] = set()
     async with request.app.state.session_factory() as session:
         for task_id in payload.task_ids:
             row = await get_task(session, task_id)
             if row is None:
                 continue
             require_resource_owner(request, row.created_by)
-            agent_ids.add(row.agent_id)
-    for agent_id in agent_ids:
-        await _validate_agent_access(request, agent_id)
+            agent_ids.add((row.agent_id, row.project_id))
+    for agent_id, project_id in agent_ids:
+        await _validate_agent_access(request, agent_id, project_id)
     result = await request.app.state.task_queue.batch_submit(payload.task_ids)
     return BatchSubmitResponse(**result)
 
@@ -2324,7 +2341,7 @@ async def task_step_summaries(
 ) -> CursorPage[StepRunResponse]:
     """Return lightweight step-run projections for the task detail page."""
 
-    await _require_task(request, task_id)
+    await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         rows = await _list_step_run_projection_rows(session, task_id)
     if latest_only:
@@ -2355,7 +2372,7 @@ async def task_step_history_summary(
 
 @router.get("/api/v1/tasks/{task_id}/steps", response_model=list[StepRunResponse])
 async def task_steps(request: Request, task_id: str) -> list[StepRunResponse]:
-    await _require_task(request, task_id)
+    await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         rows = await list_step_runs_for_task(session, task_id)
         deliverables_by_step_run = {
@@ -2474,12 +2491,13 @@ async def step_run_deliverable_detail(
                 "deliverable_payload_unavailable",
                 "The full deliverable payload is unavailable or corrupt",
             )
-    return deliverable_to_response(row)
+        lineage = await get_deliverable_lineage_summary(session, row)
+    return deliverable_to_response(row, lineage=lineage)
 
 
 @router.get("/api/v1/tasks/{task_id}/workflow-run", response_model=WorkflowRunResponse)
 async def workflow_run_detail(request: Request, task_id: str) -> WorkflowRunResponse:
-    task = await _require_task(request, task_id)
+    task = await _require_task(request, task_id, allow_project_reader=True)
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
     if workflow_run is None:
@@ -2735,25 +2753,33 @@ def _build_step_chat_briefing(task: TaskModel, step_run: Any, deliverables: list
     )
 
 
-async def _require_task(request: Request, task_id: str) -> TaskModel:
+async def _require_task(
+    request: Request, task_id: str, *, allow_project_reader: bool = False
+) -> TaskModel:
+    """Return a task for its creator, or for project readers on read routes."""
+
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_task(session, task_id)
-    if row is None:
-        raise api_exception(404, "not_found", "Task not found")
-    if row.created_by != user.email:
-        raise api_exception(404, "not_found", "Task not found")
+        if row is None:
+            raise api_exception(404, "not_found", "Task not found")
+        if row.created_by != user.email and not (
+            allow_project_reader and await can_read_task(session, row, user.email)
+        ):
+            raise api_exception(404, "not_found", "Task not found")
     return _row_to_task(row)
 
 
-async def _validate_agent_access(request: Request, agent_id: str | None) -> None:
+async def _validate_agent_access(
+    request: Request, agent_id: str | None, project_id: str | None = None
+) -> None:
     if agent_id is None:
         return
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    await check_agent_access(request, row, required="use")
+    await check_agent_access(request, row, required="use", project_id=project_id)
 
 
 async def _validate_workflow_access(
@@ -2908,7 +2934,7 @@ def _row_to_task(row: Any) -> TaskModel:
         active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
         active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
         active_executor_source=getattr(row, "active_executor_source", None),
-        workflow_state=WorkflowState.model_validate(row.workflow_state)
+        workflow_state=user_visible_workflow_state(WorkflowState.model_validate(row.workflow_state))
         if row.workflow_state
         else None,
         queue_name=row.queue_name,

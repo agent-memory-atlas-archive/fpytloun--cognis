@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import RichViewerChrome from './RichViewerChrome.svelte';
 import RichDeliverable from './RichDeliverable.svelte';
 import { heroBadges } from './hero-badges';
@@ -7,6 +7,36 @@ import { setViewerTheme } from './viewer-theme';
 
 describe('viewer chrome', () => {
   beforeEach(() => setViewerTheme('system'));
+  afterEach(() => {
+    document.documentElement.removeAttribute('data-resolved-theme');
+    document.documentElement.removeAttribute('data-theme-family');
+  });
+  it('omits theme controls from in-app viewer chrome', () => {
+    render(RichViewerChrome, { surface: 'embedded', onCopy: vi.fn() });
+    expect(screen.queryByRole('button', { name: /^Theme:/ })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Copy document' })).toBeTruthy();
+  });
+  it('keeps embedded and fullscreen documents on live app appearance despite saved reader overrides', async () => {
+    setViewerTheme('light');
+    document.documentElement.dataset.resolvedTheme = 'dark';
+    document.documentElement.dataset.themeFamily = 'paper';
+    render(RichDeliverable, {
+      surface: 'embedded', title: 'App report',
+      payload: { blocks: [{ type: 'markdown', content: 'Report body' }] },
+    });
+    const root = screen.getByTestId('rich-deliverable');
+    await waitFor(() => expect(root).toHaveAttribute('data-viewer-theme', 'dark'));
+    expect(root).toHaveAttribute('data-theme-family', 'paper');
+    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    const full = document.querySelector('.rich-full');
+    expect(full).toHaveAttribute('data-viewer-theme', 'dark');
+    expect(screen.queryByRole('button', { name: /^Theme:/ })).toBeNull();
+    document.documentElement.dataset.resolvedTheme = 'light';
+    setViewerTheme('dark');
+    await waitFor(() => expect(root).toHaveAttribute('data-viewer-theme', 'light'));
+    expect(full).toHaveAttribute('data-viewer-theme', 'light');
+    await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  });
   it.each([undefined, {}, { icon: { name: 'not-registered', alt: 'Unknown' } }])('omits absent identity %j', (identity) => {
     render(RichViewerChrome, { identity, onCopy: vi.fn() });
     expect(screen.queryByTestId('rich-viewer-identity')).toBeNull();
@@ -23,17 +53,31 @@ describe('viewer chrome', () => {
     const title = 'A long document title '.repeat(40);
     render(RichViewerChrome, { title, onCopy: vi.fn() });
     expect(screen.getByTitle(title.trim())).toHaveTextContent(title.trim());
-    await fireEvent.click(screen.getByRole('button', { name: 'Light theme' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Theme: system. Switch to light theme' }));
     expect(localStorage.getItem('cognis-rich-viewer-theme')).toBe('light');
   });
   it('uses trusted SVG controls in reference order and exposes selection', async () => {
-    const { container } = render(RichViewerChrome, { title: 'Report', onCopy: vi.fn(), onDownload: vi.fn() });
+    const { container } = render(RichViewerChrome, { title: 'Report', onCopy: vi.fn(), pdfUrl: '/report.pdf', htmlUrl: '/report.html', markdownUrl: '/report.md' });
     expect(Array.from(container.querySelectorAll('[data-viewer-icon]')).map(el => el.getAttribute('data-viewer-icon')))
-      .toEqual(['light', 'dark', 'system', 'download', 'copy']);
+      .toEqual(['system', 'download', 'copy']);
     expect(container.querySelector('select')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Follow system theme' })).toHaveAttribute('aria-pressed', 'true');
-    await fireEvent.click(screen.getByRole('button', { name: 'Dark theme' }));
-    expect(screen.getByRole('button', { name: 'Dark theme' })).toHaveAttribute('aria-pressed', 'true');
+    const theme = container.querySelector('.theme-control') as HTMLButtonElement;
+    expect(theme).toHaveAttribute('data-theme-mode', 'system');
+    await fireEvent.click(theme);
+    expect(theme).toHaveAttribute('data-theme-mode', 'light');
+    expect(theme.querySelector('svg')).toHaveAttribute('data-viewer-icon', 'light');
+    await fireEvent.click(theme);
+    expect(theme).toHaveAttribute('data-theme-mode', 'dark');
+    expect(theme.querySelector('svg')).toHaveAttribute('data-viewer-icon', 'dark');
+    await fireEvent.click(theme);
+    expect(theme).toHaveAttribute('data-theme-mode', 'system');
+    expect(theme.querySelector('svg')).toHaveAttribute('data-viewer-icon', 'system');
+    await fireEvent.click(screen.getByTitle('Download document'));
+    expect(screen.getByRole('link', { name: 'PDF' })).toHaveAttribute('href', '/report.pdf');
+    expect(screen.getByRole('link', { name: 'Single HTML' })).toHaveAttribute('href', '/report.html');
+    expect(screen.getByRole('link', { name: 'Markdown' })).toHaveAttribute('href', '/report.md');
+    await fireEvent.keyDown(screen.getByTitle('Download document'), { key: 'Escape' });
+    expect(container.querySelector('.download-menu')).not.toHaveAttribute('open');
   });
   it('normalizes typed badges without rendering unknown objects', () => {
     expect(heroBadges([{ label: 'Approved', tone: 'success' }, { label: 'Pending', tone: 'unknown' }, {}, 'Legacy']))

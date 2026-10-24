@@ -58,6 +58,7 @@ class EventType(StrEnum):
     SESSION_COMPACTION_STARTED = "session_compaction_started"
     SESSION_COMPACTION_FINISHED = "session_compaction_finished"
     SESSION_COMPACTED = "session_compacted"
+    CONVERSATION_HANDOFF_UPDATED = "conversation_handoff_updated"
 
     # Step lifecycle
     STEP_STARTED = "step_started"
@@ -101,6 +102,7 @@ class EventType(StrEnum):
 
     # Agent lifecycle
     AGENT_PROFILE_UPDATED = "agent_profile_updated"
+    HOOK_CONFIGURATION_CHANGED = "hook_configuration_changed"
 
     # Schedule lifecycle
     SCHEDULE_FIRED = "schedule_fired"
@@ -111,6 +113,8 @@ class EventType(StrEnum):
     # Unified notifications
     NOTIFICATION_CREATED = "notification_created"
     NOTIFICATION_RESOLVED = "notification_resolved"
+    INBOX_CREATED = "inbox_created"
+    INBOX_CHANGED = "inbox_changed"
 
     # Session-scoped system notices
     SYSTEM_NOTICE = "system_notice"

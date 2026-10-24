@@ -24,6 +24,7 @@ from cognis.logging import get_logger
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.settings_schema import DEFAULT_SETTINGS
 from cognis.store.database import create_engine, create_session_factory
+from cognis.store.hook_schema import ensure_hook_activation_boundary, ensure_hook_handoff
 from cognis.store.migrations.compat import normalize_legacy_profile_override_revision
 from cognis.store.models import Base, Setting
 from cognis.store.queries import (
@@ -161,6 +162,8 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(normalize_legacy_profile_override_revision)
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(ensure_hook_activation_boundary)
+        await conn.run_sync(ensure_hook_handoff)
         await conn.run_sync(_ensure_session_lifecycle_columns)
         await conn.run_sync(_ensure_delegate_lineage_column)
         await conn.run_sync(_ensure_session_compaction_columns)
@@ -200,6 +203,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_escalation_timeout_column)
         await conn.run_sync(_ensure_task_creator_agent_column)
+        await conn.run_sync(_ensure_workflow_creation_origin)
         await conn.run_sync(_ensure_task_session_policy_column)
         await conn.run_sync(_ensure_task_control_conversation_column)
         await conn.run_sync(_ensure_conversation_lineage_columns)
@@ -208,6 +212,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
             await conn.run_sync(_ensure_work_call_state_index)
         await conn.run_sync(_ensure_task_board_indexes)
         await conn.run_sync(_ensure_notification_attention_columns)
+        await conn.run_sync(_ensure_notification_inbox)
         await conn.run_sync(_ensure_agent_profile_columns)
         await conn.run_sync(_ensure_session_runtime_override_columns)
         await conn.run_sync(_ensure_managed_conversation_lineage)
@@ -238,10 +243,25 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_channel_preferred_delivery_column)
         await conn.run_sync(_ensure_projects_tables)
         await conn.run_sync(_ensure_project_links_workflows_grants)
+        await conn.run_sync(_ensure_project_collaboration_schema)
         await conn.run_sync(_ensure_step_history_columns)
         await conn.run_sync(_ensure_task_comments_table)
         await conn.run_sync(_ensure_tts_cache_table)
         await conn.run_sync(_ensure_knowledgebase_schema)
+        from cognis.store.artifact_access_schema import ensure_artifact_access_schema
+
+        await conn.run_sync(ensure_artifact_access_schema)
+        from cognis.store.content_revision_schema import ensure_content_revision_schema
+
+        await conn.run_sync(ensure_content_revision_schema)
+        from cognis.store.palette_indexes import (
+            ensure_palette_indexes,
+            ensure_palette_task_run_index,
+        )
+
+        if not is_postgresql:
+            await conn.run_sync(ensure_palette_indexes)
+            await conn.run_sync(ensure_palette_task_run_index)
         await conn.run_sync(_ensure_todos_tables)
         await conn.run_sync(_ensure_local_model_runtime_columns)
         await conn.run_sync(_ensure_local_model_byte_counter_types)
@@ -261,12 +281,21 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
             await conn.execution_options(isolation_level="AUTOCOMMIT")
             await conn.run_sync(_ensure_work_call_state_index)
             await conn.run_sync(_ensure_work_load_indexes)
+            await conn.run_sync(ensure_palette_indexes, concurrently=True)
+            await conn.run_sync(ensure_palette_task_run_index, concurrently=True)
 
 
 def _ensure_coordination_leases_table(sync_conn: object) -> None:
     from cognis.store.models import CoordinationLeaseRow
 
     cast(Any, CoordinationLeaseRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_notification_inbox(sync_conn: object) -> None:
+    """Create the informational inbox idempotently on existing installations."""
+    from cognis.store.models import InboxNotificationRow
+
+    cast(Any, InboxNotificationRow.__table__).create(sync_conn, checkfirst=True)
 
 
 def _ensure_notification_attention_columns(sync_conn: object) -> None:
@@ -899,6 +928,17 @@ def _ensure_channel_delivery_route_release_columns(sync_conn: object) -> None:
         )
     if "route_release_audit" not in columns:
         execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN route_release_audit JSON"))
+
+
+def _ensure_workflow_creation_origin(sync_conn: object) -> None:
+    """Record trusted creation origin without granting legacy rows authority."""
+    connection = cast(Any, sync_conn)
+    inspector = inspect(connection)
+    for table in ("tasks", "schedules"):
+        if inspector.has_table(table) and "creation_origin" not in {
+            column["name"] for column in inspector.get_columns(table)
+        }:
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN creation_origin VARCHAR"))
 
 
 def _ensure_task_creator_agent_column(sync_conn: object) -> None:
@@ -1699,6 +1739,26 @@ def _ensure_project_links_workflows_grants(sync_conn: object) -> None:
     execute(
         text("CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations (project_id)")
     )
+
+
+def _ensure_project_collaboration_schema(sync_conn: object) -> None:
+    """Create project agents, resource visibility columns, and project roles."""
+
+    from cognis.store.models import ProjectAgentRow
+
+    _create_model_table(ProjectAgentRow, sync_conn)
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    for table in ("conversations", "tasks"):
+        columns = {column["name"] for column in inspector.get_columns(table)}
+        if "visibility" not in columns:
+            # Existing rows predate project sharing and stay author-only.
+            execute(
+                text(
+                    f"ALTER TABLE {table} ADD COLUMN visibility VARCHAR NOT NULL DEFAULT 'private'"
+                )
+            )
+    execute(text("UPDATE project_grants SET permission = 'member' WHERE permission = 'use'"))
 
 
 def _ensure_task_board_indexes(sync_conn: object) -> None:
@@ -3036,6 +3096,43 @@ def _ensure_deliverables_table(sync_conn: object) -> None:
         text(
             "CREATE INDEX IF NOT EXISTS ix_deliverables_conversation_scope "
             "ON deliverables (conversation_id, session_id, turn_id)"
+        )
+    )
+    _ensure_deliverable_revision_columns(sync_conn)
+
+
+def _ensure_deliverable_revision_columns(sync_conn: object) -> None:
+    """Add revision lineage columns, backfill, and lineage indexes idempotently."""
+
+    from cognis.store.models import DELIVERABLE_LIVE_SUPERSEDES_PREDICATE
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("deliverables")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "lineage_id" not in columns:
+        execute(text("ALTER TABLE deliverables ADD COLUMN lineage_id VARCHAR"))
+    if "revision" not in columns:
+        execute(text("ALTER TABLE deliverables ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"))
+    if "supersedes_deliverable_id" not in columns:
+        execute(text("ALTER TABLE deliverables ADD COLUMN supersedes_deliverable_id VARCHAR"))
+    execute(text("UPDATE deliverables SET lineage_id = deliverable_id WHERE lineage_id IS NULL"))
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_deliverables_lineage "
+            "ON deliverables (lineage_id, revision)"
+        )
+    )
+    if "status" not in columns:
+        # Pre-lifecycle legacy tables cannot express the live-revision predicate.
+        return
+    execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_deliverables_live_supersedes "
+            "ON deliverables (supersedes_deliverable_id) "
+            f"WHERE {DELIVERABLE_LIVE_SUPERSEDES_PREDICATE}"
         )
     )
 

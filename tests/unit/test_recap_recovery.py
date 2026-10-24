@@ -11,7 +11,15 @@ from cognis.core.session import _to_conversation_model, _to_session_model
 from cognis.models.session import EventAppendResult
 from cognis.store.coordination import DatabaseLeaseStore
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Agent, Base, Conversation, Session, User, UserUiState
+from cognis.store.models import (
+    Agent,
+    Base,
+    Conversation,
+    ManagedConversationLink,
+    Session,
+    User,
+    UserUiState,
+)
 from cognis.store.queries import list_recent_web_recap_candidates
 
 
@@ -77,6 +85,36 @@ async def test_recovery_candidates_are_recent_active_web_chats_with_enabled_pref
             )
         assert [conversation_id for conversation_id, _last, _pref in candidates] == ["conv-due"]
         async with factory() as db:
+            db.add_all([User(email="unset@example.org"), User(email="legacy@example.org")])
+            await db.flush()
+            for suffix in ("unset", "legacy"):
+                db.add(
+                    Conversation(
+                        conversation_id=f"conv-{suffix}",
+                        user_email=f"{suffix}@example.org",
+                        agent_id="agent-recap",
+                        context_type="web",
+                        status="active",
+                        active_session_id=f"sess-{suffix}",
+                        last_message_at=now - timedelta(minutes=10),
+                    )
+                )
+            db.add(
+                UserUiState(
+                    user_email="legacy@example.org", key="ui.preferences", value={"chat": {}}
+                )
+            )
+            await db.commit()
+        async with factory() as db:
+            default_candidates = await list_recent_web_recap_candidates(
+                db, since=now - timedelta(hours=2), until=now - timedelta(minutes=5)
+            )
+        assert {candidate[0] for candidate in default_candidates} == {
+            "conv-due",
+            "conv-unset",
+            "conv-legacy",
+        }
+        async with factory() as db:
             db.add_all(
                 Conversation(
                     conversation_id=f"conv-busy-{index}",
@@ -99,6 +137,7 @@ async def test_recovery_candidates_are_recent_active_web_chats_with_enabled_pref
             )
         assert "conv-due" in {conversation_id for conversation_id, _, _ in older}
         providers = SimpleNamespace(
+            executor=SimpleNamespace(list_active=AsyncMock(return_value=[])),
             guardrails=SimpleNamespace(
                 read_events=AsyncMock(
                     return_value=SimpleNamespace(
@@ -163,6 +202,37 @@ async def test_recovery_candidates_are_recent_active_web_chats_with_enabled_pref
             == "Fixed rendering."
         )
         providers.guardrails.record_events.assert_awaited_once()
+        async with factory() as db:
+            db.add(
+                Conversation(
+                    conversation_id="conv-managed",
+                    user_email="due@example.org",
+                    agent_id="agent-recap",
+                    context_type="web",
+                )
+            )
+            await db.flush()
+            db.add(
+                ManagedConversationLink(
+                    link_id="link-managed",
+                    user_email="due@example.org",
+                    controller_agent_id="agent-recap",
+                    controller_conversation_id="conv-due",
+                    controller_session_id="sess-due",
+                    target_agent_id="agent-recap",
+                    target_conversation_id="conv-managed",
+                    turn_state="running",
+                )
+            )
+            await db.commit()
+        assert await recap._auto_if_idle("conv-due") == "Conversation is busy."
+        providers.llm.generate.assert_awaited_once()
+        async with factory() as db:
+            link = await db.get(ManagedConversationLink, "link-managed")
+            link.turn_state = "idle"
+            await db.commit()
+        assert await recap._auto_if_idle("conv-due") == "Fixed rendering."
+        assert providers.llm.generate.await_count == 2
         held = await recap._lease_store.acquire(
             "conversation-recap:conv-due", "another-pod", ttl_seconds=120
         )
@@ -174,7 +244,7 @@ async def test_recovery_candidates_are_recent_active_web_chats_with_enabled_pref
                 )
                 == "Recap is already being generated."
             )
-            providers.llm.generate.assert_awaited_once()
+            assert providers.llm.generate.await_count == 2
         finally:
             await recap._lease_store.release(held)
         async with factory() as db:

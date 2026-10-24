@@ -8,25 +8,24 @@ import {
   resetConversationWorkspaceFixture,
 } from './conversation-workspace-fixture-state';
 
-const { taskDetail, controlChat, stepRunDetail, conversationDetail, gateResponse } = vi.hoisted(() => ({
+const { taskDetail, controlChat, stepRunDetail, conversationDetail, gateResponse, getDeliverable } = vi.hoisted(() => ({
   taskDetail: vi.fn(),
   controlChat: vi.fn(),
   stepRunDetail: vi.fn(),
   conversationDetail: vi.fn(),
   gateResponse: vi.fn(),
+  getDeliverable: vi.fn(),
 }));
 
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 vi.mock('$lib/stores/auth', async () => {
-  const { readable } = await import('svelte/store');
+  const { readable, get } = await import('svelte/store');
+  const store = readable({
+    status: 'authenticated', initialized: true, expiresAt: null,
+    user: { email: 'user@example.com', name: null, role: 'user' }, error: null
+  });
   return {
-    auth: readable({
-      status: 'authenticated',
-      initialized: true,
-      expiresAt: null,
-      user: { email: 'user@example.com', name: null, role: 'user' },
-      error: null
-    })
+    auth: { ...store, getSnapshot: () => get(store) }
   };
 });
 vi.mock('./ConversationModalWorkspace.svelte', async () => (
@@ -45,7 +44,7 @@ vi.mock('$lib/api/client', () => ({
       stepResponse: vi.fn()
     },
     conversations: { detail: conversationDetail },
-    deliverables: { getForStepRun: vi.fn() },
+    deliverables: { getForStepRun: vi.fn(), get: getDeliverable },
     notifications: { list: vi.fn().mockResolvedValue([]), resolve: vi.fn() }
   },
   asApiError: (error: unknown) => error instanceof Error ? error : new Error(String(error))
@@ -106,6 +105,27 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
 }
 
 describe('DashboardEntityModal', () => {
+  it('loads a shared task result by ID instead of an owner-only work projection', async () => {
+    taskDetail.mockResolvedValue({ ...completedTask(), created_by: 'other@example.com', result_data: { final_deliverable_id: 'dlv-final' } });
+    getDeliverable.mockResolvedValue({
+      deliverable_id: 'dlv-final', format: 'markdown', content: '# Shared final result',
+      title: 'Shared result', status: 'published', version: 1, outputs: {},
+    });
+    render(DashboardEntityModal, { kind: 'task', taskId: 'task-completed', onClose: vi.fn() });
+    await screen.findByTestId('task-brief');
+    await fireEvent.click(screen.getByTestId('dashboard-task-modal-tab-deliverable'));
+    await waitFor(() => expect(getDeliverable).toHaveBeenCalledWith('dlv-final'));
+    expect(screen.queryByTestId('task-work-panel')).not.toBeInTheDocument();
+    expect(controlChat).not.toHaveBeenCalled();
+  });
+  it('does not expose mutation tabs or create control chat for another author', async () => {
+    taskDetail.mockResolvedValue({ ...completedTask(), created_by: 'other@example.com', status: 'running' });
+    render(DashboardEntityModal, { kind: 'task', taskId: 'task-completed', onClose: vi.fn() });
+    await screen.findByTestId('task-brief');
+    expect(screen.queryByTestId('dashboard-task-modal-tab-control-chat')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dashboard-task-modal-tab-activity')).not.toBeInTheDocument();
+    expect(controlChat).not.toHaveBeenCalled();
+  });
   it('opens terminal tasks on the final deliverable without creating control chat', async () => {
     taskDetail.mockResolvedValue(completedTask());
     render(DashboardEntityModal, {
@@ -278,6 +298,34 @@ describe('DashboardEntityModal', () => {
     await waitFor(() => expect(screen.getByTestId('dashboard-task-control')).toHaveTextContent('ready'));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('submits the exact gate and refreshes stale controls after a conflict', async () => {
+    const paused = {
+      ...completedTask(),
+      task_id: 'task-realtime',
+      status: 'paused',
+      pending_pause: {
+        pause_id: 'pause-conflict', task_id: 'task-realtime', step_name: 'review',
+        step_run_id: null, session_id: null,
+        pause_type: 'gate', question: 'Retry failed step?', questions: [],
+        options: [{ action: 'revise(execute)', label: 'Retry step' }], context: {}
+      }
+    } as TaskDetail;
+    taskDetail.mockResolvedValueOnce(paused).mockResolvedValue({
+      ...paused, status: 'cancelled', pending_pause: null
+    });
+    gateResponse.mockRejectedValue(new Error('Gate is no longer actionable; refresh the task'));
+    render(DashboardEntityModal, {
+      kind: 'task', taskId: 'task-realtime', agents: [], onClose: vi.fn()
+    });
+    await fireEvent.click(await screen.findByTestId('dashboard-task-modal-tab-control'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry step' }));
+    await waitFor(() => expect(taskDetail).toHaveBeenCalledTimes(2));
+    expect(gateResponse).toHaveBeenCalledWith('task-realtime', expect.objectContaining({
+      pause_id: 'pause-conflict', action: 'revise(execute)'
+    }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Retry step' })).not.toBeInTheDocument());
   });
 
   it('does not reopen step output after Escape cancels slow projection hydration', async () => {

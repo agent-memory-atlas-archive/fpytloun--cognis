@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import 'fake-indexeddb/auto';
+import { IDBDatabase } from 'fake-indexeddb';
+import { documentCoordination, CoordinationUnavailableError } from '$lib/document-coordination';
 
 vi.mock('$app/environment', () => ({ browser: true }));
 
@@ -7,9 +10,10 @@ import { auth } from './auth';
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
 describe('MFA authentication flow', () => {
-  afterEach(() => {
+  afterEach(async () => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
-    auth.clear();
+    await auth.clear();
   });
 
   it('does not authenticate before a challenge completes', async () => {
@@ -47,5 +51,74 @@ describe('MFA authentication flow', () => {
 
     const setup = await auth.startMfaSetup('challenge-token-with-sufficient-length');
     expect(setup.secret).toBe('JBSWY3DPEHPK3PXP');
+  });
+
+  it('does not authorize an old MFA challenge under a newer login intent', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    for (const token of ['first-challenge-token', 'second-challenge-token']) {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+        status: 'mfa_required', method: 'totp', challenge_token: token, expires_in: 300,
+      }), { status: 200, headers: jsonHeaders }));
+      await auth.login('user@example.com', 'password');
+    }
+    await expect(auth.completeMfa('first-challenge-token', '123456', false))
+      .rejects.toThrow('account or server changed');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(auth.getSnapshot().status).toBe('anonymous');
+  });
+
+  it('releases shared bootstrap after a stalled response body and allows fresh verification', async () => {
+    const user = { email: 'user@example.com', name: 'User', role: 'user' };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({
+      status: 'authenticated', user, expires_at: '2099-01-01T00:00:00Z',
+    }), { status: 200, headers: jsonHeaders }));
+    await auth.login(user.email, 'password');
+    const cancelled = vi.fn();
+    const response = new Response(new ReadableStream({ cancel: cancelled }), { status: 200 });
+    const getReader = vi.spyOn(response.body!, 'getReader');
+    fetchMock.mockResolvedValueOnce(response);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const first = auth.bootstrap();
+    const joined = auth.bootstrap();
+    await vi.waitFor(() => expect(getReader).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(15_001);
+    await Promise.all([first, joined]);
+    expect(cancelled).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(user), { status: 200, headers: jsonHeaders }));
+    await auth.bootstrap();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', offline: false, user });
+  });
+
+  it('revokes a stalled coordination lease, then verifies afresh through the existing login bootstrap', async () => {
+    const user = { email: 'user@example.com', name: 'User', role: 'user' };
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: 'authenticated', user, expires_at: '2099-01-01T00:00:00Z',
+      }), { status: 200, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(user), { status: 200, headers: jsonHeaders }));
+    await auth.login(user.email, 'password');
+    const coordination = documentCoordination();
+    const oldLease = coordination.capture();
+    const transaction = vi.spyOn(IDBDatabase.prototype, 'transaction').mockReturnValueOnce({
+      objectStore: () => ({ get: () => ({}) }),
+      abort: () => {},
+    } as unknown as IDBTransaction);
+    try {
+      await expect(oldLease.validate()).rejects.toBeInstanceOf(CoordinationUnavailableError);
+      expect(oldLease.signal.aborted).toBe(true);
+      expect(auth.getSnapshot().status).toBe('anonymous');
+      expect(() => coordination.capture()).toThrow();
+      // The app shell routes anonymous users to login, whose bootstrap must
+      // now be able to verify the still-valid server session on a fresh lease.
+      await auth.bootstrap();
+      expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', offline: false, user });
+      await coordination.capture().validate();
+      expect(oldLease.signal.aborted).toBe(true);
+    } finally {
+      transaction.mockRestore();
+    }
   });
 });

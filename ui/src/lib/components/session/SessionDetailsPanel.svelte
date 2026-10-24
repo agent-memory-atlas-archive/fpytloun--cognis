@@ -2,6 +2,7 @@
   import { api } from '$lib/api/client';
   import SessionDetailsContent from './SessionDetailsContent.svelte';
   import type { IntarisSessionDetail } from '$lib/types/api';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
 
   let {
     sessionId,
@@ -17,8 +18,12 @@
   let loading = $state(false);
   let error = $state('');
   let requestGeneration = 0;
+  let reloadToken = $state(0);
+  // Hidden while the global connection banner applies; reload on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(error), retry: () => { reloadToken += 1; } });
 
   $effect(() => {
+    void reloadToken;
     const requestedSessionId = sessionId;
     const generation = ++requestGeneration;
     detail = null;
@@ -41,11 +46,11 @@
   });
 </script>
 
-<section class="max-h-[min(70vh,calc(var(--app-viewport-height,100dvh)-8rem))] overflow-y-auto overscroll-contain border-b border-slate-800/80 bg-slate-900/40 px-4 py-4" data-testid="session-details-panel">
-  {#if loading}
-    <p class="text-xs text-slate-500">Loading session details…</p>
+<section class="max-h-[min(70vh,calc(var(--app-viewport-height,100dvh)-8rem))] overflow-y-auto overscroll-contain border-b border-separator/80 bg-surface/40 px-4 py-4" data-testid="session-details-panel">
+  {#if loading || (error && net.hideErrors)}
+    <p class="text-xs text-quiet">Loading session details…</p>
   {:else if error}
-    <p class="text-xs text-rose-300">{error}</p>
+    <p class="text-xs text-danger">{error}</p>
   {:else if detail}
     <SessionDetailsContent {detail} {onOpenIntaris} />
   {/if}

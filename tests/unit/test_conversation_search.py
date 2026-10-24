@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from cognis.core import conversation_search as cs
 from cognis.models.search import MIN_DISPLAY_SCORE, SearchMatch, SearchSessionMatch, kind_rank
 from cognis.settings_schema import validate_setting_value
+
+
+@pytest.fixture(autouse=True)
+def no_internal_hook_links_in_mock_database(monkeypatch):
+    # These joins use object() as their DB and mock all metadata queries.
+    # Real legacy-hook classification is covered by test_hook_subsessions.
+    monkeypatch.setattr(
+        "cognis.store.hook_visibility.is_internal_hook_conversation",
+        AsyncMock(return_value=False),
+    )
 
 
 def test_search_kind_priority_matches_ui_navigation_semantics() -> None:

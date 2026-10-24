@@ -84,6 +84,91 @@ class _FakeSessionCache:
         return self.entry
 
 
+@pytest.mark.asyncio
+async def test_shared_project_reader_strips_tools_and_rechecks_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = _conversation()
+    conversation.user_email = "owner@example.com"
+    conversation.project_id = "proj_home"
+    checks: list[str] = []
+
+    async def authorize(*_args: Any, **kwargs: Any) -> Any:
+        checks.append(kwargs["conversation_id"])
+        return conversation
+
+    monkeypatch.setattr(ct, "get_conversation", lambda *_args: _async_value(conversation))
+    monkeypatch.setattr(ct, "readable_project_conversation", authorize)
+    monkeypatch.setattr(
+        ct,
+        "get_agent",
+        lambda *_args: _async_value(SimpleNamespace(owner_email="source-owner@example.com")),
+    )
+    monkeypatch.setattr(
+        ct, "list_conversation_sessions", lambda *_args: _async_value([_session("sess-1", "int-1")])
+    )
+    handlers = ct.build_conversation_tool_handlers(
+        lambda: _SessionContext(),
+        _FakeIntaris(
+            {
+                "int-1": [
+                    _event(1, "Shared project message"),
+                    _event(2, "Never reveal this", "tool_result"),
+                ]
+            }
+        ),
+    )
+    context = _context()
+    context.runtime_metadata["runtime_access"] = {"project_id": "proj_home", "agent_id": "agent-1"}
+    result = await handlers["read_conversation_messages"]({"conversation_id": "conv-1"}, context)
+    assert [item["content"] for item in result["events"]] == ["Shared project message"]
+    assert checks == ["conv-1", "conv-1", "conv-1"]
+    with pytest.raises(ValueError, match="messages only"):
+        await handlers["read_conversation_messages"](
+            {"conversation_id": "conv-1", "kinds": ["tool_result"]}, context
+        )
+
+
+@pytest.mark.asyncio
+async def test_project_search_uses_shared_durable_messages_not_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = _conversation()
+    conversation.user_email = "owner@example.com"
+    conversation.project_id = "proj_home"
+    monkeypatch.setattr(ct, "get_conversation", lambda *_args: _async_value(conversation))
+    monkeypatch.setattr(
+        ct, "readable_project_conversation", lambda *_args, **_kwargs: _async_value(conversation)
+    )
+    monkeypatch.setattr(ct, "require_project_agent", lambda *_args, **_kwargs: _async_value(None))
+    monkeypatch.setattr(
+        ct,
+        "get_agent",
+        lambda *_args: _async_value(SimpleNamespace(owner_email="source-owner@example.com")),
+    )
+    monkeypatch.setattr(
+        ct, "list_project_conversations", lambda *_args, **_kwargs: _async_value([conversation])
+    )
+    monkeypatch.setattr(
+        ct, "list_conversation_sessions", lambda *_args: _async_value([_session("sess-1", "int-1")])
+    )
+    handlers = ct.build_conversation_tool_handlers(
+        lambda: _SessionContext(),
+        _FakeIntaris(
+            {"int-1": [_event(1, "Kitchen planning"), _event(2, "Kitchen secret", "tool_result")]}
+        ),
+    )
+    context = _context()
+    context.runtime_metadata["runtime_access"] = {"project_id": "proj_home", "agent_id": "agent-1"}
+    result = await handlers["search_conversations"](
+        {"q": "Kitchen", "project_id": "proj_home"}, context
+    )
+    assert result["backend"]["scope"] == "project_durable_messages"
+    assert result["matches"][0]["is_readonly"]
+    assert result["matches"][0]["matches"][0]["snippet"] == "Kitchen planning"
+    assert len(result["matches"][0]["matches"]) == 1
+
+
 class _FakeCompactionStrategy:
     def __init__(self, entry: Any | None = None) -> None:
         self.session_cache = _FakeSessionCache(entry)

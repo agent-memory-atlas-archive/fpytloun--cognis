@@ -1,11 +1,16 @@
 import type { UserPreferences } from '$lib/types/api';
+import { DEFAULT_THEME_FAMILY, normalizeThemeFamily } from '$lib/theme/catalog';
 
 export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   display: {
     theme: 'system',
+    theme_family: DEFAULT_THEME_FAMILY,
     language: 'auto',
     dashboard_workspace_windows: true,
+    pinned_agents_collapsed: true,
+    pinned_agents_order_by_activity: true,
     conversation_sidebar_sections: true,
+    conversation_project_badge: 'name',
     conversation_sidebar_dense: false
   },
   chat: {
@@ -14,7 +19,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
     group_tool_calls: true,
     keep_assistant_messages_separate: false,
     show_internal_tool_calls: false,
-    auto_recap: false
+    auto_recap: true
   },
   notifications: {
     include_content: true
@@ -41,10 +46,17 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
   return {
     display: {
       theme,
+      theme_family: normalizeThemeFamily(display.theme_family),
       language,
+      conversation_project_badge: display.conversation_project_badge === 'icon' || display.conversation_project_badge === 'hidden' || display.conversation_project_badge === 'monochrome'
+        ? display.conversation_project_badge : 'name',
       dashboard_workspace_windows: typeof display.dashboard_workspace_windows === 'boolean'
         ? display.dashboard_workspace_windows
         : DEFAULT_USER_PREFERENCES.display.dashboard_workspace_windows,
+      pinned_agents_collapsed: typeof display.pinned_agents_collapsed === 'boolean'
+        ? display.pinned_agents_collapsed : DEFAULT_USER_PREFERENCES.display.pinned_agents_collapsed,
+      pinned_agents_order_by_activity: typeof display.pinned_agents_order_by_activity === 'boolean'
+        ? display.pinned_agents_order_by_activity : DEFAULT_USER_PREFERENCES.display.pinned_agents_order_by_activity,
       conversation_sidebar_sections: typeof display.conversation_sidebar_sections === 'boolean'
         ? display.conversation_sidebar_sections
         : DEFAULT_USER_PREFERENCES.display.conversation_sidebar_sections,

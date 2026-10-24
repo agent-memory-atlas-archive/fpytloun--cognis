@@ -31,6 +31,52 @@ payload JSON.
   interactive block tree.
 - **PDF export** uses Cognis server-side rendering and caching. It is distinct
   from executor-side `document_generate`.
+- **Single HTML export** is a self-contained offline publication. It uses the
+  same content renderer as the hosted page, including Mermaid diagrams,
+  responsive tables, charts, and typography. JavaScript must be enabled.
+  Viewer download, copy, share, and close controls are omitted; table-of-contents
+  navigation and content interactions remain available. It embeds authorized
+  deliverable images as base64 data URLs and includes its styles and scripts in
+  one file; unlike the live standalone page, it does not need Cognis assets or
+  media routes to render. Missing referenced images cause an explicit failure
+  rather than an incomplete download. The export is limited to 32 MiB.
+- **Markdown export** downloads the stored Markdown fallback for rich and
+  Markdown deliverables. It is not available for plain-text or HTML deliverables.
+
+The download menu offers the available formats in embedded, full, and
+standalone views. Share links can download the same formats while valid; the
+downloaded files do not extend the life of a share token.
+
+Virtual deliverable preview URLs open the original deliverable viewer, not a
+reconstructed Markdown file preview. Converting a signed preview link preserves
+its exact expiry; Markdown downloads are unchanged. Installed-app previews have
+a Close control that returns to app history when available, or to the app home
+page for direct launches.
+
+Authenticated owners can open an expired share through their private access.
+The viewer labels this as an expired shared link; anonymous readers and other
+users do not gain access. Owner sharing offers 1, 7 (default), 30, or 90 days,
+or a custom date/time within the next 90 days. Creating a link does not revoke
+earlier links. Forever is not supported. The signing secret is deployment-wide,
+so selective revocation is not available through key rotation.
+
+Long documents automatically expose a table of contents based on section
+headings, including multiple headings within one Markdown block. An explicit
+`metadata.toc: false` still disables it. Figure images can be activated with a
+click or keyboard to open a borderless gallery preview. On desktop, click the
+image to zoom around the pointer, move the pointer to pan, and click again to
+reset. On touch screens, double-tap to zoom/reset, pinch to change zoom, and
+drag to pan. The magnifying-glass control also toggles zoom for touch and
+keyboard users. Escape, Close, or clicking/tapping the backdrop returns focus
+to the figure. The preview uses the same
+authorized image URL; it does not mint another share or download link.
+Deliverables inside Cognis, including task outputs and fullscreen views, follow
+your account appearance and have no separate theme control. External standalone
+readers have a theme icon that cycles through light, dark, and system settings;
+that browser-local preference never overrides in-app appearance.
+A collapsed desktop contents sidebar reopens
+from a small arrow beside the title; narrow screens retain the right-side
+contents control and overlay drawer.
 
 PDFs adapt the publication design to A4 portrait: bundled Archivo and
 JetBrains Mono fonts, semantic status badges, a compact contents list with
@@ -107,10 +153,32 @@ the host takes precedence when both values exist.
 
 ## Viewer shell
 
-Standalone and full-view rendering provide viewer-owned theme, copy, download,
-and table-of-contents controls. A payload can optionally identify that shell
+Standalone and full-view rendering provide copy, download, and table-of-contents
+controls. Only external standalone readers provide separate theme controls.
+A payload can optionally identify that shell
 with `metadata.viewer_identity` when an authored label or semantic icon adds
 meaning. Omitting it adds no identity chrome.
+
+## Revisions
+
+To edit or replace an existing deliverable, call `write_deliverable` with
+`supersedes` set to the `dlv_` ID of its latest revision. The result is a new
+deliverable and the next revision of the same document. It works for any
+format and in both direct chat and task steps. A task can also revise a
+deliverable written in chat, and chat can revise a task output.
+
+- Only the latest revision can be superseded. When the target already has a
+  newer revision, the tool rejects the call and returns
+  `latest_deliverable_id`.
+- Older revisions stay readable by their exact ID and through the revision
+  history. Artifact search and listing return only the latest revision.
+- Rewriting a deliverable inside the same task step still replaces the step
+  draft. It does not create a new revision.
+
+In the web app, the chat, the activity inspector, the Work view, and the task
+output show a revision picker when a deliverable has more than one revision.
+An older chat card stays in the history, collapsed and marked as superseded,
+with a link to the latest revision.
 
 ## Choose the smallest useful format
 

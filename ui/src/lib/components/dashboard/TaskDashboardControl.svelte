@@ -186,6 +186,7 @@
     let changed = false;
     try {
       await api.tasks.gateResponse(task.task_id, {
+        pause_id: activePause.pause_id,
         step_name: activePause.step_name,
         action,
         feedback: instruction.trim() || null
@@ -226,38 +227,38 @@
 <div class="space-y-4" data-testid="dashboard-task-control">
   {#if unavailable}
     <div data-testid="dashboard-task-control-unavailable">
-      <Card class="border-amber-500/30 bg-amber-500/5 p-4">
-        <p class="text-sm font-semibold text-amber-100">Task unavailable</p>
-        <p class="mt-1 text-sm text-slate-300">This task no longer exists or is no longer available. Lifecycle actions are disabled.</p>
+      <Card class="border-warning-border bg-warning-subtle p-4">
+        <p class="text-sm font-semibold text-warning">Task unavailable</p>
+        <p class="mt-1 text-sm text-secondary">This task no longer exists or is no longer available. Lifecycle actions are disabled.</p>
       </Card>
     </div>
     {#if error}
-      <p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{error}</p>
+      <p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{error}</p>
     {/if}
   {:else}
   <Card class="p-4">
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
-        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Task control</p>
-        <p class="mt-1 text-lg font-semibold capitalize text-white">{task.status}</p>
-        <p class="mt-1 text-xs text-slate-400">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-quiet">Task control</p>
+        <p class="mt-1 text-lg font-semibold capitalize text-strong">{task.status}</p>
+        <p class="mt-1 text-xs text-muted">
           {currentStep ? `Current step: ${currentStep}` : 'No active workflow step'}
         </p>
       </div>
-      <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2.5 py-1 text-xs text-slate-300">
+      <span class="rounded-full border border-control-border bg-canvas/70 px-2.5 py-1 text-xs text-secondary">
         Attempt {task.attempt_number}
       </span>
     </div>
     {#if blockerReason}
-      <div class="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2">
-        <p class="text-xs font-medium text-amber-200">{task.pending_pause ? 'Pause / blocker' : 'Latest status detail'}</p>
-        <p class="mt-1 text-sm text-slate-200">{blockerReason}</p>
+      <div class="mt-3 rounded-xl border border-warning-border bg-warning-subtle px-3 py-2">
+        <p class="text-xs font-medium text-warning">{task.pending_pause ? 'Pause / blocker' : 'Latest status detail'}</p>
+        <p class="mt-1 text-sm text-foreground">{blockerReason}</p>
       </div>
     {/if}
   </Card>
 
   {#if !canMutate}
-    <p class="rounded-xl border border-slate-700 bg-slate-900/70 p-3 text-sm text-slate-300" data-testid="dashboard-task-control-readonly">
+    <p class="rounded-xl border border-control-border bg-surface/70 p-3 text-sm text-secondary" data-testid="dashboard-task-control-readonly">
       View-only access. Task lifecycle actions and responses are available only to task operators.
     </p>
   {/if}
@@ -272,28 +273,28 @@
         onQuestion={respondToQuestion}
       />
     {:else}
-      <Card class="border-amber-500/30 bg-amber-500/5 p-4">
-        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-amber-300">Pending request</p>
-        <p class="mt-2 text-sm text-slate-200">
+      <Card class="border-warning-border bg-warning-subtle p-4">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-warning">Pending request</p>
+        <p class="mt-2 text-sm text-foreground">
           {activePause.question ?? activePause.questions?.[0]?.question ?? 'This task needs an operator response.'}
         </p>
       </Card>
     {/if}
   {:else if task.pending_pause}
     <div data-testid="dashboard-task-control-protected-pause">
-      <Card class="border-amber-500/30 bg-amber-500/5 p-4">
-        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-amber-300">Protected request</p>
-        <p class="mt-2 text-sm text-slate-200">
+      <Card class="border-warning-border bg-warning-subtle p-4">
+        <p class="text-xs font-semibold uppercase tracking-[0.22em] text-warning">Protected request</p>
+        <p class="mt-2 text-sm text-foreground">
           {task.pending_pause.question ?? 'This request must be completed in the full task view.'}
         </p>
-        <p class="mt-1 text-xs text-slate-400">Open the full task to use its protected resolver.</p>
+        <p class="mt-1 text-xs text-muted">Open the full task to use its protected resolver.</p>
       </Card>
     </div>
   {/if}
 
   {#if canMutate}
     <Card class="p-4">
-      <h3 class="text-sm font-semibold text-white">Lifecycle</h3>
+      <h3 class="text-sm font-semibold text-strong">Lifecycle</h3>
       <div class="mt-3 flex flex-wrap gap-2">
         {#if ['running', 'evaluating'].includes(task.status)}
           <Button size="sm" variant="secondary" disabled={busyAction !== null} onclick={() => void pause()}>
@@ -327,10 +328,10 @@
   {/if}
 
   {#if error}
-    <p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{error}</p>
+    <p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{error}</p>
   {/if}
   {#if success}
-    <p class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-sm text-emerald-100" role="status">{success}</p>
+    <p class="rounded-xl border border-success-border bg-success-subtle p-3 text-sm text-success" role="status">{success}</p>
   {/if}
   {/if}
 </div>

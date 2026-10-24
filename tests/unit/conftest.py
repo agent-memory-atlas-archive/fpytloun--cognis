@@ -5,7 +5,12 @@ import pytest
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
-from cognis.store.queries import create_deliverable, create_step_run, create_task
+from cognis.store.queries import (
+    create_conversation,
+    create_deliverable,
+    create_step_run,
+    create_task,
+)
 
 
 @pytest.fixture
@@ -47,6 +52,13 @@ async def task_continuation_db(tmp_path: object):
             agent_id="agent-owner",
             title="Owner task",
             status="completed",
+        )
+        await create_conversation(
+            session,
+            "owner@example.com",
+            "agent-owner",
+            "agent_direct",
+            conversation_id="conv-owner",
         )
         step_run = await create_step_run(
             session,

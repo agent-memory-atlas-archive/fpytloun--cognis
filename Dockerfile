@@ -28,12 +28,19 @@ FROM python:3.12-slim AS controller-wheel
 WORKDIR /src
 
 COPY pyproject.toml README.md LICENSE build.py ./
+COPY uv.lock ./
+COPY packages/common/pyproject.toml ./packages/common/pyproject.toml
+COPY packages/executor/pyproject.toml ./packages/executor/pyproject.toml
 COPY cognis/ ./cognis/
 COPY --from=ui-build /src/ui/build ./ui/build
 COPY --from=ui-build /src/ui/standalone-build ./ui/standalone-build
 
 ENV COGNIS_SKIP_UI_BUILD=1
-RUN pip install --no-cache-dir build hatchling \
+RUN pip install --no-cache-dir build hatchling uv \
+    && uv export --locked --no-dev --no-emit-project --no-emit-workspace \
+        --package cognis-controller \
+        --extra postgres --extra s3 --extra redis --extra knowledgebase \
+        --format requirements-txt --no-hashes --output-file /constraints.txt \
     && pyproject-build --wheel --sdist --no-isolation --outdir /dist
 
 
@@ -41,6 +48,7 @@ FROM python:3.12-slim AS runtime
 WORKDIR /app
 
 COPY scripts/ ./scripts/
+COPY --from=controller-wheel /constraints.txt /tmp/constraints.txt
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -66,11 +74,22 @@ RUN --mount=type=bind,from=common-wheel,source=/dist,target=/tmp/common-wheels \
     --mount=type=bind,from=controller-wheel,source=/dist,target=/tmp/controller-wheels \
     controller_wheel="$(find /tmp/controller-wheels -maxdepth 1 -name 'cognis_controller-*.whl' -print -quit)" \
     && test -n "$controller_wheel" \
-    && pip install --no-cache-dir \
+    && pip install --no-cache-dir --timeout 120 \
+        --constraint /tmp/constraints.txt \
         /tmp/common-wheels/cognis_common-*.whl \
         "${controller_wheel}[postgres,s3,redis,knowledgebase]" \
     && python -c "import asyncpg, boto3, redis, qdrant_client" \
     && rm -rf /opt/venv/lib/python3.12/site-packages/pip* \
+    && find /opt/venv -type d -name __pycache__ -prune -exec rm -rf '{}' +
+
+# The controller must never download runtime assets. Tokenizer data ships in
+# the LiteLLM wheel; the LiteLLM cost map uses its bundled copy; the
+# Hugging Face Hub is disabled. The build fails if bundled encodings are absent.
+ENV TIKTOKEN_CACHE_DIR=/opt/venv/lib/python3.12/site-packages/litellm/litellm_core_utils/tokenizers \
+    CUSTOM_TIKTOKEN_CACHE_DIR=/opt/venv/lib/python3.12/site-packages/litellm/litellm_core_utils/tokenizers \
+    LITELLM_LOCAL_MODEL_COST_MAP=True \
+    HF_HUB_OFFLINE=1
+RUN python -c "from cognis.offline_runtime import preload_bundled_encodings; preload_bundled_encodings(strict=True)" \
     && find /opt/venv -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 EXPOSE 8080

@@ -63,8 +63,8 @@
   {#snippet header()}
     <div class="flex min-w-0 flex-1 items-center justify-between gap-3" data-testid={testId}>
       <div class="min-w-0">
-        <h2 class="truncate text-lg font-semibold text-white">{title}</h2>
-        {#if status}<p class="mt-0.5 text-xs uppercase tracking-wide text-slate-400">{status}</p>{/if}
+        <h2 class="truncate text-lg font-semibold text-strong">{title}</h2>
+        {#if status}<p class="mt-0.5 text-xs uppercase tracking-wide text-muted">{status}</p>{/if}
       </div>
       <div class="flex shrink-0 items-center gap-1">
         {#if onToggleInspector && inspectorControlsId}

@@ -1,0 +1,44 @@
+/* Shared mobile containment for both dashboard and project sections. */
+@media (max-width: 767px) {
+  .dashboard-bounded-section {
+    height: min(48rem, 85svh);
+    min-height: 28rem;
+    display: flex;
+    flex-direction: column;
+  }
+  .dashboard-bounded-section > * {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: 100%;
+    overflow: hidden;
+  }
+  .dashboard-bounded-section .dashboard-section-lanes {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    gap: 0.5rem;
+    overflow: hidden;
+  }
+  .dashboard-bounded-section section {
+    display: flex;
+    flex-direction: column;
+    min-height: 2rem;
+    margin: 0;
+  }
+  .dashboard-bounded-section section > ul {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    max-height: 10rem;
+    min-height: 2rem;
+  }
+  .dashboard-bounded-section .dashboard-section-recent {
+    flex: 1;
+    min-height: 8rem;
+  }
+  .dashboard-bounded-section .dashboard-section-recent > ul {
+    flex: 1;
+    max-height: none;
+  }
+}

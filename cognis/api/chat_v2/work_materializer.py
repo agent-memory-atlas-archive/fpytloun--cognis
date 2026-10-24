@@ -391,7 +391,9 @@ def _record_metadata(
     if isinstance(item, ArtifactTimelineItem):
         entity_id = item.artifact_id
     elif isinstance(item, AssistantDeliverableTimelineItem):
-        entity_id = item.deliverable_id
+        # Revisions share one Work identity so counts and recency collapse a
+        # lineage to its newest revision. A root revision's lineage is its ID.
+        entity_id = item.lineage_id or item.deliverable_id
     elif isinstance(item, ToolCallTimelineItem):
         for diff in item.file_diffs:
             added, deleted = _diff_counts(diff)
@@ -1550,7 +1552,9 @@ class WorkMaterializer:
                     func.count().filter(evidence, WorkRecordRow.category == "mutations"),
                     func.count().filter(evidence, WorkRecordRow.category == "commands"),
                     func.count().filter(evidence, WorkRecordRow.category == "artifacts"),
-                    func.count().filter(evidence, WorkRecordRow.category == "deliverables"),
+                    func.count(func.distinct(WorkRecordRow.entity_id)).filter(
+                        evidence, WorkRecordRow.category == "deliverables"
+                    ),
                     func.coalesce(func.sum(WorkRecordRow.additions).filter(evidence), 0),
                     func.coalesce(func.sum(WorkRecordRow.deletions).filter(evidence), 0),
                 ).where(*base)

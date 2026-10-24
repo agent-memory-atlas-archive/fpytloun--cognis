@@ -1,0 +1,233 @@
+name: macOS companion assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing macos-v<canonical version> tag
+        required: true
+        type: string
+      mode:
+        description: Intentional distribution class (never inferred from project tags)
+        required: true
+        type: choice
+        options: [adhoc, release]
+      skip_gui_tests:
+        description: Explicit GUI/browser acceptance waiver for an ad-hoc prerelease only
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-assets-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.repository == 'fpytloun/cognis'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - id: plan
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          MODE: ${{ inputs.mode }}
+          SKIP_GUI_TESTS: ${{ inputs.skip_gui_tests }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tag, mode = os.environ["RELEASE_TAG"], os.environ["MODE"]
+          assert re.fullmatch(r"macos-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", tag)
+          assert mode in {"adhoc", "release"}
+          skip_gui = os.environ.get("SKIP_GUI_TESTS", "false")
+          assert skip_gui in {"true", "false"}
+          assert not (mode == "release" and skip_gui == "true"), "Trusted releases require GUI acceptance"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"tag={tag}\nmode={mode}\n")
+          PY
+  build:
+    needs: plan
+    if: github.repository == 'fpytloun/cognis'
+    environment: ${{ needs.plan.outputs.mode == 'release' && 'macos-release' || 'macos-adhoc' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+          - architecture: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      COGNIS_APP_BUILD: ${{ github.run_number }}
+      COGNIS_PACKAGE_FLAVOR: standard
+      COGNIS_DISTRIBUTION: homebrew
+      COGNIS_SIGNING_MODE: ${{ needs.plan.outputs.mode }}
+      COGNIS_RELEASE_BUILD: "1"
+      COGNIS_MACOS_RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        with:
+          version: "0.10.12"
+      - name: Validate canonical versions
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          version = json.loads(pathlib.Path("ui/package.json").read_text())["version"]
+          if os.environ["RELEASE_TAG"]:
+              for name in ("pyproject.toml", "packages/common/pyproject.toml", "packages/executor/pyproject.toml"):
+                  assert tomllib.loads(pathlib.Path(name).read_text())["project"]["version"] == version
+              assert os.environ["RELEASE_TAG"] == f"macos-v{version}", "Tag and canonical package versions differ"
+          with open(os.environ["GITHUB_ENV"], "a") as stream:
+              stream.write(f"COGNIS_APP_VERSION={version}\n")
+          PY
+      - name: Build and validate before credentials are available
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s apps/apple/tests
+          brew install cairo
+          DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix cairo)/lib"
+          export DYLD_FALLBACK_LIBRARY_PATH
+          # Signed mode builds ad-hoc first; credentials enter only after validation.
+          COGNIS_SIGNING_MODE=adhoc bash apps/apple/build.sh
+          swift test --package-path apps/apple --filter CompanionContractTests
+      - name: Native GUI and browser acceptance
+        if: ${{ !inputs.skip_gui_tests }}
+        run: |
+          set -euo pipefail
+          COGNIS_FIND_WEB_ROOT="$PWD/apps/apple/.build/Cognis.app/Contents/Resources/Web" \
+            swift test --package-path apps/apple --skip CompanionContractTests
+          COGNIS_TEST_WEB_ROOT="$PWD/apps/apple/.build/Cognis.app/Contents/Resources/Web" \
+            swift test --package-path apps/apple --filter HTTPSBootTests
+          (cd ui && node scripts/build-workspace-acceptance.mjs)
+          COGNIS_WORKSPACE_WEB_ROOT="$PWD/ui/build-apple" \
+          COGNIS_RAIL_SCREENSHOTS="$RUNNER_TEMP/cognis-rail-shots" \
+            swift test --package-path apps/apple --filter 'CanonicalRailTests|Workspace'
+      - name: Record explicit GUI acceptance waiver
+        if: ${{ inputs.skip_gui_tests }}
+        run: |
+          printf '%s\n' 'GUI/browser acceptance explicitly skipped for this ad-hoc prerelease; not a passing GUI qualification.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Configure ephemeral release identity
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          COGNIS_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          COGNIS_SIGNING_TEAM: ${{ vars.APPLE_TEAM_ID }}
+          NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          COGNIS_SIGNING_KEYCHAIN: ${{ runner.temp }}/cognis-signing.keychain-db
+          COGNIS_NOTARY_PROFILE: cognis-ci
+        run: |
+          set -euo pipefail
+          test -n "$CERTIFICATE" && test -n "$CERTIFICATE_PASSWORD" && test -n "$NOTARY_KEY"
+          test -n "$NOTARY_KEY_ID" && test -n "$NOTARY_ISSUER"
+          python3 apps/apple/sign_bundle.py --check-config
+          python3 - <<'PY'
+          import base64, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          (root / "cognis-certificate.p12").write_bytes(base64.b64decode(os.environ["CERTIFICATE"], validate=True))
+          (root / "cognis-notary.p8").write_text(os.environ["NOTARY_KEY"])
+          PY
+          keychain_password="$(openssl rand -hex 32)"
+          security create-keychain -p "$keychain_password" "$COGNIS_SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$COGNIS_SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$COGNIS_SIGNING_KEYCHAIN"
+          security import "$RUNNER_TEMP/cognis-certificate.p12" -k "$COGNIS_SIGNING_KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$keychain_password" "$COGNIS_SIGNING_KEYCHAIN" >/dev/null
+          xcrun notarytool store-credentials "$COGNIS_NOTARY_PROFILE" --keychain "$COGNIS_SIGNING_KEYCHAIN" --key "$RUNNER_TEMP/cognis-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          {
+            printf 'COGNIS_SIGNING_IDENTITY=%s\nCOGNIS_SIGNING_TEAM=%s\n' "$COGNIS_SIGNING_IDENTITY" "$COGNIS_SIGNING_TEAM"
+            printf 'COGNIS_SIGNING_KEYCHAIN=%s\n' "$COGNIS_SIGNING_KEYCHAIN"
+            printf 'COGNIS_NOTARY_PROFILE=cognis-ci\n'
+          } >> "$GITHUB_ENV"
+      - name: Sign, package and inspect mounted image
+        run: |
+          set -euo pipefail
+          python3 apps/apple/sign_bundle.py apps/apple/.build/Cognis.app
+          python3 apps/apple/package_dmg.py apps/apple/.build/Cognis.app --architecture "${{ matrix.architecture }}" --output dist
+          (cd dist && shasum -a 256 -c ./*.sha256)
+      - name: Remove task credentials
+        if: always() && needs.plan.outputs.mode == 'release'
+        env:
+          COGNIS_SIGNING_KEYCHAIN: ${{ runner.temp }}/cognis-signing.keychain-db
+        run: |
+          security delete-keychain "$COGNIS_SIGNING_KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/cognis-certificate.p12" "$RUNNER_TEMP/cognis-notary.p8"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-${{ matrix.architecture }}-${{ needs.plan.outputs.mode }}
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+            dist/*.manifest.json
+          if-no-files-found: error
+
+  attach:
+    if: github.repository == 'fpytloun/cognis'
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    environment: macos-attachments
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: macos-*-${{ needs.plan.outputs.mode }}
+          merge-multiple: true
+          path: dist
+      - name: Validate both immutable assets
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          MODE: ${{ needs.plan.outputs.mode }}
+        run: |
+          (cd dist && shasum -a 256 -c ./*.sha256)
+          python3 - <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+          sys.path.insert(0, "packaging/homebrew")
+          from generate_cask import metadata
+          records = metadata(Path("dist"), allow_adhoc=os.environ["MODE"] == "adhoc", release_tag=os.environ["RELEASE_TAG"])
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert all(record["signing"] == os.environ["MODE"] and record["identity"]["source"] == source for record in records.values())
+          PY
+      - name: Wait for reviewed draft; upload without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Never create or publish a release here. Parent reviews the draft.
+          found=false
+          for _attempt in $(seq 1 40); do
+            if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.draft == true and .prerelease == true' 2>/dev/null | grep -qx true; then
+              found=true
+              break
+            fi
+            sleep 30
+          done
+          test "$found" = true
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.sha256 dist/*.manifest.json

@@ -21,8 +21,8 @@ import math
 import os
 import re
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -49,7 +49,6 @@ from cognis.core.anchored_output import (
 )
 from cognis.core.artifact_inputs import resolve_owned_artifact_refs
 from cognis.core.attachment_utils import (
-    attachment_note,
     attachment_refs_to_dicts,
     merge_content_and_attachment_note,
     normalize_attachment_refs,
@@ -64,6 +63,8 @@ from cognis.core.compaction.publication import (
     compaction_lease_key,
     compaction_publication_guard,
 )
+from cognis.core.content_projects import lock_document_scope, resolve_new_content_project_id
+from cognis.core.content_refs import authorize_supersedes_target
 from cognis.core.context import _native_attachment_blocks
 from cognis.core.context_budget import (
     LOOP_PRESSURE_THRESHOLD_RATIO,
@@ -72,7 +73,9 @@ from cognis.core.context_budget import (
 )
 from cognis.core.context_projection import (
     CRITICAL_ESCALATE_FRACTION,
+    CROSS_TURN_TRIGGER_FRACTION,
     DEFAULT_COMPACTED_TOOL_GROUPS,
+    PRESSURE_ESCALATE_FRACTION,
     PressureMode,
     PressureSnapshot,
     ProjectionPolicy,
@@ -106,7 +109,11 @@ from cognis.core.deliverable_authoring import (
     resolve_deliverable_authoring,
     rich_action_for_presentation,
 )
-from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
+from cognis.core.direct_turn_runtime import (
+    BackgroundDirectTurnFence,
+    DirectTurnExecutionFence,
+    StaleDirectTurnOwner,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.executor_recovery import ExecutorRecoveryTimeout
@@ -142,11 +149,13 @@ from cognis.core.harness_guards import (
     tool_call_argument_fingerprint,
     uncertain_outcome_rejection_payload,
 )
+from cognis.core.history_replay import format_tool_result_message
 from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
     build_context_snapshot_event,
     sort_prefix_entries,
 )
+from cognis.core.inference_preparation import AgentInferenceDecoder, prepare_native_account_replay
 from cognis.core.json_utils import extract_json_object, extract_visible_text_from_response
 from cognis.core.managed_conversations import (
     ManagedConversationAdmissionConflict,
@@ -162,7 +171,15 @@ from cognis.core.managed_conversations import (
     project_managed_conversation_state,
 )
 from cognis.core.message_envelope import message_metadata
-from cognis.core.message_markers import PROTECTED_TOOL_OUTPUT, TOKEN_ESTIMATE, TURN_BOUNDARY
+from cognis.core.message_markers import (
+    AUDIT_METADATA,
+    AUDIT_ROLE,
+    AUDIT_SOURCE,
+    PROTECTED_TOOL_OUTPUT,
+    TOKEN_ESTIMATE,
+    TOOL_BACKGROUND_NOTICE,
+    TURN_BOUNDARY,
+)
 from cognis.core.orchestration_policy import (
     OrchestrationSurface,
     build_orchestration_capability_guidance,
@@ -177,6 +194,12 @@ from cognis.core.orchestration_targets import (
     managed_depth_limit,
 )
 from cognis.core.output_anchor_registry import build_anchor_manifest
+from cognis.core.project_access import (
+    agent_usable_in_project,
+    resolve_effective_project_id,
+    resolve_project_role_by_id,
+    role_satisfies,
+)
 from cognis.core.project_context import (
     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
     PROJECT_CONTEXT_STATUS_LOADED,
@@ -184,6 +207,7 @@ from cognis.core.project_context import (
     ProjectMetadataEntry,
     normalize_project_path,
     project_context_event_data,
+    project_context_exposure_message,
     project_metadata_event_data,
 )
 from cognis.core.project_runtime import (
@@ -198,12 +222,22 @@ from cognis.core.question_sets import (
     normalize_questions,
     validate_reply_for_questions,
 )
+from cognis.core.result_content import (
+    RESULT_MAX_CHARS as _DELEGATION_RESULT_MAX_CHARS,
+)
+from cognis.core.result_content import (
+    RESULT_TRUNCATION_TEMPLATE as _DELEGATION_RESULT_TRUNCATION_TEMPLATE,
+)
+from cognis.core.result_content import (
+    project_result_content,
+)
 from cognis.core.runtime import (
     ExecutorEnvironmentSnapshot,
     ResolvedStepRuntime,
     environment_from_metadata,
 )
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
+from cognis.core.session_recovery import SESSION_TRANSIENT_MAX_ATTEMPTS, step_failure_traits
 from cognis.core.step_profiles import (
     ResolvedStepProfile,
     resolve_step_profile,
@@ -213,6 +247,10 @@ from cognis.core.step_profiles import (
 from cognis.core.task_execution import StaleTaskExecutionOwner
 from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
+from cognis.core.tool_backgrounding import (
+    ToolBackgroundNotice,
+    tool_background_notice_from_result,
+)
 from cognis.core.tool_deferral import is_default_deferred_builtin
 from cognis.core.tool_exposure import (
     LLMApiMode,
@@ -233,6 +271,18 @@ from cognis.core.tool_output_presentation import (
 )
 from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
+)
+from cognis.core.tool_rejection_recovery import (
+    MAX_REJECTIONS_PER_TURN,
+    ToolRejectionRecoveryState,
+    plan_rejection_repair,
+    rejected_tool_name,
+)
+from cognis.core.tool_result_context import (
+    SkillActivationResult,
+    append_tool_notice,
+    format_tool_attachment_context,
+    project_context_exposure,
 )
 from cognis.core.tool_result_settlement import (
     CanonicalToolHistoryError,
@@ -264,12 +314,14 @@ from cognis.core.workflow_prompt import (
     WorkflowPromptBlockKind,
     compose_workflow_prompt,
 )
+from cognis.core.workflow_step_scope import WorkflowStepScope
 from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
 from cognis.models.deliverable import (
     Deliverable,
+    DeliverableRevisionError,
     RichPayloadValidationError,
 )
 from cognis.models.session import (
@@ -338,7 +390,9 @@ from cognis.providers.llm.errors import (
     ToolArgumentParseFailure,
     classify_llm_exception,
 )
+from cognis.providers.llm.execution import PreparedInference
 from cognis.providers.llm.reasoning import reasoning_mode_for_model
+from cognis.providers.llm.recovery import IncompatibleCandidate, commits_output
 from cognis.providers.llm.retry import (
     DEFAULT_MID_STREAM_RETRY_POLICY,
     LLMContextOverflowError,
@@ -346,6 +400,7 @@ from cognis.providers.llm.retry import (
     compute_retry_delay,
     is_context_overflow_error,
 )
+from cognis.providers.llm.stream_liveness import LLMStreamIdleStats
 from cognis.providers.memory.policy import (
     MemoryRuntimePolicy,
     memory_backend_descriptors,
@@ -363,6 +418,7 @@ from cognis.store.coordination import DatabaseLeaseStore
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.models import DirectTurnRequestRow
 from cognis.store.queries import (
+    complete_revision_conflict,
     create_deliverable,
     get_artifact_record,
     get_child_session_continuation_chain,
@@ -404,7 +460,7 @@ from cognis.tools.native_validation import (
     NativeValidationContext,
     write_deliverable_validation_state_fingerprint,
 )
-from cognis.tools.registry import RegisteredTool, ToolRegistry
+from cognis.tools.registry import ToolRegistry
 
 logger = get_logger(__name__)
 
@@ -711,7 +767,7 @@ def _artifact_url_pattern() -> re.Pattern[str]:
     if configured_base_url:
         escaped_base = re.escape(configured_base_url)
         return re.compile(rf"{escaped_base}/api/v1/artifacts/content/[^\s\"']+")
-    return re.compile(r"https://cognis\.fpy\.cz/api/v1/artifacts/content/[^\s\"']+")
+    return re.compile(r"(?!)")
 
 
 _COGNIS_ARTIFACT_URL_RE = _artifact_url_pattern()
@@ -725,12 +781,10 @@ _ASYNC_ORCHESTRATION_OUTPUT_REMINDER = (
     "or duplicating the same work."
 )
 
-_DELEGATION_RESULT_MAX_CHARS = 120_000
 _DELEGATION_RESULT_INLINE_MAX_CHARS = 50_000
 _DELEGATION_INPUT_PREVIEW_CHARS = 4_000
 _DELEGATION_SALVAGE_MAX_TOOL_RESULTS = 20
 _DELEGATION_SALVAGE_RESULT_PREVIEW_CHARS = 2_000
-_DELEGATION_RESULT_TRUNCATION_TEMPLATE = "\n\n[Output truncated: original length {original_length} chars, stored first {max_chars} chars.]"
 _DELEGATION_ACTIVE_DELIVERABLE_STATUSES = frozenset({"buffered", "approved", "delivered"})
 CONTROLLER_TOOL_SURFACE_WORKFLOW = "workflow"
 CONTROLLER_TOOL_SURFACE_DIRECT_CHAT = "direct_chat"
@@ -1335,15 +1389,21 @@ CONTROLLER_TOOLS = {
 # choices such as empty-arg ``step_todo_list``).
 _CONTROLLER_INTERCEPTED_TOOLS: frozenset[str] = frozenset(CONTROLLER_TOOLS)
 _FINALIZATION_TOOLS: frozenset[str] = frozenset(
-    {STEP_TODO_WRITE, WRITE_DELIVERABLE, ATTACH_ARTIFACT, STEP_COMPLETE}
+    {
+        STEP_TODO_WRITE,
+        WRITE_DELIVERABLE,
+        ATTACH_ARTIFACT,
+        STEP_COMPLETE,
+        VALIDATE_TOOL_CALL_TOOL.name,
+    }
 )
 _DELEGATED_CHILD_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
     {
         STEP_COMPLETE,
         WRITE_DELIVERABLE,
         ATTACH_ARTIFACT,
-        STEP_REQUEST_QUESTIONS,
-        CONTROLLER_TOOL_REQUEST_USER_INPUT,
+        "answer_question",
+        "forward_question",
     }
 )
 _DEFAULT_DEFERRED_SOURCE_TYPES = frozenset({"local_mcp", "intaris_mcp", "skill"})
@@ -1360,6 +1420,17 @@ _DEFAULT_DEFERRED_ADMIN_TOOL_NAMES = frozenset(
         "skill_restore_version",
     }
 )
+_CORE_TOOL_GROUPS = frozenset({"filesystem", "shell", "development", "web"})
+
+
+def _configured_agent_tool_groups(agent: AgentDefinition) -> set[str]:
+    """Return declared agent tool groups without trusting malformed config data."""
+
+    config = agent.tools if isinstance(agent.tools, dict) else {}
+    groups = config.get("tool_groups")
+    if not isinstance(groups, list):
+        return set()
+    return {group for group in groups if isinstance(group, str)}
 
 
 def _tool_visible_by_default(
@@ -1367,12 +1438,12 @@ def _tool_visible_by_default(
     profile: ResolvedStepProfile,
     *,
     activated_tool_ids: set[str],
+    configured_tool_groups: set[str] | None = None,
 ) -> bool:
     """Apply source-aware default deferral after step-profile eligibility."""
 
-    tool_id = stable_tool_id(tool)
-    if tool_id in activated_tool_ids:
-        return True
+    if tool.source.type == "skill":
+        return False
     config = profile.config
     if config is not None and any(
         tool_matches_identifier(tool, identifier) for identifier in config.tool_overrides.include
@@ -1384,6 +1455,19 @@ def _tool_visible_by_default(
         or is_default_deferred_builtin(tool.name)
     ):
         return False
+    config = profile.config
+    if (
+        profile.profile_id == "system:direct-default"
+        and profile.mode == StepProfileMode.SOFT
+        and config is not None
+        and not any(
+            tool_matches_identifier(tool, identifier)
+            for identifier in config.tool_overrides.exclude
+        )
+        and tool_profile_group(tool) in _CORE_TOOL_GROUPS
+        and tool_profile_group(tool) in (configured_tool_groups or set())
+    ):
+        return True
     return step_profile_visible_by_default(tool, profile)
 
 
@@ -2014,79 +2098,21 @@ def _strip_disabled_artifact_urls_from_messages(
 
 
 def _llm_stream_chunk_has_activity(chunk: dict[str, Any]) -> bool:
-    """Return whether a stream chunk should reset the meaningful-activity watchdog."""
+    from cognis.providers.llm.stream_liveness import has_activity
 
-    if chunk.get("mid_stream_failure") or chunk.get("error") or chunk.get("done"):
-        return True
-    if chunk.get("usage"):
-        return True
-    choices = chunk.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            if not isinstance(choice, dict):
-                continue
-            if choice.get("finish_reason"):
-                return True
-            for key in ("delta", "message"):
-                value = choice.get(key)
-                if _llm_stream_value_has_activity(value):
-                    return True
-    return any(
-        _llm_stream_value_has_activity(chunk.get(key))
-        for key in (
-            "content",
-            "reasoning_content",
-            "provider_thinking_blocks",
-            "thinking_blocks",
-            "tool_calls",
-            "function_call",
-        )
-    )
+    return has_activity(chunk)
 
 
 def _llm_stream_chunk_has_provider_liveness(chunk: dict[str, Any]) -> bool:
-    """Return whether a chunk proves the provider stream is still alive."""
+    from cognis.providers.llm.stream_liveness import has_provider_liveness
 
-    if _llm_stream_chunk_has_activity(chunk):
-        return True
-    if chunk.get("provider_event") or chunk.get("provider_event_type"):
-        return True
-    choices = chunk.get("choices")
-    return isinstance(choices, list)
+    return has_provider_liveness(chunk)
 
 
 def _llm_stream_chunk_has_reasoning_liveness(chunk: dict[str, Any]) -> bool:
-    """Return whether a chunk indicates model-side reasoning/progress."""
+    from cognis.providers.llm.stream_liveness import has_reasoning_liveness
 
-    item = chunk.get("responses_output_item")
-    if (
-        chunk.get("provider_event_type") == "response.output_item.done"
-        and isinstance(item, dict)
-        and item.get("type") == "reasoning"
-    ):
-        # Encrypted reasoning can complete without any public summary deltas.
-        return True
-    if chunk.get("provider_event_type") in {
-        "response.reasoning_text.delta",
-        "response.reasoning_text.done",
-        "response.reasoning_summary_text.delta",
-        "response.reasoning_summary_text.done",
-        "response.reasoning_summary_part.added",
-        "response.reasoning_summary_part.done",
-    }:
-        return True
-    choices = chunk.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            if isinstance(choice, dict):
-                delta = choice.get("delta")
-                if isinstance(delta, dict) and (
-                    "reasoning" in delta
-                    or "reasoning_content" in delta
-                    or "reasoning_part_boundary" in delta
-                ):
-                    return True
-    return False
+    return has_reasoning_liveness(chunk)
 
 
 def _llm_stream_chunk_has_visible_output(chunk: dict[str, Any]) -> bool:
@@ -2121,63 +2147,10 @@ def _llm_stream_chunk_has_visible_output(chunk: dict[str, Any]) -> bool:
     return False
 
 
-@dataclass(slots=True)
-class LLMStreamIdleStats:
-    raw_chunks: int = 0
-    meaningful_chunks: int = 0
-    reasoning_chunks: int = 0
-    first_raw_after_seconds: float | None = None
-    first_activity_after_seconds: float | None = None
-    first_reasoning_after_seconds: float | None = None
-    last_raw_after_seconds: float | None = None
-    last_activity_after_seconds: float | None = None
-    last_reasoning_after_seconds: float | None = None
-
-    @property
-    def timeout_phase(self) -> str:
-        if self.raw_chunks <= 0:
-            return "raw"
-        if self.reasoning_chunks > 0 and self.meaningful_chunks <= 0:
-            return "reasoning"
-        return "activity"
-
-    def as_dict(self) -> dict[str, Any]:
-        def _seconds(value: float | None) -> float | None:
-            return round(value, 2) if value is not None else None
-
-        return {
-            "raw_chunks": self.raw_chunks,
-            "meaningful_chunks": self.meaningful_chunks,
-            "reasoning_chunks": self.reasoning_chunks,
-            "first_raw_after_seconds": _seconds(self.first_raw_after_seconds),
-            "first_activity_after_seconds": _seconds(self.first_activity_after_seconds),
-            "first_reasoning_after_seconds": _seconds(self.first_reasoning_after_seconds),
-            "last_raw_after_seconds": _seconds(self.last_raw_after_seconds),
-            "last_activity_after_seconds": _seconds(self.last_activity_after_seconds),
-            "last_reasoning_after_seconds": _seconds(self.last_reasoning_after_seconds),
-        }
-
-
 def _llm_stream_value_has_activity(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value)
-    if isinstance(value, list):
-        return bool(value) and any(_llm_stream_value_has_activity(item) for item in value)
-    if isinstance(value, dict):
-        if "tool_calls" in value or "function_call" in value:
-            return True
-        activity_keys = (
-            "content",
-            "reasoning_content",
-            "arguments",
-            "name",
-            "id",
-            "text",
-            "delta",
-            "refusal",
-        )
-        return any(_llm_stream_value_has_activity(value.get(key)) for key in activity_keys)
-    return False
+    from cognis.providers.llm.stream_liveness import value_has_activity
+
+    return value_has_activity(value)
 
 
 def _idle_timeout_payload(message: str, phase: str) -> MidStreamErrorPayload:
@@ -2194,118 +2167,26 @@ async def _iterate_llm_stream_with_idle_timeout(
     idle_timeout_seconds: int,
     stats: LLMStreamIdleStats | None = None,
     cancel_event: asyncio.Event | None = None,
+    monitor_idle: bool = True,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield stream chunks while enforcing provider-liveness and activity timeouts."""
+    """Agent cancellation/telemetry adapter; inference owns the shared watchdog."""
+    from cognis.providers.llm.stream_liveness import iterate_stream
 
-    timeout = max(1, int(idle_timeout_seconds))
-    reasoning_timeout = max(
-        timeout,
-        min(
-            timeout * LLM_STREAM_REASONING_IDLE_MULTIPLIER,
-            LLM_STREAM_MAX_REASONING_IDLE_TIMEOUT_SECONDS,
-        ),
-    )
-    started_at = monotonic()
-    raw_deadline = started_at + timeout
-    activity_deadline = started_at + timeout
-    iterator = aiter(stream)
-    stats = stats or LLMStreamIdleStats()
     try:
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                raise asyncio.CancelledError
-            now = monotonic()
-            remaining = min(raw_deadline, activity_deadline) - now
-            if remaining <= 0:
-                message = _llm_stream_idle_timeout_message(
-                    stats,
-                    raw_timeout_seconds=timeout,
-                    activity_timeout_seconds=reasoning_timeout
-                    if stats.reasoning_chunks > 0 and stats.meaningful_chunks <= 0
-                    else timeout,
-                )
-                raise LLMStreamIdleTimeout(
-                    message,
-                    payload=_idle_timeout_payload(message, stats.timeout_phase),
-                )
-            try:
-                if cancel_event is None:
-                    chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
-                else:
-                    next_chunk = asyncio.ensure_future(anext(iterator))
-                    cancellation = asyncio.create_task(cancel_event.wait())
-                    done, pending = await asyncio.wait(
-                        {next_chunk, cancellation},
-                        timeout=remaining,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if not done:
-                        for pending_task in pending:
-                            pending_task.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        raise TimeoutError
-                    if cancellation in done and cancellation.result():
-                        next_chunk.cancel()
-                        await asyncio.gather(next_chunk, return_exceptions=True)
-                        raise asyncio.CancelledError
-                    cancellation.cancel()
-                    await asyncio.gather(cancellation, return_exceptions=True)
-                    chunk = next_chunk.result()
-            except StopAsyncIteration:
-                break
-            except asyncio.CancelledError:
-                raise
-            except TimeoutError as exc:
-                message = _llm_stream_idle_timeout_message(
-                    stats,
-                    raw_timeout_seconds=timeout,
-                    activity_timeout_seconds=reasoning_timeout
-                    if stats.reasoning_chunks > 0 and stats.meaningful_chunks <= 0
-                    else timeout,
-                )
-                raise LLMStreamIdleTimeout(
-                    message,
-                    payload=_idle_timeout_payload(message, stats.timeout_phase),
-                ) from exc
-            except Exception as exc:
-                if is_context_overflow_error(exc):
-                    raise
-                raise LLMStreamProviderError(
-                    f"{type(exc).__name__}: {exc}",
-                    payload=classify_llm_exception(exc),
-                ) from exc
-            now = monotonic()
-            if cancel_event is not None and cancel_event.is_set():
-                raise asyncio.CancelledError
-            elapsed = now - started_at
-            if _llm_stream_chunk_has_provider_liveness(chunk):
-                stats.raw_chunks += 1
-                stats.first_raw_after_seconds = stats.first_raw_after_seconds or elapsed
-                stats.last_raw_after_seconds = elapsed
-                raw_deadline = now + timeout
-            if _llm_stream_chunk_has_reasoning_liveness(chunk):
-                stats.reasoning_chunks += 1
-                stats.first_reasoning_after_seconds = stats.first_reasoning_after_seconds or elapsed
-                stats.last_reasoning_after_seconds = elapsed
-                if stats.meaningful_chunks <= 0:
-                    activity_deadline = now + reasoning_timeout
-            if _llm_stream_chunk_has_activity(chunk):
-                stats.meaningful_chunks += 1
-                stats.first_activity_after_seconds = stats.first_activity_after_seconds or elapsed
-                stats.last_activity_after_seconds = elapsed
-                activity_deadline = now + timeout
+        async for chunk in iterate_stream(
+            stream,
+            idle_timeout_seconds=idle_timeout_seconds,
+            stats=stats,
+            cancel_event=cancel_event,
+            monitor_idle=monitor_idle,
+        ):
             yield chunk
-    except (
-        LLMStreamIdleTimeout,
-        LLMStreamProviderError,
-        LLMContextOverflowError,
-        asyncio.CancelledError,
-    ):
-        closer = getattr(iterator, "aclose", None)
-        if callable(closer):
-            with contextlib.suppress(Exception):
-                await closer()
-        raise
+    except Exception as exc:
+        if isinstance(exc, LLMStreamIdleTimeout) or is_context_overflow_error(exc):
+            raise
+        raise LLMStreamProviderError(
+            f"{type(exc).__name__}: {exc}", payload=classify_llm_exception(exc)
+        ) from exc
 
 
 def _llm_stream_idle_timeout_message(
@@ -3223,6 +3104,7 @@ def _append_tool_call_event(
         # cannot reliably identify a later exact duplicate on their own.
         "duplicate_guard_fingerprint": tool_call_argument_fingerprint(tc.name, tc.arguments),
     }
+    data.update(_tool_call_replay_metadata(tc, data["arguments"]))
     if visible_name and visible_name != tc.name:
         data["visible_name"] = visible_name
         data["canonical_name"] = tc.name
@@ -3239,16 +3121,6 @@ def _append_tool_call_event(
     runtime_phase = getattr(tc, "runtime_metadata", {}).get("assistant_phase_index")
     if isinstance(runtime_phase, int):
         data["assistant_phase_index"] = runtime_phase
-    responses_output_items = getattr(tc, "runtime_metadata", {}).get(
-        RESPONSES_OUTPUT_ITEMS_EVENT_FIELD
-    )
-    if isinstance(responses_output_items, list) and responses_output_items:
-        data[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = [
-            dict(item) for item in responses_output_items if isinstance(item, dict)
-        ]
-    native_envelope = getattr(tc, "runtime_metadata", {}).get(ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD)
-    if isinstance(native_envelope, Mapping):
-        data[ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD] = dict(native_envelope)
     events.append(
         SessionEvent(
             type="tool_call",
@@ -3323,6 +3195,8 @@ def _append_assistant_deliverable_event(
             data={
                 "event": "assistant_deliverable",
                 "deliverable_id": deliverable.deliverable_id,
+                "lineage_id": deliverable.lineage_id or deliverable.deliverable_id,
+                "revision": deliverable.revision,
                 "format": deliverable.format,
                 "title": deliverable.title,
                 "render_metadata": deliverable.render_metadata,
@@ -3383,17 +3257,13 @@ def _tool_result_message(
     is_error: bool = False,
 ) -> dict[str, Any]:
     """Build a model transcript tool-result message."""
-
-    message: dict[str, Any] = {
-        "role": "tool",
-        "tool_call_id": tc.call_id,
-        "content": content,
-        "_tool_name": tc.name,
-        "_tool_is_error": is_error,
-    }
-    if protected:
-        message["_protected_tool_output"] = True
-    return message
+    return format_tool_result_message(
+        call_id=tc.call_id,
+        content=content,
+        tool_name=tc.name,
+        is_error=is_error,
+        protected=protected,
+    )
 
 
 def _tool_argument_failure_reason(failure: ToolArgumentParseFailure) -> str:
@@ -3447,7 +3317,17 @@ def _tool_argument_failure_payload(failure: ToolArgumentParseFailure) -> dict[st
 def _strip_internal_message_fields(message: dict[str, Any]) -> dict[str, Any]:
     """Remove controller-only metadata before sending a message to an LLM provider."""
 
-    return {key: value for key, value in message.items() if not str(key).startswith("_")}
+    return {
+        key: value
+        for key, value in message.items()
+        if not str(key).startswith("_")
+        or key
+        in {
+            "_audit_source",
+            "_audit_role",
+            "_tool_is_error",
+        }
+    }
 
 
 def _tool_call_id_tuple(message: dict[str, Any]) -> tuple[str, ...]:
@@ -3466,7 +3346,7 @@ def _tool_call_id_tuple(message: dict[str, Any]) -> tuple[str, ...]:
 RESPONSES_OUTPUT_ITEMS_EVENT_FIELD = "responses_output_items"
 RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD = "_responses_output_items"
 RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES = 256 * 1024
-RESPONSES_OUTPUT_ITEMS_PERSIST_TYPES = {"reasoning", "function_call", "apply_patch_call"}
+RESPONSES_OUTPUT_ITEMS_PERSIST_TYPES = {"reasoning", "message", "function_call", "apply_patch_call"}
 ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD = "anthropic_native_envelope"
 ANTHROPIC_NATIVE_ENVELOPE_INTERNAL_FIELD = "_anthropic_native_envelope"
 
@@ -3480,9 +3360,14 @@ def _safe_responses_function_call_arguments_for_persistence(
         parsed_arguments = json.loads(raw_arguments) if raw_arguments else {}
     except json.JSONDecodeError:
         parsed_arguments = {"_raw_arguments": raw_arguments}
+        original_object = False
+    else:
+        original_object = isinstance(parsed_arguments, dict)
     if not isinstance(parsed_arguments, dict):
         parsed_arguments = {"value": parsed_arguments}
     safe_arguments = _parent_visible_tool_arguments(tool_name, parsed_arguments)
+    if original_object and safe_arguments == parsed_arguments:
+        return raw_arguments
     return json.dumps(safe_arguments, separators=(",", ":"), default=str)
 
 
@@ -3561,6 +3446,19 @@ def _responses_output_items_for_persistence(
                 "responses_output_items_cap_bytes": RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES,
             },
         )
+        # Text envelopes must not crowd out reasoning or call items that were
+        # already durable before message persistence was supported.
+        without_messages = [item for item in durable_items if item.get("type") != "message"]
+        if (
+            without_messages
+            and len(
+                json.dumps(
+                    without_messages, separators=(",", ":"), ensure_ascii=False, default=str
+                ).encode("utf-8")
+            )
+            <= RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES
+        ):
+            return without_messages
         return []
     return durable_items
 
@@ -3577,6 +3475,7 @@ def _attach_responses_output_items(
         durable_items = _responses_output_items_for_persistence(items)
         if durable_items:
             target[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = durable_items
+            target["native_batch_replay_version"] = 1
         return
     target[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = [dict(item) for item in items]
 
@@ -3590,6 +3489,35 @@ def _attach_responses_output_items_to_first_tool_call(
     durable_items = _responses_output_items_for_persistence(items)
     if durable_items:
         tool_calls[0].runtime_metadata[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = durable_items
+
+
+def _tool_call_replay_metadata(tc: ToolCall, safe_arguments: dict[str, Any]) -> dict[str, Any]:
+    """Share bounded, sanitized native replay fields across call recording paths."""
+    runtime = tc.runtime_metadata
+    data: dict[str, Any] = {}
+    responses = runtime.get(RESPONSES_OUTPUT_ITEMS_EVENT_FIELD)
+    if isinstance(responses, list):
+        _attach_responses_output_items(data, responses, durable=True)
+    envelope = runtime.get(ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD)
+    if isinstance(envelope, Mapping):
+        durable_envelope = _anthropic_native_envelope_for_persistence(envelope)
+        if durable_envelope is not None:
+            data[ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD] = durable_envelope
+    if data.get(RESPONSES_OUTPUT_ITEMS_EVENT_FIELD) or data.get(
+        ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD
+    ):
+        data["native_batch_replay_version"] = 1
+    raw_arguments = runtime.get("provider_arguments_json")
+    if (
+        isinstance(raw_arguments, str)
+        and len(json.dumps(raw_arguments).encode("utf-8"))
+        <= RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES
+        and safe_arguments == tc.arguments
+        and not data.get(RESPONSES_OUTPUT_ITEMS_EVENT_FIELD)
+        and not data.get(ANTHROPIC_NATIVE_ENVELOPE_EVENT_FIELD)
+    ):
+        data["provider_arguments_json"] = raw_arguments
+    return data
 
 
 def _anthropic_native_envelope_for_persistence(value: Any) -> dict[str, Any] | None:
@@ -3805,7 +3733,22 @@ def _reattach_responses_output_items(
             raw_item_sets = raw_items_by_key.get(key)
             if raw_item_sets:
                 raw_items = raw_item_sets.pop(0)
-                copied[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = [dict(item) for item in raw_items]
+                restored_items = [dict(item) for item in raw_items]
+                projected_arguments = {
+                    str(call.get("id")): (call.get("function") or {}).get("arguments")
+                    for call in copied.get("tool_calls", [])
+                }
+                for item in restored_items:
+                    arguments = projected_arguments.get(str(item.get("call_id")))
+                    if item.get("type") != "function_call" or not isinstance(arguments, str):
+                        continue
+                    try:
+                        unchanged = json.loads(str(item.get("arguments"))) == json.loads(arguments)
+                    except (TypeError, ValueError):
+                        unchanged = item.get("arguments") == arguments
+                    if not unchanged:
+                        item["arguments"] = arguments
+                copied[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = restored_items
         restored.append(copied)
     return restored
 
@@ -4042,10 +3985,10 @@ def _cycle_cache_breakpoints(
     ]
     if turn_boundaries:
         current_turn_start = turn_boundaries[-1]
-        add(current_turn_start - 1, "5m")
+        add(current_turn_start - 1, normalized_ttl)
 
     if messages:
-        add(len(messages) - 1, "5m")
+        add(len(messages) - 1, normalized_ttl)
 
     breakpoints.sort(key=lambda item: int(item["index"]))
     for left, right in zip(breakpoints, breakpoints[1:], strict=False):
@@ -4095,6 +4038,12 @@ def _regular_tool_call_event_data(
             _canonical_tool_arguments(item.tool_call.arguments),
         ),
     }
+    data.update(
+        _tool_call_replay_metadata(
+            item.tool_call,
+            _parent_visible_tool_arguments(item.tool_call.name, item.tool_call.arguments),
+        )
+    )
     if canonical_name != item.tool_call.name:
         data["canonical_name"] = canonical_name
     runtime_metadata = getattr(item.tool_call, "runtime_metadata", {}) or {}
@@ -4469,6 +4418,14 @@ def _attached_skill_tool_ids(agent: AgentDefinition) -> set[str]:
 
 
 def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) -> bool:
+    if (
+        agent.permissions is not None
+        and agent.permissions.resolve_permission(
+            tool_display_name(tool), tool_id=stable_tool_id(tool)
+        )
+        is Permission.DENY
+    ):
+        return False
     if not isinstance(agent.tools, dict):
         return True
     disabled_categories = set(agent.tools.get("disabled_categories") or [])
@@ -4477,10 +4434,17 @@ def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) ->
         tool_matches_identifier(tool, identifier) for identifier in disabled_tools
     ):
         return False
+    if any(
+        tool_matches_identifier(tool, identifier)
+        for identifier in agent.tools.get("deny_tools") or []
+    ):
+        return False
     builtin_allow = agent.tools.get("builtin_tools")
     if not isinstance(builtin_allow, list):
         return True
-    return "*" in builtin_allow or tool.name in builtin_allow
+    return "*" in builtin_allow or any(
+        tool_matches_identifier(tool, identifier) for identifier in builtin_allow
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5172,6 +5136,7 @@ class StreamAccumulator:
                     call_id=call_id,
                     name=tc["name"],
                     arguments=args,
+                    runtime_metadata={"provider_arguments_json": tc["arguments"]},
                 )
             )
         return result
@@ -5374,16 +5339,49 @@ def prompt_context_for_step(ctx: Any) -> PromptContext:
     return PromptContext.CHAT
 
 
+def direct_chat_inference_contract(
+    platform_data: dict[str, Any], user_message: str = ""
+) -> tuple[StepDefinition, str]:
+    """Resolve the same direct-chat surface for execution and auxiliary inference."""
+    continuation_profile_id = None
+    if platform_data.get("forked_from") == "task_step":
+        raw_profile_id = platform_data.get("step_profile_id")
+        if isinstance(raw_profile_id, str) and raw_profile_id.strip():
+            continuation_profile_id = raw_profile_id.strip()
+    return (
+        StepDefinition(
+            name="direct",
+            type="run",
+            prompt=user_message,
+            allow_questions=True,
+            step_profile_id=continuation_profile_id or "system:direct-default",
+        ),
+        CONTROLLER_TOOL_SURFACE_TASK_CONTROL
+        if platform_data.get("kind") == "task_control" and platform_data.get("task_id")
+        else CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+    )
+
+
 def replace_orchestration_capability_guidance(
     messages: list[dict[str, Any]],
     content: str | None,
-) -> None:
-    """Replace the mutable capability block without leaving stale duplicates."""
+) -> bool:
+    """Append changed guidance without rewriting previously delivered notices."""
 
-    messages[:] = [
-        message for message in messages if not message.get("_orchestration_capability_guidance")
-    ]
-    if content is not None:
+    prior = next(
+        (
+            message
+            for message in reversed(messages)
+            if message.get(AUDIT_SOURCE) == "orchestration_capability_guidance"
+        ),
+        None,
+    )
+    if content is None and prior is not None:
+        content = (
+            "Orchestration tools are no longer available in this execution context. "
+            "This notice supersedes earlier orchestration capability guidance."
+        )
+    if content is not None and (prior is None or prior.get("content") != content):
         messages.append(
             {
                 "role": "system",
@@ -5393,6 +5391,8 @@ def replace_orchestration_capability_guidance(
                 "_audit_role": "developer",
             }
         )
+        return True
+    return False
 
 
 WORKFLOW_POLICY = ExecutionPolicy(
@@ -5541,10 +5541,21 @@ class PauseWaiter:
         self._events: dict[str, asyncio.Event] = {}
         self._resolutions: dict[str, PauseResolution] = {}
         self._pending: dict[str, PendingPause] = {}
+        self._legacy_claims: dict[str, tuple[PendingPause, str]] = {}
+        self._pause_deadlines: dict[str, float] = {}
 
     def register(self, pause: PendingPause) -> None:
         """Register metadata for a pause before waiting on it."""
+        if pause.pause_id in self._legacy_claims and self._pending.get(pause.pause_id) is not pause:
+            raise ValueError("Cannot replace a claimed legacy approval")
         self._pending[pause.pause_id] = pause
+
+    def retarget(self, pause_id: str, *, pause_type: str, conversation_id: str) -> None:
+        """Change delivery metadata without replacing the waiting event or resolution."""
+        pending = self._pending.get(pause_id)
+        if pending is not None:
+            pending.pause_type = pause_type
+            pending.conversation_id = conversation_id
 
     async def wait(self, pause_id: str, *, timeout: float = 300.0) -> PauseResolution:
         """Wait for a pause to be resolved. Raises TimeoutError on timeout."""
@@ -5552,6 +5563,7 @@ class PauseWaiter:
             pause_id,
             PendingPause(pause_id=pause_id, pause_type="unknown"),
         )
+        self._pause_deadlines.setdefault(pause_id, monotonic() + timeout)
         event = asyncio.Event()
         self._events[pause_id] = event
         if pause_id in self._resolutions:
@@ -5562,8 +5574,52 @@ class PauseWaiter:
         finally:
             self._events.pop(pause_id, None)
             self._pending.pop(pause_id, None)
+            self._legacy_claims.pop(pause_id, None)
+            self._pause_deadlines.pop(pause_id, None)
 
-    def resolve(self, pause_id: str, resolution: PauseResolution) -> bool:
+    def claim_escalation(
+        self, pause_id: str, *, conversation_id: str, require_unique: bool = False
+    ) -> str | None:
+        """Claim a live legacy approval before any asynchronous submission."""
+        pending = self._pending.get(pause_id)
+        if (
+            pending is None
+            or pending.resolved
+            or pending.pause_type != "escalation"
+            or pending.conversation_id != conversation_id
+            or pause_id in self._legacy_claims
+            or monotonic() >= self._pause_deadlines.get(pause_id, float("inf"))
+        ):
+            return None
+        if (
+            require_unique
+            and len(self.list_pending(conversation_id=conversation_id, pause_type="escalation"))
+            != 1
+        ):
+            return None
+        token = str(uuid.uuid4())
+        self._legacy_claims[pause_id] = (pending, token)
+        return token
+
+    def release_escalation_claim(self, pause_id: str, claim: str) -> bool:
+        """Release only a live matching claim after a definitive noncommit."""
+        owned = self._legacy_claims.get(pause_id)
+        pending = self._pending.get(pause_id)
+        if (
+            owned is None
+            or pending is None
+            or owned[0] is not pending
+            or owned[1] != claim
+            or pending.resolved
+            or monotonic() >= self._pause_deadlines.get(pause_id, float("inf"))
+        ):
+            return False
+        self._legacy_claims.pop(pause_id)
+        return True
+
+    def resolve(
+        self, pause_id: str, resolution: PauseResolution, *, claim: str | None = None
+    ) -> bool:
         """Resolve a waiting pause exactly once.
 
         Returns True when the pause was resolved by this call, False when the
@@ -5571,6 +5627,13 @@ class PauseWaiter:
         """
         pending = self._pending.get(pause_id)
         if pending is None or pending.resolved:
+            return False
+        owned = self._legacy_claims.get(pause_id)
+        if claim is not None and (owned is None or owned[0] is not pending or owned[1] != claim):
+            return False
+        if claim is None and owned is not None:
+            return False
+        if claim is not None and monotonic() >= self._pause_deadlines.get(pause_id, float("inf")):
             return False
         pending.resolved = True
         self._resolutions[pause_id] = resolution
@@ -5598,6 +5661,10 @@ class PauseWaiter:
         for pause in self._pending.values():
             if pause.resolved and not include_resolved:
                 continue
+            if pause.pause_type == "escalation" and monotonic() >= self._pause_deadlines.get(
+                pause.pause_id, float("inf")
+            ):
+                continue
             if task_id is not None and pause.task_id != task_id:
                 continue
             if session_id is not None and pause.session_id != session_id:
@@ -5624,6 +5691,10 @@ class PauseWaiter:
         for pause in self._pending.values():
             if pause.resolved:
                 continue
+            if pause.pause_type == "escalation" and monotonic() >= self._pause_deadlines.get(
+                pause.pause_id, float("inf")
+            ):
+                continue
             if task_id is not None and pause.task_id != task_id:
                 continue
             if session_id is not None and pause.session_id != session_id:
@@ -5644,6 +5715,8 @@ class PauseWaiter:
         self._events.pop(pause_id, None)
         self._resolutions.pop(pause_id, None)
         self._pending.pop(pause_id, None)
+        self._legacy_claims.pop(pause_id, None)
+        self._pause_deadlines.pop(pause_id, None)
 
     def discard_unwatched(self, pause_id: str) -> bool:
         """Discard a stale pause only when no local coroutine is waiting on it."""
@@ -5679,6 +5752,7 @@ class StepContext:
     todos: list[dict[str, Any]] = field(default_factory=list)
     task_id: str | None = None
     task_title: str = ""
+    workflow_step_scope: WorkflowStepScope | None = None
     task_description: str = ""
     task_expected_output: str | None = None
     task_source_type: str | None = None
@@ -5710,6 +5784,7 @@ class StepContext:
     interaction_mode: str = "explicit_gates"
     session_policy: dict[str, Any] = field(default_factory=dict)
     tool_registry: Any = None  # ToolRegistry instance for this step
+    rebuild_tool_registry: Callable[[Any], Awaitable[Any]] | None = None
     classified_tool_definitions: dict[str, ToolDefinition] = field(default_factory=dict)
     executor_connection: Any = None  # ExecutorConnection for this step
     executor_environment: ExecutorEnvironmentSnapshot | None = None
@@ -5802,6 +5877,7 @@ class StepContext:
     current_deliverable: Deliverable | None = None
     remember_assistant_event_seq: int | None = None
     turn_id: str | None = None
+    tool_rejection_recovery_state: ToolRejectionRecoveryState | None = None
     chat_mode: ResolvedChatMode | None = None
     controller_tool_surface: str = CONTROLLER_TOOL_SURFACE_WORKFLOW
     on_tool_progress: ToolProgressCallback | None = None
@@ -5835,6 +5911,12 @@ class StepContext:
     # Content references explicitly committed for user-facing presentation at
     # turn completion. Tool output never enters this set implicitly.
     pending_presentation_refs: set[str] = field(default_factory=set)
+    # Turn-local notices for tool calls the user moved to the background. Filled
+    # by execute_controller_tool, persisted once right after the tool batch
+    # (so every exit path keeps the durable record) and injected once before
+    # the next model call.
+    pending_tool_background_notices: list[ToolBackgroundNotice] = field(default_factory=list)
+    recorded_tool_background_notice_ids: set[str] = field(default_factory=set)
     # Every automatic direct-chat deliverable renders after the final
     # assistant message. Explicitly attached pre-existing deliverables are
     # additionally preserved in their own list.
@@ -5842,7 +5924,7 @@ class StepContext:
     pending_attached_deliverables: list[Deliverable] = field(default_factory=list)
     # Compaction recursion depth — incremented each time _rotate_after_compaction
     # recurses back into _execute_step.  Bounded by session.compaction_max_recursion
-    # (default 2) to prevent infinite loops when compaction cannot reduce context.
+    # (default 2) to bound consecutive recoveries without a completed model cycle.
     compaction_recursion_depth: int = 0
     # Monotonic per-step batch counter used to disambiguate idempotency keys
     # for distinct batches that happen to have byte-identical content.
@@ -5918,6 +6000,7 @@ class ProjectedMessages:
     raw_token_estimate: int | None = None
     projected_token_estimate: int | None = None
     prefix_fingerprint: str | None = None
+    decisions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -6026,6 +6109,12 @@ class CompactionRunContext:
 
 
 class AgentLoop:
+    @staticmethod
+    def _model_cache_ttl(ctx: StepContext, model_info: Any) -> str:
+        from cognis.providers.llm.cache_policy import effective_cache_ttl, primary_conversation
+
+        return effective_cache_ttl(model_info, primary_conversation=primary_conversation(ctx))
+
     """Runs a single step as a full agentic loop."""
 
     def __init__(
@@ -6049,7 +6138,6 @@ class AgentLoop:
         default_max_llm_cycles_per_turn: int = _MAX_LLM_CYCLES_PER_TURN,
         default_llm_stream_idle_timeout_seconds: int = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS,
         default_llm_stream_max_retries: int = DEFAULT_LLM_STREAM_MAX_RETRIES,
-        default_anthropic_cache_ttl: str = DEFAULT_ANTHROPIC_CACHE_TTL,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
         step_runtime_factory: Any = None,
@@ -6059,8 +6147,10 @@ class AgentLoop:
         trusted_evidence_admission_key: bytes = b"",
         trusted_evidence_max_attempts: int = 8,
         trusted_evidence_max_age_seconds: int = 3600,
+        hook_runtime: Any = None,
     ) -> None:
         self.providers = providers
+        self.hook_runtime = hook_runtime
         self.session_manager = session_manager
         self.session_cache = session_cache
         self.context_assembler = context_assembler
@@ -6080,9 +6170,6 @@ class AgentLoop:
             1, int(default_llm_stream_idle_timeout_seconds)
         )
         self.default_llm_stream_max_retries = max(0, int(default_llm_stream_max_retries))
-        self.default_anthropic_cache_ttl = _normalize_anthropic_cache_ttl(
-            default_anthropic_cache_ttl
-        )
         self.tool_output_store = tool_output_store
         self.artifact_store = getattr(tool_router, "artifact_store", None)
         self.notification_service: Any = None
@@ -6100,6 +6187,7 @@ class AgentLoop:
         self._follow_up_policy = FollowUpPolicy(llm=getattr(providers, "llm", None))
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
+        self._joined_child_observers: set[asyncio.Task[None]] = set()
         self._children_lock = asyncio.Lock()
         self._wire_background_shell_completion_callbacks()
 
@@ -6130,6 +6218,21 @@ class AgentLoop:
     async def _submit_managed_turn(self, conversation_id: str, content: str, **kwargs: Any) -> Any:
         """Retry one draining managed admission through the durable turn store."""
 
+        if kwargs.get("attachments"):
+            from cognis.core.artifact_sharing import grant_artifact_inputs
+            from cognis.store.queries import get_conversation
+
+            async with self.session_manager.session_factory() as db:
+                recipient = await get_conversation(db, conversation_id)
+                if recipient is None or recipient.user_email != kwargs.get("user_email"):
+                    raise ValueError("Managed artifact recipient is unavailable")
+                await grant_artifact_inputs(
+                    db,
+                    owner_email=recipient.user_email,
+                    agent_id=recipient.agent_id,
+                    content_refs=[item["artifact_id"] for item in kwargs["attachments"]],
+                )
+                await db.commit()
         error = await self._turn_scheduler.submit_turn(conversation_id, content, **kwargs)
         if error is None or error.code != "controller_draining":
             return error
@@ -6690,7 +6793,12 @@ class AgentLoop:
             STEP_DURATION.labels(phase="total").observe(duration)
 
     async def _resolve_child_agent(
-        self, child_agent_id: str, parent_agent: AgentDefinition, *, user_email: str
+        self,
+        child_agent_id: str,
+        parent_agent: AgentDefinition,
+        *,
+        user_email: str,
+        project_id: str | None = None,
     ) -> AgentDefinition:
         """Resolve the AgentDefinition for a child session (#3).
 
@@ -6699,7 +6807,7 @@ class AgentLoop:
         if child_agent_id == parent_agent.agent_id:
             return parent_agent
         from cognis.core.agent_registry import AgentRegistry
-        from cognis.store.queries import get_active_agent_grant
+        from cognis.core.project_access import resolve_agent_use_grant
 
         registry = AgentRegistry(self.session_manager.session_factory)
         child_agent = await registry.get(child_agent_id, owner_email=user_email)
@@ -6707,7 +6815,12 @@ class AgentLoop:
             raise RuntimeError(f"Delegated agent '{child_agent_id}' is not available")
         if not child_agent.is_system and child_agent.owner_email != user_email:
             async with self.session_manager.session_factory() as db:
-                grant = await get_active_agent_grant(db, child_agent.agent_id, user_email)
+                grant = await resolve_agent_use_grant(
+                    db,
+                    agent_id=child_agent.agent_id,
+                    user_email=user_email,
+                    project_id=project_id,
+                )
             if grant is None:
                 raise RuntimeError(f"Delegated agent '{child_agent_id}' is not accessible")
         return child_agent
@@ -6966,6 +7079,35 @@ class AgentLoop:
                 exc_info=True,
             )
 
+    async def run_internal_child_session(
+        self,
+        *,
+        child_session: SessionModel,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        prompt: str,
+        parent_session: SessionModel,
+        cancel_event: asyncio.Event,
+        execution_fence: Any,
+    ) -> StepOutput | None:
+        """Execute an internal child without parent delivery or delegation events.
+
+        The caller owns durable admission, fencing, cancellation and publication.
+        This reuses delegate runtime/permission/continuation handling only.
+        """
+        return await self._run_child_session(
+            child_session=child_session,
+            conversation=conversation,
+            agent=agent,
+            task_description=prompt,
+            parent_intaris_session_id=parent_session.intaris_session_id
+            or parent_session.session_id,
+            parent_session=parent_session,
+            cancel_event=cancel_event,
+            execution_fence=execution_fence,
+            internal=True,
+        )
+
     async def _run_child_session(
         self,
         *,
@@ -6979,6 +7121,7 @@ class AgentLoop:
         workspace_root_explicit: bool = False,
         working_directory_explicit: bool = False,
         deliverable_step_run_id: str | None = None,
+        allow_questions: bool = False,
         controller_tool_surface: str = CONTROLLER_TOOL_SURFACE_WORKFLOW,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
@@ -6992,6 +7135,7 @@ class AgentLoop:
         delegation_started_at: str | None = None,
         cancel_event: asyncio.Event | None = None,
         execution_fence: Any | None = None,
+        internal: bool = False,
     ) -> StepOutput | None:
         """Run a delegated child session.
 
@@ -7033,6 +7177,7 @@ class AgentLoop:
                 child_session.agent_id,
                 agent,
                 user_email=child_session.user_email,
+                project_id=getattr(conversation, "project_id", None),
             )
             child_executor_agent = self._executor_agent_for_child(agent, resolved_agent)
             child_access_context = RuntimeAccessContext(
@@ -7047,6 +7192,11 @@ class AgentLoop:
                 parent_session_id=getattr(child_session, "parent_session_id", None),
                 delegation_mode=getattr(child_session, "delegation_mode", None),
                 workflow_step=False,
+                interaction_mode="none"
+                if internal
+                else "step_requests"
+                if allow_questions
+                else "explicit_gates",
             )
             child_runtime = await self._resolve_child_runtime(
                 agent=resolved_agent,
@@ -7063,6 +7213,7 @@ class AgentLoop:
                 type="run",
                 prompt=task_description,
                 require_deliverable=False,
+                allow_questions=allow_questions,
                 **(
                     {
                         "step_profile_mode": StepProfileMode.HARD,
@@ -7098,8 +7249,13 @@ class AgentLoop:
                 policy=child_policy,
                 user_message=task_description,
                 system_initiated=True,
-                interaction_mode="explicit_gates",
+                interaction_mode="none"
+                if internal
+                else "step_requests"
+                if allow_questions
+                else "explicit_gates",
                 tool_registry=child_runtime.tool_registry,
+                rebuild_tool_registry=child_runtime.rebuild_tool_registry,
                 executor_connection=child_runtime.executor_connection,
                 executor_environment=child_runtime.executor_environment,
                 executor_pool=getattr(child_runtime, "executor_pool", None),
@@ -7126,7 +7282,43 @@ class AgentLoop:
                 access_context=child_access_context,
             ):
                 continuation_follow_up: ContinuationFollowUp | None = None
+                recovery_state = (
+                    await execution_fence.load_recovery_state()
+                    if internal and execution_fence is not None
+                    else {}
+                )
+                transient_attempts = int(recovery_state.get("transient_attempts", 0))
+                if internal and recovery_state.get("continuation_reason"):
+                    continuation_follow_up = build_automatic_continuation_follow_up(
+                        conversation_id=conversation_id,
+                        turn_id=child_ctx.turn_id or child_session_id,
+                        reason=recovery_state["continuation_reason"],
+                        metadata={},
+                        prior_follow_up=None,
+                    )
+                    if continuation_follow_up is not None:
+                        continuation_follow_up = continuation_follow_up.model_copy(
+                            update={"attempt": int(recovery_state["continuation_attempts"])}
+                        )
                 while True:
+                    if internal:
+                        assert execution_fence is not None
+                        await execution_fence.assert_current()
+                        from cognis.store.queries import get_session_row
+
+                        async with self.session_manager.session_factory() as db:
+                            current_child = await get_session_row(db, child_ctx.session.session_id)
+                        if current_child is None or current_child.status not in {"active", "idle"}:
+                            raise RuntimeError("Internal child session is terminal or unavailable")
+                        retry_at = recovery_state.get("retry_at")
+                        if retry_at:
+                            delay = (
+                                datetime.fromisoformat(retry_at) - datetime.now(UTC)
+                            ).total_seconds()
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                            await execution_fence.assert_current()
+                        await execution_fence.recover_tool_dispatch()
                     output = await self.run_step(
                         child_ctx,
                         on_token=on_token,
@@ -7136,10 +7328,37 @@ class AgentLoop:
                     metadata = (
                         output.metadata if output and isinstance(output.metadata, dict) else {}
                     )
+                    if internal and output is not None and output.error:
+                        assert execution_fence is not None
+                        transient, _ = step_failure_traits(output)
+                        if transient and transient_attempts < SESSION_TRANSIENT_MAX_ATTEMPTS:
+                            transient_attempts += 1
+                            model_error = metadata.get("model_error") or {}
+                            delay = model_error.get("retry_after_seconds", 1)
+                            if not isinstance(delay, (int, float)) or not math.isfinite(delay):
+                                delay = 1
+                            recovery_state = {
+                                **recovery_state,
+                                "transient_attempts": transient_attempts,
+                                "retry_at": (
+                                    datetime.now(UTC) + timedelta(seconds=max(1, delay))
+                                ).isoformat(),
+                            }
+                            await execution_fence.save_recovery_state(recovery_state)
+                            continue
                     continuation_reason = metadata.get("continuation_reason")
                     if continuation_reason not in {
                         TOOL_CALL_CEILING_CONTINUATION_REASON,
                         LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                        *(
+                            (
+                                MID_STREAM_FAILURE_CONTINUATION_REASON,
+                                STEP_TIMEOUT_CONTINUATION_REASON,
+                                MISSING_STEP_COMPLETE_CONTINUATION_REASON,
+                            )
+                            if internal
+                            else ()
+                        ),
                     }:
                         break
 
@@ -7157,6 +7376,15 @@ class AgentLoop:
                             "partial work was preserved in the child session."
                         )
 
+                    if internal:
+                        assert execution_fence is not None
+                        recovery_state = {
+                            **recovery_state,
+                            "retry_at": None,
+                            "continuation_reason": continuation_reason,
+                            "continuation_attempts": continuation_follow_up.attempt,
+                        }
+                        await execution_fence.save_recovery_state(recovery_state)
                     logger.info(
                         "delegation: continuing child session after automatic continuation boundary",
                         extra={
@@ -7179,6 +7407,8 @@ class AgentLoop:
                     )
                 if output is None or output.error is not None:
                     error_text = output.error if output and output.error else "no step output"
+                    if internal:
+                        raise RuntimeError(f"Internal child failed: {error_text}")
                     salvage_selection = await self._select_delegation_result_content(
                         child_session=child_session,
                         step_output=output,
@@ -7203,9 +7433,19 @@ class AgentLoop:
                 # Build durable child output from deliverables or all assistant
                 # messages, so a short cleanup tail cannot replace the report.
                 result_summary = output.summary if output and output.summary else "Completed."
-                result_selection = await self._select_delegation_result_content(
-                    child_session=child_session,
-                    step_output=output,
+                result_selection = (
+                    _DelegationResultContent(
+                        content=output.content or output.summary,
+                        source="step_output",
+                        anchors=[],
+                        truncated=False,
+                        original_length=None,
+                    )
+                    if internal
+                    else await self._select_delegation_result_content(
+                        child_session=child_session,
+                        step_output=output,
+                    )
                 )
                 result_content = result_selection.content
                 if output:
@@ -7232,6 +7472,10 @@ class AgentLoop:
                 # Compaction can replace the physical child session while the
                 # delegation keeps the original child ID as its stable identity.
                 physical_child_session_id = child_ctx.session.session_id
+                if internal:
+                    output.session_id = physical_child_session_id
+                    output.intaris_session_id = child_ctx.session.intaris_session_id
+                    return output
 
                 # Update the current physical child session status — guarded
                 try:
@@ -7370,13 +7614,16 @@ class AgentLoop:
                 physical_child_session_id = (
                     child_ctx.session.session_id if child_ctx is not None else child_session_id
                 )
-                await self.session_manager.mark_cancelled(
-                    physical_child_session_id,
-                    result_summary="Cancelled (parent task cancelled)",
-                )
+                if not internal:
+                    await self.session_manager.mark_cancelled(
+                        physical_child_session_id,
+                        result_summary="Cancelled (parent task cancelled)",
+                    )
             except Exception:
                 logger.warning("delegation: failed to mark child session cancelled", exc_info=True)
 
+            if internal:
+                raise
             cancellation_persisted = False
             try:
                 await self._record_parent_session_events(
@@ -7471,13 +7718,16 @@ class AgentLoop:
                 physical_child_session_id = (
                     child_ctx.session.session_id if child_ctx is not None else child_session_id
                 )
-                await self.session_manager.mark_failed(
-                    physical_child_session_id,
-                    result_summary=failed_summary,
-                )
+                if not internal:
+                    await self.session_manager.mark_failed(
+                        physical_child_session_id,
+                        result_summary=failed_summary,
+                    )
             except Exception:
                 logger.warning("delegation: failed to mark child session as failed", exc_info=True)
 
+            if internal:
+                raise
             failure_persisted = False
             try:
                 await self._record_parent_session_events(
@@ -7655,30 +7905,7 @@ class AgentLoop:
         *,
         max_chars: int = _DELEGATION_RESULT_MAX_CHARS,
     ) -> tuple[str, list[dict[str, Any]], bool, int | None]:
-        if len(content) <= max_chars:
-            anchors = [*anchors, *markdown_heading_anchors(content, existing_anchors=anchors)]
-            return content, anchors, False, None
-        original_length = len(content)
-        notice = _DELEGATION_RESULT_TRUNCATION_TEMPLATE.format(
-            original_length=original_length,
-            max_chars=max_chars,
-        )
-        truncated = content[: max(0, max_chars - len(notice))] + notice
-        retained_lines = truncated.count("\n") + 1
-        bounded_anchors = []
-        for anchor in anchors:
-            start_line = int(anchor.get("start_line") or 0)
-            if start_line > retained_lines:
-                continue
-            bounded = dict(anchor)
-            end_line = int(bounded.get("end_line") or retained_lines)
-            if end_line > retained_lines:
-                bounded["end_line"] = retained_lines
-            bounded_anchors.append(bounded)
-        bounded_anchors.extend(
-            markdown_heading_anchors(truncated, existing_anchors=bounded_anchors)
-        )
-        return truncated, bounded_anchors, True, original_length
+        return project_result_content(content, anchors, max_chars=max_chars)
 
     @classmethod
     def _anchors_from_delegation_result_content(cls, content: str) -> list[dict[str, Any]]:
@@ -7977,6 +8204,7 @@ class AgentLoop:
         workspace_root_explicit: bool = False,
         working_directory_explicit: bool = False,
         deliverable_step_run_id: str | None = None,
+        allow_questions: bool = False,
         controller_tool_surface: str = CONTROLLER_TOOL_SURFACE_WORKFLOW,
         parent_tool_call_id: str | None = None,
         parent_turn_id: str | None = None,
@@ -7994,6 +8222,11 @@ class AgentLoop:
         completes, publishes FOLLOW_UP_TURN_REQUESTED so the parent
         conversation gets a new system-initiated turn with the result.
         """
+        # A background child may outlive successful completion of its spawning
+        # direct turn, but must still stop on abnormal ownership loss.
+        if isinstance(execution_fence, DirectTurnExecutionFence):
+            execution_fence = BackgroundDirectTurnFence(execution_fence)
+
         parent_session_id = child_session.parent_session_id or ""
         child_session_id = child_session.session_id
         conversation_id = conversation.conversation_id
@@ -8086,6 +8319,7 @@ class AgentLoop:
                 workspace_root_explicit=workspace_root_explicit,
                 working_directory_explicit=working_directory_explicit,
                 deliverable_step_run_id=deliverable_step_run_id,
+                allow_questions=allow_questions,
                 controller_tool_surface=controller_tool_surface,
                 on_tool_call=_child_tool_call_callback,
                 on_tool_result=_child_progress_callback,
@@ -8099,6 +8333,8 @@ class AgentLoop:
                 cancel_event=cancel_event,
                 execution_fence=execution_fence,
             )
+            if execution_fence is not None:
+                await execution_fence.assert_current()
             status = "completed" if output else "failed"
             result_summary = output.summary if output else None
         except (asyncio.CancelledError, StepInterrupted, StaleTaskExecutionOwner):
@@ -8182,6 +8418,263 @@ class AgentLoop:
             )
         )
 
+    async def prepare_handoff_inference(
+        self, ctx: StepContext, snapshot: Any, instruction: str
+    ) -> Any:
+        """Prepare a detached request without entering turn execution or running hooks."""
+        from cognis.core.inference_preparation import AuxiliaryInference
+        from cognis.core.runtime_selection import resolve_runtime_selection
+
+        selection = resolve_runtime_selection(ctx.agent, ctx.session, ctx.conversation)
+        model, provider_id = await self.providers.llm.resolve_model_target(
+            explicit_model=selection.model,
+            explicit_provider_id=selection.provider_id,
+            acting_user_email=ctx.session.user_email,
+            task_type="default",
+            cognis_session_id=ctx.session.session_id,
+        )
+        model_info = await self.providers.llm.get_model_info(
+            model, provider_id=provider_id, acting_user_email=ctx.session.user_email
+        )
+        ctx.current_model = model
+        ctx.current_provider_id = provider_id
+        ctx.current_model_info = model_info
+        self._initialize_loaded_skill_snapshots(ctx)
+        controller = self._build_controller_tool_exposure(ctx)
+        memory_enabled = bool(ctx.memory_policy and ctx.memory_policy.enabled)
+        exposure, contract, _, _, inventory, _, _ = await self.prepare_auxiliary_tools(
+            ctx,
+            model=model,
+            provider_id=provider_id,
+            model_info=model_info,
+            controller_tool_schemas=filter_external_controller_schemas(
+                controller.schemas,
+                context=ctx.conversation.context,
+                memory_backend_configured=memory_enabled,
+            ),
+            authorized_deferred_controller_tools=filter_external_tool_definitions(
+                controller.deferred_definitions,
+                context=ctx.conversation.context,
+                memory_backend_configured=memory_enabled,
+            ),
+            promoted_tool_ids=self._get_initial_promoted_tool_ids(ctx),
+            activated_tool_ids=self._get_initial_activated_tool_ids(ctx),
+        )
+        result = await self.context_assembler.assemble_snapshot(
+            snapshot=snapshot,
+            session=ctx.session,
+            conversation=ctx.conversation,
+            agent=ctx.agent,
+            instruction=instruction,
+            tool_schema_tokens=sum(len(json.dumps(schema)) // 4 for schema in exposure.tools),
+            resolved_target=(model, provider_id),
+            context=prompt_context_for_step(ctx),
+            executor_environment=ctx.executor_environment,
+            executor_pool=ctx.executor_pool,
+            active_executor_id=ctx.active_executor_id,
+        )
+        projected = await self._project_model_messages_for_budget_offloaded(
+            ctx,
+            messages=result.messages,
+            tool_schemas=exposure.tools,
+            resolved_model=model,
+            max_context_tokens=result.max_context_tokens,
+            cache_breakpoint_index=result.cache_breakpoint_index,
+            anthropic_cache_ttl=self._model_cache_ttl(ctx, model_info),
+        )
+        messages = projected.messages
+        if str(contract.llm_api).strip().lower() == "responses":
+            messages = _reattach_responses_output_items(messages, result.messages)
+        else:
+            messages = _reattach_anthropic_thinking_blocks(messages, result.messages)
+            messages = _reattach_anthropic_native_envelopes(messages, result.messages)
+        if _effective_tool_discovery_mode(exposure) == ToolDiscoveryMode.CONTROLLER_SEARCH:
+            messages = _project_hidden_history_calls_through_bridge(
+                messages,
+                inventory_tools=inventory,
+                visible_tool_ids=exposure.visible_tool_ids,
+            )
+        kwargs = dict(exposure.request_kwargs)
+        kwargs["cache_breakpoint_index"] = projected.cache_breakpoints
+        kwargs["cognis_openai_apply_patch_tool_type"] = contract.native_apply_patch_tool_type
+        if selection.reasoning_effort:
+            kwargs["reasoning_effort"] = selection.reasoning_effort
+        if selection.fast_mode is not None:
+            kwargs["fast_mode"] = selection.fast_mode
+        if ctx.agent.llm_config:
+            for key in ("temperature", "top_p", "max_tokens"):
+                if (value := getattr(ctx.agent.llm_config, key, None)) is not None:
+                    kwargs[key] = value
+        prepare_chain = getattr(self.providers.llm, "prepare_anthropic_native_chain", None)
+        if callable(prepare_chain):
+            exposure.alias_map.update(controller.alias_map)
+            registry = self._get_tool_registry(ctx)
+            stable_ids = {}
+            for schema in exposure.tools:
+                function = schema.get("function", {})
+                name = function.get("name")
+                if isinstance(name, str):
+                    canonical = exposure.alias_map.get(name, name)
+                    stable_ids[name] = (
+                        _tool_id_for_call(canonical, registry) or f"controller:{canonical}"
+                    )
+            chain = await prepare_chain(
+                model=model,
+                model_info=model_info,
+                provider_id=provider_id,
+                acting_user_email=ctx.session.user_email,
+                tools=exposure.tools,
+                alias_map=dict(exposure.alias_map),
+                stable_id_map=stable_ids,
+                argument_alias_map=dict(exposure.argument_alias_map),
+                thinking=kwargs.get("thinking"),
+                request_kwargs=dict(kwargs),
+            )
+            if chain is not None:
+                kwargs.update(chain)
+                kwargs[NATIVE_CONTINUATION_REQUIRED_KWARG] = False
+        # Keep schemas in the prefix. Selection control is not the execution
+        # boundary: the caller never dispatches any returned tool calls.
+        kwargs["tool_choice"] = "none"
+        return AuxiliaryInference(messages, exposure.tools, model, provider_id, kwargs)
+
+    async def prepare_auxiliary_tools(
+        self,
+        ctx: StepContext,
+        *,
+        model: str,
+        provider_id: str | None,
+        model_info: Any,
+        controller_tool_schemas: list[dict[str, Any]],
+        authorized_deferred_controller_tools: list[ToolDefinition],
+        promoted_tool_ids: set[str],
+        activated_tool_ids: set[str],
+    ) -> tuple[Any, Any, Any, bool, list[ToolDefinition], list[ToolDefinition], set[str]]:
+        """Compile the shared model-facing exposure without dispatching tools."""
+        registry = self._get_tool_registry(ctx)
+        searchable_inventory_tools: list[ToolDefinition] = []
+        candidate_inventory_tools: list[ToolDefinition] = []
+        default_visible_tool_ids: set[str] = set()
+        resolved_profile = (
+            self._step_profile_registry.resolve_step_profile(ctx.step_definition)
+            if self._step_profile_registry is not None
+            else resolve_step_profile(ctx.step_definition)
+        )
+        allow_tool_search = (
+            resolved_profile.config.allow_tool_search
+            if resolved_profile.config is not None
+            else True
+        )
+        exposure_contract = ToolExposureContract(
+            llm_api=LLMApiMode.CHAT_COMPLETIONS,
+            discovery_mode=(
+                ToolDiscoveryMode.CONTROLLER_SEARCH if allow_tool_search else ToolDiscoveryMode.NONE
+            ),
+        )
+        resolve_contract = getattr(self.providers.llm, "resolve_tool_exposure_contract", None)
+        if callable(resolve_contract):
+            exposure_contract = await resolve_contract(
+                model_id=model,
+                model_info=model_info,
+                provider_id=provider_id,
+                allow_tool_search=allow_tool_search,
+            )
+        if registry is not None:
+            inventory_tools = registry.list_tools()
+            inventory_fingerprint = _inventory_fingerprint(inventory_tools)
+            cached_classified = (
+                self.session_cache.get_classified_inventory(
+                    ctx.session.session_id, inventory_fingerprint
+                )
+                if hasattr(self.session_cache, "get_classified_inventory")
+                else None
+            )
+            if cached_classified is not None:
+                classified_inventory = cached_classified
+            elif self._session_factory is not None:
+                classified_inventory = await resolve_tool_classifications(
+                    inventory_tools,
+                    session_factory=self._session_factory,
+                    owner_email=ctx.agent.owner_email,
+                    queue=self._tool_classification_queue,
+                )
+            else:
+                classified_inventory = classify_tool_definitions_sync(inventory_tools)
+            if cached_classified is None and hasattr(
+                self.session_cache, "set_classified_inventory"
+            ):
+                self.session_cache.set_classified_inventory(
+                    ctx.session.session_id, inventory_fingerprint, classified_inventory
+                )
+            ctx.classified_tool_definitions = {
+                stable_tool_id(tool): tool for tool in classified_inventory
+            }
+            full_inventory_tools = _filter_model_inventory_tools(
+                ctx.agent,
+                classified_inventory,
+                promoted_tool_ids,
+                activated_tool_ids,
+            )
+            searchable_inventory_tools = [
+                tool
+                for tool in full_inventory_tools
+                if step_profile_allows_tool(tool, resolved_profile)
+                or (
+                    resolved_profile.mode != StepProfileMode.HARD
+                    and stable_tool_id(tool) in activated_tool_ids
+                )
+            ]
+            searchable_inventory_tools = self._effective_inventory_tool_definitions(
+                ctx,
+                searchable_inventory_tools,
+            )
+            searchable_inventory_tools = filter_external_tool_definitions(
+                searchable_inventory_tools,
+                context=getattr(ctx.conversation, "context", None),
+                memory_backend_configured=bool(
+                    isinstance(ctx.memory_policy, MemoryRuntimePolicy) and ctx.memory_policy.enabled
+                ),
+            )
+            searchable_inventory_tools.extend(authorized_deferred_controller_tools)
+            candidate_inventory_tools = list(searchable_inventory_tools)
+            searchable_inventory_tools = filter_edit_tools_for_model(
+                searchable_inventory_tools, getattr(model_info, "model_id", None)
+            )
+            deferred_controller_ids = {
+                stable_tool_id(tool) for tool in authorized_deferred_controller_tools
+            }
+            configured_tool_groups = _configured_agent_tool_groups(ctx.agent)
+            default_visible_tool_ids = {
+                stable_tool_id(tool)
+                for tool in searchable_inventory_tools
+                if stable_tool_id(tool) not in deferred_controller_ids
+                if _tool_visible_by_default(
+                    tool,
+                    resolved_profile,
+                    activated_tool_ids=activated_tool_ids,
+                    configured_tool_groups=configured_tool_groups,
+                )
+            }
+        exposure = prepare_tool_exposure(
+            inventory_tools=searchable_inventory_tools,
+            controller_tool_schemas=controller_tool_schemas,
+            model_info=model_info,
+            contract=exposure_contract,
+            promoted_tool_ids=promoted_tool_ids,
+            default_visible_tool_ids=default_visible_tool_ids,
+            allow_tool_search=allow_tool_search,
+            anthropic_cache_ttl=self._model_cache_ttl(ctx, model_info),
+        )
+        return (
+            exposure,
+            exposure_contract,
+            resolved_profile,
+            allow_tool_search,
+            searchable_inventory_tools,
+            candidate_inventory_tools,
+            default_visible_tool_ids,
+        )
+
     async def _execute_step(
         self,
         ctx: StepContext,
@@ -8198,45 +8691,6 @@ class AgentLoop:
                 await ensure_runtime_metadata(ctx.session)
             ctx.runtime_info["_session_runtime_metadata_hydrated"] = True
         new_loaded_skill_snapshots = self._initialize_loaded_skill_snapshots(ctx)
-        # Guard: compaction recursion depth.  Each successful compaction+rotation
-        # that re-enters _execute_step increments ctx.compaction_recursion_depth.
-        # When the cap is exceeded we surface a classified failure rather than
-        # looping indefinitely.
-        refresh_compaction_settings = getattr(self.compaction_strategy, "refresh_settings", None)
-        if callable(refresh_compaction_settings):
-            await refresh_compaction_settings()
-        _max_compaction_recursion = int(getattr(self.compaction_strategy, "max_recursion", 2) or 2)
-        if ctx.compaction_recursion_depth >= _max_compaction_recursion:
-            self._set_auto_compaction_cooldown(ctx.session.session_id)
-            notice = (
-                "Compaction is not reducing context further; this conversation may need "
-                "to be split. Try /new or rephrase the request."
-            )
-            await self._emit_compaction_notice(
-                ctx,
-                notice,
-                on_token=on_token,
-                persist=True,
-            )
-            logger.warning(
-                "agent: compaction recursion depth exceeded",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        "depth": ctx.compaction_recursion_depth,
-                        "max": _max_compaction_recursion,
-                    }
-                },
-            )
-            return StepOutput(
-                summary=notice,
-                content="",
-                outcome={
-                    "status": "failed",
-                    "reason": "compaction_recursion_exhausted",
-                },
-                metadata={"compaction_recursion_depth": ctx.compaction_recursion_depth},
-            )
 
         # Budget selection:
         # 1. Secondary-agent delegations follow OpenCode: optional ``steps``
@@ -8274,6 +8728,11 @@ class AgentLoop:
         ctx.pending_tool_calls.clear()
         if not ctx.turn_id:
             ctx.turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        if ctx.tool_rejection_recovery_state is None:
+            ctx.tool_rejection_recovery_state = ToolRejectionRecoveryState.for_turn(ctx.turn_id)
+        else:
+            ctx.tool_rejection_recovery_state.reset_for_new_turn(ctx.turn_id)
+        rejected_tool_names = ctx.tool_rejection_recovery_state.seen_names
         tool_call_visible_names: dict[str, str] = {}
         tool_call_visible_arguments: dict[str, dict[str, Any]] = {}
         messages: list[dict[str, Any]] = []
@@ -8710,7 +9169,7 @@ class AgentLoop:
         self._raise_if_cancelled(ctx)
         if ctx.execution_fence is not None:
             await ctx.execution_fence.assert_current()
-        messages = context_result.messages
+        messages = list(context_result.messages)
         for message in messages:
             refs = message.get("_lazy_artifact_refs")
             if isinstance(refs, list):
@@ -8739,6 +9198,7 @@ class AgentLoop:
             ctx.tool_execution_counts[name] = max(ctx.tool_execution_counts.get(name, 0), count)
         pending_audit_messages = list(getattr(context_result, "audit_messages", []) or [])
         if ctx.consume_boundary_batch is not None and ctx.policy in {
+            CHAT_POLICY,
             WORKFLOW_POLICY,
             SECONDARY_POLICY,
         }:
@@ -8869,8 +9329,6 @@ class AgentLoop:
 
         retry_projected_model: ProjectedMessages | None = None
         continued_assistant_content = ""
-        continuation_message_index: int | None = None
-        continuation_reminder_index: int | None = None
         last_cycle_end_at: float | None = None
         workflow_step_reminder_added = False
         background_work_reminder_added = False
@@ -8967,6 +9425,18 @@ class AgentLoop:
                     attachments=list(collected_attachments),
                 )
             cycle_started_at = monotonic()
+            if agentic_step_count > 1:
+                from cognis.core.current_policy_context import refresh_current_policy
+
+                policy_update = await refresh_current_policy(
+                    messages, self.providers.guardrails, ctx.session
+                )
+                if policy_update is not None:
+                    _queue_audit_message(
+                        role="developer",
+                        source="current_policy_update",
+                        content=policy_update["content"],
+                    )
             cycle_step_type = _agent_loop_step_type(ctx)
             if last_cycle_end_at is not None:
                 inter_cycle_gap_seconds = max(0.0, cycle_started_at - last_cycle_end_at)
@@ -8988,9 +9458,6 @@ class AgentLoop:
             if _is_delegation and delegation_max_steps is not None:
                 _force_summary_mode = agentic_step_count >= delegation_max_steps
 
-            messages[:] = [
-                message for message in messages if not message.get("_todo_freshness_reminder")
-            ]
             completed_cycles = agentic_step_count - 1
             if (
                 todo_write_available
@@ -9007,6 +9474,11 @@ class AgentLoop:
                         "_todo_freshness_reminder": True,
                     }
                 )
+                _queue_audit_message(
+                    role="developer",
+                    source="todo_freshness_reminder",
+                    content=str(messages[-1]["content"]),
+                )
                 todo_last_reminder_cycle = completed_cycles
                 ctx.profile_switch_todo_last_reminder_cycle = todo_last_reminder_cycle
 
@@ -9014,6 +9486,11 @@ class AgentLoop:
                 workflow_step_reminder = self._build_workflow_step_reminder(ctx)
                 if workflow_step_reminder is not None:
                     messages.append(workflow_step_reminder)
+                    _queue_audit_message(
+                        role="developer",
+                        source="workflow_step_reminder",
+                        content=str(messages[-1]["content"]),
+                    )
                 workflow_step_reminder_added = True
 
             if not todos_reminder_seeded:
@@ -9028,6 +9505,11 @@ class AgentLoop:
                         ),
                         "_todos_reminder": True,
                     }
+                )
+                _queue_audit_message(
+                    role="developer",
+                    source="todos_reminder",
+                    content=str(messages[-1]["content"]),
                 )
                 todos_reminder_seeded = True
 
@@ -9048,6 +9530,11 @@ class AgentLoop:
                         superseding=non_primary_reminder_signature is not None,
                     )
                     messages.append(reminder_message)
+                    _queue_audit_message(
+                        role="developer",
+                        source="non_primary_executor_reminder",
+                        content=str(messages[-1]["content"]),
+                    )
                     non_primary_reminder_signature = reminder_signature
             elif non_primary_reminder_signature is not None:
                 messages.append(
@@ -9060,7 +9547,14 @@ class AgentLoop:
                         "_non_primary_executor_reminder": True,
                     }
                 )
+                _queue_audit_message(
+                    role="developer",
+                    source="non_primary_executor_reminder",
+                    content=str(messages[-1]["content"]),
+                )
                 non_primary_reminder_signature = None
+
+            await self._drain_tool_background_notices(ctx, messages, on_token=on_token)
 
             background_shell_reminder = await self._build_background_shell_status_reminder(ctx)
             if background_shell_reminder is not None:
@@ -9077,6 +9571,11 @@ class AgentLoop:
                         superseding=background_shell_reminder_signature is not None,
                     )
                     messages.append(reminder_message)
+                    _queue_audit_message(
+                        role="developer",
+                        source="background_shell_reminder",
+                        content=str(messages[-1]["content"]),
+                    )
                     background_shell_reminder_signature = reminder_signature
             elif background_shell_reminder_signature is not None:
                 messages.append(
@@ -9089,12 +9588,22 @@ class AgentLoop:
                         "_background_shell_reminder": True,
                     }
                 )
+                _queue_audit_message(
+                    role="developer",
+                    source="background_shell_reminder",
+                    content=str(messages[-1]["content"]),
+                )
                 background_shell_reminder_signature = None
 
             if not background_work_reminder_added:
                 background_work_reminder = await self._build_background_work_status_reminder(ctx)
                 if background_work_reminder is not None:
                     messages.append(background_work_reminder)
+                    _queue_audit_message(
+                        role="developer",
+                        source="background_work_reminder",
+                        content=str(messages[-1]["content"]),
+                    )
                 background_work_reminder_added = True
 
             # Post-deliverable nudge: if the model wrote the deliverable,
@@ -9103,7 +9612,14 @@ class AgentLoop:
             # the next assistant turn finalizes the step.  Capped at 2
             # emissions to avoid an infinite reminder loop on a stuck
             # model.
+            reminder_count_before = ctx.post_deliverable_reminders_sent
             self._maybe_inject_post_deliverable_reminder(ctx, messages)
+            if ctx.post_deliverable_reminders_sent != reminder_count_before:
+                _queue_audit_message(
+                    role="developer",
+                    source="post_deliverable_reminder",
+                    content=str(messages[-1]["content"]),
+                )
 
             if _force_summary_mode and _is_delegation:
                 messages.append(
@@ -9112,6 +9628,11 @@ class AgentLoop:
                         "content": self._build_delegation_max_steps_notice(ctx),
                         "_force_summary": True,
                     }
+                )
+                _queue_audit_message(
+                    role="developer",
+                    source="delegation_max_steps",
+                    content=str(messages[-1]["content"]),
                 )
 
             resolved_agent_profile = resolve_conversation_agent_profile(
@@ -9169,6 +9690,11 @@ class AgentLoop:
                         task_type="default",
                         explicit_provider_id=provider_for_llm,
                         acting_user_email=ctx.session.user_email,
+                        **(
+                            {"cognis_session_id": ctx.session.session_id}
+                            if hasattr(self.providers.llm, "inference_recovery")
+                            else {}
+                        ),
                     )
                 except TypeError:
                     (
@@ -9233,123 +9759,23 @@ class AgentLoop:
                 runtime_selection_revision=runtime_selection.revision,
             )
             registry = self._get_tool_registry(ctx)
-            searchable_inventory_tools: list[ToolDefinition] = []
-            default_visible_tool_ids: set[str] = set()
-            resolved_profile = (
-                self._step_profile_registry.resolve_step_profile(ctx.step_definition)
-                if self._step_profile_registry is not None
-                else resolve_step_profile(ctx.step_definition)
-            )
-            allow_tool_search = (
-                resolved_profile.config.allow_tool_search
-                if resolved_profile.config is not None
-                else True
-            )
-            exposure_contract = ToolExposureContract(
-                llm_api=LLMApiMode.CHAT_COMPLETIONS,
-                discovery_mode=(
-                    ToolDiscoveryMode.CONTROLLER_SEARCH
-                    if allow_tool_search
-                    else ToolDiscoveryMode.NONE
-                ),
-            )
-            resolve_tool_exposure_contract = getattr(
-                self.providers.llm,
-                "resolve_tool_exposure_contract",
-                None,
-            )
-            if callable(resolve_tool_exposure_contract):
-                exposure_contract = await resolve_tool_exposure_contract(
-                    model_id=current_model,
-                    model_info=model_info,
-                    provider_id=current_provider_id,
-                    allow_tool_search=allow_tool_search,
-                )
-            if registry is not None:
-                inventory_tools = registry.list_tools()
-                inventory_fingerprint = _inventory_fingerprint(inventory_tools)
-                cached_classified = (
-                    self.session_cache.get_classified_inventory(
-                        ctx.session.session_id, inventory_fingerprint
-                    )
-                    if hasattr(self.session_cache, "get_classified_inventory")
-                    else None
-                )
-                if cached_classified is not None:
-                    classified_inventory = cached_classified
-                elif self._session_factory is not None:
-                    classified_inventory = await resolve_tool_classifications(
-                        inventory_tools,
-                        session_factory=self._session_factory,
-                        owner_email=ctx.agent.owner_email,
-                        queue=self._tool_classification_queue,
-                    )
-                else:
-                    classified_inventory = classify_tool_definitions_sync(inventory_tools)
-                if cached_classified is None and hasattr(
-                    self.session_cache, "set_classified_inventory"
-                ):
-                    self.session_cache.set_classified_inventory(
-                        ctx.session.session_id,
-                        inventory_fingerprint,
-                        classified_inventory,
-                    )
-                ctx.classified_tool_definitions = {
-                    stable_tool_id(tool): tool for tool in classified_inventory
-                }
-                full_inventory_tools = _filter_model_inventory_tools(
-                    ctx.agent,
-                    classified_inventory,
-                    promoted_tool_ids,
-                    activated_tool_ids,
-                )
-                searchable_inventory_tools = [
-                    tool
-                    for tool in full_inventory_tools
-                    if step_profile_allows_tool(tool, resolved_profile)
-                    or (
-                        resolved_profile.mode != StepProfileMode.HARD
-                        and stable_tool_id(tool) in activated_tool_ids
-                    )
-                ]
-                searchable_inventory_tools = self._effective_inventory_tool_definitions(
-                    ctx,
-                    searchable_inventory_tools,
-                )
-                searchable_inventory_tools = filter_external_tool_definitions(
-                    searchable_inventory_tools,
-                    context=getattr(ctx.conversation, "context", None),
-                    memory_backend_configured=bool(
-                        isinstance(ctx.memory_policy, MemoryRuntimePolicy)
-                        and ctx.memory_policy.enabled
-                    ),
-                )
-                searchable_inventory_tools.extend(authorized_deferred_controller_tools)
-                searchable_inventory_tools = filter_edit_tools_for_model(
-                    searchable_inventory_tools, getattr(model_info, "model_id", None)
-                )
-                deferred_controller_ids = {
-                    stable_tool_id(tool) for tool in authorized_deferred_controller_tools
-                }
-                default_visible_tool_ids = {
-                    stable_tool_id(tool)
-                    for tool in searchable_inventory_tools
-                    if stable_tool_id(tool) not in deferred_controller_ids
-                    if _tool_visible_by_default(
-                        tool,
-                        resolved_profile,
-                        activated_tool_ids=activated_tool_ids,
-                    )
-                }
-            exposure = prepare_tool_exposure(
-                inventory_tools=searchable_inventory_tools,
-                controller_tool_schemas=controller_tool_schemas,
+            (
+                exposure,
+                exposure_contract,
+                resolved_profile,
+                allow_tool_search,
+                searchable_inventory_tools,
+                candidate_inventory_tools,
+                default_visible_tool_ids,
+            ) = await self.prepare_auxiliary_tools(
+                ctx,
+                model=current_model,
+                provider_id=current_provider_id,
                 model_info=model_info,
-                contract=exposure_contract,
+                controller_tool_schemas=controller_tool_schemas,
+                authorized_deferred_controller_tools=authorized_deferred_controller_tools,
                 promoted_tool_ids=promoted_tool_ids,
-                default_visible_tool_ids=default_visible_tool_ids,
-                allow_tool_search=allow_tool_search,
-                anthropic_cache_ttl=self.default_anthropic_cache_ttl,
+                activated_tool_ids=activated_tool_ids,
             )
             effective_discovery_mode = _effective_tool_discovery_mode(exposure)
             if controller_tool_exposure.alias_map:
@@ -9575,16 +10001,16 @@ class AgentLoop:
                 if orchestration_guidance is not None
                 else None
             )
+            guidance_appended = False
             if orchestration_guidance_signature != queued_orchestration_guidance_signature:
-                replace_orchestration_capability_guidance(messages, orchestration_guidance)
-            if (
-                orchestration_guidance is not None
-                and orchestration_guidance_signature != queued_orchestration_guidance_signature
-            ):
+                guidance_appended = replace_orchestration_capability_guidance(
+                    messages, orchestration_guidance
+                )
+            if guidance_appended:
                 _queue_audit_message(
                     role="developer",
                     source="orchestration_capability_guidance",
-                    content=orchestration_guidance,
+                    content=str(messages[-1]["content"]),
                 )
             queued_orchestration_guidance_signature = orchestration_guidance_signature
             edit_guidance = build_visible_edit_tool_guidance(
@@ -9633,6 +10059,20 @@ class AgentLoop:
                     }
                 },
             )
+            if self.hook_runtime is not None and retry_projected_model is None:
+                hook_messages = await self.hook_runtime.before_cycle(ctx, agentic_step_count)
+                for hook_message in hook_messages:
+                    if any(
+                        message.get("_hook_run_id") == hook_message["_hook_run_id"]
+                        for message in messages
+                    ):
+                        continue
+                    messages.append(hook_message)
+                    _queue_audit_message(
+                        role="developer",
+                        source="agent_hook",
+                        content=hook_message["content"],
+                    )
             if retry_projected_model is not None:
                 projected_model = retry_projected_model
                 retry_projected_model = None
@@ -9644,7 +10084,7 @@ class AgentLoop:
                     resolved_model=current_model,
                     max_context_tokens=context_result.max_context_tokens,
                     cache_breakpoint_index=cache_breakpoint,
-                    anthropic_cache_ttl=self.default_anthropic_cache_ttl,
+                    anthropic_cache_ttl=self._model_cache_ttl(ctx, model_info),
                 )
             model_messages = projected_model.messages
             if str(exposure_contract.llm_api).strip().lower() == "responses":
@@ -9790,6 +10230,7 @@ class AgentLoop:
                     metadata={"context_pressure": pressure_run.event_data()},
                     attachments=list(collected_attachments),
                 )
+            candidate_base_kwargs = dict(llm_kwargs)
             llm_kwargs.update(exposure.request_kwargs)
             frozen_executor_id = getattr(ctx, "active_executor_id", None)
             if isinstance(frozen_executor_id, str) and frozen_executor_id:
@@ -9834,6 +10275,7 @@ class AgentLoop:
             accumulator = StreamAccumulator(block_id_prefix=llm_request_id)
             mid_stream_error: str | None = None
             mid_stream_error_details: dict[str, Any] | MidStreamErrorPayload | None = None
+            committed_output_seen = False
             llm_stream_max_retries_for_error = llm_stream_max_retries
             # Multiple assistant_message segments can be produced within a single turn
             # (for example after tool calls or reprompts). The live WebSocket stream
@@ -9846,11 +10288,21 @@ class AgentLoop:
                 bool(assistant_content_parts) and not continued_assistant_content
             ) or mid_stream_partial_streamed
             mid_stream_partial_streamed = False
-            await self._record_outgoing_audit_messages(
+            await self._commit_context_delivery(
                 ctx,
-                pending_audit_messages,
+                audit_messages=pending_audit_messages,
+                projection_decisions=projected_model.decisions,
                 on_token=on_token,
             )
+            # Preserve accepted renderings within the turn without persisting
+            # full-transcript snapshots before inference.
+            from cognis.core.injection_replay import freeze_rendered_tools
+
+            if projected_model.decisions:
+                from cognis.core.context_projection import apply_projection_decisions
+
+                messages[:] = apply_projection_decisions(messages, projected_model.decisions)
+            freeze_rendered_tools(messages, model_messages)
             stream_activity_seen = False
             stream_idle_stats = LLMStreamIdleStats()
             from cognis.core.tool_preparation import ToolPreparationBudget
@@ -9911,7 +10363,8 @@ class AgentLoop:
                             },
                         )
                 llm_call_kwargs = dict(llm_kwargs)
-                llm_call_kwargs["max_retries"] = 0
+                if not hasattr(self.providers.llm, "inference_recovery"):
+                    llm_call_kwargs["max_retries"] = 0
                 if anthropic_native_chain is not None:
                     llm_call_kwargs.update(anthropic_native_chain)
                     llm_call_kwargs[NATIVE_CONTINUATION_REQUIRED_KWARG] = (
@@ -9922,6 +10375,298 @@ class AgentLoop:
                         # request must not expose it once the controller enters
                         # text-only finalization.
                         llm_call_kwargs["tool_choice"] = "none"
+                initial_decoder = AgentInferenceDecoder(
+                    current_model,
+                    current_provider_id,
+                    model_info,
+                    exposure,
+                    exposure_contract,
+                    effective_discovery_mode,
+                    projected_model,
+                    anthropic_native_chain,
+                    anthropic_native_chain_fingerprint,
+                    reasoning_mode,
+                )
+                initial_request_kwargs = dict(llm_call_kwargs)
+
+                async def prepare_candidate(
+                    candidate: Any,
+                    initial_decoder: AgentInferenceDecoder = initial_decoder,
+                    model_messages: list[dict[str, Any]] = model_messages,
+                    initial_request_kwargs: dict[str, Any] = initial_request_kwargs,
+                    effective_tools: Any = _effective_tools,
+                    continuation_required: bool = anthropic_native_continuation_required,
+                    runtime_fallbacks: Any = apply_runtime_tool_fallbacks,
+                    candidate_inventory_tools: list[ToolDefinition] = candidate_inventory_tools,
+                    default_visible_tool_ids: set[str] = default_visible_tool_ids,
+                    allow_tool_search: bool = allow_tool_search,
+                    candidate_base_kwargs: dict[str, Any] = candidate_base_kwargs,
+                    frozen_executor_id: Any = frozen_executor_id,
+                    reasoning_effort: Any = reasoning_effort,
+                    prepare_anthropic_chain: Any = prepare_anthropic_chain,
+                    registry: Any = registry,
+                    force_summary_mode: bool = _force_summary_mode,
+                ) -> PreparedInference:
+                    target = candidate.target
+                    if (target.model, target.provider_id) == (
+                        initial_decoder.model,
+                        initial_decoder.provider_id,
+                    ):
+                        return PreparedInference(
+                            model_messages,
+                            {
+                                **initial_request_kwargs,
+                                "tools": effective_tools,
+                                "cache_breakpoint_index": initial_decoder.projected.cache_breakpoints,
+                                "cognis_openai_apply_patch_tool_type": initial_decoder.exposure_contract.native_apply_patch_tool_type,
+                            },
+                            initial_decoder,
+                        )
+                    if continuation_required or any(
+                        message.get(key)
+                        for message in messages
+                        for key in (
+                            "responses_output_items",
+                            "_responses_output_items",
+                            "anthropic_thinking_blocks",
+                            "_anthropic_thinking_blocks",
+                            "anthropic_native_envelope",
+                            "_anthropic_native_envelope",
+                        )
+                    ):
+                        if (
+                            target.model != initial_decoder.model
+                            or initial_decoder.native_chain is None
+                            or not callable(prepare_anthropic_chain)
+                        ):
+                            raise IncompatibleCandidate("History requires its native provider")
+                        # Preserve the exact projection/tool contract for native
+                        # replay. Only the account and its credentials may change.
+                        info = await self.providers.llm.get_model_info(
+                            target.model,
+                            provider_id=target.provider_id,
+                            acting_user_email=ctx.session.user_email,
+                        )
+                        frozen_bundle = initial_decoder.native_chain[NATIVE_TOOL_BUNDLE_KWARG]
+                        from cognis.providers.llm.cache_policy import (
+                            apply_cache_ttl,
+                            cache_breakpoints,
+                        )
+
+                        target_ttl = self._model_cache_ttl(ctx, info)
+                        target_tools = copy.deepcopy(initial_decoder.exposure.tools)
+                        target_kwargs = copy.deepcopy(initial_request_kwargs)
+                        apply_cache_ttl(target_tools, target_ttl)
+                        apply_cache_ttl(target_kwargs, target_ttl)
+                        canonical_ids = {
+                            binding["canonical_name"]: binding["stable_id"]
+                            for binding in frozen_bundle["bindings"]
+                        }
+                        stable_ids = {
+                            visible: canonical_ids[
+                                initial_decoder.exposure.alias_map.get(visible, visible)
+                            ]
+                            for schema in initial_decoder.exposure.tools
+                            if isinstance(schema.get("function"), dict)
+                            and isinstance(visible := schema["function"].get("name"), str)
+                        }
+                        chain = await prepare_anthropic_chain(
+                            model=target.model,
+                            model_info=info,
+                            provider_id=target.provider_id,
+                            acting_user_email=ctx.session.user_email,
+                            tools=target_tools,
+                            alias_map=dict(initial_decoder.exposure.alias_map),
+                            stable_id_map=stable_ids,
+                            argument_alias_map=dict(initial_decoder.exposure.argument_alias_map),
+                            thinking=initial_request_kwargs.get("thinking"),
+                            request_kwargs=target_kwargs,
+                        )
+                        replay = prepare_native_account_replay(
+                            model_messages,
+                            initial_decoder.native_chain,
+                            chain,
+                            continuation_required=continuation_required,
+                        )
+                        apply_cache_ttl(replay, target_ttl)
+                        assert chain is not None
+                        return PreparedInference(
+                            replay,
+                            {
+                                **target_kwargs,
+                                **chain,
+                                NATIVE_CONTINUATION_REQUIRED_KWARG: continuation_required,
+                                "tools": target_tools,
+                                "cache_breakpoint_index": cache_breakpoints(
+                                    initial_decoder.projected.cache_breakpoints, target_ttl
+                                ),
+                                "cognis_openai_apply_patch_tool_type": initial_decoder.exposure_contract.native_apply_patch_tool_type,
+                            },
+                            replace(
+                                initial_decoder,
+                                provider_id=target.provider_id,
+                                model_info=info,
+                                native_chain=chain,
+                            ),
+                        )
+                    info = await self.providers.llm.get_model_info(
+                        target.model,
+                        provider_id=target.provider_id,
+                        acting_user_email=ctx.session.user_email,
+                    )
+                    if callable(runtime_fallbacks):
+                        info = runtime_fallbacks(
+                            info, provider_id=target.provider_id, model_id=target.model
+                        )
+                    if info.context_window <= 0:
+                        raise IncompatibleCandidate("Unknown candidate context capacity")
+                    contract = await self.providers.llm.resolve_tool_exposure_contract(
+                        model_id=target.model,
+                        model_info=info,
+                        provider_id=target.provider_id,
+                        allow_tool_search=allow_tool_search,
+                    )
+                    inventory = filter_edit_tools_for_model(
+                        candidate_inventory_tools, getattr(info, "model_id", None)
+                    )
+                    candidate_exposure = prepare_tool_exposure(
+                        inventory_tools=inventory,
+                        controller_tool_schemas=controller_tool_schemas,
+                        model_info=info,
+                        contract=contract,
+                        promoted_tool_ids=promoted_tool_ids,
+                        default_visible_tool_ids=default_visible_tool_ids,
+                        allow_tool_search=allow_tool_search,
+                        anthropic_cache_ttl=self._model_cache_ttl(ctx, info),
+                    )
+                    candidate_exposure.alias_map.update(controller_tool_exposure.alias_map)
+                    renderer = getattr(context_result, "candidate_renderer", None)
+                    canonical = getattr(context_result, "canonical_messages", None)
+                    source_messages = (
+                        canonical + messages[len(context_result.messages) :]
+                        if canonical is not None
+                        else messages
+                    )
+                    source = await renderer(source_messages, info) if renderer else source_messages
+                    candidate_ctx = copy.copy(ctx)
+                    candidate_ctx.current_model = target.model
+                    candidate_ctx.current_provider_id = target.provider_id
+                    candidate_ctx.current_model_info = info
+                    projected = await self._project_model_messages_for_budget_offloaded(
+                        candidate_ctx,
+                        messages=source,
+                        tool_schemas=candidate_exposure.tools,
+                        resolved_model=target.model,
+                        max_context_tokens=info.context_window,
+                        cache_breakpoint_index=cache_breakpoint,
+                        anthropic_cache_ttl=self._model_cache_ttl(ctx, info),
+                    )
+                    if (
+                        projected.snapshot is not None
+                        and projected.snapshot.prompt_tokens
+                        > projected.snapshot.available_prompt_tokens
+                    ):
+                        raise IncompatibleCandidate("Candidate cannot fit request context")
+                    candidate_messages = projected.messages
+                    if str(contract.llm_api).lower() == "responses":
+                        candidate_messages = _reattach_responses_output_items(
+                            candidate_messages, source
+                        )
+                    else:
+                        candidate_messages = _reattach_anthropic_thinking_blocks(
+                            candidate_messages, source
+                        )
+                        candidate_messages = _reattach_anthropic_native_envelopes(
+                            candidate_messages, source
+                        )
+                    discovery = _effective_tool_discovery_mode(candidate_exposure)
+                    if discovery == ToolDiscoveryMode.CONTROLLER_SEARCH:
+                        candidate_messages = _project_hidden_history_calls_through_bridge(
+                            candidate_messages,
+                            inventory_tools=inventory,
+                            visible_tool_ids=candidate_exposure.visible_tool_ids,
+                        )
+                    request_kwargs = {**candidate_base_kwargs, **candidate_exposure.request_kwargs}
+                    if frozen_executor_id:
+                        request_kwargs["_cognis_executor_affinity_id"] = frozen_executor_id
+                    candidate_reasoning = reasoning_mode_for_model(
+                        target.model, model_info=info, requested_effort=reasoning_effort
+                    )
+                    chain = None
+                    fingerprint = None
+                    if callable(prepare_anthropic_chain):
+                        stable_ids = {
+                            schema["function"]["name"]: (
+                                _tool_id_for_call(
+                                    candidate_exposure.alias_map.get(
+                                        schema["function"]["name"], schema["function"]["name"]
+                                    ),
+                                    registry,
+                                )
+                                or f"controller:{schema['function']['name']}"
+                            )
+                            for schema in candidate_exposure.tools
+                            if isinstance(schema.get("function"), dict)
+                        }
+                        chain = await prepare_anthropic_chain(
+                            model=target.model,
+                            model_info=info,
+                            provider_id=target.provider_id,
+                            acting_user_email=ctx.session.user_email,
+                            tools=candidate_exposure.tools,
+                            alias_map=dict(candidate_exposure.alias_map),
+                            stable_id_map=stable_ids,
+                            argument_alias_map=dict(candidate_exposure.argument_alias_map),
+                            thinking=request_kwargs.get("thinking"),
+                            request_kwargs=dict(request_kwargs),
+                        )
+                        if chain is not None:
+                            fingerprint = _anthropic_exposure_fingerprint(
+                                candidate_exposure,
+                                request_kwargs.get("cognis_anthropic_server_tools"),
+                            )
+                            request_kwargs.update(chain)
+                            request_kwargs[NATIVE_CONTINUATION_REQUIRED_KWARG] = False
+                    if force_summary_mode:
+                        request_kwargs["tool_choice"] = "none"
+                    await self._commit_context_delivery(
+                        candidate_ctx,
+                        audit_messages=[],
+                        projection_decisions=projected.decisions,
+                        on_token=on_token,
+                    )
+                    if projected.decisions:
+                        from cognis.core.context_projection import apply_projection_decisions
+
+                        messages[:] = apply_projection_decisions(messages, projected.decisions)
+                    return PreparedInference(
+                        candidate_messages,
+                        {
+                            **request_kwargs,
+                            "tools": None if force_summary_mode else candidate_exposure.tools,
+                            "cache_breakpoint_index": projected.cache_breakpoints,
+                            "cognis_openai_apply_patch_tool_type": contract.native_apply_patch_tool_type,
+                        },
+                        AgentInferenceDecoder(
+                            target.model,
+                            target.provider_id,
+                            info,
+                            candidate_exposure,
+                            contract,
+                            discovery,
+                            projected,
+                            chain,
+                            fingerprint,
+                            candidate_reasoning,
+                            candidate_ctx.projection_state,
+                        ),
+                    )
+
+                if hasattr(self.providers.llm, "inference_recovery"):
+                    llm_call_kwargs["cognis_prepare_candidate"] = prepare_candidate
+                    llm_call_kwargs["cognis_stream_idle_timeout_seconds"] = (
+                        llm_stream_idle_timeout_seconds
+                    )
                 # Last check before spending an LLM call on a projection that
                 # may have been computed under a lost fence.
                 self._raise_if_cancelled(ctx)
@@ -9942,12 +10687,61 @@ class AgentLoop:
                     cognis_openai_apply_patch_tool_type=exposure_contract.native_apply_patch_tool_type,
                     **llm_call_kwargs,
                 )
+                decoder = None
                 async for chunk in _iterate_llm_stream_with_idle_timeout(
                     stream,
                     idle_timeout_seconds=llm_stream_idle_timeout_seconds,
                     stats=stream_idle_stats,
                     cancel_event=ctx.cancel_event,
+                    monitor_idle=not hasattr(self.providers.llm, "inference_recovery"),
                 ):
+                    if "_inference_selection" in chunk:
+                        selected = chunk["_inference_selection"]
+                        decoder = selected.get("decoder")
+                        if isinstance(decoder, AgentInferenceDecoder):
+                            current_model = decoder.model
+                            current_provider_id = decoder.provider_id
+                            model_info = decoder.model_info
+                            exposure = decoder.exposure
+                            exposure_contract = decoder.exposure_contract
+                            effective_discovery_mode = decoder.discovery_mode
+                            projected_model = decoder.projected
+                            anthropic_native_chain = decoder.native_chain
+                            anthropic_native_chain_fingerprint = decoder.native_fingerprint
+                            ctx.current_model = current_model
+                            ctx.current_provider_id = current_provider_id
+                            ctx.current_model_info = model_info
+                            ctx.runtime_info["inference_target"] = {
+                                key: value for key, value in selected.items() if key != "decoder"
+                            }
+                            if decoder.reasoning_mode is not None:
+                                ctx.runtime_info["reasoning_mode"] = decoder.reasoning_mode
+                            self.session_cache.update_tool_runtime_info(
+                                ctx.session.session_id,
+                                {
+                                    **tool_runtime_info,
+                                    **ctx.runtime_info,
+                                    "resolved_model": current_model,
+                                    "resolved_provider_id": current_provider_id,
+                                },
+                            )
+                            await self.session_cache.persist_runtime_metadata(
+                                ctx.session.session_id
+                            )
+                            await self._store_context_usage_snapshot(
+                                ctx,
+                                snapshot=projected_model.snapshot,
+                                provider_id=current_provider_id,
+                            )
+                        continue
+                    committed_output_seen = committed_output_seen or commits_output(chunk)
+                    if (
+                        isinstance(decoder, AgentInferenceDecoder)
+                        and decoder.projection_state is not None
+                    ):
+                        # Buffered preludes only escape recovery once that attempt
+                        # commits output (or completes successfully with no output).
+                        ctx.projection_state = decoder.projection_state
                     if (
                         pending_retry_notice_id
                         and not chunk.get("mid_stream_failure")
@@ -10046,6 +10840,10 @@ class AgentLoop:
                                 ctx.current_turn_cycle_index,
                             )
                 generation_completed = not mid_stream_error
+                if generation_completed:
+                    # A completed provider cycle proves recovery made progress.
+                    # Count only rotations without a successful model call.
+                    ctx.compaction_recursion_depth = 0
             except OpenAIToolSearchFallbackRequired as exc:
                 if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
                     raise
@@ -10171,25 +10969,45 @@ class AgentLoop:
                 break
             except Exception as exc:
                 if not is_context_overflow_error(exc):
-                    raise
-                llm_status = "context_overflow"
-                step_output = await self._recover_from_context_overflow(
-                    ctx,
-                    context_result=context_result,
-                    provider_id=current_provider_id,
-                    model_id=current_model,
-                    reason="context_overflow",
-                    error_type=type(exc).__name__,
-                    assistant_content_parts=assistant_content_parts,
-                    collected_attachments=collected_attachments,
-                    on_token=on_token,
-                    on_thinking=on_thinking,
-                    on_tool_call=on_tool_call,
-                    on_tool_result=on_tool_result,
-                )
-                if step_output is not None and step_output.metadata.get("finalized_by_recovery"):
-                    ctx.finalized_by_recovery = True
-                break
+                    normalized = classify_llm_exception(exc)
+                    raw_rejection = rejected_tool_name(str(exc))
+                    normalized_rejection = rejected_tool_name(str(normalized.get("message") or ""))
+                    if raw_rejection is None and normalized_rejection is None:
+                        raise
+                    mid_stream_error = str(exc)
+                    mid_stream_error_details = normalized
+                    if normalized_rejection is None:
+                        mid_stream_error_details = {
+                            **normalized,
+                            "message": str(exc)[:500],
+                        }
+                    llm_status = "provider_error"
+                    LLM_MID_STREAM_ERRORS_TOTAL.labels(
+                        provider_id=current_provider_id or "default",
+                        model=current_model or "unknown",
+                        category=str(mid_stream_error_details.get("category") or "invalid_request"),
+                    ).inc()
+                else:
+                    llm_status = "context_overflow"
+                    step_output = await self._recover_from_context_overflow(
+                        ctx,
+                        context_result=context_result,
+                        provider_id=current_provider_id,
+                        model_id=current_model,
+                        reason="context_overflow",
+                        error_type=type(exc).__name__,
+                        assistant_content_parts=assistant_content_parts,
+                        collected_attachments=collected_attachments,
+                        on_token=on_token,
+                        on_thinking=on_thinking,
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
+                    )
+                    if step_output is not None and step_output.metadata.get(
+                        "finalized_by_recovery"
+                    ):
+                        ctx.finalized_by_recovery = True
+                    break
 
             finally:
                 if pending_retry_notice_id:
@@ -10263,6 +11081,111 @@ class AgentLoop:
                         on_tool_result=on_tool_result,
                     )
                     break
+                rejected_name = rejected_tool_name(
+                    str((mid_stream_error_details or {}).get("message") or mid_stream_error)
+                )
+                if (
+                    rejected_name is not None
+                    and len(rejected_tool_names) < MAX_REJECTIONS_PER_TURN
+                    and rejected_name not in rejected_tool_names
+                ):
+                    repair = plan_rejection_repair(
+                        rejected_name,
+                        inventory=cast(list[NativeToolDefinition], searchable_inventory_tools),
+                        aliases=dict(exposure.alias_map),
+                        visible_tool_ids=set(exposure.visible_tool_ids),
+                        seen_names=rejected_tool_names,
+                    )
+                    if repair is not None:
+                        rejected_tool_names.add(rejected_name)
+                        handles: list[dict[str, Any]] = []
+                        if repair.promoted_tool_id is not None:
+                            target_tool = next(
+                                (
+                                    tool
+                                    for tool in searchable_inventory_tools
+                                    if stable_tool_id(tool) == repair.promoted_tool_id
+                                ),
+                                None,
+                            )
+                            matched = search_inventory(
+                                cast(list[NativeToolDefinition], searchable_inventory_tools),
+                                target_tool.name
+                                if target_tool is not None
+                                else repair.rejected_name,
+                                limit=20,
+                            )
+                            handles = [
+                                dict(match["handle"])
+                                for match in matched
+                                if match.get("tool_id") == repair.promoted_tool_id
+                                and isinstance(match.get("handle"), dict)
+                            ]
+                            discovered_at = datetime.now(UTC).isoformat()
+                            for handle in handles:
+                                handle["discovered_at"] = discovered_at
+                            store_discovered = getattr(
+                                self.session_cache, "store_discovered_tool_handles", None
+                            )
+                            if handles and callable(store_discovered):
+                                store_discovered(
+                                    ctx.session.session_id, handles, discovered_at=discovered_at
+                                )
+                        messages.append({"role": "system", "content": repair.note})
+                        _queue_audit_message(
+                            role="developer",
+                            source="tool_rejection_recovery",
+                            content=repair.note,
+                        )
+                        events_to_record.append(
+                            SessionEvent(
+                                type="lifecycle",
+                                data={
+                                    "event": "tool_rejection_recovered",
+                                    "rejected_name": rejected_name[:160],
+                                    "promoted_tool_id": repair.promoted_tool_id,
+                                },
+                            )
+                        )
+                        if handles:
+                            events_to_record.append(
+                                SessionEvent(
+                                    type="lifecycle",
+                                    data={
+                                        "event": "tool_discovery",
+                                        "source_tool": "provider_tool_rejection_recovery",
+                                        "reason": "provider_rejected_hidden_authorized_tool",
+                                        "handles": handles,
+                                    },
+                                )
+                            )
+                        if accumulator.get_content():
+                            mid_stream_partial_streamed = True
+                            events_to_record.append(
+                                SessionEvent(
+                                    type="lifecycle",
+                                    data={
+                                        "event": "assistant_message_aborted",
+                                        "partial_length": len(accumulator.get_content()),
+                                    },
+                                )
+                            )
+                        retry_projected_model = None
+                        if hasattr(self.session_cache, "discard_incomplete_active_thinking"):
+                            with contextlib.suppress(Exception):
+                                self.session_cache.discard_incomplete_active_thinking(
+                                    ctx.session.session_id
+                                )
+                        if events_to_record:
+                            await self._flush_events_incremental(
+                                ctx,
+                                events_to_record,
+                                reason="tool_rejection_recovery",
+                                on_token=on_token,
+                            )
+                        visible_chunk_seen = False
+                        mid_stream_retries = 0
+                        continue
                 transcript_mutated_for_retry = False
                 error_category = _mid_stream_reason_class(mid_stream_error_details, "other")
                 artifact_fetch_failures = _artifact_failures_from_error_payload(
@@ -10345,6 +11268,11 @@ class AgentLoop:
                     failure_notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
                     if failure_notice:
                         messages.append({"role": "system", "content": failure_notice})
+                        _queue_audit_message(
+                            role="developer",
+                            source="artifact_fetch_failure",
+                            content=failure_notice,
+                        )
                 if error_category in _RECOVERY_NON_RETRYABLE_CATEGORIES or (
                     error_category in _TRANSCRIPT_PROGRESS_REQUIRED_CATEGORIES
                     and not transcript_mutated_for_retry
@@ -10356,6 +11284,13 @@ class AgentLoop:
                 provider_retry_after_seconds = _mid_stream_provider_retry_after_seconds(
                     mid_stream_error_details
                 )
+                if (
+                    hasattr(self.providers.llm, "inference_recovery")
+                    and not transcript_mutated_for_retry
+                ):
+                    # Transport recovery already spent its bounded allowance.
+                    # Only actual transcript repair may restart the agent cycle.
+                    llm_stream_max_retries_for_error = 0
                 retry_after_exceeds_inline_cap = (
                     provider_retry_after_seconds is not None
                     and provider_retry_after_seconds > _MAX_RETRY_AFTER_SLEEP_SECONDS
@@ -10516,6 +11451,10 @@ class AgentLoop:
                 successor_eligible = (
                     _should_continue_after_exhausted_mid_stream_failure(mid_stream_error_details)
                     and not retry_after_exceeds_inline_cap
+                    and (
+                        not hasattr(self.providers.llm, "inference_recovery")
+                        or committed_output_seen
+                    )
                 )
                 if successor_eligible and continuation_count < max_continuations:
                     if is_idle_timeout_failure:
@@ -10579,7 +11518,6 @@ class AgentLoop:
                         "or repeat already completed tool calls unless required information is "
                         "missing. Continue from the current state and finish with a normal assistant response."
                     )
-                    continuation_reminder_index = len(messages)
                     messages.append({"role": "system", "content": continuation_prompt})
                     pending_audit_messages = []
                     _queue_audit_message(
@@ -10833,20 +11771,11 @@ class AgentLoop:
                             )
                         )
 
-            content = continued_assistant_content + accumulator.get_content()
+            response_content = accumulator.get_content()
+            is_output_continuation = bool(continued_assistant_content)
+            content = continued_assistant_content + response_content
             raw_tool_calls = accumulator.get_tool_calls()
             responses_output_items = accumulator.get_responses_output_items()
-            if continuation_message_index is not None:
-                previous_continuation_message = messages[continuation_message_index]
-                previous_responses_output_items = previous_continuation_message.get(
-                    RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD
-                )
-                if isinstance(previous_responses_output_items, list):
-                    responses_output_items = [
-                        dict(item)
-                        for item in previous_responses_output_items
-                        if isinstance(item, dict)
-                    ] + [dict(item) for item in responses_output_items if isinstance(item, dict)]
             anthropic_thinking_blocks = accumulator.get_anthropic_thinking_blocks()
             anthropic_native_envelope = accumulator.get_anthropic_native_envelope()
             anthropic_native_continuation_required = False
@@ -10978,15 +11907,6 @@ class AgentLoop:
                     ) = failed_tool_call_by_id.get(raw_tool_call.call_id)
                     if parsed_failed_entry is not None:
                         all_emitted_tool_calls.append(parsed_failed_entry[1])
-            if continuation_reminder_index is not None and continuation_reminder_index < len(
-                messages
-            ):
-                reminder_message = messages[continuation_reminder_index]
-                if reminder_message.get("role") == "system":
-                    reminder_message["content"] = (
-                        "[Continuation reminder superseded; no-op placeholder retained to preserve transcript indices.]"
-                    )
-                continuation_reminder_index = None
             for _tc_index, tc in enumerate(tool_calls):
                 if ctx.current_turn_cycle_index is not None:
                     tc.runtime_metadata["turn_cycle_index"] = ctx.current_turn_cycle_index
@@ -11178,38 +12098,6 @@ class AgentLoop:
                 )
                 continue
 
-            if finish_reason == "length" and not tool_calls:
-                continuation_message = {"role": "assistant", "content": content}
-                _attach_responses_output_items(
-                    continuation_message,
-                    responses_output_items,
-                    durable=False,
-                )
-                if continuation_message_index is None:
-                    continuation_message_index = len(messages)
-                    messages.append(continuation_message)
-                else:
-                    messages[continuation_message_index] = continuation_message
-                continued_assistant_content = content
-                continuation_reminder_index = len(messages)
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Internal controller reminder — the previous response hit the output "
-                            "limit. Continue exactly from where you left off. Do not repeat or "
-                            "restart prior text."
-                        ),
-                    }
-                )
-                pending_audit_messages = []
-                _queue_audit_message(
-                    role="developer",
-                    source="follow_up_boundary",
-                    content=str(messages[continuation_reminder_index]["content"]),
-                )
-                continue
-
             current_assistant_message_index: int | None = None
 
             stale_session_output = await self._stale_session_step_output(
@@ -11233,7 +12121,8 @@ class AgentLoop:
             # per-cycle assistant event.
             if content:
                 _assistant_event_data_main: dict[str, Any] = {
-                    "content": content,
+                    "content": response_content,
+                    "content_is_delta": is_output_continuation,
                     "turn_id": ctx.turn_id,
                     "message_id": ctx.turn_id,
                     "assistant_phase_index": ctx.get_current_assistant_phase()
@@ -11268,45 +12157,25 @@ class AgentLoop:
                         else 0
                     )
                     assistant_content_by_phase[assistant_phase_index] = content
-                    if continuation_message_index is not None:
-                        current_assistant_message_index = continuation_message_index
-                        assistant_message = {"role": "assistant", "content": content}
-                        _attach_anthropic_thinking_blocks(
-                            assistant_message, anthropic_thinking_blocks
-                        )
-                        _attach_anthropic_native_envelope(
-                            assistant_message, anthropic_native_envelope, durable=False
-                        )
-                        _attach_responses_output_items(
-                            assistant_message,
-                            responses_output_items,
-                            durable=False,
-                        )
-                        messages[continuation_message_index] = assistant_message
-                    else:
-                        current_assistant_message_index = len(messages)
-                        assistant_message = {"role": "assistant", "content": content}
-                        _attach_anthropic_thinking_blocks(
-                            assistant_message, anthropic_thinking_blocks
-                        )
-                        _attach_anthropic_native_envelope(
-                            assistant_message, anthropic_native_envelope, durable=False
-                        )
-                        _attach_responses_output_items(
-                            assistant_message,
-                            responses_output_items,
-                            durable=False,
-                        )
-                        messages.append(assistant_message)
-                    assistant_content_parts.append(content)
+                    current_assistant_message_index = len(messages)
+                    assistant_message = {"role": "assistant", "content": response_content}
+                    _attach_anthropic_thinking_blocks(assistant_message, anthropic_thinking_blocks)
+                    _attach_anthropic_native_envelope(
+                        assistant_message, anthropic_native_envelope, durable=False
+                    )
+                    _attach_responses_output_items(
+                        assistant_message, responses_output_items, durable=False
+                    )
+                    messages.append(assistant_message)
+                    if finish_reason != "length":
+                        assistant_content_parts.append(content)
                     last_assistant_content = content
                     continued_assistant_content = ""
-                    continuation_message_index = None
                 memory_text = merge_content_and_attachment_note(
                     content,
                     [],
                 )
-                if memory_text.strip():
+                if memory_text.strip() and finish_reason != "length":
                     assistant_memory_parts.append(memory_text)
                 await self._flush_events_incremental(
                     ctx,
@@ -11314,6 +12183,25 @@ class AgentLoop:
                     reason="assistant_message",
                     on_token=on_token,
                 )
+
+            if finish_reason == "length" and not tool_calls:
+                continued_assistant_content = content
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Internal controller reminder — the previous response hit the output "
+                            "limit. Continue exactly from where you left off. Do not repeat or "
+                            "restart prior text."
+                        ),
+                    }
+                )
+                _queue_audit_message(
+                    role="developer",
+                    source="follow_up_boundary",
+                    content=str(messages[-1]["content"]),
+                )
+                continue
 
             # No tool calls — check if step is complete
             if not all_emitted_tool_calls:
@@ -11409,6 +12297,11 @@ class AgentLoop:
                                     "the step. Generic rich or text output cannot complete it."
                                 ),
                             }
+                        )
+                        _queue_audit_message(
+                            role="developer",
+                            source="daily_brief_completion",
+                            content=str(messages[-1]["content"]),
                         )
                         continue
 
@@ -12098,7 +12991,16 @@ class AgentLoop:
                         ctx.current_turn_cycle_index,
                     )
 
-                if _is_delegated_child_context(ctx) and tc.name in _DELEGATED_CHILD_FORBIDDEN_TOOLS:
+                if _is_delegated_child_context(ctx) and (
+                    tc.name in _DELEGATED_CHILD_FORBIDDEN_TOOLS
+                    or (
+                        tc.name in {STEP_REQUEST_QUESTIONS, CONTROLLER_TOOL_REQUEST_USER_INPUT}
+                        and not (
+                            ctx.interaction_mode == "step_requests"
+                            and ctx.step_definition.allow_questions
+                        )
+                    )
+                ):
                     _append_tool_call_event(
                         events_to_record,
                         tc,
@@ -12403,14 +13305,14 @@ class AgentLoop:
                             loaded_project_context
                         )
                         content_hash = loaded_project_context.content_hash
-                        if content_hash and content_hash not in queued_project_context_hashes:
+                        if (
+                            content_hash
+                            and loaded_project_context.content
+                            and content_hash not in queued_project_context_hashes
+                        ):
                             queued_project_context_hashes.add(content_hash)
                             post_tool_system_messages.append(
-                                {
-                                    "role": "system",
-                                    "content": loaded_project_context.content,
-                                    "_project_context": True,
-                                }
+                                project_context_exposure_message(loaded_project_context.content)
                             )
                     elif loaded_project_context is not None:
                         HARNESS_GUARD_TRIPS.labels(guard="project_context", tool_name=tool_id).inc()
@@ -12449,14 +13351,14 @@ class AgentLoop:
                             }
                         )
                         content_hash = loaded_project_context.content_hash
-                        if content_hash and content_hash not in queued_project_context_hashes:
+                        if (
+                            content_hash
+                            and loaded_project_context.content
+                            and content_hash not in queued_project_context_hashes
+                        ):
                             queued_project_context_hashes.add(content_hash)
                             post_tool_system_messages.append(
-                                {
-                                    "role": "system",
-                                    "content": loaded_project_context.content,
-                                    "_project_context": True,
-                                }
+                                project_context_exposure_message(loaded_project_context.content)
                             )
                         _append_tool_result_event(
                             events_to_record, tc, rejection_payload, True, tool_id=tool_id
@@ -12891,13 +13793,7 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    daily_brief_activation = resolve_daily_brief_contract(
-                        task_title=ctx.task_title,
-                        task_description=ctx.task_description,
-                        task_expected_output=ctx.task_expected_output,
-                        loaded_skill_names=ctx.loaded_skill_names,
-                        loaded_skill_snapshots=ctx.loaded_skill_snapshots,
-                    )
+                    daily_brief_activation = self._effective_daily_brief_activation(ctx)
                     strict_daily_brief = (
                         daily_brief_activation is not None
                         and daily_brief_activation.version >= CURRENT_DAILY_BRIEF_CONTRACT_VERSION
@@ -12916,6 +13812,28 @@ class AgentLoop:
                                 else None
                             ),
                         )
+                    except DeliverableRevisionError as exc:
+                        err_content = json.dumps(exc.to_tool_result())
+                        messages.append(
+                            _tool_result_message(tc, err_content, protected=True, is_error=True)
+                        )
+                        _append_tool_result_event(
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:write_deliverable",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
                     except (DeliverableAuthoringError, RichPayloadValidationError) as exc:
                         cause = (
                             {
@@ -12999,6 +13917,9 @@ class AgentLoop:
                             "status": "buffered",
                             "deliverable_id": deliverable.deliverable_id,
                             "version": deliverable.version,
+                            "lineage_id": deliverable.lineage_id,
+                            "revision": deliverable.revision,
+                            "supersedes": deliverable.supersedes_deliverable_id,
                             "length": len(deliverable.content),
                             "format": deliverable.format,
                             "scope": "step" if deliverable.step_run_id else "conversation",
@@ -13505,6 +14426,48 @@ class AgentLoop:
                     previous_executor_id = getattr(ctx, "active_executor_id", None)
                     switched_target: Any = None
                     target = pool.by_id(target_executor_id_arg.strip())
+                    replacement_registry = None
+                    connection = None
+                    if target is not None and target.usable:
+                        connection = self._resolve_target_connection(
+                            target_executor_id=target.executor_id,
+                            target_executor_type=target.executor_type,
+                        )
+                        try:
+                            if len(tool_calls) != 1:
+                                raise RuntimeError(
+                                    "Executor switch requires a standalone tool call"
+                                )
+                            if connection is None or ctx.rebuild_tool_registry is None:
+                                raise RuntimeError("Executor inventory rebuild unavailable")
+                            replacement_registry = await ctx.rebuild_tool_registry(connection)
+                        except Exception:
+                            err_content = json.dumps(
+                                {
+                                    "status": "error",
+                                    "reason": "inventory_unavailable",
+                                    "detail": "Call switch_executor alone; target inventory must be ready.",
+                                    "executor_id": target.executor_id,
+                                }
+                            )
+                            messages.append(
+                                _tool_result_message(tc, err_content, protected=True, is_error=True)
+                            )
+                            _append_tool_result_event(
+                                events_to_record, tc, err_content, True, tool_id=tool_id
+                            )
+                            await self._flush_events_incremental(
+                                ctx,
+                                events_to_record,
+                                reason="tool_result:switch_executor",
+                                on_token=on_token,
+                            )
+                            if on_tool_result:
+                                await on_tool_result(
+                                    tc.call_id, tc.name, err_content, True, None, None
+                                )
+                            continue
+                        self._raise_if_cancelled(ctx)
                     if _is_delegated_child_context(ctx):
                         if (
                             target is not None
@@ -13512,6 +14475,8 @@ class AgentLoop:
                             and self._install_active_executor_target(
                                 ctx,
                                 target,
+                                replacement_registry=replacement_registry,
+                                expected_connection=connection,
                                 update_conversation=False,
                             )
                         ):
@@ -13576,7 +14541,12 @@ class AgentLoop:
                         is_error = outcome.status == "error"
                         result_content = json.dumps(outcome.to_tool_result())
                         if not is_error and outcome.target is not None:
-                            if self._install_active_executor_target(ctx, outcome.target):
+                            if self._install_active_executor_target(
+                                ctx,
+                                outcome.target,
+                                replacement_registry=replacement_registry,
+                                expected_connection=connection,
+                            ):
                                 switched_target = outcome.target
                             else:
                                 if isinstance(previous_executor_id, str) and previous_executor_id:
@@ -13599,11 +14569,12 @@ class AgentLoop:
                                         "executor_id": outcome.target.executor_id,
                                     }
                                 )
-                    if (
-                        not is_error
-                        and switched_target is not None
-                        and switched_target.executor_id != previous_executor_id
-                    ):
+                    if not is_error and switched_target is not None:
+                        inventory_ids = {
+                            stable_tool_id(tool) for tool in ctx.tool_registry.list_tools()
+                        }
+                        promoted_tool_ids.intersection_update(inventory_ids)
+                        activated_tool_ids.intersection_update(inventory_ids)
                         await self._refresh_executor_session_policy(ctx)
                     messages.append(_tool_result_message(tc, result_content, protected=True))
                     _append_tool_result_event(
@@ -13981,7 +14952,36 @@ class AgentLoop:
                             contract_version=daily_brief_activation.version,
                         )
                     ):
-                        current_deliverable = None
+                        payload = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "deliverable_invalid",
+                                "deliverable_id": current_deliverable.deliverable_id,
+                                "message": "The existing deliverable does not satisfy this step's "
+                                "Daily Brief contract. Validate and write a corrected rich:pulse "
+                                "deliverable, then retry step_complete.",
+                                "required_action": "write_deliverable_then_retry_step_complete",
+                            }
+                        )
+                        tool_call_count += 1
+                        _append_tool_call_event(
+                            events_to_record,
+                            tc,
+                            tool_id,
+                            visible_name=tool_call_visible_names.get(tc.call_id),
+                        )
+                        messages.append(
+                            _tool_result_message(tc, payload, protected=True, is_error=True)
+                        )
+                        _append_tool_result_event(
+                            events_to_record,
+                            tc,
+                            payload,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
+                        )
+                        continue
                     if (
                         ctx.step_definition.require_deliverable
                         or daily_brief_activation is not None
@@ -14499,6 +15499,75 @@ class AgentLoop:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
+                elif tc.name in {"answer_question", "forward_question"}:
+                    _append_tool_call_event(
+                        events_to_record,
+                        tc,
+                        tool_id,
+                        visible_name=tool_call_visible_names.get(tc.call_id),
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_call:{tc.name}",
+                        on_token=on_token,
+                    )
+                    _track_pending_tool_call(ctx, tc, tool_id=tool_id)
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
+                    try:
+                        kwargs = {
+                            "user_email": ctx.session.user_email,
+                            "conversation_id": ctx.conversation.conversation_id,
+                            "expected_revision": tc.arguments["expected_revision"],
+                        }
+                        if tc.name == "answer_question":
+                            changed = await self.notification_service.answer_question(
+                                tc.arguments["question_id"],
+                                answers=tc.arguments["answers"],
+                                **kwargs,
+                            )
+                        else:
+                            changed = await self.notification_service.forward_question(
+                                tc.arguments["question_id"], **kwargs
+                            )
+                        result = {
+                            "status": "answered" if tc.name == "answer_question" else "forwarded"
+                        }
+                        if not changed:
+                            result = {
+                                "error": "Question changed, expired, or is not assigned here."
+                            }
+                    except ValueError as exc:
+                        result = {"error": str(exc)}
+                    content = json.dumps(result)
+                    messages.append(_tool_result_message(tc, content))
+                    _append_tool_result_event(
+                        events_to_record, tc, content, "error" in result, tool_id=tool_id
+                    )
+                    _resolve_pending_tool_call(ctx, tc.call_id)
+                    await self._flush_events_incremental(
+                        ctx, events_to_record, reason=f"tool_result:{tc.name}", on_token=on_token
+                    )
+                    if on_tool_result:
+                        await on_tool_result(
+                            tc.call_id, tc.name, content, "error" in result, None, None
+                        )
+                    continue
+
                 elif tc.name == STEP_REQUEST_QUESTIONS:
                     _append_tool_call_event(
                         events_to_record,
@@ -14613,15 +15682,22 @@ class AgentLoop:
                     # Create the step question via the notification service
                     # so it is persisted, resolved to the source conversation,
                     # and survives restarts.
-                    await self.notification_service.create(
-                        notification_type="step_question",
+                    from cognis.core.questions import QuestionOrigin
+
+                    question_notification = await self.notification_service.create_question(
+                        origin=QuestionOrigin(
+                            conversation_id=ctx.conversation.conversation_id,
+                            session_id=ctx.session.session_id,
+                            agent_id=ctx.session.agent_id,
+                            tool_call_id=tc.call_id,
+                            tool_name=tc.name,
+                            task_id=ctx.task_id,
+                            step_name=ctx.step_definition.name,
+                            step_run_id=ctx.step_run_id or ctx.deliverable_step_run_id,
+                        ),
                         user_email=ctx.session.user_email,
-                        conversation_id=ctx.conversation.conversation_id,
-                        task_id=ctx.task_id,
-                        step_name=ctx.step_definition.name,
-                        step_run_id=ctx.step_run_id,
-                        session_id=ctx.session.session_id,
                         notification_id=pause_id,
+                        deliver=False,
                         payload={
                             "questions": questions,
                             "context": pause_context,
@@ -14635,7 +15711,11 @@ class AgentLoop:
 
                     await self._set_interactive_pause_state(
                         ctx,
-                        pause_type="step_input",
+                        pause_type=(
+                            "agent_question"
+                            if question_notification.notification_type == "agent_question"
+                            else "step_input"
+                        ),
                         pause_payload={
                             "pause_id": pause_id,
                             "step_name": ctx.step_definition.name,
@@ -14645,6 +15725,7 @@ class AgentLoop:
                             "context": pause_context,
                         },
                     )
+                    await self.notification_service.activate_question(pause_id)
                     try:
                         resolution = await self.notification_service.wait_for_resolution(
                             pause_id,
@@ -14675,6 +15756,12 @@ class AgentLoop:
                             await on_tool_result(
                                 tc.call_id, tc.name, resp_content, False, None, None
                             )
+                    except (asyncio.CancelledError, StepInterrupted, StaleTaskExecutionOwner):
+                        await self.notification_service.mark_orphaned(
+                            pause_id,
+                            reason="origin_execution_interrupted",
+                        )
+                        raise
                     except TimeoutError:
                         await self._clear_interactive_pause_state(ctx)
                         if self.notification_service is not None:
@@ -15169,11 +16256,12 @@ class AgentLoop:
                     discovered_at = datetime.now(UTC).isoformat()
                     discovered_handles: list[dict[str, Any]] = []
                     for match in matches:
-                        handle = match.get("handle")
-                        if not isinstance(handle, dict):
+                        handle_value = match.get("handle")
+                        if not isinstance(handle_value, Mapping):
                             continue
+                        handle = dict(handle_value)
                         handle["discovered_at"] = discovered_at
-                        discovered_handles.append(dict(handle))
+                        discovered_handles.append(handle)
                     store_discovered = getattr(
                         self.session_cache,
                         "store_discovered_tool_handles",
@@ -15444,7 +16532,16 @@ class AgentLoop:
                 prepared_regular_batch.clear()
 
             if post_tool_system_messages:
-                messages.extend(post_tool_system_messages)
+                # Project loading is persisted before tool execution, but the
+                # model sees these notices after the whole tool batch. Record
+                # that exposure separately at its actual transcript boundary.
+                for message in post_tool_system_messages:
+                    if message.get("_project_context"):
+                        message, audit = project_context_exposure(message)
+                        pending_audit_messages.append(audit)
+                    messages.append(message)
+
+            await self._record_tool_background_notices(ctx, on_token=on_token)
 
             if restart_llm_cycle:
                 continue
@@ -15466,7 +16563,7 @@ class AgentLoop:
                 resolved_model=resolved_model,
                 max_context_tokens=context_result.max_context_tokens,
                 cache_breakpoint_index=cache_breakpoint,
-                anthropic_cache_ttl=self.default_anthropic_cache_ttl,
+                anthropic_cache_ttl=self._model_cache_ttl(ctx, model_info),
             )
             post_tool_snapshot = post_tool_projection.snapshot
             await self._store_context_usage_snapshot(
@@ -15730,18 +16827,6 @@ class AgentLoop:
         ctx.pending_events = None
         ctx.pending_tool_calls.clear()
 
-        # Post-step prune: walk back over recent tool results and mark
-        # the older ones for clearance from the in-context view. The
-        # tool output store keeps originals recoverable via
-        # read_tool_output. This runs in the background so an empty or
-        # transient cache failure cannot delay the user-visible step
-        # completion.
-        import contextlib as _contextlib  # local import keeps top-of-file lean
-
-        with _contextlib.suppress(RuntimeError):
-            # ``RuntimeError`` is raised when no event loop is running
-            # (rare; e.g. a synchronous test harness). Silent best-effort.
-            asyncio.create_task(self._prune_tool_outputs_after_step(ctx))
         return step_output
 
     # ------------------------------------------------------------------
@@ -15755,6 +16840,8 @@ class AgentLoop:
         ctx: StepContext,
         events_to_record: list[SessionEvent],
         on_tool_result: ToolResultCallback | None,
+        *,
+        approval_refresh_allowed: bool = True,
     ) -> ToolResult:
         """If the tool was escalated, block and wait for user approval.
 
@@ -15767,11 +16854,25 @@ class AgentLoop:
         if not eval_meta or eval_meta.get("decision") != "escalate":
             return result
 
-        if ctx.interaction_mode == "none":
-            # A task without an approval channel must never turn an Intaris
+        from cognis.core.intaris_policy import approvals_unattended
+
+        task_interaction_mode_override = None
+        if ctx.task_id is not None and ctx.agent.capabilities.approval_mode == "unattended":
+            from cognis.store.queries import get_task
+
+            async with self.session_manager.session_factory() as db:
+                task_row = await get_task(db, ctx.task_id)
+            if task_row is not None:
+                task_interaction_mode_override = task_row.interaction_mode_override
+        if approvals_unattended(ctx.interaction_mode, ctx.agent, task_interaction_mode_override):
+            # An unattended task or agent must never turn an Intaris
             # escalation into a silent approval (or wait for a human).
+            reasoning = eval_meta.get("reasoning") or "Approval is required."
             return ToolResult(
-                output="Tool denied: escalation is disabled for this unattended task.",
+                output=(
+                    "Tool denied: this unattended session can't ask for approval, "
+                    f"and Intaris flagged it: {reasoning}"
+                ),
                 is_error=True,
                 metadata={
                     **(result.metadata or {}),
@@ -15913,6 +17014,20 @@ class AgentLoop:
             )
         )
 
+        from cognis.providers.guardrails.resolution_errors import stale_approval_result
+
+        stale_result = stale_approval_result(resolution.decision, resolution.data)
+        if stale_result is not None:
+            return ToolResult(
+                output=json.dumps(stale_result),
+                is_error=True,
+                metadata={
+                    **(result.metadata or {}),
+                    "evaluation": {**eval_meta, "resolution": "stale", "pending": False},
+                    "tool_status": "failed",
+                },
+            )
+
         if resolution.decision == "approve":
             logger.info(
                 "Escalation approved — re-executing tool",
@@ -15924,30 +17039,30 @@ class AgentLoop:
                     }
                 },
             )
-            # Re-execute: Intaris auto-approves via escalation retry (10 min)
-            retry_result = cast(
-                ToolResult,
-                await self.tool_router.execute(
-                    tc.model_copy(
-                        update={
-                            "runtime_metadata": {
-                                **self._tool_runtime_metadata_for_call(ctx, tc),
-                                "approval_call_id": intaris_call_id,
-                            }
-                        }
-                    ),
-                    ctx.session,
-                    ctx.agent,
-                    self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
-                    self._get_executor(ctx),
-                ),
+            # Re-evaluate the exact action with the authoritative approval receipt.
+            retry_result = await self.execute_controller_tool(
+                ctx,
+                tc,
+                approval_call_id=intaris_call_id,
             )
-            await self._sync_guardrails_terminal_result(ctx, retry_result)
             self._record_execution_evidence(ctx, tool_name=tc.name, result=retry_result)
             # If Intaris still escalates on retry (shouldn't happen), treat
             # as denied to avoid infinite loops.
             retry_eval = retry_result.metadata.get("evaluation") if retry_result.metadata else None
             if retry_eval and retry_eval.get("decision") == "escalate":
+                if retry_eval.get("conflict_code") == "stale_approval":
+                    if approval_refresh_allowed:
+                        # One fresh human approval within this handling attempt;
+                        # never reuse the expired receipt or recurse indefinitely.
+                        return await self._handle_escalation(
+                            retry_result,
+                            tc,
+                            ctx,
+                            events_to_record,
+                            on_tool_result,
+                            approval_refresh_allowed=False,
+                        )
+                    return retry_result
                 logger.warning(
                     "Escalation retry still escalated — treating as denied",
                     extra={
@@ -16740,30 +17855,76 @@ class AgentLoop:
                         todos=progress_todos,
                     )
 
-            output = await self._run_child_session(
-                child_session=child_session,
-                conversation=ctx.conversation,
-                agent=ctx.executor_agent or ctx.agent,
-                task_description=task_description,
-                parent_intaris_session_id=parent_intaris_id,
-                workspace_root=child_workspace_root,
-                working_directory=child_working_directory,
-                workspace_root_explicit=ctx.workspace_root_explicit,
-                working_directory_explicit=ctx.working_directory_explicit,
-                deliverable_step_run_id=ctx.step_run_id,
-                controller_tool_surface=ctx.controller_tool_surface,
-                on_tool_call=_child_tool_call_callback,
-                on_tool_result=_child_progress_callback,
-                parent_tool_call_id=tc.call_id,
-                parent_turn_id=ctx.turn_id,
-                parent_assistant_phase_index=parent_tool_phase,
-                parent_turn_cycle_index=parent_tool_cycle,
-                parent_session=ctx.session,
-                wait=wait,
-                delegation_started_at=delegation_started_at,
-                cancel_event=ctx.cancel_event,
-                execution_fence=ctx.execution_fence,
+            from cognis.core.questions import join_until_boundary
+
+            boundary_generation = (
+                ctx.get_boundary_action_generation()
+                if ctx.get_boundary_action_generation is not None
+                else None
             )
+            child_task = asyncio.create_task(
+                self._run_child_session(
+                    child_session=child_session,
+                    conversation=ctx.conversation,
+                    agent=ctx.executor_agent or ctx.agent,
+                    task_description=task_description,
+                    parent_intaris_session_id=parent_intaris_id,
+                    workspace_root=child_workspace_root,
+                    working_directory=child_working_directory,
+                    workspace_root_explicit=ctx.workspace_root_explicit,
+                    working_directory_explicit=ctx.working_directory_explicit,
+                    deliverable_step_run_id=ctx.step_run_id,
+                    allow_questions=(
+                        ctx.interaction_mode == "step_requests"
+                        and ctx.step_definition.allow_questions
+                    ),
+                    controller_tool_surface=ctx.controller_tool_surface,
+                    on_tool_call=_child_tool_call_callback,
+                    on_tool_result=_child_progress_callback,
+                    parent_tool_call_id=tc.call_id,
+                    parent_turn_id=ctx.turn_id,
+                    parent_assistant_phase_index=parent_tool_phase,
+                    parent_turn_cycle_index=parent_tool_cycle,
+                    parent_session=ctx.session,
+                    wait=wait,
+                    delegation_started_at=delegation_started_at,
+                    cancel_event=ctx.cancel_event,
+                    execution_fence=ctx.execution_fence,
+                )
+            )
+            await self._track_child(ctx.session.session_id, child_session.session_id, child_task)
+            try:
+                output, yield_reason = await join_until_boundary(
+                    child_task, ctx.wait_for_boundary_input, boundary_generation
+                )
+            except BaseException:
+                await self._untrack_child(ctx.session.session_id, child_session.session_id)
+                raise
+            if yield_reason is not None:
+                observer = asyncio.create_task(
+                    self._observe_joined_child(
+                        child_task, ctx=ctx, child_session_id=child_session.session_id
+                    )
+                )
+                observer.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                self._joined_child_observers.add(observer)
+                observer.add_done_callback(self._joined_child_observers.discard)
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "running",
+                            "session_id": child_session.session_id,
+                            "wait_yield_reason": yield_reason,
+                            "continue_controller_turn": True,
+                            "message": (
+                                "The child remains active. Handle the incoming question/event; "
+                                "its completion will return through a follow-up. Do not start a duplicate."
+                            ),
+                        }
+                    ),
+                    metadata={"orchestration": True, "mode": "delegate", "wait": True},
+                )
+            await self._untrack_child(ctx.session.session_id, child_session.session_id)
             duration_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
             if output:
                 if ctx.step_run_id is not None and output.deliverable_id is not None:
@@ -16853,6 +18014,10 @@ class AgentLoop:
                     workspace_root_explicit=ctx.workspace_root_explicit,
                     working_directory_explicit=ctx.working_directory_explicit,
                     deliverable_step_run_id=ctx.step_run_id,
+                    allow_questions=(
+                        ctx.interaction_mode == "step_requests"
+                        and ctx.step_definition.allow_questions
+                    ),
                     controller_tool_surface=ctx.controller_tool_surface,
                     parent_tool_call_id=tc.call_id,
                     parent_turn_id=ctx.turn_id,
@@ -16878,6 +18043,40 @@ class AgentLoop:
                 },
             )
             return result_with_flag
+
+    async def _observe_joined_child(
+        self,
+        child_task: asyncio.Task[StepOutput | None],
+        *,
+        ctx: StepContext,
+        child_session_id: str,
+    ) -> None:
+        """Own completion delivery after a joined child yields for a parent question."""
+        try:
+            output = await child_task
+        except (asyncio.CancelledError, StepInterrupted, StaleTaskExecutionOwner):
+            return
+        except Exception:
+            output = None
+        finally:
+            await self._untrack_child(ctx.session.session_id, child_session_id)
+        follow_up = self._follow_up_policy.build_delegation_follow_up(
+            conversation_id=ctx.conversation.conversation_id,
+            child_session_id=child_session_id,
+            status="completed" if output else "failed",
+            result_summary=output.summary if output else None,
+        )
+        await self.event_bus.publish(
+            Event(
+                type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "origin_session_id": ctx.session.session_id,
+                    "follow_up": follow_up.model_dump(mode="json"),
+                    "channel_deliverable": False,
+                },
+            )
+        )
 
     async def _handle_delegate_lineage(
         self,
@@ -20162,6 +21361,12 @@ class AgentLoop:
         events_to_record: list[SessionEvent],
     ) -> ToolResult:
         """Handle task management tools in main-chat contexts."""
+        from cognis.core.intaris_policy import profile_mutation_error, tool_session_policy
+
+        profile_error = profile_mutation_error(tc.arguments)
+        if profile_error is not None:
+            return profile_error
+
         from cognis.core.management import (
             resolve_task_pause_action,
             respond_task_input,
@@ -20171,9 +21376,7 @@ class AgentLoop:
         from cognis.store.queries import (
             assert_task_attempt_current,
             create_task_comment,
-            get_active_project_grant,
             get_agent,
-            get_project,
             get_session_row,
             get_task,
             list_step_runs_for_task,
@@ -20436,9 +21639,18 @@ class AgentLoop:
                             is_error=True,
                         )
 
+                project_id = tc.arguments.get("project_id") or await self._effective_project_id(ctx)
+                if isinstance(project_id, str) and not project_id.strip():
+                    project_id = None
                 async with self.session_manager.session_factory() as db:
                     agent_row = await get_agent(db, str(raw_agent_id))
-                if agent_row is None or agent_row.owner_email != ctx.session.user_email:
+                    agent_accessible = agent_row is not None and await agent_usable_in_project(
+                        db,
+                        agent=agent_row,
+                        user_email=ctx.session.user_email,
+                        project_id=str(project_id) if project_id else None,
+                    )
+                if agent_row is None or not agent_accessible:
                     return ToolResult(
                         output=json.dumps(
                             {
@@ -20475,22 +21687,15 @@ class AgentLoop:
                 workflow_id = tc.arguments.get("workflow_id")
                 if isinstance(workflow_id, str) and not workflow_id.strip():
                     workflow_id = None
-                project_id = tc.arguments.get("project_id") or ctx.conversation.project_id
-                if isinstance(project_id, str) and not project_id.strip():
-                    project_id = None
                 if project_id:
                     async with self.session_manager.session_factory() as db:
-                        project = await get_project(db, str(project_id))
+                        project, project_role = await resolve_project_role_by_id(
+                            db, str(project_id), ctx.session.user_email
+                        )
                         project_access = (
                             project is not None
-                            and (project.status == "active")
-                            and (
-                                project.owner_email == ctx.session.user_email
-                                or await get_active_project_grant(
-                                    db, str(project_id), ctx.session.user_email
-                                )
-                                is not None
-                            )
+                            and project.status == "active"
+                            and role_satisfies(project_role.role, "use")
                         )
                     if not project_access:
                         return ToolResult(
@@ -21048,7 +22253,6 @@ class AgentLoop:
         elif tc.name == "update_task":
             task_id = tc.arguments.get("task_id", "")
             from cognis.core.workflow_management import get_workflow_for_user
-            from cognis.models.workflow import SessionPolicy
 
             workflow_id = tc.arguments.get("workflow_id")
             async with self.session_manager.session_factory() as db:
@@ -21082,19 +22286,15 @@ class AgentLoop:
                         is_error=True,
                     )
                 project_id_arg = tc.arguments.get("project_id")
-                project_id = str(project_id_arg) if project_id_arg else task_row.project_id
+                project_id = project_id_arg if "project_id" in tc.arguments else task_row.project_id
                 if project_id_arg:
-                    project = await get_project(db, str(project_id))
+                    project, project_role = await resolve_project_role_by_id(
+                        db, str(project_id), ctx.session.user_email
+                    )
                     project_access = (
                         project is not None
-                        and (project.status == "active")
-                        and (
-                            project.owner_email == ctx.session.user_email
-                            or await get_active_project_grant(
-                                db, str(project_id), ctx.session.user_email
-                            )
-                            is not None
-                        )
+                        and project.status == "active"
+                        and role_satisfies(project_role.role, "use")
                     )
                     if not project_access:
                         return ToolResult(
@@ -21102,6 +22302,23 @@ class AgentLoop:
                                 {
                                     "status": "error",
                                     "message": "Project not found or not accessible.",
+                                }
+                            ),
+                            is_error=True,
+                        )
+                if "project_id" in tc.arguments:
+                    assigned_agent = await get_agent(db, task_row.agent_id)
+                    if assigned_agent is None or not await agent_usable_in_project(
+                        db,
+                        agent=assigned_agent,
+                        user_email=ctx.session.user_email,
+                        project_id=project_id,
+                    ):
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": "Agent is not available in the selected project.",
                                 }
                             ),
                             is_error=True,
@@ -21132,8 +22349,9 @@ class AgentLoop:
                     priority=tc.arguments.get("priority"),
                     workflow_id=tc.arguments.get("workflow_id"),
                     project_id=project_id_arg,
+                    clear_project_id=("project_id" in tc.arguments and project_id_arg is None),
                     session_policy=(
-                        SessionPolicy.model_validate(tc.arguments["session_policy"]).model_dump()
+                        tool_session_policy(tc.arguments["session_policy"], task_row.session_policy)
                         if "session_policy" in tc.arguments
                         else None
                     ),
@@ -21277,128 +22495,6 @@ class AgentLoop:
         if task_agent_type == "secondary" and current_agent_type == "primary":
             return await registry.is_secondary_bound(current_agent_id, task_agent_id)
         return False
-
-    async def _prune_tool_outputs_after_step(self, ctx: StepContext) -> None:
-        """Mark older tool-result call ids for clearance in the in-context view.
-
-        Mirrors OpenCode's post-loop ``prune``: walks back from the most
-        recent events, keeps the last few user turns intact, accumulates
-        tool output tokens, and once the tail exceeds ``PRUNE_PROTECT``
-        tokens registers the older call ids on the session cache so
-        future context assembly substitutes a clearance marker. The tool
-        output store is unchanged. Only events with a confirmed recovery
-        handle are eligible, so every marker can recover the original.
-        """
-
-        from cognis.core.tool_output_prune import (
-            PruneCandidate,
-            prune_candidate_from_event_data,
-            select_prune_call_ids,
-        )
-
-        cache_get_events = getattr(self.session_cache, "get_events_since_compaction", None)
-        cache_add_pruned = getattr(self.session_cache, "add_pruned_tool_call_ids", None)
-        if not callable(cache_get_events) or not callable(cache_add_pruned):
-            return
-
-        try:
-            cached_events = cache_get_events(ctx.session.session_id)
-        except Exception:
-            return
-        if not cached_events:
-            return
-
-        candidates: list[PruneCandidate] = []
-        total_tool_tokens = 0
-        token_counter = self._build_token_counter_for_pruning(ctx)
-        policy = ProjectionPolicy.from_budget(
-            max_context_tokens=(
-                ctx.last_projection_policy.max_context_tokens
-                if ctx.last_projection_policy is not None
-                else 272_000
-            ),
-            available_prompt_tokens=(
-                ctx.last_projection_policy.available_prompt_tokens
-                if ctx.last_projection_policy is not None
-                else None
-            ),
-            phase="cross_turn",
-            pressure_mode="normal",
-        )
-        for event in cached_events:
-            event_type = getattr(event, "type", None) or (
-                event.get("type") if isinstance(event, dict) else None
-            )
-            data = getattr(event, "data", None) or (
-                event.get("data", {}) if isinstance(event, dict) else {}
-            )
-            if not isinstance(data, dict):
-                continue
-            if event_type == "user_message":
-                candidates.append(PruneCandidate("", "", "", is_user_turn=True))
-                continue
-            if event_type != "tool_result":
-                continue
-            candidate = prune_candidate_from_event_data(data)
-            if candidate is None:
-                continue
-            candidates.append(candidate)
-            try:
-                total_tool_tokens += token_counter(candidate.output)
-            except Exception:
-                total_tool_tokens += max(1, len(candidate.output) // 4)
-
-        # Below the minimum we don't bother — the gain is too small to
-        # justify cluttering the context with clearance markers.
-        if total_tool_tokens < policy.prune_minimum_savings_tokens:
-            return
-
-        prune_ids = select_prune_call_ids(
-            candidates,
-            token_counter=token_counter,
-            protect_tokens=policy.prune_protect_tokens,
-        )
-        if not prune_ids:
-            return
-        try:
-            cache_add_pruned(ctx.session.session_id, prune_ids)
-        except Exception:
-            logger.debug(
-                "tool output prune: failed to record cleared call ids",
-                extra={"extra_data": {"session_id": ctx.session.session_id}},
-                exc_info=True,
-            )
-            return
-        logger.info(
-            "tool output prune: cleared older results from context view",
-            extra={
-                "extra_data": {
-                    "session_id": ctx.session.session_id,
-                    "pruned_count": len(prune_ids),
-                    "total_tool_tokens": total_tool_tokens,
-                    "projection_policy": policy.as_metadata(),
-                }
-            },
-        )
-
-    def _build_token_counter_for_pruning(self, ctx: StepContext) -> Callable[[str], int]:
-        """Return a token counter that prefers the live LLM provider when available."""
-
-        llm = getattr(self.providers, "llm", None)
-        model = ctx.current_model
-        if llm is not None and model:
-            count_tokens = getattr(llm, "count_tokens", None)
-            if callable(count_tokens):
-                resolved_model: str = model
-
-                def _llm_counter(text: str) -> int:
-                    try:
-                        return int(count_tokens(text, resolved_model))
-                    except Exception:
-                        return max(1, len(text) // 4)
-
-                return _llm_counter
-        return lambda text: max(1, len(text) // 4)
 
     async def _save_tool_output_if_available(
         self, call_id: str, result: ToolResult, tool_name: str = ""
@@ -21969,7 +23065,7 @@ class AgentLoop:
             create_user_workflow,
             delete_user_workflow,
             duplicate_visible_workflow,
-            get_workflow_for_user,
+            get_workflow_for_management,
             list_workflows_for_user,
             update_user_workflow,
         )
@@ -21987,7 +23083,7 @@ class AgentLoop:
 
         if tc.name == "get_workflow":
             workflow_id = str(tc.arguments.get("workflow_id", "")).strip()
-            workflow = await get_workflow_for_user(
+            workflow = await get_workflow_for_management(
                 workflow_registry=workflow_registry,
                 workflow_id=workflow_id,
                 owner_email=owner_email,
@@ -22025,6 +23121,7 @@ class AgentLoop:
                     session_factory=self.session_manager.session_factory,
                     workflow_id=workflow_id,
                     owner_email=owner_email,
+                    agent_composed=True,
                     payload={
                         key: value for key, value in tc.arguments.items() if key != "workflow_id"
                     },
@@ -22087,6 +23184,11 @@ class AgentLoop:
         events_to_record: list[SessionEvent],
     ) -> ToolResult:
         """Handle workflow composition from the main chat agent."""
+        from cognis.core.intaris_policy import profile_mutation_error
+
+        profile_error = profile_mutation_error(tc.arguments)
+        if profile_error is not None:
+            return profile_error
 
         from cognis.core.schedule_management import create_user_schedule
         from cognis.core.workflow_composition import (
@@ -23075,6 +24177,17 @@ class AgentLoop:
                                     )
                             elif event.type == "assistant_message":
                                 ctx.remember_assistant_event_seq = next_seq
+                                if (
+                                    ctx.session.delegation_mode == "hook"
+                                    and ctx.execution_fence is not None
+                                    and event.data.get("content")
+                                ):
+                                    await ctx.execution_fence.capture_assistant_event(
+                                        session_id=ctx.session.session_id,
+                                        intaris_session_id=intaris_id,
+                                        seq=next_seq,
+                                        turn_id=ctx.turn_id,
+                                    )
                                 if ctx.remember_evidence_event_hash:
                                     ctx.remember_assistant_event_hash = event_hash(
                                         intaris_id,
@@ -23152,6 +24265,19 @@ class AgentLoop:
                             and isinstance(event.data.get("name"), str)
                         ],
                     )
+                if ctx.session.delegation_mode == "hook" and ctx.execution_fence is not None:
+                    completed_calls = [
+                        event.data["call_id"]
+                        for event in batch
+                        if event.type == "tool_result"
+                        and isinstance(event.data.get("call_id"), str)
+                    ]
+                    if completed_calls:
+                        await ctx.execution_fence.complete_tool_dispatch(
+                            session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                            turn_id=ctx.turn_id,
+                            call_ids=completed_calls,
+                        )
                 # Delete only the snapshotted prefix: the Intaris append (and
                 # a potentially minutes-long recovery wait) may have allowed
                 # concurrent orchestration handlers to append new events to
@@ -23217,9 +24343,21 @@ class AgentLoop:
             if isinstance(metadata, dict):
                 for key, value in metadata.items():
                     data.setdefault(str(key), value)
+            replayable = (
+                data.get("context_injection") is True
+                and data.get("replayable") is True
+                and data.get("visibility") == "agent_context"
+                and data.get("model_role") in {"system", "developer"}
+            )
             events.append(
                 SessionEvent(
-                    type="system_message" if item.get("role") == "system" else "developer_message",
+                    type=(
+                        "developer_message"
+                        if replayable
+                        else "system_message"
+                        if item.get("role") == "system"
+                        else "developer_message"
+                    ),
                     data=data,
                 )
             )
@@ -23239,6 +24377,36 @@ class AgentLoop:
             AUDIT_EVENTS_TOTAL.labels(type=event_type, source=source).inc()
         audit_messages.clear()
 
+    async def _commit_context_delivery(
+        self,
+        ctx: StepContext,
+        *,
+        audit_messages: list[dict[str, Any]],
+        projection_decisions: dict[str, list[dict[str, Any]]],
+        on_token: TokenCallback | None,
+    ) -> None:
+        """Make new context durable before inference; a no-op when unchanged."""
+        self._raise_if_cancelled(ctx)
+        if ctx.execution_fence is not None:
+            await ctx.execution_fence.assert_current()
+        if ctx.pending_events and any(
+            event.type == "developer_message" and event.data.get("tool_context_notice_version") == 1
+            for event in ctx.pending_events
+        ):
+            await self._flush_events_incremental(
+                ctx, ctx.pending_events, reason="tool_context_delivery", on_token=on_token
+            )
+        await self._record_outgoing_audit_messages(
+            ctx, audit_messages=audit_messages, on_token=on_token
+        )
+        if projection_decisions:
+            await self.context_assembler.persist_projection_decisions(
+                session=ctx.session, agent=ctx.agent, decisions=projection_decisions
+            )
+        self._raise_if_cancelled(ctx)
+        if ctx.execution_fence is not None:
+            await ctx.execution_fence.assert_current()
+
     def _append_pending_audit_message(
         self,
         messages: list[dict[str, Any]],
@@ -23248,13 +24416,38 @@ class AgentLoop:
         source: str,
         content: str,
     ) -> None:
+        position = len(messages) - 1
+        prompt_message = messages[position] if position >= 0 else {}
+        model_role = prompt_message.get("role")
+        replayable = (
+            role != "user"
+            and model_role in {"system", "developer"}
+            and prompt_message.get("content") == content
+        )
+        metadata = (
+            {
+                "context_injection": True,
+                "replayable": True,
+                "replay_scope": "same_session",
+                "visibility": "agent_context",
+                "model_role": model_role,
+                "canonical_role": role,
+            }
+            if replayable
+            else {}
+        )
+        if replayable:
+            prompt_message[AUDIT_SOURCE] = source
+            prompt_message[AUDIT_ROLE] = role
+            prompt_message[AUDIT_METADATA] = metadata
         pending_audit_messages.append(
             {
-                "position": len(messages) - 1,
+                "position": position,
                 "role": role,
                 "content": content,
                 "source": source,
                 "content_type": "text",
+                "metadata": metadata,
                 "hash": hashlib.sha256(
                     json.dumps(
                         {
@@ -23851,8 +25044,25 @@ class AgentLoop:
 
         if not ctx.policy.require_step_complete or not (ctx.task_id or ctx.step_run_id):
             return None
-        if ctx.step_definition.require_deliverable and self._deliverable_owner_step_run_id(ctx):
+        activation = self._strict_daily_brief_activation(ctx)
+        if (
+            ctx.step_definition.require_deliverable or activation is not None
+        ) and self._deliverable_owner_step_run_id(ctx):
             current_deliverable = await self._get_current_deliverable(ctx)
+            if (
+                current_deliverable is not None
+                and activation is not None
+                and not persisted_daily_brief_is_valid(
+                    current_deliverable, contract_version=activation.version
+                )
+            ):
+                return {
+                    "required_action": "write_deliverable_then_step_complete",
+                    "message": "The existing deliverable is invalid for this step's Daily Brief "
+                    "contract. Validate and write a corrected rich:pulse deliverable, "
+                    "then call step_complete.",
+                    "reminder": "Repair the invalid deliverable, then call step_complete.",
+                }
             if current_deliverable is None:
                 return {
                     "required_action": "write_deliverable_then_step_complete",
@@ -24161,6 +25371,8 @@ class AgentLoop:
         self,
         ctx: StepContext,
         tc: ToolCall,
+        *,
+        approval_call_id: str | None = None,
     ) -> ToolResult:
         """Execute one tool with controller-owned routing, policy, and executor handling.
 
@@ -24353,6 +25565,8 @@ class AgentLoop:
                     )
 
             runtime_metadata = self._tool_runtime_metadata_for_call(ctx, tc)
+            if approval_call_id is not None:
+                runtime_metadata["approval_call_id"] = approval_call_id
             if target_executor_environment is not None:
                 runtime_metadata.pop("workspace_root", None)
                 target_working_directory = (
@@ -24388,6 +25602,8 @@ class AgentLoop:
                     if registered is not None and registered.definition.source.type == "executor"
                     else None
                 ),
+                workflow_step_scope=ctx.workflow_step_scope,
+                workflow_executor_id=target_executor_id or ctx.active_executor_id,
             )
             if isinstance(result.metadata, dict):
                 delivery_metadata = dict(result.metadata)
@@ -24411,6 +25627,16 @@ class AgentLoop:
                 )
                 if retry_result is not None:
                     result = retry_result
+            background_notice = tool_background_notice_from_result(
+                call_id=tc.call_id,
+                tool_name=tc.name,
+                executor_native=(
+                    registered is not None and registered.definition.source.type == "executor"
+                ),
+                result=result,
+            )
+            if background_notice is not None:
+                ctx.pending_tool_background_notices.append(background_notice)
             if result.is_error:
                 outcome = "error"
             _observe_web_tool_execution(tc.name, result, outcome)
@@ -24571,6 +25797,8 @@ class AgentLoop:
 
     def _is_same_executor_transient_failure(self, result: ToolResult) -> bool:
         if not result.is_error or not isinstance(result.metadata, dict):
+            return False
+        if result.metadata.get("capacity_retry_exhausted"):
             return False
         code = result.metadata.get("code")
         delivery_state = result.metadata.get("delivery_state")
@@ -24989,6 +26217,7 @@ class AgentLoop:
                 conversation_id=ctx.conversation.conversation_id,
                 task_id=ctx.task_id,
                 executor_id=executor_id,
+                notice_dispatcher=getattr(self.providers, "executor_pin_notice_dispatcher", None),
             )
             budget = min(budget, window.remaining_seconds())
         if recovery_deadline is None:
@@ -25024,6 +26253,9 @@ class AgentLoop:
                         conversation_id=ctx.conversation.conversation_id,
                         task_id=ctx.task_id,
                         executor_id=executor_id,
+                        notice_dispatcher=getattr(
+                            self.providers, "executor_pin_notice_dispatcher", None
+                        ),
                     )
                 return reconciled_result
             if reconciled_state == "not_sent":
@@ -25267,6 +26499,9 @@ class AgentLoop:
                     conversation_id=ctx.conversation.conversation_id,
                     task_id=ctx.task_id,
                     executor_id=executor_id,
+                    notice_dispatcher=getattr(
+                        self.providers, "executor_pin_notice_dispatcher", None
+                    ),
                 )
             metadata.update(
                 {
@@ -25342,6 +26577,8 @@ class AgentLoop:
                     output_chunk_callback=output_chunk_callback,
                     before_executor_send=_before_retry_send,
                     after_executor_send=_after_retry_send,
+                    workflow_step_scope=ctx.workflow_step_scope,
+                    workflow_executor_id=getattr(conn, "executor_id", None),
                 ),
                 timeout=remaining,
             )
@@ -25483,6 +26720,7 @@ class AgentLoop:
                 conversation_id=ctx.conversation.conversation_id,
                 task_id=ctx.task_id,
                 executor_id=executor_id,
+                notice_dispatcher=getattr(self.providers, "executor_pin_notice_dispatcher", None),
             )
         return retry_result
 
@@ -25568,6 +26806,8 @@ class AgentLoop:
         ctx: StepContext,
         target: Any,
         *,
+        replacement_registry: ToolRegistry | None,
+        expected_connection: Any | None = None,
         update_conversation: bool = True,
     ) -> bool:
         """Update turn-local runtime routing after a successful executor switch."""
@@ -25591,7 +26831,9 @@ class AgentLoop:
             target_executor_id=target_executor_id,
             target_executor_type=target_executor_type,
         )
-        if resolved_conn is None:
+        if resolved_conn is None or replacement_registry is None:
+            return False
+        if expected_connection is not None and resolved_conn is not expected_connection:
             return False
 
         ctx.active_executor_id = target_executor_id
@@ -25599,6 +26841,8 @@ class AgentLoop:
             with contextlib.suppress(Exception):
                 ctx.conversation.active_executor_id = target_executor_id
         ctx.executor_connection = resolved_conn
+        ctx.tool_registry = replacement_registry
+        ctx.classified_tool_definitions.clear()
         ctx.executor_environment = self._executor_environment_for_target(target)
         working_directory = ctx.executor_environment.cwd or ctx.executor_environment.home
         ctx.workspace_root = working_directory
@@ -25907,6 +27151,8 @@ class AgentLoop:
             source_url = result.metadata.get("source_url")
             if isinstance(artifact_id, str) and isinstance(source_url, str):
                 materialized_artifact_evidence[artifact_id] = source_url
+        from cognis.core.guardrails_context import execution_outcome
+
         events_to_record.append(
             SessionEvent(
                 type="tool_result",
@@ -25939,8 +27185,17 @@ class AgentLoop:
                     "anchors_available": presentation_meta["anchors_available"],
                     "anchor_count": presentation_meta["anchor_count"],
                     "evaluation": eval_meta,
+                    "execution_outcome": execution_outcome(
+                        result,
+                        executor_id=(result.metadata or {}).get("executor_id")
+                        or ctx.active_executor_id,
+                        native_shell=tool_id
+                        in {"builtin:bash", "builtin:bash_output", "builtin:bash_kill"},
+                    ),
                     "file_diffs": file_diffs,
                     "attachments": safe_result_attachments,
+                    "tool_attachment_context_version": 1,
+                    "tool_attachment_context_refs": normalized_result_attachments,
                     "agent_visible": True,
                     "view_kind": "model_tool_result",
                     "turn_cycle_index": tc.runtime_metadata.get("turn_cycle_index"),
@@ -25987,6 +27242,7 @@ class AgentLoop:
                                 "call_id": tc.call_id,
                                 "skill_id": skill_id,
                                 "skill_name": skill_name,
+                                "model_context": False,
                             },
                         ),
                     )
@@ -26038,7 +27294,7 @@ class AgentLoop:
             )
         # Tool-returned artifacts remain tool output. A persisted `art_…` becomes
         # user-facing only through the controller-owned attach_artifact tool.
-        activation_notice: str | None = None
+        activation_result: SkillActivationResult | None = None
         if result.metadata:
             self._merge_promoted_tool_ids(promoted_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
@@ -26048,7 +27304,7 @@ class AgentLoop:
                 # Skill mutation changed the runtime tool inventory; the
                 # next cycle must reclassify rather than reuse the memo.
                 self.session_cache.invalidate_classified_inventory(ctx.session.session_id)
-            activation_notice = await self._apply_skill_activation(
+            activation_result = await self._apply_skill_activation(
                 ctx,
                 metadata=result.metadata,
                 promoted_tool_ids=promoted_tool_ids,
@@ -26081,7 +27337,9 @@ class AgentLoop:
         )
         record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, result.output)
         _record_tool_outcome_in_same_turn_ledger(ctx, tc, result)
-        attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)
+        attachment_context = self._build_tool_attachment_context(
+            ctx, tc, normalized_result_attachments
+        )
         if attachment_context is not None:
             attachment_context["_recovery_call_id"] = recovery_call_id
             messages.append(attachment_context)
@@ -26104,36 +27362,62 @@ class AgentLoop:
                 and str(attachment["artifact_id"]).startswith(("art_", "att_", "doc_", "img_"))
             ]
             if created_refs:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Content references created by this tool are available but will not be "
-                            "presented to the user automatically:\n"
-                            + "\n".join(f"- {content_ref}" for content_ref in created_refs)
-                            + "\n\nTo present one with the final response, call "
-                            'attach_artifact({"content_ref":"<reference>"}) exactly once.'
-                        ),
-                    }
+                append_tool_notice(
+                    messages,
+                    events_to_record,
+                    call_id=tc.call_id,
+                    source="created_artifact_reminder",
+                    content=(
+                        "Content references created by this tool are available but will not be "
+                        "presented to the user automatically:\n"
+                        + "\n".join(f"- {content_ref}" for content_ref in created_refs)
+                        + "\n\nTo present one with the final response, call "
+                        'attach_artifact({"content_ref":"<reference>"}) exactly once.'
+                    ),
                 )
         protected_context = result.metadata.get("protected_context") if result.metadata else None
         if isinstance(protected_context, str) and protected_context.strip():
-            messages.append(
+            loaded_metadata = (
                 {
-                    "role": "system",
-                    "content": protected_context,
-                    "_prior_context": True,
+                    **{
+                        key: skill_activation[key]
+                        for key in (
+                            "skill_id",
+                            "name",
+                            "description",
+                            "version_id",
+                            "version_number",
+                            "content_hash",
+                            "contract_version",
+                        )
+                        if key in skill_activation
+                    },
+                    "kind": "loaded_skill",
+                    "append_only_loaded_skill_version": 1,
+                    "activated_tool_ids": sorted(activation_result.tool_ids),
                 }
+                if isinstance(skill_activation, dict) and activation_result is not None
+                else {}
+            )
+            append_tool_notice(
+                messages,
+                events_to_record,
+                call_id=tc.call_id,
+                source="loaded_skill" if loaded_metadata else "protected_tool_context",
+                content=protected_context,
+                prior_context=True,
+                metadata=loaded_metadata,
             )
         # B2 — inject the skill activation transparency notice after the
         # skill instructions so the model can self-correct bad tool picks.
-        if isinstance(activation_notice, str) and activation_notice.strip():
-            messages.append(
-                {
-                    "role": "system",
-                    "content": activation_notice,
-                    "_prior_context": True,
-                }
+        if activation_result is not None and activation_result.notice:
+            append_tool_notice(
+                messages,
+                events_to_record,
+                call_id=tc.call_id,
+                source="skill_activation",
+                content=activation_result.notice,
+                prior_context=True,
             )
         await self.event_bus.publish(
             Event(
@@ -26167,46 +27451,17 @@ class AgentLoop:
         if not attachments:
             return None
         normalized = normalize_attachment_refs(attachments)
+        blocks: list[dict[str, Any]] = []
+        unsupported: list[str] = []
         if ctx.current_model_info is not None:
             blocks, unsupported = _ctx_native_attachment_blocks(ctx, normalized)
-            if blocks:
-                content_blocks: list[dict[str, Any]] = [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Untrusted tool output from {tc.name} (tool_call_id={tc.call_id}) included attachments. "
-                            "Use the following attachment content carefully.\n\n"
-                            f"{attachment_note(normalized)}"
-                        ),
-                    }
-                ]
-                content_blocks.extend(blocks)
-                if unsupported:
-                    content_blocks.append(
-                        {
-                            "type": "text",
-                            "text": "Unsupported tool attachments were omitted: "
-                            + ", ".join(unsupported),
-                        }
-                    )
-                return {
-                    "role": "user",
-                    "content": content_blocks,
-                    "_tool_attachment_context": True,
-                    "_tool_call_id": tc.call_id,
-                }
-        if not normalized:
-            return None
-        return {
-            "role": "system",
-            "content": (
-                "Tool attachments were produced as untrusted output for "
-                f"tool_call_id={tc.call_id}. They are available in the UI and later context.\n"
-                + attachment_note(normalized)
-            ),
-            "_tool_attachment_context": True,
-            "_tool_call_id": tc.call_id,
-        }
+        return format_tool_attachment_context(
+            call_id=tc.call_id,
+            tool_name=tc.name,
+            attachments=normalized,
+            blocks=blocks,
+            unsupported=unsupported,
+        )
 
     def _project_model_messages(
         self,
@@ -26263,6 +27518,9 @@ class AgentLoop:
                 prior_turn_state.record_demotions(demoted_anchors)
                 if pressure_mode == "critical":
                     prior_turn_state.prune_committed_preservations(demoted_anchors)
+        from cognis.core.context_projection import projection_decisions_from_diff
+
+        decisions = projection_decisions_from_diff(messages, pruned)
         stripped = [_strip_internal_message_fields(message) for message in pruned]
         projected_token_estimate = _projected_messages_token_estimate(stripped)
         prefix_fingerprint = projected_prefix_fingerprint(stripped, projection.mutable_start_index)
@@ -26280,6 +27538,7 @@ class AgentLoop:
             raw_token_estimate=raw_token_estimate,
             projected_token_estimate=projected_token_estimate,
             prefix_fingerprint=prefix_fingerprint,
+            decisions=decisions,
         )
 
     def _record_projection_prefix_stability(
@@ -26371,6 +27630,109 @@ class AgentLoop:
                 ctx.current_model,
             ),
         )
+
+        # Below the lightweight-compaction threshold, the accepted base is
+        # immutable. In particular, do not reapply per-result historical caps.
+        stable_snapshot = self._context_pressure_snapshot(
+            ctx,
+            messages=messages,
+            tool_schemas=tool_schemas,
+            max_context_tokens=max_context_tokens,
+        )
+        stable_policy = ProjectionPolicy.from_budget(
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
+            phase="within_turn",
+        )
+        entry_trigger_tokens = int(
+            (budget.available_prompt_tokens + budget.prompt_serialization_margin_tokens)
+            * CROSS_TURN_TRIGGER_FRACTION
+        )
+        deciding_trigger_tokens: int | None = None
+
+        def finish(result: ProjectedMessages, *, reason: str) -> ProjectedMessages:
+            if result.decisions and result.snapshot is not None:
+                from cognis.core.context_projection import projection_diagnostic_fields
+
+                logger.info(
+                    "Context projection decision",
+                    extra={
+                        "extra_data": {
+                            "session_id": getattr(
+                                getattr(ctx, "session", None), "session_id", None
+                            ),
+                            "turn_id": ctx.turn_id,
+                            "projection_decision_targets": len(result.decisions),
+                            **projection_diagnostic_fields(
+                                result.policy or stable_policy,
+                                reason=reason,
+                                before_prompt_tokens=(
+                                    stable_snapshot.prompt_tokens if stable_snapshot else 0
+                                ),
+                                after_prompt_tokens=result.snapshot.prompt_tokens,
+                                trigger_tokens=deciding_trigger_tokens,
+                                entry_trigger_tokens=entry_trigger_tokens,
+                            ),
+                        }
+                    },
+                )
+            return result
+
+        if ctx.projection_state is None:
+            ctx.projection_state = ProjectionTurnState(
+                turn_id=ctx.turn_id or "",
+                policy=stable_policy,
+            )
+        if (
+            stable_snapshot is not None
+            and stable_snapshot.prompt_tokens
+            <= (budget.available_prompt_tokens + budget.prompt_serialization_margin_tokens) * 0.75
+            and stable_snapshot.prompt_tokens <= stable_policy.hard_prompt_tokens
+            and ctx.projection_state.pressure_mode == PressureMode.normal
+            # A pending delta must reuse its cached rendering and delivery
+            # requirements through the projection-cache path below.
+            and (
+                ctx.projection_state.last_result is None
+                or not ctx.projection_state.last_result.decisions
+            )
+            and (
+                ctx.projection_state.last_result is None
+                or (
+                    len(messages) >= ctx.projection_state.last_message_count
+                    and ctx.projection_state.last_prefix_fingerprint
+                    == tool_transcript_prefix_fingerprint(
+                        messages[: ctx.projection_state.last_message_count]
+                    )
+                )
+            )
+        ):
+            if ctx.projection_state is not None:
+                ctx.projection_state.skip_count += 1
+                ctx.projection_state.policy = stable_policy
+                ctx.projection_state.last_result = ProjectionResult(
+                    messages=list(messages),
+                    mutable_start_index=len(messages),
+                )
+                ctx.projection_state.last_message_count = len(messages)
+                ctx.projection_state.last_projected_token_estimate = stable_snapshot.prompt_tokens
+                ctx.projection_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(
+                    messages
+                )
+            return ProjectedMessages(
+                messages=[_strip_internal_message_fields(message) for message in messages],
+                snapshot=stable_snapshot,
+                mode="normal",
+                policy=stable_policy,
+                cache_breakpoints=_cycle_cache_breakpoints(
+                    messages,
+                    prefix_index=cache_breakpoint_index,
+                    ttl=anthropic_cache_ttl,
+                ),
+                mutable_start_index=len(messages),
+                raw_token_estimate=stable_snapshot.prompt_tokens,
+                projected_token_estimate=stable_snapshot.prompt_tokens,
+                prefix_fingerprint=projected_prefix_fingerprint(messages, len(messages)),
+            )
 
         # ── Initialise per-turn state on first within-turn call ───────────────
         if ctx.projection_state is None:
@@ -26485,6 +27847,37 @@ class AgentLoop:
             prefix_fingerprint_unchanged=prefix_fingerprint_unchanged,
         )
         PROJECTION_CYCLES_TOTAL.labels(decision=str(decision)).inc()
+        projection_reason = (
+            "initial_projection"
+            if turn_state.last_result is None
+            else "prefix_changed"
+            if not prefix_fingerprint_unchanged
+            else "oversized_result"
+            if pressure_snap.oversized_result_appended
+            else "pressure_transition"
+            if new_mode != prior_mode
+            else "steady_target"
+        )
+        if projection_reason == "steady_target":
+            deciding_trigger_tokens = turn_state.policy.steady_target_tokens
+        elif projection_reason == "initial_projection":
+            deciding_trigger_tokens = (
+                entry_trigger_tokens
+                if stable_snapshot and stable_snapshot.prompt_tokens > entry_trigger_tokens
+                else None
+            )
+        elif projection_reason == "pressure_transition" and new_mode in (
+            PressureMode.pressure,
+            PressureMode.critical,
+        ):
+            deciding_trigger_tokens = int(
+                budget.available_prompt_tokens
+                * (
+                    CRITICAL_ESCALATE_FRACTION
+                    if new_mode == PressureMode.critical
+                    else PRESSURE_ESCALATE_FRACTION
+                )
+            )
 
         if decision is ReprojectDecision.skip and turn_state.last_result is not None:
             # Fast path: append new tail messages verbatim (stripped of internal markers).
@@ -26510,6 +27903,7 @@ class AgentLoop:
                 )
                 skipped_projection = ProjectedMessages(
                     messages=result.messages,
+                    decisions=result.decisions,
                     snapshot=snapshot,
                     mode=str(new_mode),
                     policy=policy,
@@ -26537,7 +27931,8 @@ class AgentLoop:
                         messages
                     )
                     turn_state.skip_count += 1
-                    return skipped_projection
+                    deciding_trigger_tokens = None
+                    return finish(skipped_projection, reason="cached_rendering")
 
                 # Exact provider token counting is authoritative. If the cheap
                 # cached estimate allowed the skip path but the exact projected
@@ -26552,6 +27947,18 @@ class AgentLoop:
                 PROJECTION_FORCED_CRITICAL_TOTAL.labels(reason="exact_pressure_skip_guard").inc()
                 new_mode = PressureMode.critical
                 decision = ReprojectDecision.critical_reproject
+                projection_reason = "exact_budget_exceeded"
+                deciding_trigger_tokens = min(
+                    (skipped_projection.policy or stable_policy).hard_prompt_tokens,
+                    snapshot.available_prompt_tokens
+                    if snapshot
+                    else budget.available_prompt_tokens,
+                    getattr(
+                        snapshot,
+                        "threshold_prompt_tokens",
+                        (skipped_projection.policy or stable_policy).hard_prompt_tokens,
+                    ),
+                )
                 if prior_exact_mode != PressureMode.critical:
                     PROJECTION_PRESSURE_TRANSITIONS_TOTAL.labels(
                         from_mode=str(prior_exact_mode), to_mode=str(PressureMode.critical)
@@ -26665,8 +28072,9 @@ class AgentLoop:
         turn_state.last_result = ProjectionResult(
             messages=last_projection.messages,
             mutable_start_index=last_projection.mutable_start_index,
+            decisions=last_projection.decisions,
         )
-        return last_projection
+        return finish(last_projection, reason=projection_reason)
 
     def _log_projection_pressure_recovery(
         self, ctx: StepContext, *, projection: ProjectedMessages
@@ -27402,6 +28810,58 @@ class AgentLoop:
         except Exception:
             logger.warning("agent: failed to resolve recovery notice", exc_info=True)
 
+    async def _drain_tool_background_notices(
+        self,
+        ctx: StepContext,
+        messages: list[dict[str, Any]],
+        *,
+        on_token: TokenCallback | None = None,
+    ) -> None:
+        """Inject notices for tool calls moved to the background into the next model call.
+
+        Any notice not yet recorded (for example from a path that skipped the
+        post-batch hook) is recorded first, so injection never outruns the
+        durable history.
+        """
+
+        await self._record_tool_background_notices(ctx, on_token=on_token)
+        while ctx.pending_tool_background_notices:
+            notice = ctx.pending_tool_background_notices.pop(0)
+            messages.append(
+                {
+                    "role": "system",
+                    "content": notice.agent_context,
+                    TOOL_BACKGROUND_NOTICE: True,
+                }
+            )
+
+    async def _record_tool_background_notices(
+        self,
+        ctx: StepContext,
+        *,
+        on_token: TokenCallback | None = None,
+    ) -> None:
+        """Persist each pending background-handoff notice exactly once.
+
+        The persisted ``system_notice`` keeps the handoff visible in the
+        timeline and in replayed history after compaction, a step exit, or a
+        later turn. It is recorded after the batch's tool results so history
+        keeps tool_call/tool_result adjacency.
+        """
+
+        for notice in list(ctx.pending_tool_background_notices):
+            if notice.notice_id in ctx.recorded_tool_background_notice_ids:
+                continue
+            ctx.recorded_tool_background_notice_ids.add(notice.notice_id)
+            await self._emit_recovery_notice(
+                ctx,
+                notice.message,
+                on_token=on_token,
+                persist=True,
+                metadata=notice.metadata(),
+                record_reason="tool_background_notice",
+            )
+
     async def _emit_recovery_notice(
         self,
         ctx: StepContext,
@@ -27610,7 +29070,7 @@ class AgentLoop:
         second rotation. The compaction lease is always released here.
         """
 
-        if not compaction_result.compacted or compaction_result.turns_compacted <= 0:
+        if not compaction_result.compacted or compaction_result.events_compacted <= 0:
             await self._release_compaction_lease(ctx)
             return None
         try:
@@ -27662,6 +29122,7 @@ class AgentLoop:
                         "marker_role": "context_seed",
                         "timeline_visible": True,
                         "turns_compacted": compaction_result.turns_compacted,
+                        "events_compacted": compaction_result.events_compacted,
                         "tokens_before": compaction_result.tokens_before,
                         "tokens_after": compaction_result.tokens_after,
                         **(
@@ -27786,6 +29247,7 @@ class AgentLoop:
                     "summary_preview": summary_preview,
                     "method": compaction_result.method,
                     "turns_compacted": compaction_result.turns_compacted,
+                    "events_compacted": compaction_result.events_compacted,
                     "tokens_before": compaction_result.tokens_before,
                     "tokens_after": compaction_result.tokens_after,
                     **run_data,
@@ -28120,6 +29582,29 @@ class AgentLoop:
         execution_fence = getattr(ctx, "execution_fence", None)
         if execution_fence is not None:
             await execution_fence.assert_current()
+        if trigger in {"pre_model_pressure", "tool_loop_pressure", "provider_context_overflow"}:
+            refresh_settings = getattr(self.compaction_strategy, "refresh_settings", None)
+            if callable(refresh_settings):
+                await refresh_settings()
+            max_recursion = int(getattr(self.compaction_strategy, "max_recursion", 2) or 2)
+            # Check only after projection or the provider confirms pressure,
+            # never before trying the newly compacted session.
+            if ctx.compaction_recursion_depth >= max_recursion:
+                if run is not None:
+                    run.reason = "compaction_recursion_exhausted"
+                self._set_auto_compaction_cooldown(ctx.session.session_id)
+                logger.warning(
+                    "agent: consecutive compaction recovery limit reached",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "depth": ctx.compaction_recursion_depth,
+                            "max": max_recursion,
+                            "trigger": trigger,
+                        }
+                    },
+                )
+                return None
         lease_store = self._compaction_lease_store()
         if lease_store is not None:
             lease = await lease_store.acquire(
@@ -28407,7 +29892,10 @@ class AgentLoop:
                 )
                 return None
 
-        if compaction_result.compacted and compaction_result.turns_compacted <= 0:
+        # The strategy returns ``noop`` before recording when nothing is
+        # summarizable; this guards only results that claim success without
+        # summarized events. Intra-turn compaction legitimately has zero turns.
+        if compaction_result.compacted and compaction_result.events_compacted <= 0:
             compaction_result = compaction_result.model_copy(
                 update={"compacted": False, "method": "no_compactable_history"}
             )
@@ -28426,6 +29914,7 @@ class AgentLoop:
                     "session_id": ctx.session.session_id,
                     "method": compaction_result.method,
                     "turns_compacted": compaction_result.turns_compacted,
+                    "events_compacted": compaction_result.events_compacted,
                     "used_timeout_fallback": bool(run and run.used_timeout_fallback),
                 }
             },
@@ -28715,6 +30204,9 @@ class AgentLoop:
                 "session_id": getattr(row, "session_id", None),
                 "turn_id": getattr(row, "turn_id", None),
                 "version": row.version,
+                "lineage_id": getattr(row, "lineage_id", None) or row.deliverable_id,
+                "revision": getattr(row, "revision", None) or 1,
+                "supersedes_deliverable_id": getattr(row, "supersedes_deliverable_id", None),
                 "content": row.content,
                 "format": row.format,
                 "title": row.title,
@@ -28744,16 +30236,19 @@ class AgentLoop:
     async def _get_current_deliverable(self, ctx: StepContext) -> Deliverable | None:
         """Return the active deliverable for the current step run, if any."""
 
+        from cognis.store.queries import get_task
+
         deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
         if deliverable_step_run_id is None:
             return None
-        if ctx.current_deliverable is not None:
+        if ctx.current_deliverable is not None and ctx.task_id is None:
             return ctx.current_deliverable
         daily_brief_activation = self._strict_daily_brief_activation(ctx)
         if (
             ctx.current_deliverable_id
             and ctx.current_deliverable_content is not None
             and daily_brief_activation is None
+            and ctx.task_id is None
         ):
             return Deliverable.model_validate(
                 {
@@ -28770,12 +30265,27 @@ class AgentLoop:
 
         async with self.session_manager.session_factory() as db_session:
             step_run = await get_step_run(db_session, deliverable_step_run_id)
+            if ctx.task_id is not None:
+                task = await get_task(db_session, ctx.task_id)
+                if (
+                    task is None
+                    or step_run is None
+                    or task.created_by != ctx.session.user_email
+                    or step_run.task_id != ctx.task_id
+                    or step_run.agent_id != ctx.agent.agent_id
+                    or step_run.step_name != ctx.step_definition.name
+                    or step_run.attempt_number != task.attempt_number
+                    or step_run.status == "superseded"
+                    or step_run.superseded_by_step_run_id is not None
+                ):
+                    self._clear_cached_deliverable(ctx)
+                    return None
             row = (
                 await get_deliverable(db_session, step_run.deliverable_id)
                 if step_run is not None and isinstance(step_run.deliverable_id, str)
                 else None
             )
-        if row is None:
+        if row is None or row.step_run_id != deliverable_step_run_id or row.status == "superseded":
             self._clear_cached_deliverable(ctx)
             return None
         if self.artifact_store is not None:
@@ -28790,14 +30300,19 @@ class AgentLoop:
         """Resolve one authorized persisted content reference for final presentation."""
 
         if content_ref.startswith(("art_", "att_", "doc_", "img_")):
+            from cognis.core.artifact_access import artifact_authorized_for_conversation
+
             async with self.session_manager.session_factory() as db_session:
                 row = await get_artifact_record(db_session, content_ref)
-            if (
-                row is None
-                or row.owner_email != ctx.conversation.user_email
-                or row.status == "deleted"
-                or (row.expires_at is not None and row.expires_at <= datetime.now(UTC))
-            ):
+                allowed = await artifact_authorized_for_conversation(
+                    db_session,
+                    artifact=row,
+                    owner_email=ctx.conversation.user_email,
+                    conversation_id=ctx.conversation.conversation_id,
+                    agent_id=ctx.session.agent_id,
+                    session_id=ctx.session.session_id,
+                )
+            if row is None or not allowed:
                 raise ValueError("Content reference was not found or is unavailable.")
             return (
                 AttachmentRef(
@@ -28811,21 +30326,23 @@ class AgentLoop:
             )
 
         if content_ref.startswith("dlv_"):
+            from cognis.core.content_refs import authorize_deliverable_access
+
             async with self.session_manager.session_factory() as db_session:
                 deliverable_row = await get_deliverable(db_session, content_ref)
-                published_row = await get_artifact_record(db_session, content_ref)
-            owner_published = (
-                published_row is not None
-                and published_row.owner_email == ctx.conversation.user_email
-                and published_row.conversation_id is None
-                and published_row.status != "deleted"
-                and published_row.deleted_at is None
-                and published_row.purpose == "conversation_deliverable"
-            )
-            if deliverable_row is None or (
-                deliverable_row.conversation_id != ctx.conversation.conversation_id
-                and not owner_published
-            ):
+                access = (
+                    await authorize_deliverable_access(
+                        db_session,
+                        deliverable_row,
+                        ctx.conversation.user_email,
+                        accessor_conversation_id=ctx.conversation.conversation_id,
+                        accessor_agent_id=ctx.session.agent_id,
+                        accessor_session_id=ctx.session.session_id,
+                    )
+                    if deliverable_row is not None
+                    else None
+                )
+            if deliverable_row is None or access is None:
                 raise ValueError("Content reference was not found or is unavailable.")
             if self.artifact_store is not None:
                 try:
@@ -28839,6 +30356,9 @@ class AgentLoop:
                         "deliverable_id": deliverable_row.deliverable_id,
                         "step_run_id": deliverable_row.step_run_id,
                         "version": deliverable_row.version,
+                        "lineage_id": deliverable_row.lineage_id or deliverable_row.deliverable_id,
+                        "revision": deliverable_row.revision or 1,
+                        "supersedes_deliverable_id": deliverable_row.supersedes_deliverable_id,
                         "content": deliverable_row.content,
                         "format": deliverable_row.format,
                         "title": deliverable_row.title,
@@ -28905,6 +30425,32 @@ class AgentLoop:
             try:
                 if ctx.execution_fence is not None and deliverable_step_run_id is not None:
                     await ctx.execution_fence.assert_current(db_session)
+                # Lock order: chat, then revision target (see lock_document_scope),
+                # so a concurrent sharing change cannot strand this document.
+                await lock_document_scope(db_session, ctx.conversation.conversation_id)
+                revision_target = None
+                if authoring.supersedes is not None:
+                    revision_target = await authorize_supersedes_target(
+                        db_session,
+                        authoring.supersedes,
+                        user_email=ctx.conversation.user_email,
+                        accessor_conversation_id=ctx.conversation.conversation_id,
+                        accessor_agent_id=ctx.conversation.agent_id,
+                        accessor_session_id=ctx.session.session_id,
+                        lock=True,
+                    )
+                document_project_id = await resolve_new_content_project_id(
+                    db_session,
+                    user_email=ctx.conversation.user_email,
+                    agent_id=ctx.conversation.agent_id,
+                    conversation_id=ctx.conversation.conversation_id,
+                    session_id=ctx.session.session_id,
+                    requested_project_id=authoring.project_id,
+                    inherited_project_id=(
+                        revision_target.project_id if revision_target is not None else None
+                    ),
+                    inherit=revision_target is not None,
+                )
                 row = await create_deliverable(
                     db_session,
                     step_run_id=deliverable_step_run_id,
@@ -28926,6 +30472,8 @@ class AgentLoop:
                     published_owner_email=ctx.conversation.user_email
                     if deliverable_step_run_id is None
                     else None,
+                    supersedes_deliverable_id=authoring.supersedes,
+                    project_id=document_project_id,
                 )
                 if daily_brief_contract_fingerprint is not None:
                     render_metadata = dict(row.render_metadata or {})
@@ -28944,6 +30492,8 @@ class AgentLoop:
                 await db_session.commit()
             except RichPayloadValidationError:
                 raise
+            except DeliverableRevisionError as exc:
+                raise await complete_revision_conflict(db_session, exc) from None
             except Exception as exc:
                 raise DeliverablePersistenceError(
                     f"{type(exc).__name__}: {str(exc)[:500]}"
@@ -29002,13 +30552,14 @@ class AgentLoop:
             return None
 
     async def _ensure_known_project_context_loaded(self, ctx: StepContext) -> None:
-        explicit_project_id = self._explicit_project_id(ctx)
+        explicit_project_id = await self._effective_project_id(ctx)
         if explicit_project_id is not None:
             await self._maybe_resolve_and_store_project_metadata(
                 ctx,
                 project_id=explicit_project_id,
                 raw_path=ctx.working_directory or ctx.workspace_root,
                 path_kind="directory",
+                refresh_changed=True,
             )
         if not (ctx.workspace_root_explicit or ctx.working_directory_explicit):
             return
@@ -29107,6 +30658,40 @@ class AgentLoop:
             "explicit_path": explicit_path,
         }
 
+    async def _effective_project_id(self, ctx: StepContext) -> str | None:
+        """Return the project this turn's work belongs to.
+
+        The stored conversation project wins; long-lived chats fall back to
+        the agent default project. Cached per step context because the
+        answer cannot change within one step.
+        """
+
+        cache_key = "_effective_project_id"
+        if cache_key in ctx.runtime_info:
+            cached = ctx.runtime_info[cache_key]
+            return cached if isinstance(cached, str) else None
+        explicit = self._explicit_project_id(ctx)
+        resolved: str | None = explicit
+        if explicit is None and self._session_factory is not None:
+            try:
+                async with self._session_factory() as db_session:
+                    resolved = await resolve_effective_project_id(
+                        db_session,
+                        conversation=ctx.conversation,
+                        agent_id=ctx.agent.agent_id,
+                        user_email=ctx.session.user_email,
+                    )
+            except Exception:
+                logger.debug(
+                    "agent: failed to resolve effective project",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+                resolved = None
+        ctx.runtime_info[cache_key] = resolved
+        ctx.conversation.effective_project_id = resolved
+        return resolved
+
     def _explicit_project_id(self, ctx: StepContext) -> str | None:
         project_id = getattr(ctx.conversation, "project_id", None)
         if isinstance(project_id, str) and project_id.strip():
@@ -29136,6 +30721,8 @@ class AgentLoop:
         self,
         ctx: StepContext,
         entry: ProjectMetadataEntry,
+        *,
+        replace: bool = False,
     ) -> ProjectMetadataEntry:
         get_entry = getattr(self.session_cache, "get_entry", None)
         refresh = getattr(self.session_cache, "refresh", None)
@@ -29144,6 +30731,10 @@ class AgentLoop:
         store = getattr(self.session_cache, "store_project_metadata_context", None)
         if not callable(store):
             return entry
+        if replace:
+            return cast(
+                ProjectMetadataEntry, await store(ctx.session.session_id, entry, replace=True)
+            )
         return cast(ProjectMetadataEntry, await store(ctx.session.session_id, entry))
 
     async def _maybe_resolve_and_store_project_metadata(
@@ -29153,14 +30744,24 @@ class AgentLoop:
         project_id: str | None = None,
         raw_path: str | None = None,
         path_kind: str = "directory",
+        refresh_changed: bool = False,
     ) -> ProjectMetadataEntry | None:
+        """Load DB project metadata into the session once per project.
+
+        With ``refresh_changed`` an already loaded explicit project is
+        re-resolved and replaced when its rendered metadata changed (for
+        example edited instructions), recording a new durable event.
+        """
+
         if self._session_factory is None:
             return None
-        explicit_project_id = project_id or self._explicit_project_id(ctx)
-        if (
-            explicit_project_id
-            and self._session_project_metadata(ctx, explicit_project_id) is not None
-        ):
+        explicit_project_id = project_id or await self._effective_project_id(ctx)
+        loaded = (
+            self._session_project_metadata(ctx, explicit_project_id)
+            if explicit_project_id
+            else None
+        )
+        if loaded is not None and not refresh_changed:
             return None
         try:
             async with self._session_factory() as db_session:
@@ -29181,12 +30782,15 @@ class AgentLoop:
                 if resolved is None:
                     return None
                 project_id = str(resolved.project.project_id)
-                if self._session_project_metadata(ctx, project_id) is not None:
-                    return None
                 entry = project_metadata_entry_from_resolution(
                     resolved,
                     working_directory=ctx.working_directory or raw_path,
                 )
+                current = self._session_project_metadata(ctx, project_id)
+                if current is not None and (
+                    loaded is None or current.content_hash == entry.content_hash
+                ):
+                    return None
         except Exception:
             logger.debug(
                 "agent: failed to resolve project metadata context",
@@ -29194,11 +30798,16 @@ class AgentLoop:
                 exc_info=True,
             )
             return None
-        was_loaded = self._session_project_metadata(ctx, entry.project_id) is None
-        stored_entry = await self._store_session_project_metadata(ctx, entry)
-        if was_loaded:
+        current = self._session_project_metadata(ctx, entry.project_id)
+        if current is None:
+            stored_entry = await self._store_session_project_metadata(ctx, entry)
             await self._record_project_metadata_event(ctx, stored_entry)
             return stored_entry
+        if current.content_hash != entry.content_hash:
+            # Record first so the durable event owns the new seq; the cache
+            # replacement mirrors what replay produces (latest event wins).
+            await self._record_project_metadata_event(ctx, entry)
+            return await self._store_session_project_metadata(ctx, entry, replace=True)
         return None
 
     async def _maybe_probe_and_store_project_context(
@@ -29465,6 +31074,7 @@ class AgentLoop:
             "tool_agent_type": ctx.agent.agent_type,
             "session_id": ctx.session.session_id,
             "conversation_id": ctx.conversation.conversation_id,
+            "project_id": getattr(ctx.conversation, "project_id", None),
             "task_id": ctx.task_id,
             "step_name": ctx.step_definition.name,
             "step_run_id": ctx.step_run_id,
@@ -29497,7 +31107,6 @@ class AgentLoop:
         if ctx.chat_mode is not None:
             metadata["chat_mode"] = ctx.chat_mode.mode
             metadata["chat_mode_source"] = ctx.chat_mode.source
-            metadata["read_only_required"] = ctx.chat_mode.read_only_required
         if ctx.task_id:
             metadata["task_id"] = ctx.task_id
         if ctx.step_definition.name:
@@ -29536,6 +31145,18 @@ class AgentLoop:
         metadata = self._tool_runtime_metadata(ctx)
         metadata["tool_call_id"] = tool_call.call_id
         metadata["tool_name"] = tool_call.name
+        from cognis.core.guardrails_context import loaded_skills_context, recent_outcomes
+
+        snapshots = self.session_cache.get_loaded_skill_snapshots(ctx.session.session_id)
+        metadata["loaded_skills"] = loaded_skills_context(snapshots)
+        events = self.session_cache.get_events_since_compaction(
+            ctx.session.session_id, types=["tool_call", "tool_result"]
+        )
+        metadata["recent_outcomes"] = recent_outcomes(
+            [*events, *(ctx.pending_events or [])],
+            user_id=ctx.session.user_email,
+            session_id=ctx.session.session_id,
+        )
         if isinstance(ctx.memory_policy, MemoryRuntimePolicy):
             metadata["memory_policy_enabled"] = ctx.memory_policy.tools_enabled
             metadata["memory_policy_fingerprint"] = ctx.memory_policy.policy_fingerprint
@@ -30599,7 +32220,9 @@ class AgentLoop:
 
         from cognis.tools.builtin.orchestration import orchestration_tools
         from cognis.tools.builtin.workflow import (
+            ANSWER_QUESTION_TOOL,
             ATTACH_ARTIFACT_TOOL,
+            FORWARD_QUESTION_TOOL,
             LIST_CREDENTIALS_TOOL,
             REQUEST_AUTH_CHALLENGE_TOOL,
             REQUEST_CREDENTIAL_TOOL,
@@ -30635,11 +32258,9 @@ class AgentLoop:
         def _visible_description(tool_def: ToolDefinition) -> str:
             if direct_chat_surface and tool_def.name == STEP_REQUEST_QUESTIONS_TOOL.name:
                 return (
-                    "Ask the user structured questions during execution. Use this to clarify "
-                    "ambiguous instructions, gather requirements or preferences, get decisions "
-                    "on implementation choices, or choose between directions when the answer "
-                    "would materially affect the result. This pauses the turn and resumes after "
-                    "the user answers."
+                    "Request structured clarification and pause until answered. Child questions "
+                    "go to the parent agent, which can answer or forward to the user. "
+                    "Direct-chat questions go to the user."
                 )
             if direct_chat_surface and tool_def.name == STEP_TODO_WRITE_TOOL.name:
                 return (
@@ -30734,13 +32355,15 @@ class AgentLoop:
 
         # step_request_questions — only when the step permits interactive questions.
         if (
-            not delegated_child
+            not task_control_surface
             and ctx.interaction_mode == "step_requests"
             and ctx.step_definition.allow_questions
         ):
             tools.append(_to_schema(STEP_REQUEST_QUESTIONS_TOOL))
 
         # step_todo tools — always available.
+        if not task_control_surface and not delegated_child:
+            tools.extend([_to_schema(ANSWER_QUESTION_TOOL), _to_schema(FORWARD_QUESTION_TOOL)])
         if not task_control_surface:
             tools.append(_to_schema(STEP_TODO_WRITE_TOOL))
             tools.append(_to_schema(STEP_TODO_LIST_TOOL))
@@ -30838,35 +32461,16 @@ class AgentLoop:
             else:
                 tools.append(_to_schema(tool_def))
 
-        # Stage 36: switch_executor — exposed only when the agent has at
-        # least two USABLE assigned executors. Hiding it when fewer are
-        # usable avoids offering a no-op tool to the LLM.
+        # Availability belongs in append-only context, not in tool schemas.
+        # Runtime switching still validates assignment and current usability.
         pool = getattr(ctx, "executor_pool", None)
-        if not task_control_surface and pool is not None and not _is_delegated_child_context(ctx):
-            usable_ids = sorted(t.executor_id for t in pool.all if t.usable and t.executor_id)
-            if len(usable_ids) >= 2:
-                import copy as _copy
-
-                schema = _copy.deepcopy(tool_input_schema(SWITCH_EXECUTOR_TOOL))
-                properties = schema.setdefault("properties", {})
-                executor_field = properties.setdefault("executor_id", {"type": "string"})
-                executor_field["enum"] = usable_ids
-                tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": SWITCH_EXECUTOR_TOOL.name,
-                            "description": SWITCH_EXECUTOR_TOOL.description,
-                            "parameters": schema,
-                        },
-                    }
-                )
-                exposed_definitions.append(
-                    tool_with_input_schema(
-                        SWITCH_EXECUTOR_TOOL,
-                        schema,
-                    )
-                )
+        if (
+            not task_control_surface
+            and pool is not None
+            and len(pool.all) >= 2
+            and not _is_delegated_child_context(ctx)
+        ):
+            tools.append(_to_schema(SWITCH_EXECUTOR_TOOL))
 
         validate_direct_schema_sizes([*exposed_definitions, *deferred_definitions])
         return ControllerToolExposure(
@@ -30955,11 +32559,7 @@ class AgentLoop:
                 task_queue=getattr(self.tool_router, "_task_queue", None),
                 guardrails=getattr(self.providers, "guardrails", None),
                 assignable_tools=assignable_tools,
-                assignable_knowledgebase_ids=(
-                    set(ctx.agent.permissions.allowed_knowledgebases)
-                    if ctx.agent.permissions is not None
-                    else None
-                ),
+                caller_agent_id=ctx.agent.agent_id,
             ),
             session_factory=self._session_factory,
             artifact_store=getattr(self, "artifact_store", None),
@@ -30971,6 +32571,9 @@ class AgentLoop:
             task_title=getattr(ctx, "task_title", ""),
             task_description=getattr(ctx, "task_description", ""),
             task_expected_output=getattr(ctx, "task_expected_output", None),
+            daily_brief_task_output=self._daily_brief_task_output(ctx),
+            deliverable_step_run_id=getattr(ctx, "step_run_id", None)
+            or getattr(ctx, "deliverable_step_run_id", None),
             loaded_skill_names=frozenset(getattr(ctx, "loaded_skill_names", set())),
             loaded_skill_snapshots=skill_snapshots,
             executed_tool_names=tool_names,
@@ -30991,11 +32594,9 @@ class AgentLoop:
     ) -> dict[str, Any]:
         """Validate through the same provider-backed context used by the live tool path."""
 
-        assignable_tools = [
-            tool
-            for tool in introspection_tools
-            if tool.configurable and tool.source.type in {"builtin", "executor"}
-        ]
+        from cognis.core.tool_router import caller_assignable_tools
+
+        assignable_tools = caller_assignable_tools(self._get_tool_registry(ctx), ctx.agent)
         validation_context = self._native_validation_context(
             ctx,
             assignable_tools,
@@ -31044,14 +32645,34 @@ class AgentLoop:
                             },
                         )
             result["validation_state_fingerprint"] = state_fingerprint
-            if result.get("valid") is True and validation_phase == "preflight":
-                activation = resolve_daily_brief_contract(
-                    task_title=getattr(ctx, "task_title", ""),
-                    task_description=getattr(ctx, "task_description", ""),
-                    task_expected_output=getattr(ctx, "task_expected_output", None),
-                    loaded_skill_names=getattr(ctx, "loaded_skill_names", set()),
-                    loaded_skill_snapshots=getattr(ctx, "loaded_skill_snapshots", {}),
+            if getattr(ctx, "task_id", None) and getattr(ctx, "step_definition", None):
+                from cognis.core.workflow_output_contract import resolve_output_ownership
+
+                ownership = resolve_output_ownership(
+                    getattr(ctx, "workflow_steps", None),
+                    ctx.step_definition,
+                    getattr(ctx, "step_index", 0),
                 )
+                result["output_contract"] = {
+                    "task_id": ctx.task_id,
+                    "step_run_id": validation_context.deliverable_step_run_id,
+                    "agent_id": validation_context.current_agent_id,
+                    "step_index": getattr(ctx, "step_index", 0),
+                    "task_output": validation_context.daily_brief_task_output,
+                    "producer_step": ownership.producer_step,
+                    "reason": ownership.reason,
+                    "phase": validation_phase,
+                }
+                logger.info(
+                    "Workflow output contract validation",
+                    extra={
+                        "output_contract": result["output_contract"],
+                        "validation_state_fingerprint": state_fingerprint,
+                        "validation_valid": result.get("valid") is True,
+                    },
+                )
+            if result.get("valid") is True and validation_phase == "preflight":
+                activation = self._effective_daily_brief_activation(ctx)
                 result["validation_receipt"] = {
                     "payload_fingerprint": payload_fingerprint,
                     "state_fingerprint": state_fingerprint,
@@ -31070,14 +32691,11 @@ class AgentLoop:
             TOOL_GROUP_DEFINITIONS,
             _settings_field_names,
         )
-        from cognis.core.workflow_registry import SYSTEM_WORKFLOWS
         from cognis.store.queries import (
             list_executors,
-            list_knowledgebases,
             list_llm_providers,
             list_skills,
             list_visible_agents,
-            list_workflows,
         )
         from cognis.tools.skills import is_agent_assignable_skill
 
@@ -31096,11 +32714,13 @@ class AgentLoop:
                 | {str(item) for item in raw_models if isinstance(item, str) and item}
             )
 
-        assignable_tools = [
-            tool
-            for tool in tools
-            if tool.configurable and tool.source.type in {"builtin", "executor"}
-        ]
+        from cognis.core.agent_management_catalog import (
+            assignable_knowledgebases,
+            available_workflows,
+        )
+        from cognis.core.tool_router import caller_assignable_tools
+
+        assignable_tools = caller_assignable_tools(self._get_tool_registry(ctx), ctx.agent)
         assignable_ids = {stable_tool_id(tool) for tool in assignable_tools}
         values: dict[str, list[Any]] = {
             "agent_management.assignable_tools": sorted(assignable_ids),
@@ -31114,14 +32734,11 @@ class AgentLoop:
         if self._session_factory is not None and user_email:
             async with self._session_factory() as session:
                 visible_agents = await list_visible_agents(session, user_email)
-                workflows = await list_workflows(
+                workflows = await available_workflows(session, user_email)
+                knowledgebases = await assignable_knowledgebases(
                     session,
-                    owner_email=user_email,
-                    include_system=False,
-                )
-                knowledgebases = await list_knowledgebases(
-                    session,
-                    owner_email=user_email,
+                    actor_email=user_email,
+                    caller_agent_id=ctx.agent.agent_id,
                 )
                 providers = await list_llm_providers(session)
                 executors = await list_executors(
@@ -31141,27 +32758,17 @@ class AgentLoop:
                 if getattr(row, "status", "active") == "active"
             ]
             workflow_values = [
-                {"workflow_id": workflow.workflow_id, "name": workflow.name}
-                for workflow in SYSTEM_WORKFLOWS.values()
-            ]
-            workflow_values.extend(
                 {"workflow_id": row.workflow_id, "name": row.name} for row in workflows
-            )
+            ]
             values["schedule.visible_agents"] = agent_values
             values["schedule.agent_profiles"] = agent_values
             values["schedule.available_workflows"] = workflow_values
-            allowed_knowledgebases = (
-                set(ctx.agent.permissions.allowed_knowledgebases)
-                if ctx.agent.permissions is not None
-                else None
-            )
             values["agent_management.authorized_knowledgebases"] = [
                 {
                     "knowledgebase_id": row.knowledgebase_id,
                     "name": row.name,
                 }
                 for row in knowledgebases
-                if allowed_knowledgebases is None or row.knowledgebase_id in allowed_knowledgebases
             ]
             values["agent_management.available_skills"] = [
                 {
@@ -31202,7 +32809,9 @@ class AgentLoop:
 
         from cognis.tools.builtin.orchestration import orchestration_tools
         from cognis.tools.builtin.workflow import (
+            ANSWER_QUESTION_TOOL,
             ATTACH_ARTIFACT_TOOL,
+            FORWARD_QUESTION_TOOL,
             LIST_CREDENTIALS_TOOL,
             REQUEST_AUTH_CHALLENGE_TOOL,
             REQUEST_CREDENTIAL_TOOL,
@@ -31216,6 +32825,8 @@ class AgentLoop:
         )
 
         registry = {
+            ANSWER_QUESTION_TOOL.name: ANSWER_QUESTION_TOOL,
+            FORWARD_QUESTION_TOOL.name: FORWARD_QUESTION_TOOL,
             ATTACH_ARTIFACT_TOOL.name: ATTACH_ARTIFACT_TOOL,
             WRITE_DELIVERABLE_TOOL.name: WRITE_DELIVERABLE_TOOL,
             STEP_COMPLETE_TOOL.name: STEP_COMPLETE_TOOL,
@@ -31469,8 +33080,6 @@ class AgentLoop:
         active_id = getattr(ctx, "active_executor_id", None)
 
         def _per_call_routable(target: Any) -> bool:
-            if not target.usable:
-                return False
             if active_id is not None and target.executor_id == active_id:
                 return True
             return bool(target.executor_type == "websocket")
@@ -31489,7 +33098,8 @@ class AgentLoop:
             offering = sorted(
                 target.executor_id
                 for target in pool.all
-                if tool_observed_on(target, tool.name) and _per_call_routable(target)
+                if tool_observed_on(target, tool.name, require_usable=False)
+                and _per_call_routable(target)
             )
             if len(offering) < 2:
                 effective.append(tool)
@@ -31524,20 +33134,7 @@ class AgentLoop:
         if not isinstance(registry, ToolRegistry):
             return registry
 
-        classified_registry = ToolRegistry()
-        changed = False
-        for registered in registry.items():
-            classified_definition = classified_definitions.get(
-                stable_tool_id(registered.definition)
-            )
-            if classified_definition is None:
-                classified_registry.register(registered)
-                continue
-            changed = True
-            classified_registry.register(
-                RegisteredTool(definition=classified_definition, handler=registered.handler)
-            )
-        return classified_registry if changed else registry
+        return registry.with_definition_overrides(classified_definitions)
 
     def _record_tool_call_ledger_events(
         self,
@@ -31569,37 +33166,48 @@ class AgentLoop:
     def _get_initial_promoted_tool_ids(self, ctx: StepContext) -> set[str]:
         """Return tool ids that should be promoted visible before any discovery calls.
 
-        Only auto-loaded skill links are promoted from agent metadata. Explicit
-        skill loads and classifier activations are restored from session state
-        by ``_get_initial_activated_tool_ids``.
+        Only bounded bundled-hook hints are promoted. Skill activation controls
+        execution eligibility, never direct schema promotion.
         """
 
         promoted: set[str] = set()
+        from cognis.core.hooks import hook_startup_tool_names
+
+        promoted.update(hook_startup_tool_names(getattr(ctx, "session", None)))
+        return self._canonicalize_skill_tool_ids(ctx, promoted)
+
+    def _canonicalize_skill_tool_ids(self, ctx: StepContext, references: set[str]) -> set[str]:
+        registry = self._get_tool_registry(ctx)
+        if registry is None:
+            return references
+        tools = classify_tool_definitions_sync(registry.list_tools())
+        bindings = {
+            reference: stable_tool_id(tool)
+            for reference in references
+            if (tool := resolve_inventory_tool(tools, reference)) is not None
+        }
+        resolved_profile = resolve_step_profile(ctx.step_definition)
+        allowed_ids = {
+            stable_tool_id(tool)
+            for tool in _filter_model_inventory_tools(
+                ctx.agent, tools, set(bindings.values()), set()
+            )
+            if step_profile_allows_tool(tool, resolved_profile)
+        }
+        # Preserve unresolved persisted IDs across executor reconnects. They cannot
+        # expose a tool until it exists in the current permission-filtered inventory.
+        return (set(bindings.values()) & allowed_ids) | (references - bindings.keys())
+
+    def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
+        activated = self._get_initial_promoted_tool_ids(ctx)
         if isinstance(ctx.agent.skills, dict):
             auto_loaded_ids = ctx.agent.skills.get("_auto_loaded_skill_tool_ids")
             if isinstance(auto_loaded_ids, list):
-                promoted.update(
-                    str(tool_id)
-                    for tool_id in auto_loaded_ids
-                    if isinstance(tool_id, str) and tool_id.strip()
-                )
-        return promoted
-
-    def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
-        activated: set[str] = set()
-        if isinstance(ctx.agent.skills, dict):
-            raw_auto_loaded_ids = ctx.agent.skills.get("_auto_loaded_skill_tool_ids")
-            if isinstance(raw_auto_loaded_ids, list):
-                activated.update(
-                    str(tool_id)
-                    for tool_id in raw_auto_loaded_ids
-                    if isinstance(tool_id, str) and tool_id.strip()
-                )
+                activated.update(tool_id for tool_id in auto_loaded_ids if isinstance(tool_id, str))
         getter = getattr(self.session_cache, "get_activated_skill_tool_ids", None)
-        if not callable(getter):
-            return activated
-        activated.update(getter(ctx.session.session_id))
-        return activated
+        if callable(getter):
+            activated.update(getter(ctx.session.session_id))
+        return self._canonicalize_skill_tool_ids(ctx, activated)
 
     def _step_log_metadata(self, ctx: StepContext) -> dict[str, Any]:
         workflow = getattr(ctx, "workflow", None)
@@ -31948,12 +33556,10 @@ class AgentLoop:
         metadata: dict[str, Any],
         promoted_tool_ids: set[str],
         activated_tool_ids: set[str],
-    ) -> str | None:
+    ) -> SkillActivationResult | None:
         """Activate tools for a loaded skill.
 
-        Returns an optional transparency notice string (``<skill_activation>``
-        block) that the caller should inject as a system message so the model
-        knows which tools were auto-enabled and can self-correct if needed.
+        Return resolved eligibility separately from its optional appended notice.
         """
         activation = metadata.get("skill_activation")
         if not isinstance(activation, dict):
@@ -31969,6 +33575,7 @@ class AgentLoop:
             for key in (
                 "skill_id",
                 "name",
+                "description",
                 "version_id",
                 "version_number",
                 "content_hash",
@@ -31981,25 +33588,41 @@ class AgentLoop:
             store_snapshot(ctx.session.session_id, skill_id, snapshot)
 
         # Wire protocol: skill management tools emit "discovered_tool_ids" in their
-        # metadata dicts.  The internal variable is promoted_tool_ids, but the key
-        # name is kept stable so existing skill tool metadata round-trips correctly.
+        # metadata dicts. Keep that protocol key without promoting direct schemas.
         raw_declared_tool_ids = metadata.get("discovered_tool_ids")
         declared_tool_ids = raw_declared_tool_ids if isinstance(raw_declared_tool_ids, list) else []
-        resolved_tool_ids = {
+        declared_references = {
             str(tool_id)
             for tool_id in declared_tool_ids
             if isinstance(tool_id, str) and tool_id.strip()
         }
+        resolved_tool_ids: set[str] = set()
+        unresolved_references = set(declared_references)
+        registry = self._get_tool_registry(ctx)
+        if declared_references and registry is not None:
+            registry_tools = classify_tool_definitions_sync(registry.list_tools())
+            bindings = {
+                reference: stable_tool_id(tool)
+                for reference in declared_references
+                if (tool := resolve_inventory_tool(registry_tools, reference)) is not None
+            }
+            resolved_tool_ids = self._canonicalize_skill_tool_ids(ctx, set(bindings.values()))
+            unresolved_references = {
+                reference
+                for reference in declared_references
+                if bindings.get(reference) not in resolved_tool_ids
+            }
         resolution_path = "declared"
-        if not resolved_tool_ids and ctx.tool_registry is not None:
+        if not declared_references and registry is not None:
             resolution_path = "classified"
             resolved_profile = resolve_step_profile(ctx.step_definition)
             full_inventory_tools = _filter_model_inventory_tools(
                 ctx.agent,
-                classify_tool_definitions_sync(ctx.tool_registry.list_tools()),
+                classify_tool_definitions_sync(registry.list_tools()),
                 promoted_tool_ids,
                 activated_tool_ids,
             )
+            configured_tool_groups = _configured_agent_tool_groups(ctx.agent)
             # B1 — strict policy-hidden scope.
             # The classifier's job is to UNLOCK tools that the step profile
             # would not expose by default.  Policy-visible tools are already
@@ -32020,8 +33643,8 @@ class AgentLoop:
                     tool,
                     resolved_profile,
                     activated_tool_ids=activated_tool_ids,
+                    configured_tool_groups=configured_tool_groups,
                 )
-                and stable_tool_id(tool) not in activated_tool_ids
             ]
             resolved_tool_ids = await self._classify_skill_activation_tool_ids(
                 ctx,
@@ -32040,10 +33663,10 @@ class AgentLoop:
                     }
                 },
             )
-            return None
+            if not unresolved_references:
+                return SkillActivationResult(frozenset())
 
-        # Promote the resolved tool ids so they become visible next turn.
-        promoted_tool_ids.update(resolved_tool_ids)
+        # Activation grants execution eligibility without editing the schema prefix.
         activated_tool_ids.update(resolved_tool_ids)
         activate = getattr(self.session_cache, "activate_skill_tools", None)
         if callable(activate):
@@ -32066,7 +33689,7 @@ class AgentLoop:
         # Keeps it short: tool names only, plus a self-correction hint.
         notice_lines = [
             f'<skill_activation skill_id="{skill_id}">',
-            "The following tools were auto-enabled for this skill. "
+            "The following resolved tools are available through describe_tool and call_tool. "
             "If they do not match what the skill actually needs, call search_tools "
             "to find the correct ones.",
         ]
@@ -32074,15 +33697,23 @@ class AgentLoop:
             tool_obj = next(
                 (
                     t
-                    for t in (ctx.tool_registry.list_tools() if ctx.tool_registry else [])
+                    for t in (registry.list_tools() if registry else [])
                     if stable_tool_id(t) == tool_id_str
                 ),
                 None,
             )
             name = tool_obj.name if tool_obj else tool_id_str
             notice_lines.append(f"- {name} ({tool_id_str})")
+        if unresolved_references:
+            notice_lines.append(
+                "These declared references were not enabled: unavailable, ambiguous, or "
+                "disallowed by the current inventory/policy. Use search_tools to find "
+                "authorized alternatives; a failed reference is not proof that its service "
+                "is unavailable."
+            )
+            notice_lines.extend(f"- {reference}" for reference in sorted(unresolved_references))
         notice_lines.append("</skill_activation>")
-        return "\n".join(notice_lines)
+        return SkillActivationResult(frozenset(resolved_tool_ids), "\n".join(notice_lines))
 
     def _initialize_loaded_skill_snapshots(self, ctx: StepContext) -> list[dict[str, Any]]:
         """Seed concrete auto/session-loaded skill versions into step validation state."""
@@ -32122,6 +33753,7 @@ class AgentLoop:
                 for key in (
                     "skill_id",
                     "name",
+                    "description",
                     "version_id",
                     "version_number",
                     "content_hash",
@@ -32139,20 +33771,41 @@ class AgentLoop:
         return new_snapshots
 
     @staticmethod
+    def _daily_brief_task_output(ctx: StepContext) -> bool | None:
+        from cognis.core.workflow_output_contract import step_is_task_output
+
+        if _is_delegated_child_context(ctx):
+            return None
+        if getattr(ctx, "controller_tool_surface", None) == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT:
+            return None
+        if not hasattr(ctx, "step_definition"):
+            return None
+        return step_is_task_output(
+            getattr(ctx, "workflow_steps", None),
+            ctx.step_definition,
+            getattr(ctx, "step_index", 0),
+        )
+
+    @staticmethod
+    def _effective_daily_brief_activation(ctx: StepContext) -> Any | None:
+        return resolve_daily_brief_contract(
+            task_title=getattr(ctx, "task_title", ""),
+            task_description=getattr(ctx, "task_description", ""),
+            task_expected_output=getattr(ctx, "task_expected_output", None),
+            loaded_skill_names=getattr(ctx, "loaded_skill_names", set()),
+            loaded_skill_snapshots=getattr(ctx, "loaded_skill_snapshots", {}),
+            task_output=AgentLoop._daily_brief_task_output(ctx),
+        )
+
+    @staticmethod
     def _strict_daily_brief_activation(ctx: StepContext) -> Any | None:
         if _is_delegated_child_context(ctx):
             return None
-        if not ctx.policy.require_step_complete:
+        if not getattr(getattr(ctx, "policy", None), "require_step_complete", False):
             return None
         if ctx.step_run_id is None and ctx.deliverable_step_run_id is None:
             return None
-        activation = resolve_daily_brief_contract(
-            task_title=ctx.task_title,
-            task_description=ctx.task_description,
-            task_expected_output=ctx.task_expected_output,
-            loaded_skill_names=ctx.loaded_skill_names,
-            loaded_skill_snapshots=ctx.loaded_skill_snapshots,
-        )
+        activation = AgentLoop._effective_daily_brief_activation(ctx)
         if activation is None or activation.version < CURRENT_DAILY_BRIEF_CONTRACT_VERSION:
             return None
         return activation
@@ -32160,22 +33813,7 @@ class AgentLoop:
     def _merge_promoted_tool_ids(
         self, promoted_tool_ids: set[str], metadata: dict[str, Any]
     ) -> None:
-        """Merge newly promoted tool ids from tool metadata.
-
-        ``discovered_tool_ids`` in tool metadata carries tool ids that a tool
-        result wants to promote into the visible surface (e.g. skill-write
-        auto-binding a newly created skill).  ``removed_tool_ids`` revokes
-        promotion (e.g. skill deletion).
-        """
-
-        # Wire protocol key — intentionally kept as "discovered_tool_ids" to match
-        # what skill management tools emit in their metadata dicts.
-        raw_ids = metadata.get("discovered_tool_ids")
-        if not isinstance(raw_ids, list):
-            raw_ids = []
-        promoted_tool_ids.update(
-            str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()
-        )
+        """Revoke removed tools without promoting metadata into the schema prefix."""
         removed_ids = metadata.get("removed_tool_ids")
         if isinstance(removed_ids, list):
             promoted_tool_ids.difference_update(

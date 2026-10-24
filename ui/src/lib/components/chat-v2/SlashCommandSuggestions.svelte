@@ -16,21 +16,21 @@
 
 <div
   id={listboxId}
-  class="mb-1 max-h-[40vh] overflow-y-auto overscroll-contain rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg"
+  class="mb-1 max-h-[40vh] overflow-y-auto overscroll-contain rounded-xl border border-control-border bg-elevated/95 py-1 text-sm shadow-lg"
   role="listbox"
   aria-label="Slash command suggestions"
 >
   {#each suggestions as suggestion, index}
     <button
       id={`${listboxId}-option-${index}`}
-      class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-xs transition {index === selectedIndex ? 'bg-slate-700/60 text-slate-100' : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'}"
+      class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-xs transition {index === selectedIndex ? 'bg-accent-subtle text-foreground' : 'text-secondary hover:bg-surface-hover hover:text-foreground'}"
       onmousedown={(event) => event.preventDefault()}
       onclick={(event) => onSelect(event, index)}
       type="button"
       role="option"
       aria-selected={index === selectedIndex}
     >
-      <span class="min-w-0 font-mono font-medium text-sky-400">
+      <span class="min-w-0 font-mono font-medium text-accent">
         {suggestion.kind === 'parameter' ? suggestion.value : suggestion.command}
       </span>
       <span class="min-w-0 flex-1 truncate opacity-70">
@@ -44,7 +44,7 @@
       {#if suggestion.badges.length > 0}
         <span class="flex shrink-0 gap-1">
           {#each suggestion.badges as badge}
-            <span class="rounded-full border border-slate-600 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">{badge}</span>
+            <span class="rounded-full border border-control-border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-secondary">{badge}</span>
           {/each}
         </span>
       {/if}

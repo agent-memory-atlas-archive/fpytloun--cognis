@@ -21,7 +21,7 @@ from cognis.models.deliverable import (
     RichPayloadValidationError,
     normalize_rich_payload,
 )
-from cognis.store.models import Agent, ManagedConversationLink
+from cognis.store.models import Agent, ArtifactGrantRow, ManagedConversationLink
 from cognis.store.queries import (
     create_artifact_record,
     create_conversation,
@@ -496,7 +496,7 @@ async def test_private_media_forwards_accessor_conversation_to_authorization(
 
 
 @pytest.mark.asyncio
-async def test_cross_conversation_media_is_rehomed_before_child_purge(
+async def test_cross_conversation_media_preserves_provenance_and_survives_child_purge(
     task_continuation_db,
 ) -> None:
     await _seed_managed_rich_deliverable(task_continuation_db)
@@ -527,7 +527,7 @@ async def test_cross_conversation_media_is_rehomed_before_child_purge(
         media_key = deliverable.rich_payload["blocks"][0]["media"]["key"]
         artifact = await get_artifact_record(session, "att_child_media_rehomed")
         assert artifact is not None
-        assert artifact.conversation_id == "conv-controller"
+        assert artifact.conversation_id == "conv-grandchild"
         assert artifact.status == "attached"
         await session.execute(
             delete(ManagedConversationLink).where(
@@ -558,18 +558,42 @@ async def test_cross_conversation_media_is_rehomed_before_child_purge(
 
 
 @pytest.mark.asyncio
-async def test_owner_global_media_is_retained_by_the_deliverable_conversation(
+@pytest.mark.parametrize("authorized", [False, True])
+async def test_unscoped_media_requires_explicit_owner_and_agent_grant(
     task_continuation_db,
+    authorized,
 ) -> None:
     await _seed_managed_rich_deliverable(task_continuation_db)
     await _artifact(
         task_continuation_db,
         artifact_id="att_owner_global_media",
-        owner=None,
+        owner="owner@example.com" if authorized else None,
         conversation_id=None,
     )
 
     async with task_continuation_db() as session:
+        if not authorized:
+            with pytest.raises(RichPayloadValidationError, match="rich_media_not_accessible"):
+                await create_deliverable(
+                    session,
+                    deliverable_id="dlv_owner_global_media",
+                    conversation_id="conv-controller",
+                    content="Fallback",
+                    format="rich",
+                    rich={
+                        "blocks": [{"type": "figure", "media": {"ref": "att_owner_global_media"}}]
+                    },
+                    artifact_store=task_continuation_db.artifact_store,
+                )
+            return
+        session.add(
+            ArtifactGrantRow(
+                owner_email="owner@example.com",
+                content_ref="att_owner_global_media",
+                agent_id="agent-owner",
+            )
+        )
+        await session.flush()
         await create_deliverable(
             session,
             deliverable_id="dlv_owner_global_media",

@@ -19,7 +19,7 @@ from cognis.models.skill import (
     SkillToolSpec,
 )
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
-from cognis.models.tool import ToolResult, ToolSource, stable_tool_id
+from cognis.models.tool import ToolCapability, ToolResult, ToolSource, stable_tool_id
 from cognis.tools.skill_service import (
     apply_mapping_patch,
     apply_named_list_patch,
@@ -90,6 +90,12 @@ SKILL_LOAD_TOOL = ToolDefinition(
         "Do not read filesystem SKILL.md files as a substitute for loading visible "
         "Cognis skills. "
         "Loading a skill also makes its deferred skill tools available for subsequent model calls."
+        " Assets are automatically verified and cached on the active authorized executor; "
+        "Python assets share an automatically maintained skill virtualenv. Dependencies come "
+        "from PEP 723 inline comments, falling back to best-effort import inference. "
+        "Use python_environment.python_path with each returned local_path. Preparation failures "
+        "do not block instructions: inspect preparation_warning, correct executor issues through "
+        "normal tools, and reload to retry. Reload after publishing assets or switching executors."
     ),
     parameters={
         "type": "object",
@@ -101,7 +107,7 @@ SKILL_LOAD_TOOL = ToolDefinition(
     source=_SKILL_SOURCE,
     category="skill",
     read_only=True,
-    timeout_seconds=15,
+    timeout_seconds=120,
 )
 
 SKILL_GET_TOOL = ToolDefinition(
@@ -288,6 +294,7 @@ SKILL_ASSET_WRITE_TOOL = ToolDefinition(
 
 SKILL_ASSET_DELETE_TOOL = ToolDefinition(
     name="skill_asset_delete",
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
     description=(
         "Remove an asset from a skill by filename, creating a new skill version. "
         "Use this Cognis tool instead of deleting files from a filesystem skill directory."
@@ -309,6 +316,7 @@ SKILL_ASSET_DELETE_TOOL = ToolDefinition(
 
 SKILL_DELETE_TOOL = ToolDefinition(
     name="skill_delete",
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
     description=(
         "Delete a skill by ID. This removes the skill and all its versions. "
         "Use this Cognis tool instead of removing filesystem skill manifests."
@@ -562,12 +570,26 @@ def materialize_loaded_skill_context(
     version_id: str | None = None,
     version_number: int | None = None,
     content_hash: str | None = None,
+    prepared_assets: list[dict[str, Any]] | None = None,
+    python_environment: dict[str, Any] | None = None,
+    preparation_warning: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the protected context and activation metadata for a loaded skill."""
 
     from cognis import json_codec as json
 
-    asset_manifest = _skill_asset_llm_manifest(asset_refs)
+    asset_manifest = (
+        prepared_assets if prepared_assets is not None else _skill_asset_llm_manifest(asset_refs)
+    )
+    asset_guidance = (
+        "Use the local_path in this manifest on its named executor. Reload the skill "
+        "after publishing assets, switching executors, or losing cached files. "
+        "Run Python assets with python_environment.python_path, not system Python. "
+        "Runnable skill tools are exposed separately by the tool runtime."
+        if prepared_assets is not None
+        else "Asset paths have not been prepared. Call skill_load before using asset-only "
+        "helpers, even if instructions are already loaded. Do not use scratch copies."
+    )
     protected_context_parts = [
         "<loaded_skill>",
         f"<skill_id>{skill_id}</skill_id>",
@@ -583,17 +605,22 @@ def materialize_loaded_skill_context(
             + json.dumps(asset_manifest, indent=2, default=str)
             + "\n</asset_manifest>"
         )
-        protected_context_parts.append(
-            "<asset_guidance>Use skill_asset_materialize only when you need an "
-            "asset-only script or need to inspect an asset as an executor-local "
-            "file. Runnable skill tools are exposed separately by the tool "
-            "runtime.</asset_guidance>"
-        )
+        protected_context_parts.append(f"<asset_guidance>{asset_guidance}</asset_guidance>")
     if templates:
         protected_context_parts.append(
             "<prompt_templates>\n"
             + json.dumps(templates, indent=2, default=str)
             + "\n</prompt_templates>"
+        )
+    if python_environment:
+        protected_context_parts.append(
+            "<python_environment>\n"
+            + json.dumps(python_environment, indent=2, default=str)
+            + "\n</python_environment>"
+        )
+    if preparation_warning:
+        protected_context_parts.append(
+            f"<preparation_warning>{preparation_warning}</preparation_warning>"
         )
     protected_context_parts.append("</loaded_skill>")
 
@@ -619,13 +646,9 @@ def materialize_loaded_skill_context(
         "template_count": len(templates or {}),
         "asset_count": len(asset_refs),
         "asset_manifest": asset_manifest,
-        "asset_guidance": (
-            "Use skill_asset_materialize(skill_id, asset_id) only for asset-only "
-            "scripts or asset inspection. Runnable skill tools are exposed "
-            "separately by the tool runtime."
-            if asset_manifest
-            else None
-        ),
+        "python_environment": python_environment,
+        "preparation_warning": preparation_warning,
+        "asset_guidance": asset_guidance if asset_manifest else None,
         "message": "Skill loaded into working context for this turn.",
         "tags": tags or [],
         "version_id": version_id,
@@ -672,13 +695,20 @@ async def handle_skill_management_tool(
     llm: Any | None = None,
     artifact_store: Any | None = None,
     current_agent_id: str | None = None,
+    executor: Any | None = None,
 ) -> ToolResult:
     """Handle a skill management tool call."""
     try:
         if tool_name == "skill_list":
             return await _handle_skill_list(session_factory, user_email)
         if tool_name == "skill_load":
-            return await _handle_skill_load(session_factory, user_email, arguments)
+            return await _handle_skill_load(
+                session_factory,
+                user_email,
+                arguments,
+                executor=executor,
+                artifact_store=artifact_store,
+            )
         if tool_name == "skill_get":
             return await _handle_skill_get(session_factory, user_email, arguments)
         if tool_name == "skill_versions":
@@ -864,7 +894,12 @@ async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResul
 
 
 async def _handle_skill_load(
-    session_factory: Any, user_email: str, arguments: dict[str, Any]
+    session_factory: Any,
+    user_email: str,
+    arguments: dict[str, Any],
+    *,
+    executor: Any = None,
+    artifact_store: Any = None,
 ) -> ToolResult:
     """Load a skill's full instructions, templates, and asset manifest.
 
@@ -902,6 +937,16 @@ async def _handle_skill_load(
         )
         steps = getattr(version_row, "steps", None) if version_row is not None else None
 
+    from cognis.core.skill_assets import prepare_loaded_skill_assets
+
+    preparation = await prepare_loaded_skill_assets(
+        skill_id=row.skill_id,
+        version_id=version_row.version_id if version_row is not None else None,
+        asset_refs=asset_refs,
+        owner_email=user_email,
+        executor=executor,
+        artifact_store=artifact_store,
+    )
     result, metadata = materialize_loaded_skill_context(
         skill_id=row.skill_id,
         name=row.name,
@@ -917,6 +962,11 @@ async def _handle_skill_load(
         version_id=version_row.version_id if version_row is not None else None,
         version_number=version_row.version_number if version_row is not None else None,
         content_hash=version_row.content_hash if version_row is not None else None,
+        prepared_assets=preparation.assets
+        if not preparation.warning or preparation.assets
+        else None,
+        python_environment=preparation.python_environment,
+        preparation_warning=preparation.warning,
     )
     declared_tool_ids = metadata.get("discovered_tool_ids", [])
     skill_activation = metadata.get("skill_activation")

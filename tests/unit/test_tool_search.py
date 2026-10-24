@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from jsonschema import Draft7Validator
 
 from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
@@ -31,7 +32,7 @@ def _tool(name: str, description: str, category: str) -> ToolDefinition:
     )
 
 
-def _mcp_tool(name: str, raw_name: str, server_id: str = "slack-lumilens") -> ToolDefinition:
+def _mcp_tool(name: str, raw_name: str, server_id: str = "slack-sample") -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description=f"MCP tool {raw_name}",
@@ -68,6 +69,193 @@ def test_search_inventory_returns_ranked_permission_filtered_matches() -> None:
     assert "operations" not in matches[0]
 
 
+def test_named_tool_rejection_parser_and_repair_are_bounded_and_inventory_scoped() -> None:
+    from cognis.core.tool_rejection_recovery import (
+        MAX_REJECTIONS_PER_TURN,
+        plan_rejection_repair,
+        rejected_tool_name,
+    )
+
+    read = _tool("read", "Read a file", "filesystem")
+    bash = _tool("bash", "Run shell commands", "shell")
+    assert (
+        rejected_tool_name(
+            "MidStreamFallbackError: Attempted to call tool 'bash' which was not in request.tools"
+        )
+        == "bash"
+    )
+    assert (
+        rejected_tool_name(
+            "Attempted to call tool 'repo_browser.list_directory' which was not in request.tools"
+        )
+        == "repo_browser.list_directory"
+    )
+    assert rejected_tool_name("invalid_request: malformed arguments for bash") is None
+
+    hidden = plan_rejection_repair(
+        "bash",
+        inventory=[read, bash],
+        aliases={},
+        visible_tool_ids={"builtin:read"},
+        seen_names=set(),
+    )
+    assert hidden is not None
+    assert hidden.promoted_tool_id == "builtin:bash"
+    assert "rejected call" in hidden.note
+
+    unknown = plan_rejection_repair(
+        "repo_browser.list_directory",
+        inventory=[read, bash],
+        aliases={},
+        visible_tool_ids={"builtin:read", "builtin:bash"},
+        seen_names=set(),
+    )
+    assert unknown is not None
+    assert unknown.promoted_tool_id is None
+    assert "search_tools" in unknown.note
+    assert "repo_browser.list_directory" not in unknown.note or "authorized" in unknown.note
+
+    assert (
+        plan_rejection_repair(
+            "bash",
+            inventory=[read, bash],
+            aliases={},
+            visible_tool_ids={"builtin:read"},
+            seen_names={"bash"},
+        )
+        is None
+    )
+    assert MAX_REJECTIONS_PER_TURN == 4
+    assert (
+        plan_rejection_repair(
+            "read",
+            inventory=[read, bash],
+            aliases={},
+            visible_tool_ids=set(),
+            seen_names={"a", "b", "c", "d"},
+        )
+        is None
+    )
+    excluded = plan_rejection_repair(
+        "bash",
+        inventory=[read],  # The current effective inventory excludes bash.
+        aliases={},
+        visible_tool_ids={"builtin:read"},
+        seen_names=set(),
+    )
+    assert excluded is not None
+    assert excluded.promoted_tool_id is None
+
+
+def test_named_tool_rejection_alias_must_resolve_uniquely_and_never_suffix_matches() -> None:
+    from cognis.core.tool_rejection_recovery import plan_rejection_repair
+
+    tool = _tool("list_directory", "List files", "filesystem")
+    alias_repair = plan_rejection_repair(
+        "visible_list_dir",
+        inventory=[tool],
+        aliases={"visible_list_dir": "list_directory"},
+        visible_tool_ids=set(),
+        seen_names=set(),
+    )
+    assert alias_repair is not None
+    assert alias_repair.promoted_tool_id == "builtin:list_directory"
+    assert (
+        plan_rejection_repair(
+            "repo_browser.list_directory",
+            inventory=[tool],
+            aliases={},
+            visible_tool_ids=set(),
+            seen_names=set(),
+        ).promoted_tool_id
+        is None
+    )
+
+
+def test_tool_rejection_recovery_state_persists_within_turn_and_resets_for_new_turn() -> None:
+    from cognis.core.tool_rejection_recovery import ToolRejectionRecoveryState
+
+    state = ToolRejectionRecoveryState.for_turn("turn-a")
+    state.seen_names.update({"bash", "read_file"})
+
+    # Same-turn profile switch or compaction re-entry retains the owner state.
+    state.reset_for_new_turn("turn-a")
+    assert state.seen_names == {"bash", "read_file"}
+
+    state.seen_names.update({"mcp:calendar:list", "shell_exec"})
+    assert len(state.seen_names) == 4
+    state.reset_for_new_turn("turn-b")
+    assert state.turn_id == "turn-b"
+    assert state.seen_names == set()
+
+
+def test_native_project_management_and_kb_discovery_are_searchable() -> None:
+    from cognis.core.tool_arguments import validate_tool_arguments
+    from cognis.tools.builtin.conversations import conversation_tools
+    from cognis.tools.builtin.knowledgebase import knowledgebase_tools
+    from cognis.tools.builtin.projects import project_tools
+
+    tools = [*project_tools(), *knowledgebase_tools(), *conversation_tools()]
+    calls = {
+        "find_project_share_recipients": {"project_id": "proj_home", "query": "Romana"},
+        "list_project_grants": {"project_id": "proj_home"},
+        "create_project_grant": {
+            "project_id": "proj_home",
+            "grantee_user_email": "recipient@example.com",
+            "permission": "member",
+        },
+        "update_project_grant": {
+            "project_id": "proj_home",
+            "grant_id": "pgrant_active",
+            "permission": "viewer",
+        },
+        "revoke_project_grant": {"project_id": "proj_home", "grant_id": "pgrant_active"},
+        "set_project_avatar": {"project_id": "proj_home", "content_ref": "img_generated"},
+        "knowledgebase_list": {"query": "Egypt"},
+        "knowledgebase_list_owned": {"query": "Egypt"},
+        "list_project_knowledgebases": {"project_id": "proj_home", "query": "Egypt"},
+        "assign_knowledgebase_to_project": {
+            "project_id": "proj_home",
+            "knowledgebase_id": "kb_egypt",
+        },
+        "unassign_knowledgebase_from_project": {
+            "project_id": "proj_home",
+            "knowledgebase_id": "kb_egypt",
+        },
+        "list_project_conversations": {"project_id": "proj_home"},
+        "list_project_tasks": {"project_id": "proj_home", "limit": 1},
+        "restore_project": {"project_id": "proj_home"},
+        "leave_project": {"project_id": "proj_home", "make_private": True},
+        "set_conversation_project": {"conversation_id": "conv_owned", "project_id": None},
+    }
+    for name, arguments in calls.items():
+        matches = search_inventory(tools, name, limit=20)
+        assert name in {match["name"] for match in matches}
+        tool = resolve_inventory_tool(tools, f"builtin:{name}")
+        assert tool is not None
+        assert tool.descriptor.operations[0].operation == name
+        assert validate_tool_arguments(name, arguments, schema=tool.parameters) is None
+    tool = resolve_inventory_tool(tools, "create_project_grant")
+    assert validate_tool_arguments(
+        tool.name,
+        {
+            "project_id": "proj_home",
+            "grantee_user_email": "recipient@example.com",
+            "permission": "owner",
+        },
+        schema=tool.parameters,
+    )
+    # Searching a narrower allowed inventory never leaks the omitted capability.
+    assert (
+        search_inventory(
+            [tool for tool in tools if tool.category == "knowledgebase"],
+            "set_project_avatar",
+            category="project",
+        )
+        == []
+    )
+
+
 def test_search_inventory_adds_compact_multi_operation_index() -> None:
     matches = search_inventory([MANAGE_AGENTS_TOOL], "manage agents", limit=5)
 
@@ -84,6 +272,41 @@ def test_search_inventory_adds_compact_multi_operation_index() -> None:
     ]
     assert all("input_schema" not in operation for operation in result["operations"])
     assert result["operations_truncated"] is True
+
+
+def test_schedule_project_operations_preserve_null_and_omission_contract() -> None:
+    from cognis.core.tool_arguments import validate_tool_arguments
+    from cognis.tools.argument_normalization import strip_empty_optional_values
+    from cognis.tools.builtin.orchestration import UPDATE_TASK_TOOL
+    from cognis.tools.builtin.schedule import MANAGE_SCHEDULES_TOOL
+
+    for arguments in (
+        {"action": "list", "project_id": "proj_home"},
+        {
+            "action": "create",
+            "name": "Home",
+            "schedule_type": "interval",
+            "interval_seconds": 60,
+            "project_id": "proj_home",
+        },
+        {"action": "update", "schedule_id": "sched_owned", "project_id": None},
+    ):
+        normalized = strip_empty_optional_values(arguments, MANAGE_SCHEDULES_TOOL.parameters)
+        assert "project_id" in normalized and normalized["project_id"] == arguments["project_id"]
+        assert (
+            validate_tool_arguments(
+                "manage_schedules", normalized, schema=MANAGE_SCHEDULES_TOOL.parameters
+            )
+            is None
+        )
+    assert (
+        validate_tool_arguments(
+            "update_task",
+            {"task_id": "task_owned", "project_id": None},
+            schema=UPDATE_TASK_TOOL.parameters,
+        )
+        is None
+    )
 
 
 def test_search_inventory_caps_operation_index_at_25() -> None:
@@ -149,6 +372,89 @@ def test_resolve_inventory_tool_prefers_stable_id_and_requires_unique_name() -> 
 
     assert resolve_inventory_tool([first, second], "mcp:gmail:search_messages") is first
     assert resolve_inventory_tool([first, second], "shared_name") is None
+
+
+def _slack_tool_with_opaque_id(server_id: str = "mcp_111111111111") -> ToolDefinition:
+    tool = _mcp_tool(
+        "mcp_slack-sample__conversations_search_messages",
+        "conversations_search_messages",
+        server_id=server_id,
+    )
+    return tool.model_copy(
+        update={"source": tool.source.model_copy(update={"server_name": "slack-sample"})}
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "mcp:mcp_111111111111:conversations_search_messages",
+        "mcp:slack-sample:conversations_search_messages",
+        "mcp_slack-sample__conversations_search_messages",
+        "conversations_search_messages",
+        "mcp__cognis__mcp__slack-sample__conversations_search_messages",
+    ],
+)
+def test_inventory_reference_resolution_and_selection_share_aliases(reference: str) -> None:
+    tool = _slack_tool_with_opaque_id()
+    assert resolve_inventory_tool([tool], reference) is tool
+    matches = search_inventory([tool], f"select:{reference}")
+    assert [match["tool_id"] for match in matches] == [
+        "mcp:mcp_111111111111:conversations_search_messages"
+    ]
+    assert resolve_inventory_tool([], reference) is None
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "mcp:slack-sample:conversations_search_messages",
+        "conversations_search_messages",
+        "mcp_slack-sample__conversations_search_messages",
+    ],
+)
+def test_inventory_reference_ambiguity_never_selects_first_match(reference: str) -> None:
+    first = _slack_tool_with_opaque_id()
+    second = _slack_tool_with_opaque_id("mcp_second_workspace")
+    for tools in ([first, second], [second, first]):
+        assert resolve_inventory_tool(tools, reference) is None
+        assert search_inventory(tools, f"select:{reference}") == []
+        assert search_inventory(tools, reference, limit=1) == []
+        assert (
+            resolve_inventory_tool(tools, "mcp:mcp_111111111111:conversations_search_messages")
+            is first
+        )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "+slack-sample conversations_search_messages",
+        "slack-sample conversations_search_messages",
+        "mcp:slack-sample:conversations_search_messages",
+        "mcp_slack-sample__conversations_search_messages",
+        "conversations_search_messages",
+    ],
+)
+@pytest.mark.parametrize("already_visible", [False, True])
+def test_exact_tool_search_returns_target_even_if_visible(
+    query: str, already_visible: bool
+) -> None:
+    target = _slack_tool_with_opaque_id()
+    unrelated = _mcp_tool("mcp_slack-sample__usergroups_create", "usergroups_create")
+    unrelated.description = "slack sample " * 30
+    matches = search_inventory(
+        [unrelated, target],
+        query,
+        category="mcp",
+        limit=1,
+        already_visible_tool_ids=(
+            {"mcp:mcp_111111111111:conversations_search_messages"} if already_visible else set()
+        ),
+    )
+    assert len(matches) == 1
+    assert matches[0]["tool_id"] == "mcp:mcp_111111111111:conversations_search_messages"
+    assert matches[0]["already_visible"] is already_visible
 
 
 def test_search_inventory_omits_already_visible_tools() -> None:
@@ -256,26 +562,26 @@ def test_search_inventory_selects_claude_mcp_prefixed_tool_names() -> None:
     tools = [
         _tool("skill_load", "Load a skill", "skill"),
         _mcp_tool(
-            "mcp_slack-lumilens__conversations_search_messages",
+            "mcp_slack-sample__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
         (
             "select:mcp__cognis__skill_load,"
-            "mcp__cognis__mcp_slack-lumilens__conversations_search_messages,"
-            "mcp__cognis__mcp_slack-lumilens__channels_list"
+            "mcp__cognis__mcp_slack-sample__conversations_search_messages,"
+            "mcp__cognis__mcp_slack-sample__channels_list"
         ),
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
         "skill_load",
-        "mcp_slack-lumilens__conversations_search_messages",
-        "mcp_slack-lumilens__channels_list",
+        "mcp_slack-sample__conversations_search_messages",
+        "mcp_slack-sample__channels_list",
     ]
     assert all(match["handle"]["confidence"] == 100.0 for match in matches)
 
@@ -283,45 +589,45 @@ def test_search_inventory_selects_claude_mcp_prefixed_tool_names() -> None:
 def test_search_inventory_select_accepts_stable_ids_and_raw_names() -> None:
     tools = [
         _mcp_tool(
-            "mcp_slack-lumilens__conversations_search_messages",
+            "mcp_slack-sample__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
-        "select:mcp:slack-lumilens:conversations_search_messages,channels_list,missing",
+        "select:mcp:slack-sample:conversations_search_messages,channels_list,missing",
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
-        "mcp_slack-lumilens__conversations_search_messages",
-        "mcp_slack-lumilens__channels_list",
+        "mcp_slack-sample__conversations_search_messages",
+        "mcp_slack-sample__channels_list",
     ]
 
 
 def test_search_inventory_select_accepts_double_underscore_mcp_aliases() -> None:
     tools = [
         _mcp_tool(
-            "mcp_slack-lumilens__conversations_search_messages",
+            "mcp_slack-sample__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
         (
-            "select:mcp__cognis__mcp__slack-lumilens__conversations_search_messages,"
-            "mcp__cognis__mcp__slack-lumilens__channels_list"
+            "select:mcp__cognis__mcp__slack-sample__conversations_search_messages,"
+            "mcp__cognis__mcp__slack-sample__channels_list"
         ),
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
-        "mcp_slack-lumilens__conversations_search_messages",
-        "mcp_slack-lumilens__channels_list",
+        "mcp_slack-sample__conversations_search_messages",
+        "mcp_slack-sample__channels_list",
     ]
 
 
@@ -329,19 +635,19 @@ def test_search_inventory_select_returns_already_visible_tools() -> None:
     tools = [
         SEARCH_TOOLS_TOOL,
         _tool("skill_load", "Load a skill", "skill"),
-        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
-        "select:mcp__cognis__search_tools,mcp__cognis__skill_load,mcp__cognis__mcp_slack-lumilens__channels_list",
+        "select:mcp__cognis__search_tools,mcp__cognis__skill_load,mcp__cognis__mcp_slack-sample__channels_list",
         already_visible_tool_ids={"builtin:skill_load"},
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
         "skill_load",
-        "mcp_slack-lumilens__channels_list",
+        "mcp_slack-sample__channels_list",
     ]
     assert matches[0]["already_visible"] is True
     assert matches[1]["already_visible"] is False

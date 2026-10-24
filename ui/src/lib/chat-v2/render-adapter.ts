@@ -201,6 +201,8 @@ function toRenderAssistantDeliverable(
     createdAt: item.created_at ?? undefined,
     updatedAt: item.updated_at ?? undefined,
     deliverableId: item.deliverable_id,
+    lineageId: item.lineage_id ?? undefined,
+    revision: item.revision ?? undefined,
     format: item.format,
     title: item.title ?? undefined,
     content: item.content ?? undefined,
@@ -214,14 +216,16 @@ function toRenderMessage(
   if (item.role === 'system') {
     return toRenderSystemMessage(item);
   }
-  const streaming = item.stable === false && (item.status === 'running' || item.partial === true);
+  // Partial describes incomplete content, not an actively emitting text stream.
+  const streaming = item.stable === false && item.status === 'running' && item.text_streaming !== false;
+  const previewing = item.stable === false && (item.status === 'running' || item.partial === true);
   return {
     id: item.id,
     kind: 'message',
     sessionId: firstSessionId(item),
     role: item.role,
     content: item.content,
-    html: renderMarkdownContent(item.content, `message:${item.id}`, streaming),
+    html: renderMarkdownContent(item.content, `message:${item.id}`, previewing),
     seq: firstSeq(item),
     timestamp: item.created_at ?? item.updated_at ?? null,
     turnId: item.turn_id ?? null,
@@ -230,6 +234,7 @@ function toRenderMessage(
     // overlay clears (has_active_turn=false), the store terminalizes items
     // so this resolves to false and no message hangs "in progress".
     streaming,
+    arrivalEligible: item.stable === false && (item.status === 'running' || item.status === 'pending'),
     attachments: item.attachments,
     optimistic: item.role === 'user' && item.source_refs.length === 0,
     deliveryStatus: item.role === 'user' && item.source_refs.length === 0
@@ -255,6 +260,7 @@ function toRenderSystemMessage(
   return {
     id: item.id,
     kind: 'system_message',
+    turnId: item.turn_id ?? null,
     text: item.content,
     noticeId: item.notice_id ?? null,
     noticeKind: item.notice_kind ?? null,
@@ -498,6 +504,7 @@ function toRenderCompaction(item: ChatV2CompactionTimelineItem): CompactionTimel
     summary: item.summary ?? undefined,
     method: item.method,
     turnsCompacted: item.turns_compacted,
+    eventsCompacted: item.events_compacted ?? 0,
     trigger: item.trigger ?? undefined,
     reason: item.reason ?? undefined,
     previousUsagePercentage: item.previous_usage_percentage ?? null,

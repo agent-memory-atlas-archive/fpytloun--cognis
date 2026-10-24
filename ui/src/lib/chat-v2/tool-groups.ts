@@ -147,6 +147,7 @@ const EXPLORATION_TOOLS = new Set([
   'search_tools',
   'artifact_read',
   'artifact_get_metadata',
+  'artifact_get_content',
   'artifact_get_url',
   'artifact_list_recent',
   'artifact_search',
@@ -513,34 +514,34 @@ function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
   let summary: ToolGroupSummary;
   switch (kind) {
     case 'explore':
-      summary = { ...common, label: 'Exploring…', icon: 'search', accentClass: 'border-sky-400/30 text-sky-200' };
+      summary = { ...common, label: 'Exploring…', icon: 'search', accentClass: 'border-blue-border text-blue-tone' };
       break;
     case 'command':
-      summary = { ...common, label: 'Running commands…', icon: 'terminal', accentClass: 'border-violet-400/30 text-violet-200' };
+      summary = { ...common, label: 'Running commands…', icon: 'terminal', accentClass: 'border-violet-border text-violet-tone' };
       break;
     case 'edit':
-      summary = { ...common, label: 'Editing files…', icon: 'edit', accentClass: 'border-emerald-400/30 text-emerald-200' };
+      summary = { ...common, label: 'Editing files…', icon: 'edit', accentClass: 'border-teal-border text-teal-tone' };
       break;
     case 'delegate':
-      summary = { ...common, label: 'Delegating work…', icon: 'delegate', accentClass: 'border-amber-400/30 text-amber-200' };
+      summary = { ...common, label: 'Delegating work…', icon: 'delegate', accentClass: 'border-orange-border text-orange-tone' };
       break;
     case 'web':
-      summary = { ...common, label: 'Searching web…', icon: 'globe', accentClass: 'border-cyan-400/30 text-cyan-200' };
+      summary = { ...common, label: 'Searching web…', icon: 'globe', accentClass: 'border-cyan-border text-cyan-tone' };
       break;
     case 'browser':
-      summary = { ...common, label: 'Using browser…', icon: 'browser', accentClass: 'border-indigo-400/30 text-indigo-200' };
+      summary = { ...common, label: 'Using browser…', icon: 'browser', accentClass: 'border-indigo-border text-indigo-tone' };
       break;
     case 'image':
-      summary = { ...common, label: 'Generating images…', icon: 'image', accentClass: 'border-pink-400/30 text-pink-200' };
+      summary = { ...common, label: 'Generating images…', icon: 'image', accentClass: 'border-pink-border text-pink-tone' };
       break;
     case 'memory':
-      summary = { ...common, label: 'Accessing memory…', icon: 'brain', accentClass: 'border-fuchsia-400/30 text-fuchsia-200' };
+      summary = { ...common, label: 'Accessing memory…', icon: 'brain', accentClass: 'border-fuchsia-border text-fuchsia-tone' };
       break;
     case 'knowledgebase':
-      summary = { ...common, label: 'Querying knowledgebase…', icon: 'database', accentClass: 'border-teal-400/30 text-teal-200' };
+      summary = { ...common, label: 'Querying knowledgebase…', icon: 'database', accentClass: 'border-teal-border text-teal-tone' };
       break;
     default:
-      summary = { ...common, label: 'Using tools…', icon: 'wrench', accentClass: 'border-slate-500/40 text-slate-200' };
+      summary = { ...common, label: 'Using tools…', icon: 'wrench', accentClass: 'border-control-border text-foreground' };
   }
 
   if (cacheKey) {
@@ -564,7 +565,7 @@ function summarizeThinkingGroup(items: ThinkingTimelineItem[]): ThinkingGroupSum
   return {
     label: 'Thinking…',
     icon: 'brain',
-    accentClass: 'border-cyan-400/30 text-cyan-300/80',
+    accentClass: 'border-cyan-border text-cyan-tone',
     thoughtCount,
     detailLabel: `${thoughtCount} ${thoughtCount === 1 ? 'thought' : 'thoughts'}`,
     durationMs,

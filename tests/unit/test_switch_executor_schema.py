@@ -1,7 +1,7 @@
 """Stage 36 schema overlay coverage:
 
-- ``switch_executor`` controller tool is exposed only when the agent has
-  >=2 USABLE assigned executors (not just >=2 assigned).
+- ``switch_executor`` uses a stable schema when >=2 executors are assigned,
+  regardless of temporary availability.
 - ``target_executor`` enum overlay only appears on executor-routed tools
   observed on >=2 per-call-routable executors.
 - Controller-injected tools never carry ``target_executor``.
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from cognis.core.agent_loop import AgentLoop
 from cognis.core.executor_pool import (
@@ -106,8 +108,8 @@ def _profile_switch_tool(schemas: list[dict]) -> dict | None:
     return None
 
 
-def test_switch_executor_hidden_with_one_usable() -> None:
-    """Only one usable executor → no switch_executor schema."""
+def test_switch_executor_visible_with_one_usable() -> None:
+    """A temporary outage must not remove the switching schema."""
     loop = _make_loop()
     # Stub the helpers used by _build_controller_tool_schemas
     loop._deliverable_owner_step_run_id = lambda c: None
@@ -118,7 +120,7 @@ def test_switch_executor_hidden_with_one_usable() -> None:
         ]
     )
     schemas = loop._build_controller_tool_schemas(_ctx(pool, active_executor_id="exec-a"))
-    assert _switch_tool(schemas) is None
+    assert _switch_tool(schemas) is not None
 
 
 def test_switch_agent_profile_hidden_without_switch_eligible_profiles() -> None:
@@ -182,7 +184,7 @@ def test_switch_agent_profile_rejects_missing_or_blank_reason() -> None:
     assert "reason" in " ".join([blank.message, *blank.errors])
 
 
-def test_switch_executor_hidden_with_zero_usable() -> None:
+def test_switch_executor_visible_with_zero_usable() -> None:
     loop = _make_loop()
     loop._deliverable_owner_step_run_id = lambda c: None
     pool = ExecutorPool(
@@ -192,11 +194,11 @@ def test_switch_executor_hidden_with_zero_usable() -> None:
         ]
     )
     schemas = loop._build_controller_tool_schemas(_ctx(pool))
-    assert _switch_tool(schemas) is None
+    assert _switch_tool(schemas) is not None
 
 
 def test_switch_executor_visible_with_two_usable() -> None:
-    """Two or more usable assigned executors → schema injected with enum."""
+    """Executor IDs belong in context, not in a changing schema enum."""
     loop = _make_loop()
     loop._deliverable_owner_step_run_id = lambda c: None
     pool = ExecutorPool(
@@ -206,9 +208,38 @@ def test_switch_executor_visible_with_two_usable() -> None:
     schemas = loop._build_controller_tool_schemas(_ctx(pool, active_executor_id="exec-a"))
     schema = _switch_tool(schemas)
     assert schema is not None
-    enum_values = schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
-    # Must contain only the USABLE assigned executors, sorted
-    assert enum_values == ["exec-a", "exec-add", "exec-b"]
+    assert "enum" not in schema["function"]["parameters"]["properties"]["executor_id"]
+
+
+def test_switch_executor_schema_stable_across_availability_and_active_target() -> None:
+    loop = _make_loop()
+    loop._deliverable_owner_step_run_id = lambda c: None
+    online = ExecutorPool(primary=[_target("exec-a"), _target("exec-b")])
+    offline = ExecutorPool(
+        primary=[
+            _target("exec-a", state=ExecutorAvailability.OFFLINE),
+            _target("exec-b", state=ExecutorAvailability.OFFLINE),
+        ]
+    )
+    first = _switch_tool(
+        loop._build_controller_tool_schemas(_ctx(online, active_executor_id="exec-a"))
+    )
+    second = _switch_tool(
+        loop._build_controller_tool_schemas(_ctx(offline, active_executor_id="exec-b"))
+    )
+    assert first is not None
+    assert first == second
+
+
+def test_switch_executor_hidden_with_one_assigned() -> None:
+    loop = _make_loop()
+    loop._deliverable_owner_step_run_id = lambda c: None
+    assert (
+        _switch_tool(
+            loop._build_controller_tool_schemas(_ctx(ExecutorPool(primary=[_target("exec-a")])))
+        )
+        is None
+    )
 
 
 def test_switch_executor_hidden_for_delegated_child_session() -> None:
@@ -234,6 +265,7 @@ def test_child_executor_install_rejects_non_websocket_target() -> None:
     ok = loop._install_active_executor_target(
         ctx,
         _target("exec-b", executor_type="local"),
+        replacement_registry=None,
         update_conversation=False,
     )
 
@@ -242,7 +274,10 @@ def test_child_executor_install_rejects_non_websocket_target() -> None:
     assert ctx.conversation.active_executor_id == "exec-a"
 
 
-def test_switch_executor_enum_excludes_offline() -> None:
+def test_switch_executor_uses_canonical_schema_even_with_offline_assignments() -> None:
+    from cognis.models.tool import tool_input_schema
+    from cognis.tools.builtin.workflow import SWITCH_EXECUTOR_TOOL
+
     loop = _make_loop()
     loop._deliverable_owner_step_run_id = lambda c: None
     pool = ExecutorPool(
@@ -255,8 +290,7 @@ def test_switch_executor_enum_excludes_offline() -> None:
     schemas = loop._build_controller_tool_schemas(_ctx(pool))
     schema = _switch_tool(schemas)
     assert schema is not None
-    enum_values = schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
-    assert "exec-down" not in enum_values
+    assert schema["function"]["parameters"] == tool_input_schema(SWITCH_EXECUTOR_TOOL)
 
 
 # --------------------------------------------------------------------------
@@ -377,6 +411,72 @@ def test_target_executor_overlay_single_executor_omitted() -> None:
     )
     bash = next(s for s in schemas if s["function"]["name"] == "bash")
     assert "target_executor" not in bash["function"]["parameters"]["properties"]
+
+
+@pytest.mark.parametrize(
+    "state", [ExecutorAvailability.OFFLINE, ExecutorAvailability.RECONFIGURING]
+)
+def test_target_executor_schema_stable_across_availability_changes(state) -> None:
+    from cognis.core.executor_pool import tool_observed_on
+
+    loop = _make_loop()
+    registry = _build_registry_with_executor_tool("bash")
+    first = _target("exec-a", observed_tools=[{"name": "bash"}])
+    available = _target("exec-b", is_primary=False, observed_tools=[{"name": "bash"}])
+    unavailable = _target(
+        "exec-b", is_primary=False, state=state, observed_tools=[{"name": "bash"}]
+    )
+    definitions = [
+        loop._effective_inventory_tool_definitions(
+            _exec_ctx(
+                ExecutorPool(primary=[first], additional=[second]),
+                registry,
+                active_executor_id="exec-a",
+            ),
+            [registry.get("bash").definition],
+        )
+        for second in (available, unavailable)
+    ]
+    before, after = [describe_available_tool(tools, "bash")["descriptor"] for tools in definitions]
+    assert before["input_schema"] == after["input_schema"]
+    assert before["schema_hash"] == after["schema_hash"]
+    assert after["input_schema"]["properties"]["target_executor"]["enum"] == ["exec-a", "exec-b"]
+    assert not validate_available_tool_call(
+        definitions[1], "bash", {"command": "pwd", "target_executor": "exec-unassigned"}
+    )["valid"]
+    assert not tool_observed_on(unavailable, "bash"), "Routing still requires a usable target"
+    assert tool_observed_on(unavailable, "bash", require_usable=False)
+
+
+def test_target_executor_schema_does_not_advertise_disabled_target_tools() -> None:
+    from dataclasses import replace
+
+    loop = _make_loop()
+    registry = _build_registry_with_executor_tool("bash")
+    pool = ExecutorPool(
+        primary=[_target("exec-a", observed_tools=[{"name": "bash"}])],
+        additional=[
+            replace(
+                _target(
+                    "exec-b",
+                    is_primary=False,
+                    state=ExecutorAvailability.OFFLINE,
+                    observed_tools=[{"name": "bash"}],
+                ),
+                enabled_tools=["read"],
+            )
+        ],
+    )
+    effective = loop._effective_inventory_tool_definitions(
+        _exec_ctx(pool, registry, active_executor_id="exec-a"),
+        [registry.get("bash").definition],
+    )
+    assert (
+        "target_executor"
+        not in (
+            describe_available_tool(effective, "bash")["descriptor"]["input_schema"]["properties"]
+        )
+    )
 
 
 def test_target_executor_overlay_filters_in_process_additional() -> None:

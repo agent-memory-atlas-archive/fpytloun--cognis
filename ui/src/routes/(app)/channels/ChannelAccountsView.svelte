@@ -20,14 +20,14 @@
 <div class="space-y-4">
   <div class="flex items-center justify-between gap-3">
     <div>
-      <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Accounts</p>
-      <h2 class="mt-1 text-lg font-semibold text-white">Messaging accounts</h2>
+      <p class="text-xs uppercase tracking-[0.24em] text-quiet">Accounts</p>
+      <h2 class="mt-1 text-lg font-semibold text-strong">Messaging accounts</h2>
     </div>
     <Button size="sm" onclick={onCreate}>New account</Button>
   </div>
 
   {#if accounts.length === 0}
-    <Card class="p-6 text-sm text-slate-300">
+    <Card class="p-6 text-sm text-secondary">
       No channel accounts yet. Start by adding a platform and follow the setup guide.
     </Card>
   {/if}

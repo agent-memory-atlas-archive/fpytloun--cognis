@@ -1,8 +1,8 @@
 import { slugify } from '$lib/agents';
-import type { LLMProvider, ModelEntry } from '$lib/types/api';
+import type { LLMProvider, ModelEntry, ProviderMonitoringOptions } from '$lib/types/api';
 import { defaultModelEntry } from '$lib/types/api';
 
-export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt';
+export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt' | 'groq' | 'openrouter' | 'gemini' | 'systemone' | 'bedrock';
 export type AuthMode = 'env' | 'secret' | 'oauth' | 'none';
 export type ProviderOwnerScope = 'user' | 'system';
 export type CodexTransport = 'litellm' | 'direct';
@@ -20,9 +20,12 @@ export interface ProviderFormState {
   executor_selector: string;
   backend: string;
   status: string;
+  monitoring: ProviderMonitoringOptions;
   preset: ProviderPreset;
   owner_scope: ProviderOwnerScope;
   base_url: string;
+  aws_region_name: string;
+  aws_profile_name: string;
   default_model: string;
   models: ModelEntry[];
   auth_mode: AuthMode;
@@ -47,7 +50,21 @@ const PRESET_ENV_VARS: Record<string, string> = {
   openai: 'OPENAI_API_KEY',
   openai_compatible: 'OPENAI_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
-  litellm_proxy: 'LITELLM_PROXY_API_KEY'
+  litellm_proxy: 'LITELLM_PROXY_API_KEY',
+  groq: 'GROQ_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  gemini: 'GEMINI_API_KEY',
+  systemone: 'TYPESAFE_API_KEY',
+  bedrock: ''
+};
+
+export const PRESET_BASE_URLS: Partial<Record<ProviderPreset, string>> = {
+  ollama: 'http://localhost:11434',
+  litellm_proxy: 'http://localhost:4000',
+  groq: 'https://api.groq.com/openai/v1',
+  openrouter: 'https://openrouter.ai/api/v1',
+  gemini: 'https://generativelanguage.googleapis.com',
+  systemone: 'https://api.typesafe.ai/v1'
 };
 
 /** Display names for presets. */
@@ -57,13 +74,19 @@ export const PRESET_LABELS: Record<ProviderPreset, string> = {
   anthropic: 'Anthropic',
   ollama: 'Ollama (local)',
   litellm_proxy: 'LiteLLM Proxy',
-  chatgpt: 'ChatGPT Subscription (Codex)'
+  chatgpt: 'ChatGPT Subscription (Codex)',
+  groq: 'Groq',
+  openrouter: 'OpenRouter',
+  gemini: 'Google Gemini',
+  systemone: 'System One (TypeSafe Jev)',
+  bedrock: 'AWS Bedrock (IAM)'
 };
+export const PROVIDER_PRESETS = Object.keys(PRESET_LABELS) as ProviderPreset[];
 
 /** Config keys that are handled by structured form fields. */
 const KNOWN_CONFIG_KEYS = new Set([
   'preset', 'default_model', 'models', 'auth_config', 'codex_transport', 'use_responses_api',
-  'base_url', 'api_base', 'executor_id', 'executor_labels', 'executor_backend', 'scope', 'owner_scope'
+  'base_url', 'api_base', 'executor_id', 'executor_labels', 'executor_backend', 'scope', 'owner_scope', 'monitoring', 'aws_region_name', 'aws_profile_name'
 ]);
 
 const DEFAULT_CODEX_TRANSPORT: CodexTransport = 'direct';
@@ -74,11 +97,14 @@ export const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
   'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'supports_fast_mode', 'fast_mode_tier', 'fast_mode_parameter', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
+  'primary_cache_ttl', 'auxiliary_cache_ttl', 'supported_cache_ttls',
   'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
   'supports_openai_apply_patch', 'supports_responses_api', 'supports_extended_thinking',
   'supports_image_generation', 'supported_image_mime_types', 'supported_audio_mime_types',
+  'supports_video_generation', 'supports_video_input', 'video_capabilities',
   'supported_openai_params', 'max_tools', 'input_cost_per_mtok', 'output_cost_per_mtok', 'tier',
-  'provider_metadata', 'runtime_metadata'
+  'provider_metadata', 'runtime_metadata', 'cache_read_cost_per_mtok', 'cache_write_cost_per_mtok', 'model_mode', 'pricing',
+  'supports_parallel_tools', 'supports_structured_output'
 ];
 
 /** Parse a raw model dict from the DB into a typed ModelEntry. */
@@ -94,12 +120,24 @@ function parseModelEntry(raw: Record<string, unknown>, effective?: ModelEntry): 
   return { ...base, _configuredFields: Object.keys(raw), _initialValues: { ...base } };
 }
 
+/** Initialize an editable model without turning unknown runtime defaults into overrides. */
+export function modelEntryFromMetadata(raw: ModelEntry): ModelEntry {
+  const sources = raw.provider_metadata?.field_sources;
+  if (!sources || typeof sources !== 'object' || Array.isArray(sources)) {
+    return parseModelEntry(raw as unknown as Record<string, unknown>);
+  }
+  const supplied = Object.fromEntries(Object.entries(raw).filter(([key]) =>
+    key === 'model_id' || key === 'provider_metadata' || key === 'runtime_metadata' || Object.hasOwn(sources, key)
+  ));
+  return parseModelEntry(supplied, raw);
+}
+
 /** Serialize a ModelEntry for the config.models array, omitting default values. */
 function serializeModelEntry(entry: ModelEntry): Record<string, unknown> {
   const defaults = defaultModelEntry(entry.model_id);
   const result: Record<string, unknown> = { model_id: entry.model_id };
   for (const key of MODEL_ENTRY_KEYS) {
-    if (key === 'model_id') continue;
+    if (key === 'model_id' || key === 'supported_cache_ttls') continue;
     const val = entry[key];
     const def = defaults[key];
     // Include if value differs from default, or if it's set and default is undefined
@@ -125,7 +163,7 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
     if (raw === 'custom') {
       return 'openai_compatible';
     }
-    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'chatgpt'].includes(raw)) {
+    if (PROVIDER_PRESETS.includes(raw as ProviderPreset)) {
       return raw as ProviderPreset;
     }
   }
@@ -213,6 +251,10 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
         : '',
     backend: provider?.backend ?? 'litellm',
     status: provider?.status ?? 'active',
+    monitoring: {
+      enabled: true, interval_minutes: 15, warning_percent: 20, critical_percent: 0,
+      ...(typeof config.monitoring === 'object' && config.monitoring !== null ? config.monitoring : {})
+    },
     preset,
     owner_scope: !provider
       ? 'user'
@@ -224,14 +266,12 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
         ? config.base_url
         : typeof config.api_base === 'string'
           ? (config.api_base as string)
-          : preset === 'ollama'
-            ? 'http://localhost:11434'
-            : preset === 'litellm_proxy'
-              ? 'http://localhost:4000'
-              : '',
+           : PRESET_BASE_URLS[preset] ?? '',
     default_model: typeof config.default_model === 'string' ? config.default_model : '',
+    aws_region_name: typeof config.aws_region_name === 'string' ? config.aws_region_name : '',
+    aws_profile_name: typeof config.aws_profile_name === 'string' ? config.aws_profile_name : '',
     models,
-    auth_mode: preset === 'ollama' ? 'none' : preset === 'chatgpt' ? 'oauth' : authInfo.auth_mode,
+    auth_mode: preset === 'ollama' || preset === 'bedrock' ? 'none' : preset === 'chatgpt' ? 'oauth' : authInfo.auth_mode,
     auth_env_var: authInfo.auth_env_var || defaultEnvVar,
     auth_secret_name: authInfo.auth_secret_name || `${preset}_api_key`,
     auth_secret_value: '',
@@ -247,6 +287,26 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
 
 export function deriveProviderId(displayName: string): string {
   return slugify(displayName);
+}
+
+export function applyProviderPresetDefaults(form: ProviderFormState): void {
+  form.base_url = PRESET_BASE_URLS[form.preset] ?? '';
+  form.auth_env_var = PRESET_ENV_VARS[form.preset] ?? '';
+  form.auth_secret_name = `${form.preset}_api_key`;
+  form.auth_secret_value = '';
+  if (form.preset === 'ollama' || form.preset === 'bedrock') form.auth_mode = 'none';
+  else if (form.auth_mode === 'none') form.auth_mode = 'env';
+}
+
+export function isDecisionModel(model: Pick<ModelEntry, 'model_id' | 'model_mode'>): boolean {
+  if (model.model_mode) return model.model_mode === 'systemone';
+  // Compatibility for manual native IDs without metadata, not every jev-* product.
+  return /^(?:~?typesafe\/)?jev-(?:latest|preview|\d+(?:\.\d+)+(?:-\d{8})?)$/.test(model.model_id);
+}
+
+export function isChatModel(model: Pick<ModelEntry, 'model_id' | 'model_mode'> & Partial<Pick<ModelEntry, 'supports_embedding'>>): boolean {
+  return !isDecisionModel(model) && !model.supports_embedding &&
+    (!model.model_mode || ['chat', 'completion', 'responses'].includes(model.model_mode));
 }
 
 export function providerRequiresExecutorLocation(_preset: ProviderPreset): boolean {
@@ -321,10 +381,13 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
     status: form.status,
     config: {
       preset: form.preset,
+      monitoring: form.monitoring,
       scope: form.owner_scope,
       default_model: form.default_model,
       models: serializedModels,
       auth_config: authConfig,
+      ...(form.preset === 'bedrock' && form.aws_region_name.trim() ? { aws_region_name: form.aws_region_name.trim() } : {}),
+      ...(form.preset === 'bedrock' && form.aws_profile_name.trim() ? { aws_profile_name: form.aws_profile_name.trim() } : {}),
       ...(form.preset === 'chatgpt' ? { codex_transport: form.codex_transport } : {}),
       use_responses_api: form.use_responses_api,
       ...(form.location === 'executor' && executorId ? { executor_id: executorId } : {}),
@@ -349,7 +412,7 @@ export function providerFormToUpdatePayload(form: ProviderFormState): Record<str
   };
 }
 
-export function collectModelOptions(providers: LLMProvider[]): ProviderModelOption[] {
+export function collectModelOptions(providers: LLMProvider[], includeNonChatModels = false): ProviderModelOption[] {
   const options = new Map<string, ProviderModelOption>();
 
   const currentDefaultProviderId =
@@ -387,11 +450,14 @@ export function collectModelOptions(providers: LLMProvider[]): ProviderModelOpti
   };
 
   for (const provider of providers) {
+    if (!includeNonChatModels && provider.config?.preset === 'systemone') continue;
     const defaultModel =
       typeof provider.config?.default_model === 'string' ? provider.config.default_model : '';
-    pushOption(provider, defaultModel);
+    const defaultEntry = provider.models?.find((model) => model.model_id === defaultModel);
+    if (includeNonChatModels || isChatModel(defaultEntry ?? { model_id: defaultModel })) pushOption(provider, defaultModel);
 
     for (const model of provider.models ?? []) {
+      if (!includeNonChatModels && !isChatModel(model)) continue;
       const value = typeof model.model_id === 'string' ? model.model_id : '';
       pushOption(provider, value);
     }
@@ -401,16 +467,17 @@ export function collectModelOptions(providers: LLMProvider[]): ProviderModelOpti
 
 /** Whether the preset needs authentication credentials. */
 export function presetNeedsAuth(preset: ProviderPreset): boolean {
-  return preset !== 'ollama';
+  return preset !== 'ollama' && preset !== 'bedrock';
 }
 
 /** Whether the preset allows configuring base URL. */
 export function presetHasBaseUrl(preset: ProviderPreset): boolean {
-  return preset === 'openai_compatible' || preset === 'anthropic' || preset === 'ollama' || preset === 'litellm_proxy';
+  return preset !== 'openai' && preset !== 'chatgpt' && preset !== 'bedrock';
 }
 
 /** Format a token count for display (e.g. 1048576 → "~1M", 128000 → "128k"). */
-export function formatTokenCount(tokens: number): string {
+export function formatTokenCount(tokens: number | null | undefined): string {
+  if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens <= 0) return 'unknown';
   if (tokens >= 1_000_000) {
     const m = tokens / 1_000_000;
     return m === Math.floor(m) ? `${m}M` : `~${Math.round(m)}M`;
@@ -420,4 +487,35 @@ export function formatTokenCount(tokens: number): string {
     return k === Math.floor(k) ? `${k}k` : `${k.toFixed(1)}k`;
   }
   return String(tokens);
+}
+
+/** Distinguish discovered/configured metadata from runtime safety defaults. */
+export function hasModelMetadata(model: ModelEntry, field: keyof ModelEntry): boolean {
+  const sources = model.provider_metadata?.field_sources;
+  if (sources && typeof sources === 'object' && !Array.isArray(sources)) {
+    return Object.hasOwn(sources, field) || Boolean(model._configuredFields?.includes(field));
+  }
+  return model[field] !== undefined && model[field] !== null;
+}
+
+export function formatModelMetadata(model: ModelEntry): string {
+  const parts: string[] = [];
+  if (model.model_mode) parts.push(model.model_mode.replaceAll('_', ' '));
+  if (!model.model_mode || ['chat', 'responses', 'embedding'].includes(model.model_mode)) {
+    parts.push(hasModelMetadata(model, 'context_window') ? `${formatTokenCount(model.context_window)} ctx` : 'Context unknown');
+    if (hasModelMetadata(model, 'max_input_tokens') && model.max_input_tokens && model.max_input_tokens !== model.context_window) {
+      parts.push(`${formatTokenCount(model.max_input_tokens)} in`);
+    }
+    parts.push(hasModelMetadata(model, 'max_output_tokens') ? `${formatTokenCount(model.max_output_tokens)} out` : 'Output limit unknown');
+  }
+  if (model.input_cost_per_mtok != null || model.output_cost_per_mtok != null) {
+    parts.push(`$${model.input_cost_per_mtok ?? '?'}/$${model.output_cost_per_mtok ?? '?'} per Mtok`);
+  } else if (typeof model.pricing?.input_cost_per_second === 'number') {
+    parts.push(`$${model.pricing.input_cost_per_second}/s input`);
+  } else {
+    parts.push('Price unknown');
+  }
+  if (model.cache_read_cost_per_mtok != null) parts.push(`$${model.cache_read_cost_per_mtok}/Mtok cache read`);
+  if (model.cache_write_cost_per_mtok != null) parts.push(`$${model.cache_write_cost_per_mtok}/Mtok cache write`);
+  return parts.join(' \u00b7 ');
 }

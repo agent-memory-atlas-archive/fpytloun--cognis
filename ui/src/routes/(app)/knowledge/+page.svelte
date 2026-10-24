@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import KnowledgeCard from '$lib/components/knowledge/KnowledgeCard.svelte';
   import KnowledgeFormModal from '$lib/components/knowledge/KnowledgeFormModal.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -19,6 +20,8 @@
 
   let loading = $state(true);
   let error = $state('');
+  // Hidden while the global connection banner applies; reload on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(error), retry: () => refresh() });
   let capabilities = $state<KnowledgebaseCapabilities | null>(null);
   let knowledgebases = $state<KnowledgebaseModel[]>([]);
   let diagnosticsById = $state<Record<string, KnowledgebaseDiagnostics>>({});
@@ -157,8 +160,8 @@
 <div class="mx-auto flex max-w-5xl flex-col gap-6 px-4 py-6 md:px-6">
   <div class="flex flex-wrap items-start justify-between gap-4">
     <div>
-      <h1 class="text-2xl font-semibold text-white">Knowledge</h1>
-      <p class="mt-1 text-sm text-slate-400">
+      <h1 class="text-2xl font-semibold text-strong">Knowledge</h1>
+      <p class="mt-1 text-sm text-muted">
         Give agents grounded, cited access to your documents via hybrid search and retrieval.
       </p>
     </div>
@@ -170,7 +173,7 @@
   </div>
 
   {#if capabilities && (!operational || readiness.degraded)}
-    <div class="rounded-2xl border border-amber-800/60 bg-amber-950/40 px-4 py-3 text-sm text-amber-200" role="status">
+    <div class="rounded-2xl border border-warning-border bg-warning-subtle px-4 py-3 text-sm text-warning" role="status">
       {#if !capabilities.enabled}
         Knowledge is not enabled on this Cognis instance. Ask an administrator to configure a vector backend and embedding route.
       {:else}
@@ -186,21 +189,21 @@
     </div>
   {/if}
 
-  {#if loading}
+  {#if loading || (error && net.hideErrors)}
     <LoadingState label="Loading knowledgebases…" />
   {:else if error}
-    <div class="rounded-2xl border border-rose-800/60 bg-rose-950/40 px-4 py-3 text-sm text-rose-300" role="alert">{error}</div>
+    <div class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger" role="alert">{error}</div>
   {:else if operational}
     <div class="flex flex-wrap items-center gap-3">
       <div class="relative flex-1 min-w-[220px]">
-        <Search class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
-        <Input bind:value={search} placeholder="Search knowledgebases…" class="pl-9" data-testid="knowledge-search-input" />
+        <Search class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-quiet" />
+        <Input find bind:value={search} placeholder="Search knowledgebases…" class="pl-9" data-testid="knowledge-search-input" />
       </div>
-      <div class="flex gap-1 rounded-xl border border-slate-800/80 bg-slate-900/60 p-1 text-sm">
+      <div class="flex gap-1 rounded-xl border border-separator/80 bg-surface/60 p-1 text-sm">
         {#each [['active', 'Active'], ['archived', 'Archived'], ['all', 'All']] as [value, label] (value)}
           <button
             type="button"
-            class={`rounded-lg px-3 py-1.5 font-medium transition ${statusFilter === value ? 'bg-sky-500 text-slate-950' : 'text-slate-300 hover:bg-slate-800'}`}
+            class={`rounded-lg px-3 py-1.5 font-medium transition ${statusFilter === value ? 'bg-accent text-on-accent' : 'text-secondary hover:bg-raised'}`}
             onclick={() => (statusFilter = value as typeof statusFilter)}
           >
             {label}
@@ -210,13 +213,13 @@
     </div>
 
     {#if knowledgebases.length === 0}
-      <div class="flex flex-col items-center gap-4 rounded-3xl border border-dashed border-slate-800/80 px-6 py-16 text-center">
-        <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-sky-500/10 text-sky-300">
+      <div class="flex flex-col items-center gap-4 rounded-3xl border border-dashed border-separator/80 px-6 py-16 text-center">
+        <span class="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-subtle text-accent">
           <Library class="h-7 w-7" />
         </span>
         <div>
-          <h2 class="text-lg font-semibold text-white">No knowledgebases yet</h2>
-          <p class="mx-auto mt-1 max-w-sm text-sm text-slate-400">
+          <h2 class="text-lg font-semibold text-strong">No knowledgebases yet</h2>
+          <p class="mx-auto mt-1 max-w-sm text-sm text-muted">
             Create one, then add documents — files, folders, or existing artifacts — to give agents grounded, cited answers.
           </p>
         </div>
@@ -227,13 +230,13 @@
         {/if}
       </div>
     {:else if filtered.length === 0}
-      <div class="rounded-3xl border border-dashed border-slate-800/80 px-6 py-12 text-center text-sm text-slate-400">
+      <div class="rounded-3xl border border-dashed border-separator/80 px-6 py-12 text-center text-sm text-muted">
         No knowledgebases match your filters.
       </div>
     {:else}
       {#if owned.length > 0}
         <section class="flex flex-col gap-3" aria-labelledby="owned-heading">
-          <h2 id="owned-heading" class="text-sm font-semibold text-slate-300">Owned by you</h2>
+          <h2 id="owned-heading" class="text-sm font-semibold text-secondary">Owned by you</h2>
           <div class="grid gap-4 sm:grid-cols-2">
         {#each owned as kb (kb.knowledgebase_id)}
           <KnowledgeCard
@@ -251,7 +254,7 @@
       {/if}
       {#if shared.length > 0}
         <section class="mt-6 flex flex-col gap-3" aria-labelledby="shared-heading">
-          <h2 id="shared-heading" class="text-sm font-semibold text-slate-300">Shared with you</h2>
+          <h2 id="shared-heading" class="text-sm font-semibold text-secondary">Shared with you</h2>
           <div class="grid gap-4 sm:grid-cols-2">
             {#each shared as kb (kb.knowledgebase_id)}
               <KnowledgeCard {kb} diagnostics={diagnosticsById[kb.knowledgebase_id] ?? null}

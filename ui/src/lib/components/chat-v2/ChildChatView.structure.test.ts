@@ -353,7 +353,7 @@ describe('ChildChatView PWA-safe theme and layout', () => {
 
   it('never overlaps header actions: title stays min-width-constrained and actions stay shrink-0', () => {
     const header = childSource.slice(childSource.indexOf('<header'), childSource.indexOf('</header>'));
-    expect(header).toContain('<h2 class="truncate text-sm font-semibold text-slate-100">{node.title}</h2>');
+    expect(header).toContain('<h2 class="truncate text-sm font-semibold text-foreground">{node.title}</h2>');
     expect(header).toContain('class="min-w-0 flex-1"');
     expect(header).toContain('class="flex shrink-0 items-center gap-0.5 sm:gap-1.5"');
   });

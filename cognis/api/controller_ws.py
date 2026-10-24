@@ -90,9 +90,7 @@ def _bounded_frame(value: Any) -> dict[str, Any]:
 def _canonical_result_bytes(result: Any) -> bytes:
     if not isinstance(result, dict):
         raise _BridgeProtocolError("Bridge success result must be an object")
-    encoded = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
-    )
+    encoded = json.encode(result, sort_keys=True)
     if len(encoded) > BRIDGE_RESULT_MAX_BYTES:
         raise _BridgeProtocolError("Bridge result exceeds maximum size")
     return encoded

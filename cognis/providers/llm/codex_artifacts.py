@@ -13,7 +13,7 @@ from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, JpegImagePlugin, UnidentifiedImageError
 
 from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.artifact import ArtifactKind, ArtifactStatus
@@ -25,6 +25,9 @@ MAX_CODEX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_CODEX_ENCODED_IMAGE_BYTES = 28 * 1024 * 1024
 DEFAULT_CODEX_IMAGE_CACHE_BYTES = 64 * 1024 * 1024
 MAX_CODEX_IMAGE_PIXELS = 16 * 1024 * 1024
+# JPEG can reduce its decode dimensions in the codec before allocating pixels.
+# Keep a separate source ceiling; other formats still use the full-decode budget.
+MAX_CODEX_JPEG_SOURCE_PIXELS = 64 * 1024 * 1024
 # The native worker owns this slot, including after its asyncio waiter is cancelled.
 _decode_slot = threading.Lock()
 # Still-image formats direct Codex accepts on the wire. Anything else that
@@ -109,6 +112,7 @@ async def materialize_codex_artifact_images(
     owner_email: str | None,
     conversation_id: str | None,
     agent_id: str | None,
+    session_id: str | None = None,
     normalization_cache: CodexImageNormalizationCache | None = None,
 ) -> list[dict[str, Any]]:
     """Return a deep copy with authorized artifact images replaced by data URLs."""
@@ -129,6 +133,7 @@ async def materialize_codex_artifact_images(
                 owner_email=owner_email,
                 conversation_id=conversation_id,
                 agent_id=agent_id,
+                session_id=session_id,
             ):
                 records[record.artifact_id] = record
 
@@ -172,8 +177,8 @@ async def materialize_codex_artifact_images(
                     content,
                     artifact_id=artifact_id,
                 )
-        except CodexArtifactError:
-            undeliverable[artifact_id] = "the provider cannot read this image"
+        except CodexArtifactError as exc:
+            undeliverable[artifact_id] = f"safe image normalization failed: {exc}"
             continue
         projected_total = encoded_total + len(data_url) * reference_counts[artifact_id]
         if projected_total > MAX_CODEX_ENCODED_IMAGE_BYTES:
@@ -297,8 +302,13 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(content)) as image:
-                if image.width * image.height > MAX_CODEX_IMAGE_PIXELS:
-                    raise CodexArtifactError(f"Image exceeds decode pixel budget: {artifact_id}")
+                source_pixel_limit = (
+                    MAX_CODEX_JPEG_SOURCE_PIXELS
+                    if isinstance(image, JpegImagePlugin.JpegImageFile)
+                    else MAX_CODEX_IMAGE_PIXELS
+                )
+                if image.width * image.height > source_pixel_limit:
+                    raise CodexArtifactError(f"Image exceeds source pixel budget: {artifact_id}")
                 image.verify()
             with Image.open(io.BytesIO(content)) as image:
                 source_format = str(image.format or "")
@@ -307,18 +317,39 @@ def _normalize_image(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
                     or int(getattr(image, "n_frames", 1)) != 1
                 )
                 original_size = image.size
-                if source_format == "JPEG":
+                jpeg_backed = isinstance(image, JpegImagePlugin.JpegImageFile)
+                if jpeg_backed:
                     image.draft("RGB", (MAX_CODEX_IMAGE_DIMENSION, MAX_CODEX_IMAGE_DIMENSION))
+                # draft() is advisory. Check the actual decoder size before load(),
+                # including for aspect ratios the JPEG codec cannot shrink enough.
+                if image.width * image.height > MAX_CODEX_IMAGE_PIXELS:
+                    raise CodexArtifactError(f"Image exceeds decode pixel budget: {artifact_id}")
                 image.load()
                 # Direct Codex accepts a narrow set of still formats. Convert
                 # anything else, including the first frame of an animation,
                 # rather than refusing an image the model could otherwise read.
                 needs_conversion = animated or source_format not in _SUPPORTED_FORMATS
-                target_format = _CONVERSION_FORMAT if needs_conversion else source_format
+                # MPO phone photos use the JPEG decoder but contain auxiliary
+                # frames. Flatten the primary frame to JPEG, never replay MPO.
+                target_format = (
+                    "JPEG"
+                    if jpeg_backed
+                    else _CONVERSION_FORMAT
+                    if needs_conversion
+                    else source_format
+                )
                 oversized = max(image.size) > MAX_CODEX_IMAGE_DIMENSION
-                if not needs_conversion and not oversized and image.size == original_size:
+                orientation = image.getexif().get(274, 1)
+                if (
+                    not needs_conversion
+                    and not oversized
+                    and image.size == original_size
+                    and orientation == 1
+                ):
                     return content, _FORMAT_MIME_TYPES[target_format]
-                normalized_image: Image.Image = image
+                # Resaving strips EXIF. Apply orientation first so phone photos
+                # do not become sideways when their normalized bytes are cached.
+                normalized_image = ImageOps.exif_transpose(image)
                 if oversized:
                     normalized_image.thumbnail(
                         (MAX_CODEX_IMAGE_DIMENSION, MAX_CODEX_IMAGE_DIMENSION),

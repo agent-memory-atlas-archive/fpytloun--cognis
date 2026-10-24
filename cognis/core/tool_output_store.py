@@ -682,79 +682,70 @@ class S3ToolOutputBackend:
 
     async def maintain(self, ttl_seconds: int, max_size_bytes: int) -> RetentionResult:
         def run(stopped: threading.Event) -> RetentionResult:
+            from cognis.core.retention_inventory import retention_inventory
+
             result = RetentionResult()
-            pairs: dict[str, dict[str, Any]] = {}
             try:
-                paginator = self._client.get_paginator("list_objects_v2")
-                for page in paginator.paginate(Bucket=self._bucket, Prefix="tool-outputs/"):
+                with retention_inventory() as inventory:
+                    paginator = self._client.get_paginator("list_objects_v2")
+                    for page in paginator.paginate(Bucket=self._bucket, Prefix="tool-outputs/"):
+                        for obj in page.get("Contents", []):
+                            if stopped.is_set():
+                                return result
+                            key = obj["Key"].removeprefix("tool-outputs/")
+                            suffix = ".anchors.json" if key.endswith(".anchors.json") else ".txt"
+                            if key.endswith(suffix):
+                                inventory.add(
+                                    key.removesuffix(suffix),
+                                    text=suffix == ".txt",
+                                    size=obj["Size"],
+                                    modified=obj["LastModified"].timestamp(),
+                                )
                     if stopped.is_set():
                         return result
-                    for obj in page.get("Contents", []):
-                        key = obj["Key"].removeprefix("tool-outputs/")
-                        suffix = ".anchors.json" if key.endswith(".anchors.json") else ".txt"
-                        if not key.endswith(suffix):
-                            continue
-                        pair = pairs.setdefault(
-                            key.removesuffix(suffix),
-                            {
-                                "size": 0,
-                                "last_modified": obj["LastModified"],
-                                "text_time": None,
-                                "text_size": 0,
-                                "anchor_size": 0,
-                            },
+                    total_size = inventory.finish()
+                    now = time.time()
+                    for phase in ("ttl", "size"):
+                        candidates = inventory.candidates(
+                            expired_before=now - ttl_seconds if phase == "ttl" else None
                         )
-                        pair["size"] += obj["Size"]
-                        pair["text_size" if suffix == ".txt" else "anchor_size"] += obj["Size"]
-                        if suffix == ".txt":
-                            pair["last_modified"] = obj["LastModified"]
-                            pair["text_time"] = obj["LastModified"].timestamp()
+                        with contextlib.closing(candidates):
+                            for pair in candidates:
+                                if stopped.is_set():
+                                    return result
+                                if phase == "size" and total_size <= max_size_bytes:
+                                    break
+                                try:
+                                    self._client.delete_object(
+                                        Bucket=self._bucket, Key=f"tool-outputs/{pair.key}.txt"
+                                    )
+                                    total_size -= pair.text_size
+                                    if stopped.is_set():
+                                        return result
+                                    self._client.delete_object(
+                                        Bucket=self._bucket,
+                                        Key=f"tool-outputs/{pair.key}.anchors.json",
+                                    )
+                                    total_size -= pair.anchor_size
+                                except Exception:
+                                    if phase == "ttl":
+                                        result.cleanup_failed = True
+                                    else:
+                                        result.size_cap_failed = True
+                                    logger.warning(
+                                        "Tool-output pair deletion failed", exc_info=True
+                                    )
+                                else:
+                                    if phase == "ttl":
+                                        result.expired_deleted += 1
+                                    else:
+                                        result.size_cap_deleted += 1
+                                # Failed pairs are not retried in the size phase;
+                                # successful text deletions still reduce total_size.
+                                inventory.skip(pair.key)
             except Exception:
-                logger.warning("Tool-output inventory failed", exc_info=True)
-                return RetentionResult(cleanup_failed=True, size_cap_failed=True)
-            total_size = sum(pair["size"] for pair in pairs.values())
-            now = time.time()
-            failed: set[str] = set()
-            ordered = sorted(pairs.items(), key=lambda item: item[1]["last_modified"])
-            for phase in ("ttl", "size"):
-                for safe_id, pair in ordered:
-                    if stopped.is_set():
-                        return result
-                    if safe_id not in pairs or safe_id in failed:
-                        continue
-                    if phase == "ttl":
-                        if pair["text_time"] is None or now - pair["text_time"] <= ttl_seconds:
-                            continue
-                    elif total_size <= max_size_bytes:
-                        break
-                    try:
-                        self._client.delete_object(
-                            Bucket=self._bucket, Key=f"tool-outputs/{safe_id}.txt"
-                        )
-                        total_size -= pair["text_size"]
-                        pair["size"] -= pair["text_size"]
-                        pair["text_size"] = 0
-                        if stopped.is_set():
-                            return result
-                        self._client.delete_object(
-                            Bucket=self._bucket, Key=f"tool-outputs/{safe_id}.anchors.json"
-                        )
-                        total_size -= pair["anchor_size"]
-                        pair["size"] -= pair["anchor_size"]
-                        pair["anchor_size"] = 0
-                    except Exception:
-                        failed.add(safe_id)
-                        if phase == "ttl":
-                            result.cleanup_failed = True
-                        else:
-                            result.size_cap_failed = True
-                        logger.warning("Tool-output pair deletion failed", exc_info=True)
-                        continue
-                    pairs.pop(safe_id)
-                    if phase == "ttl":
-                        result.expired_deleted += 1
-                    else:
-                        result.size_cap_deleted += 1
+                logger.warning("Tool-output retention inventory failed", exc_info=True)
+                result.cleanup_failed = result.size_cap_failed = True
             return result
 
         return await _maintenance_thread(run)

@@ -419,7 +419,7 @@ Agents and workflow composers should prefer this pattern:
 - name: fetch_recent_messages
   type: tool_call
   tool_call:
-    tool: mcp:slack-lumilens:conversations_history
+    tool: mcp:slack-example:conversations_history
     args:
       channel: "{{ vars.alerts_channel_id }}"
       limit: 30

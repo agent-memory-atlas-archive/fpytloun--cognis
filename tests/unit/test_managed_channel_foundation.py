@@ -647,12 +647,17 @@ async def test_attachment_only_managed_final_enters_fenced_outbox(tmp_path) -> N
                 "size_bytes": 321,
             }
         ]
-        assert row.attachments_json[0]["_delivery_authorization"]["scope"] == "conversation"
+        grant = row.attachments_json[0]["_delivery_authorization"]
+        assert grant["scope"] == "agent"
+        assert grant["accessor_agent_id"] == target.agent_id
+        assert grant["accessor_link_id"] == link.link_id
     await engine.dispose()
 
 
 @pytest.mark.asyncio
 async def test_managed_child_can_authorize_parent_artifact_for_outbound_delivery(tmp_path) -> None:
+    from cognis.store.models import ArtifactGrantRow
+
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'parent-artifact.db'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -666,6 +671,7 @@ async def test_managed_child_can_authorize_parent_artifact_for_outbound_delivery
             object_id="artifact-parent",
             filename="context.txt",
             owner_email="owner@example.com",
+            owner_agent_id=controller.agent_id,
             conversation_id=controller.conversation_id,
             purpose="chat_input",
             kind="file",
@@ -673,6 +679,14 @@ async def test_managed_child_can_authorize_parent_artifact_for_outbound_delivery
             size_bytes=42,
             status="attached",
         )
+        session.add(
+            ArtifactGrantRow(
+                owner_email="owner@example.com",
+                content_ref=artifact.artifact_id,
+                agent_id=target.agent_id,
+            )
+        )
+        await session.flush()
         authorized = await authorize_outbound_artifact_refs_in_session(
             session,
             [
@@ -691,8 +705,9 @@ async def test_managed_child_can_authorize_parent_artifact_for_outbound_delivery
         await session.commit()
 
         grant = authorized[0]["_delivery_authorization"]
-        assert grant["scope"] == "ancestor"
-        assert grant["descendant_link_id"]
+        assert grant["scope"] == "agent"
+        assert grant["accessor_agent_id"] == target.agent_id
+        assert grant["accessor_link_id"]
         assert await outbound_artifact_grant_is_valid(
             session,
             attachment=authorized[0],

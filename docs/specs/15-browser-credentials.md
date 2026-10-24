@@ -339,6 +339,15 @@ Suggested request fields:
 
 ## Auth Challenge Flow (MFA and Step-Up Verification)
 
+Auth-challenge notifications persist their deadline. An explicit provider
+deadline (including OAuth metadata) takes precedence; otherwise the value-ref
+wait timeout is clamped to 1–600 seconds, defaulting to 180 seconds. Legacy rows
+without `expires_at` derive the same deadline from `created_at` and payload.
+Lifecycle reconciliation and conversation/navigation projections apply this
+shared policy. Expired challenges reject resolution and are retired as
+cancelled/expired, never replayed or submitted to an executor. Cancellation of
+the value-ref wait orphans its notification without continuing the tool.
+
 Live authentication challenges that occur during browser automation must use a
 separate orchestration primitive from `request_credential`.
 

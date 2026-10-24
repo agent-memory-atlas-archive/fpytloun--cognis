@@ -4,6 +4,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AssistantDeliverableTimelineItem } from '$lib/chat-v2/types';
 import type { Deliverable } from '$lib/types/api';
 import AssistantDeliverableBlock from './AssistantDeliverableBlock.svelte';
+import { readable } from 'svelte/store';
+import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
+// Lazily imported by the component under test; load it during collection.
+import '$lib/components/rich/RichDeliverable.svelte';
 
 const mocks = vi.hoisted(() => ({
   getDeliverable: vi.fn()
@@ -62,6 +66,16 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 describe('AssistantDeliverableBlock', () => {
+  it('does not offer public sharing when a parent workspace denies it', async () => {
+    mocks.getDeliverable.mockResolvedValue(deliverable());
+    render(AssistantDeliverableBlock, {
+      props: { item: item() },
+      context: new Map([[DELIVERABLE_SHARING_CONTEXT, readable(false)]])
+    });
+    await screen.findByTestId('rich-deliverable');
+    expect(screen.queryByRole('button', { name: 'Share deliverable' })).not.toBeInTheDocument();
+    expect(screen.getByTitle('Download document')).toBeInTheDocument();
+  });
   beforeEach(() => {
     mocks.getDeliverable.mockReset();
   });
@@ -81,6 +95,11 @@ describe('AssistantDeliverableBlock', () => {
     // `markdown` block inside RichDeliverable like every other format.
     expect(container.querySelector('.assistant-deliverable-card')).toBeNull();
     expect(container.querySelector('.rich-markdown')).toBeTruthy();
+    await fireEvent.click(screen.getByTitle('Download document'));
+    expect(screen.getByRole('link', { name: 'Single HTML' }))
+      .toHaveAttribute('href', '/api/v1/deliverables/dlv-1/download.html');
+    expect(screen.getByRole('link', { name: 'Markdown' }))
+      .toHaveAttribute('href', '/api/v1/deliverables/dlv-1/download.md');
   });
 
   it('renders markdown deliverables as a single document with a generated TOC using the shared RichToc component', async () => {
@@ -142,6 +161,8 @@ describe('AssistantDeliverableBlock', () => {
     expect(screen.queryByRole('heading', { name: 'Not a heading' })).toBeNull();
     expect(screen.queryByRole('link', { name: 'not a link' })).toBeNull();
     expect(screen.getByText('# Not a heading', { exact: false })).toBeTruthy();
+    await fireEvent.click(screen.getByTitle('Download document'));
+    expect(screen.queryByRole('link', { name: 'Markdown' })).toBeNull();
   });
 
   it('renders html-format deliverables as sanitized HTML, not escaped/markdown-parsed text', async () => {

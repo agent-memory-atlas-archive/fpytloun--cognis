@@ -49,6 +49,7 @@ from cognis.models.config import (
     TokenUsage,
     normalize_reasoning_level,
 )
+from cognis.offline_runtime import configure_offline_runtime
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.anthropic.integration import (
     NATIVE_REQUEST_CONTEXT_KWARG,
@@ -57,6 +58,10 @@ from cognis.providers.llm.anthropic.integration import (
     build_native_chain,
     build_native_request,
     is_anthropic_native_provider,
+)
+from cognis.providers.llm.anthropic.model_policy import (
+    anthropic_model_policy,
+    prepare_model_history,
 )
 from cognis.providers.llm.anthropic.transport import AnthropicMessagesClient
 from cognis.providers.llm.anthropic_subscription import (
@@ -100,6 +105,7 @@ from cognis.providers.llm.anthropic_usage import (
 from cognis.providers.llm.anthropic_usage import (
     unsupported_usage as _unsupported_provider_usage,
 )
+from cognis.providers.llm.bedrock import discover_bedrock_models
 from cognis.providers.llm.chatgpt_oauth import (
     CHATGPT_OAUTH_AUTH_FILE,
 )
@@ -135,6 +141,12 @@ from cognis.providers.llm.codex import (
     test_codex_responses,
 )
 from cognis.providers.llm.codex_transport import DirectCodexTransport
+from cognis.providers.llm.compatible_transport import (
+    compatible_model,
+    normalize_compatible_kwargs,
+    openai_endpoint,
+    proxy_service_root,
+)
 from cognis.providers.llm.errors import (
     FastModeFallbackRequired,
     LLMStreamProviderError,
@@ -145,7 +157,19 @@ from cognis.providers.llm.errors import (
     reasoning_summary_rejected,
 )
 from cognis.providers.llm.fast_mode import enrich_fast_mode, prepare_fast_mode
+from cognis.providers.llm.hosted import (
+    PROVIDER_BASES,
+    PROVIDER_ENV_VARS,
+    api_endpoint,
+    discover_hosted_models,
+    is_chat_model,
+    is_openrouter_catalog,
+    is_systemone_model,
+    systemone_metadata,
+    systemone_provider_preset,
+)
 from cognis.providers.llm.message_projection import project_messages_for_provider
+from cognis.providers.llm.model_metadata import normalize_model_metadata, resolve_model_metadata
 from cognis.providers.llm.ollama import (
     discover_ollama_models,
     fetch_ollama_show,
@@ -155,6 +179,7 @@ from cognis.providers.llm.ollama import (
     ollama_model_name,
 )
 from cognis.providers.llm.performance import LocalGenerationPerformanceObserver
+from cognis.providers.llm.prefix_divergence import PROMPT_PREFIX_TRACKER
 from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
@@ -174,6 +199,11 @@ from cognis.providers.llm.responses_bridge import (
     split_messages_for_responses,
     split_system_messages_for_responses,
 )
+from cognis.providers.llm.systemone import (
+    SystemOneRequest,
+    request_systemone,
+    validate_systemone_response,
+)
 from cognis.providers.llm.terminal import (
     ResponseIncompleteDetails,
     response_incomplete_details,
@@ -188,7 +218,14 @@ logger = get_logger(__name__)
 MODEL_CACHE_TTL_SECONDS = 60.0
 PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info fetches
 PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
-SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "timeout"}
+SAFE_PROVIDER_KWARGS = {
+    "api_base",
+    "api_version",
+    "base_url",
+    "timeout",
+    "aws_region_name",
+    "aws_profile_name",
+}
 OAUTH_PROVIDER_PRESETS = {"chatgpt"}
 CODEX_TRANSPORT_LITELLM = "litellm"
 CODEX_TRANSPORT_DIRECT = "direct"
@@ -199,10 +236,10 @@ _CACHE_MISS = object()
 # determine which provider API to use.  Standard presets (openai, anthropic)
 # are recognised by litellm natively and need no prefix.
 PRESET_TO_MODEL_PREFIX: dict[str, str] = {
-    "litellm_proxy": "litellm_proxy",
-    "openai_compatible": "openai",
     "chatgpt": "chatgpt",
     "ollama": "ollama",
+    "gemini": "gemini",
+    "bedrock": "bedrock",
 }
 
 # Preset-to-image-generation strategy mapping.
@@ -378,6 +415,10 @@ except importlib.metadata.PackageNotFoundError:
 # internal marker keys (ints, dicts, bools) must not affect the key.
 _COUNT_MEMO_MIN_BYTES = 32 * 1024
 _COUNT_MEMO_MAX_ENTRIES = 64
+_COUNT_MESSAGE_BLOCK_SIZE = 32
+_COUNT_FALLBACK_WARN_INTERVAL_SECONDS = 60.0
+# Hugging Face tokenizers are not bundled; never download them at runtime.
+litellm.disable_hf_tokenizer_download = True
 
 
 def _tokenizer_visible_message(message: Mapping[str, Any]) -> dict[str, Any]:
@@ -725,8 +766,9 @@ def _responses_prompt_cache_status(
     chatgpt_cache_key_env = os.getenv("COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED")
     if is_chatgpt and config.get("use_prompt_cache_key") is not True:
         if chatgpt_cache_key_env is None:
-            return "disabled_by_default"
-        if chatgpt_cache_key_env.strip().lower() not in {"true", "1", "yes", "on"}:
+            if not _uses_direct_codex_transport(provider):
+                return "disabled_by_default"
+        elif chatgpt_cache_key_env.strip().lower() not in {"true", "1", "yes", "on"}:
             return "disabled_by_env"
     provider_id = provider.provider_id if provider is not None else ""
     if (provider_id, resolved_model) in (prompt_cache_key_broken_keys or set()):
@@ -781,6 +823,21 @@ def _record_llm_token_metrics(
     llm_api: str,
     location: str,
 ) -> dict[str, int]:
+    token_values = llm_token_values(usage)
+    for kind, value in token_values.items():
+        if value > 0:
+            LLM_TOKENS_TOTAL.labels(
+                provider_id=provider_id,
+                model=model,
+                llm_api=llm_api,
+                location=location,
+                kind=kind,
+            ).inc(value)
+    return token_values
+
+
+def llm_token_values(usage: dict[str, Any]) -> dict[str, int]:
+    """Normalize provider usage without recording or estimating tokens."""
     prompt_tokens = _usage_int(usage, "prompt_tokens", "input_tokens")
     completion_tokens = _usage_int(usage, "completion_tokens", "output_tokens")
     total_tokens = _usage_int(usage, "total_tokens")
@@ -805,7 +862,7 @@ def _record_llm_token_metrics(
         or _usage_detail_int(usage, "output_tokens_details", "reasoning_tokens")
     )
 
-    token_values = {
+    return {
         "input": prompt_tokens,
         "output": completion_tokens,
         "total": total_tokens,
@@ -814,16 +871,6 @@ def _record_llm_token_metrics(
         "cache_creation": cache_creation_tokens,
         "reasoning": reasoning_tokens,
     }
-    for kind, value in token_values.items():
-        if value > 0:
-            LLM_TOKENS_TOTAL.labels(
-                provider_id=provider_id,
-                model=model,
-                llm_api=llm_api,
-                location=location,
-                kind=kind,
-            ).inc(value)
-    return token_values
 
 
 @asynccontextmanager
@@ -1448,6 +1495,13 @@ def _metadata_floor_for_model(model_id: str) -> dict[str, int] | None:
             "max_input_tokens": 922_000,
             "max_output_tokens": 128_000,
         }
+    if normalized == "gpt-6.1-sol":
+        return {
+            "context_window": 1_050_000,
+            "max_context_window": 1_050_000,
+            "max_input_tokens": 922_000,
+            "max_output_tokens": 128_000,
+        }
     if normalized == "gpt-5.3-codex-spark":
         return {
             "context_window": 128_000,
@@ -1492,7 +1546,7 @@ def _positive_float(value: Any, default: float) -> float:
 def _provider_request_kwarg_value(key: str, value: Any) -> Any | None:
     """Return a LiteLLM-safe provider kwarg value from DB-backed config."""
 
-    if key in {"api_base", "api_version", "base_url"}:
+    if key in {"api_base", "api_version", "base_url", "aws_region_name", "aws_profile_name"}:
         return value.strip() if isinstance(value, str) and value.strip() else None
     if key == "timeout":
         if isinstance(value, bool):
@@ -1515,7 +1569,17 @@ def _provider_request_kwargs_from_config(config: dict[str, Any]) -> dict[str, An
             request_kwargs[key] = value
     if "base_url" in request_kwargs and "api_base" not in request_kwargs:
         request_kwargs["api_base"] = request_kwargs["base_url"]
-    return request_kwargs
+    preset = str(config.get("preset", ""))
+    if preset in PROVIDER_BASES and not request_kwargs.get("api_base"):
+        request_kwargs["api_base"] = PROVIDER_BASES[preset]
+    if preset == "gemini":
+        # LiteLLM expects a versioned Gemini inference base, unlike discovery.
+        request_kwargs["api_base"] = api_endpoint(
+            str(request_kwargs["api_base"]), "", "v1beta"
+        ).rstrip("/")
+        # LiteLLM's Gemini adapter lets base_url override the versioned api_base.
+        request_kwargs.pop("base_url", None)
+    return normalize_compatible_kwargs(config, request_kwargs)
 
 
 def _apply_message_cache_hints(
@@ -2026,9 +2090,9 @@ def _apply_responses_request_defaults(
 
     For ChatGPT/Codex OAuth providers the ``store`` field is intentionally
     omitted — the LiteLLM ChatGPT transform forces ``store=False`` regardless,
-    and sending it explicitly causes a redundant override. Explicit cache key
-    params are also omitted by default because ChatGPT/Codex rejects them today;
-    stream calls use session-affinity headers for automatic cache routing.
+    and sending it explicitly causes a redundant override. The direct Codex
+    transport sends a session-derived ``prompt_cache_key`` by default, matching
+    the official Codex CLI; the LiteLLM ChatGPT path still requires opt-in.
 
     ``prompt_cache_key_broken_keys`` is the provider-level capability-fallback
     set.  When ``(provider_id, resolved_model)`` is present in that set the
@@ -2061,14 +2125,14 @@ def _apply_responses_request_defaults(
         result["store"] = configured_store if isinstance(configured_store, bool) else False
 
     # Prompt cache params: apply for all providers unless the capability
-    # fallback has marked this (provider, model) pair as unsupported. ChatGPT
-    # Codex rejects explicit prompt_cache_key/prompt_cache_retention today, so
-    # it uses automatic cache routing via session-affinity headers by default.
+    # fallback has marked this (provider, model) pair as unsupported. The
+    # direct Codex transport keys the cache by session like the Codex CLI;
+    # the LiteLLM ChatGPT path stays opt-in. The env var overrides both.
     chatgpt_cache_key_env = os.getenv("COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED")
     chatgpt_cache_key_enabled = (
         chatgpt_cache_key_env.strip().lower() in {"true", "1", "yes", "on"}
         if isinstance(chatgpt_cache_key_env, str)
-        else False
+        else _uses_direct_codex_transport(provider)
     )
     provider_id = provider.provider_id if provider is not None else ""
     broken = prompt_cache_key_broken_keys or set()
@@ -2172,6 +2236,8 @@ def _looks_like_openai_apply_patch_model(model_name: str) -> bool:
             "openai/gpt-5.5",
             "gpt-6-astra",
             "openai/gpt-6-astra",
+            "gpt-6.1-sol",
+            "openai/gpt-6.1-sol",
             "gpt-6-sol",
             "openai/gpt-6-sol",
             "gpt-6-luna",
@@ -2187,75 +2253,16 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
     keys like ``max_input_tokens``, ``supports_function_calling``, etc.  This
     helper maps them to the field names used by :class:`ModelInfo`.
     """
-    normalized: dict[str, Any] = {}
-    # Context / output limits
-    max_context_window = (
-        info.get("max_context_window_tokens")
-        or info.get("max_context_window")
-        or info.get("context_window")
-    )
-    if max_context_window:
-        normalized["context_window"] = int(max_context_window)
-        normalized["max_context_window"] = int(max_context_window)
-    if info.get("max_input_tokens"):
-        normalized["max_input_tokens"] = int(info["max_input_tokens"])
-        normalized.setdefault("context_window", int(info["max_input_tokens"]))
-    elif info.get("max_tokens"):
-        normalized["context_window"] = int(info["max_tokens"])
-    if info.get("max_output_tokens"):
-        normalized["max_output_tokens"] = int(info["max_output_tokens"])
-    # Capability flags
-    if "supports_function_calling" in info:
-        normalized["supports_tools"] = bool(info["supports_function_calling"])
-    if "supports_vision" in info:
-        normalized["supports_vision"] = bool(info["supports_vision"])
-    if "supports_audio_input" in info:
-        normalized["supports_audio_input"] = bool(info["supports_audio_input"])
-    if "supports_image_generation" in info:
-        normalized["supports_image_generation"] = bool(info["supports_image_generation"])
-    if isinstance(info.get("supported_image_mime_types"), list):
-        normalized["supported_image_mime_types"] = [
-            str(item) for item in info["supported_image_mime_types"] if str(item).strip()
-        ]
-    if isinstance(info.get("supported_audio_mime_types"), list):
-        normalized["supported_audio_mime_types"] = [
-            str(item) for item in info["supported_audio_mime_types"] if str(item).strip()
-        ]
-    if "supports_pdf_input" in info:
-        normalized["supports_pdf_input"] = bool(info["supports_pdf_input"])
-    if "supports_embedding" in info:
-        normalized["supports_embedding"] = bool(info["supports_embedding"])
-    if "supports_reasoning" in info:
-        normalized["supports_reasoning"] = bool(info["supports_reasoning"])
-    if "supports_extended_thinking" in info:
-        normalized["supports_extended_thinking"] = bool(info["supports_extended_thinking"])
-    if "supports_verbosity" in info:
-        normalized["supports_verbosity"] = bool(info["supports_verbosity"])
-    elif "support_verbosity" in info:
-        normalized["supports_verbosity"] = bool(info["support_verbosity"])
-    if "default_verbosity" in info and info["default_verbosity"] is not None:
-        normalized["default_verbosity"] = str(info["default_verbosity"])
-    if "supports_prompt_caching" in info:
-        normalized["supports_prompt_caching"] = bool(info["supports_prompt_caching"])
-    if "supports_openai_namespace_tools" in info:
-        normalized["supports_openai_namespace_tools"] = bool(
-            info["supports_openai_namespace_tools"]
-        )
-    if "supports_openai_apply_patch" in info:
-        normalized["supports_openai_apply_patch"] = bool(info["supports_openai_apply_patch"])
-    if "openai_apply_patch_tool_type" in info and info["openai_apply_patch_tool_type"] is not None:
-        normalized["openai_apply_patch_tool_type"] = str(info["openai_apply_patch_tool_type"])
-    if "supports_tool_choice" in info and info.get("supports_function_calling"):
-        normalized["supports_tools"] = True
-    # Cost conversion: per-token → per-million-tokens (rounded to avoid float drift)
-    if "input_cost_per_token" in info and info["input_cost_per_token"] is not None:
-        normalized["input_cost_per_mtok"] = round(
-            float(info["input_cost_per_token"]) * 1_000_000, 6
-        )
-    if "output_cost_per_token" in info and info["output_cost_per_token"] is not None:
-        normalized["output_cost_per_mtok"] = round(
-            float(info["output_cost_per_token"]) * 1_000_000, 6
-        )
+    normalized = normalize_model_metadata(info)
+    # Older LiteLLM proxies supply only max_tokens as their context limit.
+    if "context_window" not in normalized and (
+        limit := _coerce_positive_int(info.get("max_tokens"))
+    ):
+        normalized["context_window"] = limit
+    if normalized:
+        normalized["provider_metadata"] = {
+            "field_sources": {field: "provider" for field in normalized},
+        }
     return normalized
 
 
@@ -2315,11 +2322,14 @@ class LiteLLMProvider:
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
         self._model_provider_cache: dict[str, tuple[str | None, float]] = {}
         self._proxy_model_info_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
+        self._discovery_metadata_cache: dict[str, tuple[dict[str, dict[str, Any]], float]] = {}
         self._codex_model_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._anthropic_subscription_model_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
         self._tokenizer_backend_cache: dict[str, tuple[str, str]] = {}
         self._count_memo: dict[tuple[str, str, str], int] = {}
         self._count_memo_lock = threading.Lock()
+        self._count_fallback_warn_lock = threading.Lock()
+        self._count_fallback_warn_state: dict[tuple[str, str, str], tuple[float | None, int]] = {}
         # In-process cache of (provider_id, resolved_model) pairs for which
         # response_format-style structured JSON has been observed to break
         # (either via empty Responses API reply or a JSON-validator
@@ -2357,18 +2367,21 @@ class LiteLLMProvider:
         self._fast_mode_broken_keys: CapabilityMarkers = _CapabilityMarkers()
 
     def set_artifact_store(self, artifact_store: Any) -> None:
-        """Set the controller artifact store used by direct Codex requests."""
+        """Set the controller artifact store used for native image normalization."""
 
         self._artifact_store = artifact_store
 
-    async def _prepare_direct_codex_messages(
+    async def _prepare_native_image_messages(
         self,
         messages: list[dict[str, Any]],
         *,
         owner_email: str | None,
         conversation_id: str | None,
         agent_id: str | None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        # Reuse the bounded, authorized Codex normalizer. Its 2048px ceiling
+        # also satisfies Anthropic's stricter 3000px many-image request limit.
         from cognis.providers.llm.codex_artifacts import (
             CodexImageNormalizationCache,
             materialize_codex_artifact_images,
@@ -2386,6 +2399,7 @@ class LiteLLMProvider:
             conversation_id=conversation_id,
             agent_id=agent_id,
             normalization_cache=self._codex_image_cache,
+            session_id=session_id,
         )
 
     @staticmethod
@@ -3035,7 +3049,11 @@ class LiteLLMProvider:
                 scope="system",
                 agent_id=None,
             )
-            return {"status": "authorized", "provider_id": provider_id}
+            return {
+                "status": "authorized",
+                "provider_id": provider_id,
+                "authorization_completed": True,
+            }
 
     async def clear_chatgpt_oauth(self, provider_id: str) -> bool:
         provider = await self._get_chatgpt_oauth_provider(provider_id)
@@ -3362,10 +3380,8 @@ class LiteLLMProvider:
             )
         if explicit_model is not None:
             async with self.session_factory() as session:
-                provider = await self._find_provider_for_model(
-                    session, explicit_model, acting_user_email=acting_user_email
-                )
-            return explicit_model, provider
+                rows = await self._visible_active_providers(session, acting_user_email)
+            return self._resolve_model_reference_from_providers(explicit_model, rows)
         cache_scope = _owner_scope_cache_key(acting_user_email)
         cache_key = f"{cache_scope}:{task_type}"
         cached_target = await self._get_cached_resolved_model(cache_key)
@@ -3545,10 +3561,14 @@ class LiteLLMProvider:
         prompt: str | None = None,
         language: str | None = None,
         acting_user_email: str | None = None,
+        provider_id: str | None = None,
+        timeout: float = 120,
+        max_retries: int = 0,
     ) -> SpeechToTextResult:
         resolved_model, provider = await self._resolve_model_target(
             model,
             task_type=task_type,
+            explicit_provider_id=provider_id,
             acting_user_email=acting_user_email,
         )
         if provider is None:
@@ -3586,6 +3606,8 @@ class LiteLLMProvider:
             if self._inference_router is None:
                 raise RuntimeError("Speech-to-text executor routing is unavailable")
             request_kwargs = await self._resolve_provider_kwargs(provider)
+            request_kwargs["timeout"] = timeout
+            request_kwargs = await self._single_executor_attempt(request_kwargs)
             return cast(
                 SpeechToTextResult,
                 await self._inference_router.route_transcribe(
@@ -3615,7 +3637,9 @@ class LiteLLMProvider:
             api_base = "https://api.openai.com"
         api_key = request_kwargs.get("api_key")
         extra_headers = request_kwargs.get("extra_headers")
-        timeout = request_kwargs.get("timeout", 120)
+        request_kwargs["timeout"] = timeout
+        request_kwargs = await self._single_executor_attempt(request_kwargs)
+        timeout = request_kwargs["timeout"]
         data: dict[str, str] = {"model": model_name}
         if prompt:
             data["prompt"] = prompt
@@ -3633,7 +3657,7 @@ class LiteLLMProvider:
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
-                    f"{api_base.rstrip('/')}/v1/audio/transcriptions",
+                    openai_endpoint(api_base, "audio/transcriptions"),
                     headers=headers,
                     data=data,
                     files={"file": (filename, file_obj, mime_type)},
@@ -3641,10 +3665,16 @@ class LiteLLMProvider:
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = self._sanitize_http_error_detail(exc)
-            raise RuntimeError(f"Speech-to-text request failed: {detail}") from exc
+            raise LLMStreamProviderError(
+                "Speech-to-text request failed",
+                payload={**classify_llm_exception(exc), "message": detail},
+            ) from exc
         except Exception as exc:
             detail = self._sanitize_error_detail(exc)
-            raise RuntimeError(f"Speech-to-text request failed: {detail}") from exc
+            raise LLMStreamProviderError(
+                "Speech-to-text request failed",
+                payload={**classify_llm_exception(exc), "message": detail},
+            ) from exc
 
         payload = response.json()
         text = payload.get("text")
@@ -3668,6 +3698,10 @@ class LiteLLMProvider:
         response_format: str = "mp3",
         speed: float = 1.0,
         low_latency: bool = False,
+        provider_id: str | None = None,
+        acting_user_email: str | None = None,
+        timeout: float = 120,
+        max_retries: int = 0,
     ) -> TextToSpeechResult:
         """Synthesize speech via LiteLLM (OpenAI, ElevenLabs, Azure, etc.).
 
@@ -3678,7 +3712,12 @@ class LiteLLMProvider:
         """
         if not text or not text.strip():
             raise ValueError("Text-to-speech requires non-empty text")
-        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        resolved_model, provider = await self._resolve_model_target(
+            model,
+            task_type=task_type,
+            explicit_provider_id=provider_id,
+            acting_user_email=acting_user_email,
+        )
         if provider is None:
             raise ValueError(f"No LLM provider found for synthesis model {resolved_model!r}")
         provider_preset = str(dict(provider.config).get("preset", "")).lower()
@@ -3700,6 +3739,7 @@ class LiteLLMProvider:
             },
         )
         request_kwargs = await self._resolve_provider_kwargs(provider)
+        request_kwargs["timeout"] = timeout
         if low_latency:
             configured_timeout = request_kwargs.get("timeout", 120)
             request_kwargs["timeout"] = (
@@ -3709,6 +3749,7 @@ class LiteLLMProvider:
         if self._should_route_to_executor(provider):
             if self._inference_router is None:
                 raise RuntimeError("Text-to-speech executor routing is unavailable")
+            request_kwargs = await self._single_executor_attempt(request_kwargs)
             return cast(
                 TextToSpeechResult,
                 await self._inference_router.route_synthesize(
@@ -3747,6 +3788,7 @@ class LiteLLMProvider:
         preset: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        catalog_provider: str | None = None,
     ) -> ModelInfo:
         """Enrich a model ID with metadata from a provider and/or litellm.
 
@@ -3771,6 +3813,8 @@ class LiteLLMProvider:
         if base_url:
             temp_config["base_url"] = base_url
             temp_config["api_base"] = base_url
+        if catalog_provider:
+            temp_config["catalog_provider"] = catalog_provider
         temp_provider = LLMProviderRow(
             provider_id="__preview__",
             display_name="Preview",
@@ -3863,29 +3907,34 @@ class LiteLLMProvider:
         ``provider_id/model_id`` references are always unambiguous.
         """
 
+        async with self.session_factory() as session:
+            rows = await self._visible_active_providers(session, acting_user_email)
+        model_id, provider = self._resolve_model_reference_from_providers(reference, rows)
+        if provider is None:
+            raise ValueError(f"Model {reference.strip()!r} is not present in configured providers")
+        return model_id, provider.provider_id
+
+    @classmethod
+    def _resolve_model_reference_from_providers(
+        cls, reference: str, rows: list[LLMProviderRow]
+    ) -> tuple[str, LLMProviderRow | None]:
+        """Resolve references and literal wire IDs against an authorized catalog."""
         value = reference.strip()
         if not value:
             raise ValueError("Model reference is empty")
-        explicit = self._split_provider_model_reference(value)
-        async with self.session_factory() as session:
-            rows = await self._visible_active_providers(session, acting_user_email)
-            if explicit is not None:
-                explicit_provider_id, model_id = explicit
-                provider = next(
-                    (row for row in rows if row.provider_id == explicit_provider_id),
-                    None,
-                )
-                if provider is not None:
-                    if not self._provider_matches_model(provider, model_id):
-                        raise ValueError(
-                            f"LLM provider {explicit_provider_id!r} does not expose model {model_id!r}"
-                        )
-                    return model_id, explicit_provider_id
+        explicit = cls._split_provider_model_reference(value)
+        if explicit is not None:
+            explicit_provider_id, model_id = explicit
+            provider = next((row for row in rows if row.provider_id == explicit_provider_id), None)
+            if provider is not None and cls._provider_matches_model(provider, model_id):
+                return model_id, provider
 
-            matches = [row for row in rows if self._provider_matches_model(row, value)]
-        provider_id = self._select_provider_id_from_matches(matches)
+        # A slash may belong to a literal wire ID (e.g. openai/gpt-oss on Groq),
+        # even when its publisher name is also a configured provider ID.
+        matches = [row for row in rows if cls._provider_matches_model(row, value)]
+        provider_id = cls._select_provider_id_from_matches(matches)
         if provider_id is not None:
-            return value, provider_id
+            return value, next(row for row in matches if row.provider_id == provider_id)
         if matches:
             refs = ", ".join(f"{row.provider_id}/{value}" for row in matches[:8])
             suffix = " ..." if len(matches) > 8 else ""
@@ -3893,7 +3942,7 @@ class LiteLLMProvider:
                 f"Model {value!r} is ambiguous across multiple providers; use one of: "
                 f"{refs}{suffix}"
             )
-        raise ValueError(f"Model {value!r} is not present in configured providers")
+        return value, None
 
     async def _get_route_reasoning_effort(
         self, task_type: str, acting_user_email: str | None = None
@@ -3938,142 +3987,19 @@ class LiteLLMProvider:
         # ChatGPT transport/auth stack. Runtime generation still uses LiteLLM;
         # metadata comes from the bundled/remote Codex catalog plus overrides.
         if preset != "chatgpt":
-            try:
-                provider_kwargs = await self._resolve_provider_kwargs(provider)
-                live = litellm.get_model_info(
-                    model=self._apply_model_prefix(model_id, provider),
-                    custom_llm_provider=(
-                        dict(provider.config).get("preset") if provider is not None else None
-                    ),
-                    api_base=provider_kwargs.get("api_base"),
+            config = dict(provider.config) if provider is not None else {}
+            merged.update(
+                resolve_model_metadata(
+                    model_id,
+                    preset=preset,
+                    base_url=str(config.get("base_url") or config.get("api_base") or ""),
+                    catalog_provider=config.get("catalog_provider"),
                 )
-                if isinstance(live, dict):
-                    live_dict = cast(dict[str, Any], live)
-                    live_context_window = (
-                        live_dict.get("max_context_window_tokens")
-                        or live_dict.get("max_context_window")
-                        or live_dict.get("context_window")
-                        or live_dict.get("max_input_tokens")
-                    )
-                    merged.update(
-                        {
-                            "context_window": live_context_window or merged.get("context_window"),
-                            "max_context_window": live_context_window
-                            or merged.get("max_context_window"),
-                            "max_input_tokens": live_dict.get("max_input_tokens")
-                            or merged.get("max_input_tokens"),
-                            "max_output_tokens": live_dict.get("max_output_tokens")
-                            or merged.get("max_output_tokens"),
-                            "supports_tools": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_tools",
-                                fallback=bool(
-                                    live_dict.get("supports_function_calling")
-                                    or "tools" in (live_dict.get("supported_openai_params") or [])
-                                ),
-                            ),
-                            "supports_streaming": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_streaming",
-                                fallback="stream"
-                                in (live_dict.get("supported_openai_params") or []),
-                            ),
-                            "supports_vision": _merge_live_bool(
-                                live_dict, merged, "supports_vision"
-                            ),
-                            "supports_audio_input": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_audio_input",
-                            ),
-                            "supports_image_generation": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_image_generation",
-                            ),
-                            "supports_embedding": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_embedding",
-                                fallback=looks_like_embedding_model(model_id),
-                            ),
-                            "supported_audio_mime_types": list(
-                                live_dict.get("supported_audio_mime_types")
-                                or merged.get("supported_audio_mime_types")
-                                or []
-                            ),
-                            "supports_pdf_input": _merge_live_bool(
-                                live_dict, merged, "supports_pdf_input"
-                            ),
-                            "supports_file_input": _merge_live_bool(
-                                live_dict, merged, "supports_file_input"
-                            ),
-                            "supports_reasoning": _merge_live_bool(
-                                live_dict, merged, "supports_reasoning"
-                            ),
-                            "supports_extended_thinking": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_extended_thinking",
-                                fallback=_looks_like_extended_thinking_model(model_id, preset),
-                            ),
-                            "supports_verbosity": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_verbosity",
-                            ),
-                            "default_verbosity": live_dict.get("default_verbosity")
-                            or merged.get("default_verbosity"),
-                            "supports_prompt_caching": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_prompt_caching",
-                            ),
-                            "supports_tool_search": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_tool_search",
-                                fallback=bool(live_dict.get("supports_builtin_tool_search")),
-                            ),
-                            "supports_defer_loading": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_defer_loading",
-                            ),
-                            "supports_responses_api": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_responses_api",
-                            ),
-                            "supports_openai_namespace_tools": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_openai_namespace_tools",
-                            ),
-                            "supports_openai_allowed_tools": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_openai_allowed_tools",
-                            ),
-                            "supports_openai_apply_patch": _merge_live_bool(
-                                live_dict,
-                                merged,
-                                "supports_openai_apply_patch",
-                            ),
-                            "supported_openai_params": list(
-                                live_dict.get("supported_openai_params") or []
-                            ),
-                            "max_tools": live_dict.get("max_tools") or merged.get("max_tools"),
-                        }
-                    )
-            except Exception:
-                logger.debug(
-                    "LLM model metadata lookup via LiteLLM failed",
-                    extra={"extra_data": {"model_id": model_id}},
-                    exc_info=True,
-                )
+            )
+            if provider is not None:
+                cached = self._discovery_metadata_cache.get(self._discovery_metadata_key(provider))
+                if cached is not None and monotonic() < cached[1]:
+                    merged.update(cached[0].get(model_id, {}))
 
         # For litellm_proxy preset, fetch live metadata from the proxy's
         # /model/info endpoint.  This overrides the (potentially stale)
@@ -4099,7 +4025,11 @@ class LiteLLMProvider:
                 merged["reasoning_efforts"] = (
                     codex_info.get("reasoning_efforts") or existing_efforts
                 )
-        elif preset == "openai" and model_id in {"gpt-6-sol", "gpt-6-luna"}:
+        elif preset == "openai" and model_id in {
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+        }:
             openai_catalog_info = codex_catalog_model_info(model_id)
             if openai_catalog_info is not None:
                 merged.update(openai_catalog_info)
@@ -4125,7 +4055,14 @@ class LiteLLMProvider:
                         model_name=ollama_model_name(model_id),
                         headers=headers,
                     )
-                merged.update(normalize_ollama_model_info(model_id, show=show))
+                ollama_info = normalize_ollama_model_info(model_id, show=show)
+                ollama_info["provider_metadata"]["field_sources"] = {
+                    field: "provider"
+                    for field in ollama_info
+                    if field in ModelInfo.model_fields
+                    and field not in {"model_id", "provider_metadata", "runtime_metadata"}
+                }
+                merged.update(ollama_info)
             except Exception:
                 logger.debug(
                     "Ollama /api/show metadata lookup failed",
@@ -4177,7 +4114,35 @@ class LiteLLMProvider:
         if _looks_like_extended_thinking_model(model_id, preset):
             merged["supports_reasoning"] = True
             merged["supports_extended_thinking"] = True
+        configured = dict(configured)
+        saved_metadata = configured.get("provider_metadata")
+        saved_sources = (
+            saved_metadata.get("field_sources") if isinstance(saved_metadata, dict) else None
+        )
+        saved_sources = saved_sources if isinstance(saved_sources, dict) else {}
+        if (
+            merged.get("model_mode")
+            and configured.get("model_mode") != merged["model_mode"]
+            and saved_sources.get("model_mode") == "provider"
+        ):
+            # Correct an imported protocol snapshot, but never erase capability
+            # restrictions: older editors did not record explicit edit provenance.
+            configured.pop("model_mode", None)
+        metadata = dict(merged.get("provider_metadata") or {})
+        field_sources = dict(metadata.get("field_sources") or {})
+        for field in configured:
+            if field in ModelInfo.model_fields and field not in {
+                "provider_metadata",
+                "runtime_metadata",
+            }:
+                field_sources[field] = "configured"
         merged.update(configured)
+        if is_systemone_model(model_id, preset, merged):
+            merged.update(systemone_metadata())
+        if field_sources:
+            metadata.update(merged.get("provider_metadata") or {})
+            metadata["field_sources"] = field_sources
+            merged["provider_metadata"] = metadata
         merged["model_id"] = model_id
         if preset == "ollama":
             runtime_metadata = (
@@ -4225,7 +4190,9 @@ class LiteLLMProvider:
                     else context_source or "runtime_metadata.num_ctx"
                 )
                 merged["runtime_metadata"] = runtime_metadata
-        if preset != "chatgpt" or not merged.get("reasoning_efforts"):
+        if not merged.get("supports_reasoning"):
+            merged["reasoning_efforts"] = []
+        elif not merged.get("reasoning_efforts"):
             profile_preview = ModelInfo.model_validate(merged)
             merged["reasoning_efforts"] = reasoning_efforts_for_model(
                 model_id,
@@ -4233,10 +4200,21 @@ class LiteLLMProvider:
                 model_info=profile_preview,
                 supports_reasoning=bool(merged.get("supports_reasoning")),
             )
+        if (
+            preset == "openai"
+            and model_id == "gpt-6.1-sol"
+            and configured.get("reasoning_efforts") is None
+        ):
+            merged["reasoning_efforts"] = ["low", "medium", "high", "xhigh", "max"]
         if preset == "anthropic" and "supports_fast_mode" not in configured:
             merged.pop("supports_fast_mode", None)
         merged = enrich_fast_mode(
             merged, preset, dict(provider.config) if provider is not None else None
+        )
+        from cognis.providers.llm.cache_policy import supported_cache_ttls
+
+        merged["supported_cache_ttls"] = supported_cache_ttls(
+            model_id, preset, bool(merged.get("supports_prompt_caching"))
         )
         return ModelInfo.model_validate(merged)
 
@@ -5152,6 +5130,13 @@ class LiteLLMProvider:
                 model_info.openai_apply_patch_tool_type,
             )
         provider_preset = str(dict(provider.config).get("preset", "")).lower() if provider else ""
+        if anthropic_model_policy(model_id).binds_thinking_to_prefix and (
+            provider is None or not is_anthropic_native_provider(provider)
+        ):
+            raise ValueError(
+                "Sonnet 5.5 requires the native anthropic_messages transport in Cognis "
+                "to preserve and validate signed thinking history"
+            )
         request_kwargs = prepare_fast_mode(
             request_kwargs,
             model_info,
@@ -5186,6 +5171,7 @@ class LiteLLMProvider:
         model: str | None = None,
         task_type: str = "default",
         cache_breakpoint_index: int | None = None,
+        preserve_response_format: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         from cognis.providers.llm.retry import with_llm_retry
@@ -5203,6 +5189,7 @@ class LiteLLMProvider:
         )
         if provider is None:
             raise ValueError(f"No LLM provider found for model {resolved_model!r}")
+        messages = prepare_model_history(resolved_model, messages)
         if _looks_like_chatgpt_oauth_provider(provider):
             self._ensure_controller_side_oauth_provider(provider)
         if _looks_like_anthropic_subscription_provider(provider):
@@ -5216,6 +5203,12 @@ class LiteLLMProvider:
             provider_id=provider.provider_id if provider is not None else None,
             acting_user_email=acting_user_email,
         )
+        if is_systemone_model(
+            resolved_model, str(provider.config.get("preset", "")), model_info.model_dump()
+        ):
+            raise ValueError("System One models require the typed evaluation API")
+        if not is_chat_model(model_info.model_dump()):
+            raise ValueError("Model does not support chat generation")
         if _looks_like_chatgpt_oauth_provider(provider):
             _register_litellm_chatgpt_model_info(
                 resolved_model=resolved_model,
@@ -5261,7 +5254,7 @@ class LiteLLMProvider:
         explicit_llm_api = str(request_kwargs.pop("cognis_llm_api", "") or "").strip().lower()
         wants_json_response = "response_format" in request_kwargs
         cache_key = (provider.provider_id, resolved_model)
-        response_format_cache_broken = self._capability_is_broken(
+        response_format_cache_broken = not preserve_response_format and self._capability_is_broken(
             self._json_response_format_broken_keys,
             cache_key,
             marker_name="json_response_format",
@@ -5317,12 +5310,15 @@ class LiteLLMProvider:
                 request_kwargs["store"] = (
                     configured_store if isinstance(configured_store, bool) else False
                 )
-        if use_responses_api and _uses_direct_codex_transport(provider):
-            prepared_messages = await self._prepare_direct_codex_messages(
+        if (use_responses_api and _uses_direct_codex_transport(provider)) or (
+            not use_responses_api and _provider_preset(provider) == "anthropic"
+        ):
+            prepared_messages = await self._prepare_native_image_messages(
                 prepared_messages,
                 owner_email=acting_user_email,
                 conversation_id=cognis_conversation_id,
                 agent_id=cognis_agent_id,
+                session_id=cognis_session_id,
             )
         logger.debug(
             "LLM generate",
@@ -5345,6 +5341,18 @@ class LiteLLMProvider:
                 prepared_messages,
                 provider=provider,
                 llm_api="chat_completions",
+                preserve_internal_fields=(
+                    frozenset(
+                        {
+                            "_anthropic_native_envelope",
+                            "_anthropic_thinking_blocks",
+                            "_tool_is_error",
+                            "_cache_control",
+                        }
+                    )
+                    if is_anthropic_native_provider(provider)
+                    else frozenset()
+                ),
             )
             chat_messages = projection.messages
             if self._should_route_to_executor(provider):
@@ -5403,6 +5411,13 @@ class LiteLLMProvider:
         async def _generate_responses(responses_source_kwargs: dict[str, Any]) -> dict[str, Any]:
             responses_source_kwargs = dict(responses_source_kwargs)
             responses_source_kwargs["cognis_llm_api"] = "responses"
+            responses_projection = project_messages_for_provider(
+                prepared_messages,
+                provider=provider,
+                llm_api="responses",
+                preserve_internal_fields=frozenset({"_responses_output_items", "_tool_is_error"}),
+            )
+            response_messages = responses_projection.messages
             if self._should_route_to_executor(provider):
                 if isinstance(retry_count, int):
                     responses_source_kwargs["max_retries"] = retry_count
@@ -5411,18 +5426,18 @@ class LiteLLMProvider:
                     executor_route_kwargs["acting_user_email"] = acting_user_email
                 return await self._executor_generate(
                     prefixed_model,
-                    prepared_messages,
+                    response_messages,
                     provider,
                     request_kwargs=responses_source_kwargs,
                     **executor_route_kwargs,
                 )
             if _uses_direct_codex_transport(provider) and cache_breakpoint_index is None:
                 responses_instructions, responses_input_messages = (
-                    split_system_messages_for_responses(prepared_messages)
+                    split_system_messages_for_responses(response_messages)
                 )
             else:
                 responses_instructions, responses_input_messages = split_messages_for_responses(
-                    prepared_messages, cache_breakpoint_index
+                    response_messages, cache_breakpoint_index
                 )
             responses_kwargs = responses_request_kwargs(
                 responses_source_kwargs,
@@ -5549,6 +5564,13 @@ class LiteLLMProvider:
             return responses_to_chat_response(raw_response_dict)
 
         async def _generate_json() -> dict[str, Any]:
+            if preserve_response_format:
+                # Public inference must preserve the caller's schema and let
+                # upstream validation errors reach the sanitized API boundary.
+                # Internal agent generation retains the repair fallback below.
+                if use_responses_api:
+                    return await _generate_responses(request_kwargs)
+                return await _generate_chat(request_kwargs)
             last_reason = "unknown"
             if use_responses_api:
                 try:
@@ -5719,6 +5741,7 @@ class LiteLLMProvider:
         )
         if provider is None:
             raise ValueError(f"No LLM provider found for model {resolved_model!r}")
+        messages = prepare_model_history(resolved_model, messages)
         provider_id = provider.provider_id
         _observe_provider_phase(
             llm_request_id=llm_request_id,
@@ -5739,6 +5762,12 @@ class LiteLLMProvider:
             provider_id=provider_id,
             acting_user_email=acting_user_email,
         )
+        if is_systemone_model(
+            resolved_model, str(provider.config.get("preset", "")), model_info.model_dump()
+        ):
+            raise ValueError("System One models require the typed evaluation API")
+        if not is_chat_model(model_info.model_dump()):
+            raise ValueError("Model does not support chat generation")
         _observe_provider_phase(
             llm_request_id=llm_request_id,
             provider_id=provider_id,
@@ -5854,9 +5883,11 @@ class LiteLLMProvider:
                 request_kwargs["store"] = (
                     configured_store if isinstance(configured_store, bool) else False
                 )
-        if use_responses_api and _uses_direct_codex_transport(provider):
+        if (use_responses_api and _uses_direct_codex_transport(provider)) or (
+            not use_responses_api and _provider_preset(provider) == "anthropic"
+        ):
             phase_started_at = monotonic()
-            prepared_messages = await self._prepare_direct_codex_messages(
+            prepared_messages = await self._prepare_native_image_messages(
                 prepared_messages,
                 owner_email=acting_user_email,
                 conversation_id=cognis_conversation_id,
@@ -5866,31 +5897,46 @@ class LiteLLMProvider:
                 llm_request_id=llm_request_id,
                 provider_id=provider_id,
                 model=resolved_model,
-                llm_api="responses",
+                llm_api="responses" if use_responses_api else "chat_completions",
                 location="controller",
                 phase="materialize_artifact_images",
                 duration=monotonic() - phase_started_at,
             )
         projection_diagnostics: dict[str, Any] = {}
-        if not use_responses_api:
-            phase_started_at = monotonic()
-            projection = project_messages_for_provider(
-                prepared_messages,
-                provider=provider,
-                llm_api="chat_completions",
-            )
-            prepared_messages = projection.messages
-            projection_diagnostics = projection.diagnostics
-            _observe_provider_phase(
-                llm_request_id=llm_request_id,
-                provider_id=provider_id,
-                model=resolved_model,
-                llm_api="chat_completions",
-                location="controller",
-                phase="message_projection",
-                duration=monotonic() - phase_started_at,
-                extra_data=projection_diagnostics,
-            )
+        phase_started_at = monotonic()
+        projection = project_messages_for_provider(
+            prepared_messages,
+            provider=provider,
+            llm_api="responses" if use_responses_api else "chat_completions",
+            preserve_internal_fields=(
+                frozenset({"_responses_output_items", "_tool_is_error"})
+                if use_responses_api
+                else (
+                    frozenset(
+                        {
+                            "_anthropic_native_envelope",
+                            "_anthropic_thinking_blocks",
+                            "_tool_is_error",
+                            "_cache_control",
+                        }
+                    )
+                    if is_anthropic_native_provider(provider)
+                    else frozenset()
+                )
+            ),
+        )
+        prepared_messages = projection.messages
+        projection_diagnostics = projection.diagnostics
+        _observe_provider_phase(
+            llm_request_id=llm_request_id,
+            provider_id=provider_id,
+            model=resolved_model,
+            llm_api="responses" if use_responses_api else "chat_completions",
+            location="controller",
+            phase="message_projection",
+            duration=monotonic() - phase_started_at,
+            extra_data=projection_diagnostics,
+        )
         request_diagnostics = _request_payload_diagnostics(
             prepared_messages,
             request_kwargs,
@@ -5901,6 +5947,15 @@ class LiteLLMProvider:
             else "chat_completions_request",
         )
         request_diagnostics.update(projection_diagnostics)
+        PROMPT_PREFIX_TRACKER.observe(
+            session_id=cognis_session_id,
+            channel="messages",
+            provider_id=provider_id,
+            model=resolved_model,
+            llm_request_id=llm_request_id,
+            head=request_diagnostics.get("tool_schema_hash"),
+            items=prepared_messages,
+        )
         llm_api_label = "responses" if use_responses_api else "chat_completions"
         _observe_provider_phase(
             llm_request_id=llm_request_id,
@@ -6078,6 +6133,15 @@ class LiteLLMProvider:
                 responses_input_bytes, responses_input_hash = _payload_size_hash(responses_input)
                 responses_instructions_bytes, responses_instructions_hash = _payload_size_hash(
                     responses_instructions
+                )
+                PROMPT_PREFIX_TRACKER.observe(
+                    session_id=cognis_session_id,
+                    channel="responses_input",
+                    provider_id=provider.provider_id if provider is not None else "default",
+                    model=resolved_model,
+                    llm_request_id=llm_request_id,
+                    head=(responses_instructions_hash, request_diagnostics.get("tool_schema_hash")),
+                    items=responses_input,
                 )
                 prompt_cache_key = responses_kwargs.get("prompt_cache_key")
                 prompt_cache_retention = responses_kwargs.get("prompt_cache_retention")
@@ -6528,24 +6592,68 @@ class LiteLLMProvider:
         with self._count_memo_lock:
             self._count_memo.clear()
 
+    def _warn_token_count_fallback(
+        self,
+        *,
+        model: str,
+        family: str,
+        failed_backend: str,
+        fallback_backend: str,
+        error: BaseException | None,
+    ) -> None:
+        """Log every degraded token-count path as a warning, rate limited per path."""
+
+        key = (model, failed_backend, fallback_backend)
+        now = monotonic()
+        with self._count_fallback_warn_lock:
+            last, suppressed = self._count_fallback_warn_state.get(key, (None, 0))
+            if last is not None and now - last < _COUNT_FALLBACK_WARN_INTERVAL_SECONDS:
+                self._count_fallback_warn_state[key] = (last, suppressed + 1)
+                return
+            self._count_fallback_warn_state[key] = (now, 0)
+        logger.warning(
+            "llm: token counting fell back to a less accurate estimator",
+            extra={
+                "extra_data": {
+                    "model": model,
+                    "tokenizer_family": family,
+                    "failed_backend": failed_backend,
+                    "fallback_backend": fallback_backend,
+                    "error_type": type(error).__name__ if error is not None else None,
+                    "error": str(error)[:300] if error is not None else None,
+                    "suppressed_since_last_warning": suppressed,
+                }
+            },
+        )
+
     def count_tokens(self, text: str, model: str) -> int:
+        configure_offline_runtime()
         family = self._tokenizer_family(model)
         memo_key: tuple[str, str, str] | None = None
+        primary_backend: str | None = None
+        primary_error: BaseException | None = None
         try:
             if family == "openai":
                 import tiktoken
 
+                primary_backend = "tiktoken"
                 memo_key = _count_memo_key(model, "tiktoken", text)
                 cached = self._count_memo_get(memo_key)
                 if cached is not None:
                     self._record_tokenizer_backend(model, family, "tiktoken")
                     return cached
-                encoding = tiktoken.encoding_for_model(model)
+                try:
+                    encoding = tiktoken.encoding_for_model(model)
+                except KeyError:
+                    # Unmapped model name: o200k_base below is the intended default.
+                    primary_backend = None
+                    raise
                 count = len(encoding.encode(text))
                 self._record_tokenizer_backend(model, family, "tiktoken")
                 self._count_memo_put(memo_key, count)
                 return count
             if family in {"anthropic", "gemini"}:
+                primary_backend = "litellm_native"
                 memo_key = _count_memo_key(model, "litellm_native", text)
                 cached = self._count_memo_get(memo_key)
                 if cached is not None:
@@ -6556,8 +6664,16 @@ class LiteLLMProvider:
                 self._record_tokenizer_backend(model, family, "litellm_native")
                 self._count_memo_put(memo_key, count)
                 return count
-        except Exception:
-            pass
+        except Exception as exc:
+            primary_error = exc
+        if primary_backend is not None:
+            self._warn_token_count_fallback(
+                model=model,
+                family=family,
+                failed_backend=primary_backend,
+                fallback_backend="tiktoken_o200k_base",
+                error=primary_error,
+            )
         try:
             import tiktoken
 
@@ -6565,28 +6681,68 @@ class LiteLLMProvider:
             count = len(encoding.encode(text))
             self._record_tokenizer_backend(model, family, "tiktoken_o200k_base")
             return count
-        except Exception:
-            pass
+        except Exception as exc:
+            self._warn_token_count_fallback(
+                model=model,
+                family=family,
+                failed_backend="tiktoken_o200k_base",
+                fallback_backend="chars_div_4",
+                error=exc,
+            )
         self._record_tokenizer_backend(model, family, "chars_div_4")
         return max(1, len(text) // 4)
 
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int:
         family = self._tokenizer_family(model)
         try:
+            visible = [_tokenizer_visible_message(message) for message in messages]
             memo_key = _count_memo_key(
                 model,
                 "litellm_native",
-                [_tokenizer_visible_message(message) for message in messages],
+                visible,
             )
             cached = self._count_memo_get(memo_key)
             if cached is not None:
                 self._record_tokenizer_backend(model, family, "litellm_native")
                 return cached
-            count = int(litellm.token_counter(model=model, messages=messages))
+            if len(messages) <= _COUNT_MESSAGE_BLOCK_SIZE:
+                count = int(litellm.token_counter(model=model, messages=messages))
+            else:
+                # Native message counts are additive without response priming.
+                # Count that once, and reuse unchanged blocks as the tail grows.
+                # Keep the same bounded digest/count memo; never retain prompts.
+                count = int(litellm.token_counter(model=model, messages=[]))
+                pending: list[tuple[tuple[str, str, str] | None, int]] = []
+                for start in range(0, len(messages), _COUNT_MESSAGE_BLOCK_SIZE):
+                    end = start + _COUNT_MESSAGE_BLOCK_SIZE
+                    block_key = _count_memo_key(
+                        model, "litellm_native_message_block", visible[start:end]
+                    )
+                    block_count = self._count_memo_get(block_key)
+                    if block_count is None:
+                        block_count = int(
+                            litellm.token_counter(
+                                model=model,
+                                messages=messages[start:end],
+                                count_response_tokens=True,
+                            )
+                        )
+                        pending.append((block_key, block_count))
+                    count += block_count
+                # An unsuccessful count must not cache partial/fallback results.
+                for block_key, block_count in pending:
+                    self._count_memo_put(block_key, block_count)
             self._record_tokenizer_backend(model, family, "litellm_native")
             self._count_memo_put(memo_key, count)
             return count
-        except Exception:
+        except Exception as exc:
+            self._warn_token_count_fallback(
+                model=model,
+                family=family,
+                failed_backend="litellm_native_messages",
+                fallback_backend="serialized_text_estimate",
+                error=exc,
+            )
             serialized = "\n".join(
                 f"{message.get('role', 'unknown')}: {message.get('content', '')}"
                 for message in messages
@@ -6600,9 +6756,10 @@ class LiteLLMProvider:
         cached_family, backend = self._tokenizer_backend_cache.get(model, (family, "unobserved"))
         return f"litellm:{_LITELLM_DISTRIBUTION_VERSION}:{cached_family}:{backend}:v1"
 
-    async def list_models(self) -> list[dict[str, Any]]:
+    async def list_models(self, acting_user_email: str | None = None) -> list[dict[str, Any]]:
+        """Return configured models from active providers visible to the caller."""
         async with self.session_factory() as session:
-            rows = (await session.execute(select(LLMProviderRow))).scalars().all()
+            rows = await self._visible_active_providers(session, acting_user_email)
             models: list[dict[str, Any]] = []
             for row in rows:
                 config = dict(row.config)
@@ -6648,7 +6805,7 @@ class LiteLLMProvider:
         preset = str(config.get("preset", ""))
 
         if provider.location == "executor":
-            return await self._discover_models_via_executor(
+            entries = await self._discover_models_via_executor(
                 preset=preset,
                 base_url=str(base_url),
                 api_key=str(api_key or ""),
@@ -6660,17 +6817,51 @@ class LiteLLMProvider:
                 else None,
                 provider_id=provider.provider_id,
                 owner_email=provider.owner_email,
+                aws_config={
+                    key: config[key]
+                    for key in ("aws_region_name", "aws_profile_name")
+                    if config.get(key)
+                },
             )
+            self._discovery_metadata_cache[self._discovery_metadata_key(provider)] = (
+                {entry["model_id"]: entry for entry in entries},
+                monotonic() + MODEL_CACHE_TTL_SECONDS,
+            )
+            self._model_info_cache.clear()
+            return entries
 
         if _looks_like_chatgpt_oauth_provider(provider):
             return await self._discover_codex_models(provider)
         if _looks_like_anthropic_subscription_provider(provider):
             return await self._discover_anthropic_subscription_models(provider)
 
-        return [
+        entries = [
             enrich_fast_mode(enrich_model_entry(entry, provider_preset=preset), preset, config)
-            for entry in await self._discover_models_remote(preset, base_url, api_key)
+            for entry in await self._discover_models_remote(
+                preset,
+                base_url,
+                api_key,
+                config.get("catalog_provider"),
+                aws_config={
+                    key: config[key]
+                    for key in ("aws_region_name", "aws_profile_name")
+                    if config.get(key)
+                },
+            )
         ]
+        self._discovery_metadata_cache[self._discovery_metadata_key(provider)] = (
+            {entry["model_id"]: entry for entry in entries},
+            monotonic() + MODEL_CACHE_TTL_SECONDS,
+        )
+        self._model_info_cache.clear()
+        return entries
+
+    @staticmethod
+    def _discovery_metadata_key(provider: LLMProviderRow) -> str:
+        revision = hashlib.sha256(
+            json.dumps(dict(provider.config), sort_keys=True, default=str).encode()
+        ).hexdigest()
+        return f"{provider.provider_id}:{revision}"
 
     async def discover_models_preview(
         self,
@@ -6682,6 +6873,8 @@ class LiteLLMProvider:
         location: str | None = None,
         executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
+        catalog_provider: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Discover models without a saved provider (preview mode).
 
@@ -6703,6 +6896,7 @@ class LiteLLMProvider:
                 api_key=resolved_key,
                 executor_id=executor_id,
                 executor_labels=executor_labels,
+                aws_config=aws_config,
             )
         if preset == "chatgpt":
             return bundled_codex_model_entries()
@@ -6710,7 +6904,9 @@ class LiteLLMProvider:
             enrich_fast_mode(
                 enrich_model_entry(entry, provider_preset=preset), preset, {"base_url": base_url}
             )
-            for entry in await self._discover_models_remote(preset, base_url, resolved_key)
+            for entry in await self._discover_models_remote(
+                preset, base_url, resolved_key, catalog_provider, aws_config=aws_config
+            )
         ]
 
     async def _discover_models_via_executor(
@@ -6723,11 +6919,14 @@ class LiteLLMProvider:
         executor_labels: dict[str, str] | None = None,
         provider_id: str | None = None,
         owner_email: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
-        if preset.strip().lower() != "ollama":
-            raise ValueError(
-                "Executor-routed model discovery currently supports Ollama providers only"
-            )
+        if preset.strip().lower() not in {
+            "ollama",
+            "bedrock",
+            *PROVIDER_BASES,
+        } and not is_openrouter_catalog(preset, base_url):
+            raise ValueError("Executor-routed model discovery unsupported for this preset")
         if self._inference_router is None:
             raise RuntimeError("Executor-routed model discovery requires an inference router")
         models = await self._inference_router.discover_models(
@@ -6738,9 +6937,31 @@ class LiteLLMProvider:
             executor_labels=executor_labels,
             provider_id=provider_id,
             owner_email=owner_email,
+            **({"aws_config": aws_config} if aws_config else {}),
         )
         if not isinstance(models, list):
             return []
+        if preset in PROVIDER_BASES or is_openrouter_catalog(preset, base_url):
+            return [
+                {
+                    "model_id": str(record["id"]),
+                    "name": str(record["id"]),
+                    **resolve_model_metadata(
+                        str(record["id"]), preset=preset, base_url=base_url, remote=record
+                    ),
+                }
+                for record in models
+                if isinstance(record, dict) and record.get("id")
+            ]
+        if preset == "bedrock":
+            return [
+                {
+                    **record,
+                    **resolve_model_metadata(record["model_id"], preset=preset, remote=record),
+                }
+                for record in models
+                if isinstance(record, dict) and record.get("model_id")
+            ]
         return [cast(dict[str, Any], item) for item in models if isinstance(item, dict)]
 
     async def _discover_codex_models(self, provider: LLMProviderRow) -> list[dict[str, Any]]:
@@ -6866,16 +7087,56 @@ class LiteLLMProvider:
         return usage
 
     async def _discover_models_remote(
-        self, preset: str, base_url: str, api_key: str
+        self,
+        preset: str,
+        base_url: str,
+        api_key: str,
+        catalog_provider: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Shared implementation for model discovery."""
         import httpx
+
+        if preset == "bedrock":
+            config = aws_config or {}
+            records = await discover_bedrock_models(
+                region=config.get("aws_region_name"), profile=config.get("aws_profile_name")
+            )
+            return [
+                {
+                    **record,
+                    **resolve_model_metadata(record["model_id"], preset=preset, remote=record),
+                }
+                for record in records
+            ]
 
         headers: dict[str, str] = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
         async with httpx.AsyncClient(timeout=15) as client:
+            if preset in PROVIDER_BASES or is_openrouter_catalog(preset, base_url):
+                records = await discover_hosted_models(
+                    client,
+                    preset=preset if preset in PROVIDER_BASES else "openrouter",
+                    base_url=base_url,
+                    api_key=api_key,
+                )
+                return [
+                    {
+                        "model_id": str(record["id"]),
+                        "name": str(record["id"]),
+                        **resolve_model_metadata(
+                            str(record["id"]),
+                            preset=preset,
+                            base_url=base_url,
+                            catalog_provider=catalog_provider,
+                            remote=record,
+                        ),
+                    }
+                    for record in records
+                    if record.get("id")
+                ]
             if is_ollama_remote(preset, base_url):
                 # Ollama: GET /api/tags, then read-only POST /api/show per model.
                 return await discover_ollama_models(
@@ -6907,8 +7168,8 @@ class LiteLLMProvider:
                 # Fall through to /v1/models below
 
             # OpenAI-compatible (incl. litellm_proxy fallback): GET /v1/models
-            openai_url = base_url.rstrip("/") if base_url else "https://api.openai.com"
-            response = await client.get(f"{openai_url}/v1/models", headers=headers)
+            models_url = openai_endpoint(base_url or "https://api.openai.com", "models")
+            response = await client.get(models_url, headers=headers)
             response.raise_for_status()
             data = response.json()
             raw_models = data.get("data", [])
@@ -6920,14 +7181,15 @@ class LiteLLMProvider:
                     continue
                 mid = str(m["id"])
                 entry: dict[str, Any] = {"model_id": mid, "name": mid}
-                try:
-                    live: Any = litellm.get_model_info(model=mid)
-                    if isinstance(live, ModelInfo):
-                        live = live.model_dump()
-                    if isinstance(live, dict):
-                        entry.update(_normalize_proxy_model_info(live))
-                except Exception:
-                    pass
+                entry.update(
+                    resolve_model_metadata(
+                        mid,
+                        preset=preset,
+                        base_url=base_url,
+                        catalog_provider=catalog_provider,
+                        remote=m,
+                    )
+                )
                 metadata_floor = _metadata_floor_for_model(mid)
                 if metadata_floor is not None and preset in {"openai", "azure"}:
                     for key, value in metadata_floor.items():
@@ -7023,6 +7285,31 @@ class LiteLLMProvider:
                 )
 
         model_info = await self.get_model_info(default_model, provider_id=provider.provider_id)
+        if is_systemone_model(
+            default_model, str(config.get("preset", "")), model_info.model_dump()
+        ):
+            try:
+                await self._system_one_for_provider(
+                    SystemOneRequest.model_validate(
+                        {
+                            "model": default_model,
+                            "state": "Connectivity check",
+                            "questions": {
+                                "check": {"type": "noul", "instructions": "Is this a check?"}
+                            },
+                        }
+                    ),
+                    provider,
+                    timeout=float(timeout_seconds),
+                )
+                return _test_result(True, error_type=None, error_detail=None)
+            except Exception as exc:
+                return _test_result(
+                    False,
+                    error_type=self._classify_provider_error(exc),
+                    error_detail="System One provider test failed",
+                )
+
         request_kwargs = await self._resolve_provider_kwargs(provider)
         configured_timeout = request_kwargs.get("timeout")
         request_kwargs["timeout"] = (
@@ -7194,12 +7481,15 @@ class LiteLLMProvider:
         """
         if provider is None:
             return model
+        wire_model = compatible_model(model, dict(provider.config))
+        if wire_model is not None:
+            return wire_model
         preset = dict(provider.config).get("preset", "")
         prefix = PRESET_TO_MODEL_PREFIX.get(preset)
         if prefix:
             if model.startswith(f"{prefix}/"):
                 return model
-            if preset != "ollama" and "/" in model:
+            if preset not in {"ollama", "gemini", "bedrock"} and "/" in model:
                 return model
             return f"{prefix}/{model}"
         return model
@@ -7256,7 +7546,8 @@ class LiteLLMProvider:
         """
         auth_config = config.get("auth_config")
         if not isinstance(auth_config, dict):
-            return None
+            env_var = PROVIDER_ENV_VARS.get(str(config.get("preset", "")))
+            return os.environ.get(env_var) if env_var else None
 
         mode = auth_config.get("mode")
         if mode == "secret":
@@ -7283,7 +7574,8 @@ class LiteLLMProvider:
         """Async version of API key resolution (supports secrets store)."""
         auth_config = config.get("auth_config")
         if not isinstance(auth_config, dict):
-            return None
+            env_var = PROVIDER_ENV_VARS.get(str(config.get("preset", "")))
+            return os.environ.get(env_var) if env_var else None
 
         mode = auth_config.get("mode")
         if mode == "secret":
@@ -7483,7 +7775,8 @@ class LiteLLMProvider:
         import httpx
 
         api_hash = hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "anonymous"
-        cache_key = f"{base_url.rstrip('/')}#{api_hash}"
+        base_url = proxy_service_root(base_url)
+        cache_key = f"{base_url}#{api_hash}"
 
         if not bypass_cache:
             async with self._cache_lock:
@@ -7560,6 +7853,40 @@ class LiteLLMProvider:
             return False
         return getattr(provider, "location", None) == "executor"
 
+    async def _system_one_for_provider(
+        self, payload: SystemOneRequest, provider: LLMProviderRow, *, timeout: float
+    ) -> dict[str, Any]:
+        """Dispatch native typed inference without entering chat fallbacks."""
+        kwargs = await self._resolve_provider_kwargs(provider)
+        base_url = str(kwargs.get("api_base") or kwargs.get("base_url") or "")
+        preset = systemone_provider_preset(str(provider.config.get("preset", "")), base_url)
+        if preset is None:
+            raise ValueError("Provider does not support System One")
+        configured_timeout = kwargs.get("timeout")
+        if isinstance(configured_timeout, int | float):
+            timeout = min(timeout, float(configured_timeout))
+        transport_kwargs: dict[str, Any] = {
+            "preset": preset,
+            "base_url": base_url,
+            "api_key": str(kwargs.get("api_key") or ""),
+            "timeout": timeout,
+            "extra_headers": kwargs.get("extra_headers"),
+        }
+        if provider.location == "executor":
+            result = await self._executor_generate(
+                payload.model,
+                [],
+                provider,
+                request_kwargs={
+                    "cognis_llm_api": "systemone",
+                    "payload": payload.model_dump(mode="json", exclude_none=True),
+                    **transport_kwargs,
+                },
+                acting_user_email=provider.owner_email,
+            )
+            return validate_systemone_response(result, payload)
+        return await request_systemone(payload, **transport_kwargs)
+
     async def _executor_generate(
         self,
         model: str,
@@ -7584,6 +7911,7 @@ class LiteLLMProvider:
         )
         if self._inference_router is None:
             raise RuntimeError("Inference router is not configured")
+        request_kwargs = await self._single_executor_attempt(request_kwargs)
         result = await self._inference_router.route_generate(
             messages=messages,
             model=model,
@@ -7634,6 +7962,7 @@ class LiteLLMProvider:
         )
         if self._inference_router is None:
             raise RuntimeError("Inference router is not configured")
+        request_kwargs = await self._single_executor_attempt(request_kwargs)
         async for chunk in self._inference_router.route_stream(
             messages=messages,
             model=model,
@@ -7660,6 +7989,25 @@ class LiteLLMProvider:
         ):
             yield chunk
 
+    @staticmethod
+    async def _single_executor_attempt(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Charge every RPC, including controller-side compatibility resubmissions."""
+        from cognis.providers.llm.recovery import active_attempt_budget
+
+        budget = active_attempt_budget.get()
+        if budget is not None:
+            await budget.before_dispatch()
+            budget.before_transport()
+            return {
+                **request_kwargs,
+                "num_retries": 0,
+                "max_retries": 0,
+                "timeout": min(
+                    float(request_kwargs.get("timeout") or budget.remaining), budget.remaining
+                ),
+            }
+        return request_kwargs
+
     # ------------------------------------------------------------------
     # Embeddings
     # ------------------------------------------------------------------
@@ -7673,6 +8021,17 @@ class LiteLLMProvider:
     ) -> list[list[float]]:
         if not texts:
             return []
+        response = await self.embed_response(texts, model=model, task_type=task_type, **kwargs)
+        return [item["embedding"] for item in response["data"]]
+
+    async def embed_response(
+        self,
+        texts: list[str],
+        model: str | None = None,
+        task_type: str = "embedding",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Return normalized embeddings with the provider's exact usage."""
         explicit_provider_id = cast(str | None, kwargs.pop("provider_id", None))
         acting_user_email = cast(str | None, kwargs.pop("acting_user_email", None))
         resolved_model, provider = await self._resolve_model_target(
@@ -7687,32 +8046,125 @@ class LiteLLMProvider:
         request_kwargs = _merge_request_kwargs(
             await self._resolve_provider_kwargs(provider), kwargs
         )
-        async with self._provider_oauth_token_context(provider):
-            response = await litellm.aembedding(
-                model=prefixed_model,
-                input=texts,
-                **request_kwargs,
+        if provider.location == "executor":
+            response = await self._executor_generate(
+                prefixed_model,
+                [],
+                provider,
+                request_kwargs={**request_kwargs, "cognis_llm_api": "embeddings", "input": texts},
+                acting_user_email=acting_user_email,
             )
+        else:
+            async with self._provider_oauth_token_context(provider):
+                response = await litellm.aembedding(
+                    model=prefixed_model,
+                    input=texts,
+                    **request_kwargs,
+                )
         data = getattr(response, "data", None)
         if data is None and isinstance(response, dict):
             data = response.get("data")
-        vectors: list[list[float]] = []
+        vectors: dict[int, list[float]] = {}
         for item in data or []:
+            index = item.get("index") if isinstance(item, dict) else getattr(item, "index", None)
             embedding = (
                 item.get("embedding")
                 if isinstance(item, dict)
                 else getattr(item, "embedding", None)
             )
-            if embedding is None:
-                continue
-            vectors.append([float(value) for value in embedding])
+            if (
+                type(index) is not int
+                or index < 0
+                or index >= len(texts)
+                or index in vectors
+                or embedding is None
+            ):
+                raise RuntimeError("Embedding provider returned invalid vector indices")
+            vectors[index] = [float(value) for value in embedding]
         if len(vectors) != len(texts):
             raise RuntimeError("Embedding provider returned an unexpected number of vectors")
-        return vectors
+        normalized = response if isinstance(response, dict) else response.model_dump()
+        return {
+            "object": "list",
+            "model": resolved_model,
+            "data": [
+                {"object": "embedding", "index": index, "embedding": vector}
+                for index, vector in sorted(vectors.items())
+            ],
+            "usage": normalized.get("usage") or {},
+        }
 
     # ------------------------------------------------------------------
     # Image generation (ImageGenerationProvider)
     # ------------------------------------------------------------------
+
+    async def resolve_video_connection(
+        self, *, model: str | None, provider_id: str | None, owner: str, role: str
+    ) -> tuple[Any, dict[str, Any]]:
+        """Resolve caller-scoped video configuration without exposing secrets in metadata."""
+        from cognis.providers.video import VideoConnection, video_adapter_name
+
+        resolved, provider = await self._resolve_model_target(
+            model, task_type=role, explicit_provider_id=provider_id, acting_user_email=owner
+        )
+        if provider is None:
+            raise ValueError("No video provider configured")
+        config = dict(provider.config or {})
+        adapter = video_adapter_name(config.get("preset", ""), resolved)
+        runtime = "executor" if self._should_route_to_executor(provider) else "controller"
+        options = await self._resolve_provider_kwargs(provider)
+        endpoint = (
+            "https://openrouter.ai/api/v1"
+            if adapter == "openrouter"
+            else "https://generativelanguage.googleapis.com/v1beta"
+        )
+        configured = options.get("api_base") or options.get("base_url")
+        if configured and configured.rstrip("/") != endpoint:
+            raise ValueError("Video endpoint does not match the native provider")
+        key = options.get("api_key")
+        if not isinstance(key, str) or not key:
+            raise ValueError("Video provider requires an API key")
+        connection = VideoConnection(
+            adapter=adapter, model=resolved, api_key=key, base_url=endpoint
+        )
+        return connection, {
+            "provider_id": provider.provider_id,
+            "model": resolved,
+            "adapter": adapter,
+            "endpoint": endpoint,
+            "runtime": runtime,
+            "executor_id": config.get("executor_id"),
+            "executor_labels": config.get("executor_labels"),
+            "provider_owner": provider.owner_email,
+        }
+
+    async def video_rpc(self, binding: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        if self._inference_router is None:
+            raise ValueError("Executor inference is unavailable")
+        result = await self._inference_router.route_video(
+            params=params,
+            executor_id=binding.get("executor_id"),
+            executor_labels=binding.get("executor_labels"),
+        )
+        if not isinstance(result, dict):
+            raise ValueError("Invalid executor video response")
+        return result
+
+    async def resolve_video_analysis(
+        self, *, model: str | None, provider_id: str | None, owner: str
+    ) -> tuple[str, str]:
+        resolved, provider = await self._resolve_model_target(
+            model,
+            task_type="video_analysis",
+            explicit_provider_id=provider_id,
+            acting_user_email=owner,
+        )
+        if provider is None or (provider.config or {}).get("preset") != "gemini":
+            raise ValueError("Native video analysis currently requires a Gemini provider")
+        info = await self.get_model_info(resolved, provider.provider_id, acting_user_email=owner)
+        if not info.supports_video_input:
+            raise ValueError("Enable native video input only on an account-verified analysis model")
+        return resolved, provider.provider_id
 
     async def image_generate(
         self,
@@ -7734,7 +8186,12 @@ class LiteLLMProvider:
         - Gemini: litellm.acompletion() with modalities=["image", "text"]
         """
 
-        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        resolved_model, provider = await self._resolve_model_target(
+            model,
+            task_type=task_type,
+            explicit_provider_id=kwargs.pop("provider_id", None),
+            acting_user_email=kwargs.pop("acting_user_email", None),
+        )
         if provider is None:
             raise ValueError(f"No LLM provider found for image generation model {resolved_model!r}")
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
@@ -7891,10 +8348,11 @@ class LiteLLMProvider:
 
         # Filter kwargs — don't pass image-specific params to acompletion
         completion_kwargs = {k: v for k, v in request_kwargs.items() if k not in ("size",)}
-        if size:
-            completion_kwargs.setdefault("extra_body", {})
-            if isinstance(completion_kwargs["extra_body"], dict):
-                completion_kwargs["extra_body"]["image_size"] = size
+        from cognis.providers.llm.image_config import gemini_image_config
+
+        image_config = gemini_image_config(size, model)
+        if image_config is not None:
+            completion_kwargs["imageConfig"] = image_config
 
         response = await with_llm_retry(
             litellm.acompletion,
@@ -8026,6 +8484,10 @@ class LiteLLMProvider:
         **kwargs: Any,
     ) -> ImageGenerationResult:
         """Route image generation to executor-side inference."""
+        request_kwargs = dict(request_kwargs)
+        if kwargs.get("timeout") is not None:
+            request_kwargs["timeout"] = kwargs["timeout"]
+        request_kwargs = await self._single_executor_attempt(request_kwargs)
         config = provider.config if hasattr(provider, "config") else {}
         executor_id = config.get("executor_id") if isinstance(config, dict) else None
         executor_labels = config.get("executor_labels") if isinstance(config, dict) else None
@@ -8097,6 +8559,7 @@ async def _run_synthesize_local(
 
     aspeech = getattr(litellm, "aspeech", None)
     if callable(aspeech) and not direct_first:
+        request_kwargs = await LiteLLMProvider._single_executor_attempt(request_kwargs)
         try:
             result = await aspeech(
                 model=wire_model,
@@ -8107,6 +8570,8 @@ async def _run_synthesize_local(
                 api_key=request_kwargs.get("api_key"),
                 api_base=request_kwargs.get("api_base") or request_kwargs.get("base_url"),
                 timeout=request_kwargs.get("timeout", 120),
+                num_retries=0,
+                max_retries=0,
             )
             audio_bytes = _extract_tts_bytes(result)
             if audio_bytes:
@@ -8118,6 +8583,12 @@ async def _run_synthesize_local(
                     duration_seconds=None,
                 )
         except Exception as exc:  # noqa: BLE001 — fall back to direct HTTP
+            from cognis.providers.llm.recovery import active_attempt_budget
+
+            if active_attempt_budget.get() is not None:
+                raise LLMStreamProviderError(
+                    "Speech synthesis failed", payload=classify_llm_exception(exc)
+                ) from exc
             logger.debug(
                 "litellm.aspeech failed; falling back to direct HTTP",
                 extra={"extra_data": {"error": str(exc)[:200], "model": wire_model}},
@@ -8142,21 +8613,28 @@ async def _run_synthesize_local(
         "response_format": response_format,
         "speed": speed,
     }
+    request_kwargs = await LiteLLMProvider._single_executor_attempt(request_kwargs)
     timeout = request_kwargs.get("timeout", 120)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
-                f"{api_base.rstrip('/')}/v1/audio/speech",
+                openai_endpoint(api_base, "audio/speech"),
                 headers=headers,
                 json=body,
             )
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = sanitize_http(exc) if callable(sanitize_http) else str(exc)
-        raise RuntimeError(f"Text-to-speech request failed: {detail}") from exc
+        raise LLMStreamProviderError(
+            "Text-to-speech request failed",
+            payload={**classify_llm_exception(exc), "message": detail},
+        ) from exc
     except Exception as exc:
         detail = sanitize_general(exc) if callable(sanitize_general) else str(exc)
-        raise RuntimeError(f"Text-to-speech request failed: {detail}") from exc
+        raise LLMStreamProviderError(
+            "Text-to-speech request failed",
+            payload={**classify_llm_exception(exc), "message": detail},
+        ) from exc
 
     audio_bytes = response.content
     if not audio_bytes:

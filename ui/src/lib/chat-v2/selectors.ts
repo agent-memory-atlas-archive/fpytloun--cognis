@@ -30,6 +30,7 @@ export const TIMELINE_KIND_RENDER_POLICY = {
   assistant_deliverable: true,
   file_diff: true,
   recap: true,
+  handoff: true,
   notice: true,
   compaction: true,
   error: true,
@@ -41,7 +42,21 @@ export function isRenderableTimelineItem(item: TimelineItem): boolean {
 }
 
 export function selectRenderableTimeline(items: TimelineItem[]): TimelineItem[] {
-  return items.filter(isRenderableTimelineItem);
+  const modelErrorTurns = new Set<string>();
+  for (const item of items) {
+    if (isRenderableTimelineItem(item) && item.kind === 'message'
+      && item.role === 'system'
+      && item.notice_kind === 'model_error'
+      && item.notice_scope === 'failed_turn'
+      && item.turn_id) {
+      modelErrorTurns.add(item.turn_id);
+    }
+  }
+  return items.filter((item) => isRenderableTimelineItem(item)
+    && !(item.kind === 'error'
+      && item.error_code === 'step_failed'
+      && item.turn_id
+      && modelErrorTurns.has(item.turn_id)));
 }
 
 export function isPinnedTransientNotice(item: TimelineItem): boolean {

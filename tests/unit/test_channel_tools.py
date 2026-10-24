@@ -236,6 +236,7 @@ async def _seed_artifact(
                 object_id=f"objects/{artifact_id}",
                 filename="photo.png",
                 owner_email=owner_email,
+                owner_agent_id=f"agent-{owner_email.split('@', 1)[0]}",
                 conversation_id=conversation_id,
                 purpose="chat_input",
                 kind="image",
@@ -827,7 +828,9 @@ async def test_one_shot_picture_only_artifact_and_idempotency(tmp_path) -> None:
         async with factory() as session:
             row = await session.get(ChannelDeliveryOutboxRow, first["delivery_id"])
             assert row is not None
-            assert row.attachments_json[0]["_delivery_authorization"]["scope"] == "owner_global"
+            authorization = row.attachments_json[0]["_delivery_authorization"]
+            assert authorization["scope"] == "agent"
+            assert authorization["accessor_agent_id"] == "agent-owner"
             stored = await session.get(ArtifactRecordRow, "img-owned")
             assert stored is not None
             stored.status = "deleted"

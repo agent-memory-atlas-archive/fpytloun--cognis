@@ -300,8 +300,8 @@ def _recovery_router(*, persist_raises: bool = False):
         metadata["credential_persisted"] = True
         return result.model_copy(update={"metadata": metadata})
 
-    async def _materialize(result, session, tool_name):
-        del session, tool_name
+    async def _materialize(result, session, tool_name, *, arguments=None):
+        del session, tool_name, arguments
         calls.append("materialize")
         return result
 

@@ -26,8 +26,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis import json_codec as json
 from cognis.core.agent_loop import (
     CHAT_POLICY,
-    CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
-    CONTROLLER_TOOL_SURFACE_TASK_CONTROL,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
@@ -124,6 +122,10 @@ from cognis.store.queries import (
 from cognis.tools.builtin.orchestration import OrchestrationMode
 
 logger = get_logger(__name__)
+
+# Intaris captures at most this many characters per user source; a longer
+# message is stored truncated and is no longer citable as a complete statement.
+_INTARIS_SOURCE_MAX_CHARS = 16_000
 
 
 def _normalize_executor_path(value: str | None) -> str | None:
@@ -351,6 +353,7 @@ class WorkflowEngine:
             else None
         )
         live_task_session_policy: dict[str, Any] | None = None
+        control_interaction_mode_override: str | None = None
         if control_task_id is not None:
             from cognis.store.queries import get_task
 
@@ -364,6 +367,7 @@ class WorkflowEngine:
                 raise PermissionError("Task control conversation is no longer authorized")
             if isinstance(control_task.session_policy, dict):
                 live_task_session_policy = dict(control_task.session_policy)
+            control_interaction_mode_override = control_task.interaction_mode_override
         access_context = RuntimeAccessContext(
             user_email=session.user_email,
             agent_id=agent.agent_id,
@@ -378,6 +382,7 @@ class WorkflowEngine:
             delegation_mode=getattr(session, "delegation_mode", None),
             workflow_step=False,
             interaction_mode="step_requests",
+            interaction_mode_override=control_interaction_mode_override,
             session_policy=(
                 live_task_session_policy
                 if control_task_id is not None
@@ -398,19 +403,10 @@ class WorkflowEngine:
             execution_fence=execution_fence,
         )
 
-        continuation_profile_id = None
-        if platform_data.get("forked_from") == "task_step":
-            raw_profile_id = platform_data.get("step_profile_id")
-            if isinstance(raw_profile_id, str) and raw_profile_id.strip():
-                continuation_profile_id = raw_profile_id.strip()
+        from cognis.core.agent_loop import direct_chat_inference_contract
 
-        direct_step = StepDefinition(
-            name="direct",
-            type="run",
-            prompt=user_message,
-            allow_questions=True,
-            # Keep the inline hot path, but apply the shipped direct-chat profile.
-            step_profile_id=continuation_profile_id or "system:direct-default",
+        direct_step, controller_surface = direct_chat_inference_contract(
+            platform_data, user_message
         )
         ctx = StepContext(
             step_definition=direct_step,
@@ -448,6 +444,7 @@ class WorkflowEngine:
             follow_up=follow_up,
             interaction_mode="step_requests",
             tool_registry=runtime.tool_registry,
+            rebuild_tool_registry=runtime.rebuild_tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
             executor_pool=getattr(runtime, "executor_pool", None),
@@ -460,11 +457,7 @@ class WorkflowEngine:
             orchestration_mode=OrchestrationMode.FULL,
             turn_id=turn_id,
             chat_mode=chat_mode,
-            controller_tool_surface=(
-                CONTROLLER_TOOL_SURFACE_TASK_CONTROL
-                if control_task_id
-                else CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
-            ),
+            controller_tool_surface=controller_surface,
             consume_boundary_batch=consume_boundary_batch,
             wait_for_boundary_input=wait_for_boundary_input,
             get_boundary_action_generation=get_boundary_action_generation,
@@ -571,6 +564,17 @@ class WorkflowEngine:
                     break
 
                 step_def = workflow.steps[state.current_step_index]
+                # A saved gate is a continuation boundary, not permission to execute
+                # its originating step again. Consume it before touching StepRun rows.
+                if state.pending_pause_type == "gate" and step_def.type != "gate":
+                    if not await self._resume_derived_gate(task, step_def, state, workflow):
+                        state.status = "paused"
+                        task.status = TaskStatus.PAUSED
+                        await self._persist_workflow_state(task, sync_status=True)
+                        return task
+                    if state.status in {"failed", "cancelled"}:
+                        break
+                    continue
                 state.current_step_status = "running"
                 state.routing_skips.pop(step_def.name, None)
 
@@ -1679,7 +1683,34 @@ class WorkflowEngine:
             agent_profile_id=profile.profile_id,
             session_policy=session_policy,
         )
+        from cognis.core.workflow_step_scope import WorkflowStepScope, refresh_scope_origin
+
+        scope_task, scope_origin_reason = await refresh_scope_origin(task, self._session_factory)
+        # Local audit only: never extend the frozen declaration or Intaris evidence.
+        runtime_info["scope_origin_reason"] = scope_origin_reason
+        await self._persist_deterministic_checkpoint(step_run_id, runtime_info=runtime_info)
+        workflow_step_scope = WorkflowStepScope.build(
+            task=scope_task,
+            workflow=workflow,
+            state=state,
+            step=step_def,
+            session_id=session.intaris_session_id or session.session_id,
+            step_run_id=step_run_id,
+            logical_call_id=call_identity,
+            rendered_args=rendered_args,
+        )
         executor_agent = self._executor_agent_for_step(primary_agent, agent)
+        from cognis.core.artifact_sharing import grant_referenced_inputs
+
+        async with self._session_factory() as db_session:
+            await grant_referenced_inputs(
+                db_session,
+                owner_email=task.created_by,
+                source_agent_id=task.agent_id,
+                target_session_id=session.session_id,
+                text=json.dumps(rendered_args),
+            )
+            await db_session.commit()
         access_context = RuntimeAccessContext(
             user_email=task.created_by,
             agent_id=executor_agent.agent_id,
@@ -1694,6 +1725,7 @@ class WorkflowEngine:
             delegation_mode=session.delegation_mode,
             workflow_step=True,
             interaction_mode=task.interaction_mode_override or workflow.interaction.mode,
+            interaction_mode_override=task.interaction_mode_override,
             session_policy=session_policy,
         )
         runtime = await self._resolve_step_runtime(
@@ -1768,6 +1800,7 @@ class WorkflowEngine:
                 system_initiated=task.source_type in {"scheduler", "webhook"},
                 orchestration_mode=OrchestrationMode.NONE,
                 turn_id=call_identity,
+                workflow_step_scope=workflow_step_scope,
                 execution_fence=current_task_execution_fence(),
             )
             ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
@@ -1782,6 +1815,16 @@ class WorkflowEngine:
                 arguments=rendered_args,
                 execution_scope_id=step_run_id,
             )
+            if workflow_step_scope.authorized_by == "owner_configured" and not runtime_info.get(
+                "step_input_reported"
+            ):
+                await self._report_deterministic_step_input(
+                    ctx,
+                    call_identity,
+                    step_run_id,
+                    runtime_info,
+                    workflow_id=workflow.workflow_id,
+                )
             await self._record_deterministic_tool_event(
                 ctx,
                 call_identity,
@@ -1803,6 +1846,16 @@ class WorkflowEngine:
                 executor_environment=runtime.executor_environment,
                 access_context=access_context,
             ):
+                refreshed_policy = await self._session_manager.refresh_intaris_session_policy(
+                    session
+                )
+                # Legacy evaluation has no configured-scope grant. Use the
+                # acknowledged policy, not a separate capability guess.
+                if (
+                    not isinstance(refreshed_policy, dict)
+                    or refreshed_policy.get("evaluation_policy_version") != "hybrid_v1"
+                ):
+                    ctx.workflow_step_scope = None
                 dispatch = self._agent_loop.execute_controller_tool(ctx, tool_call)
                 result: ToolResult
                 # An interruption is not a durable tool result: read-only
@@ -1921,6 +1974,69 @@ class WorkflowEngine:
             )
         finally:
             await runtime.cleanup()
+
+    async def _report_deterministic_step_input(
+        self,
+        ctx: StepContext,
+        call_identity: str,
+        step_run_id: str,
+        runtime_info: dict[str, Any],
+        *,
+        workflow_id: str,
+    ) -> None:
+        """Report an owner-configured deterministic step as the session user message.
+
+        A tool_call step has no agent input, so its rendered step is the input.
+        It uses the agent-step path: a durable ``user_message`` event, then an
+        Intaris reasoning report resolved from events. The append is idempotent
+        per call identity; the checkpoint flag prevents a second report on retry.
+        """
+        step_def = ctx.step_definition
+        assert step_def.tool_call is not None
+        rendered = (runtime_info.get("render") or {}).get("rendered")
+        args_summary = (
+            json.dumps(rendered, ensure_ascii=False, sort_keys=True)
+            if rendered is not None
+            else "arguments too large to summarize"
+        )
+        content = (
+            f"Workflow step {step_def.name}: run {step_def.tool_call.tool} with {args_summary}"
+        )[:_INTARIS_SOURCE_MAX_CHARS]
+        await self._record_deterministic_tool_event(
+            ctx,
+            call_identity,
+            SessionEvent(
+                type="user_message",
+                data={
+                    "role": "user",
+                    "content": content,
+                    "content_type": "text",
+                    "source": "user_input",
+                    "prompt_visibility": "model_only",
+                    "user_visible_content": None,
+                    "prompt_provenance": {
+                        "kind": "internal_workflow_prompt",
+                        "task_id": ctx.task_id,
+                        "step_run_id": step_run_id,
+                        "workflow_id": workflow_id,
+                    },
+                    "intention_eligible": True,
+                    "hash": hashlib.sha256(
+                        json.dumps(
+                            {"role": "user", "content": content, "source": "user_input"},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+            ),
+        )
+        await self._providers.guardrails.report_reasoning(
+            session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+            from_events=True,
+        )
+        runtime_info["step_input_reported"] = True
+        await self._persist_deterministic_checkpoint(step_run_id, runtime_info=runtime_info)
 
     async def _record_deterministic_tool_event(
         self, ctx: StepContext, call_identity: str, event: SessionEvent
@@ -2279,7 +2395,10 @@ class WorkflowEngine:
     ) -> str:
         from cognis.models.workflow import GateConfig, GateOption
 
-        if (task.interaction_mode_override or workflow.interaction.mode) == "none":
+        if (
+            state.pending_pause_type != "gate"
+            and (task.interaction_mode_override or workflow.interaction.mode) == "none"
+        ):
             return "fail"
         gate = StepDefinition(
             name=f"{step_def.name}:error",
@@ -2592,6 +2711,7 @@ class WorkflowEngine:
                 delegation_mode=session.delegation_mode,
                 workflow_step=True,
                 interaction_mode=interaction_mode,
+                interaction_mode_override=task.interaction_mode_override,
                 session_policy=session_policy,
             )
             runtime_workspace_root, runtime_working_directory = _resolve_task_execution_paths(task)
@@ -2855,6 +2975,19 @@ class WorkflowEngine:
 
         # Build step context. Primary task steps can coordinate restricted,
         # task-owned workstreams; secondary reviewer steps cannot orchestrate.
+        from cognis.core.artifact_sharing import grant_referenced_inputs
+
+        async with self._session_factory() as db_session:
+            await grant_referenced_inputs(
+                db_session,
+                owner_email=task.created_by,
+                source_agent_id=task.agent_id,
+                target_session_id=session.session_id,
+                text="\n".join(
+                    (task.description or task.title, prior_context or "", step_def.prompt or "")
+                ),
+            )
+            await db_session.commit()
         trigger_context = await self._task_trigger_context(task)
         ctx = StepContext(
             step_definition=step_def,
@@ -2886,6 +3019,7 @@ class WorkflowEngine:
             interaction_mode=interaction_mode,
             session_policy=session_policy,
             tool_registry=runtime.tool_registry,
+            rebuild_tool_registry=runtime.rebuild_tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
             executor_pool=getattr(runtime, "executor_pool", None),
@@ -3018,7 +3152,7 @@ class WorkflowEngine:
         # premature "approved" — the evaluation will set the final status.
         completion = self._resolve_completion(step_def, workflow)
         missing_required_deliverable = self._missing_required_deliverable(step_def, output)
-        if missing_required_deliverable and output is not None:
+        if missing_required_deliverable and output is not None and output.error is None:
             output.error = (
                 f"Step {step_def.name!r} requires a deliverable, but the step finished without one."
             )
@@ -3324,12 +3458,28 @@ class WorkflowEngine:
         workflow: Workflow,
     ) -> str:
         """Handle a gate step — pause and wait for caller response."""
-        if (task.interaction_mode_override or workflow.interaction.mode) == "none":
+        from cognis.models.workflow import GateConfig
+
+        existing_pause_payload = state.pending_pause_payload or {}
+        reuse_pause = (
+            state.pending_pause_type == "gate"
+            and str(existing_pause_payload.get("step_name") or "") == step_def.name
+        )
+        if state.pending_pause_type == "gate" and not reuse_pause:
+            # Never reinterpret an unidentified saved approval as a new gate,
+            # including autonomous/condition-skipped gates.
+            raise StepInterrupted(task.task_id)
+        if (
+            not reuse_pause
+            and (task.interaction_mode_override or workflow.interaction.mode) == "none"
+        ):
             # Autonomous mode — gates become continue
             GATES_TOTAL.labels(action="auto_continue").inc()
             return "continue"
 
         gate = step_def.gate
+        if reuse_pause and isinstance(existing_pause_payload.get("gate_definition"), dict):
+            gate = GateConfig.model_validate(existing_pause_payload["gate_definition"])
         if gate is None:
             return "continue"
 
@@ -3381,7 +3531,7 @@ class WorkflowEngine:
                     )
                 await db_session.commit()
 
-        if gate.conditions:
+        if gate.conditions and not reuse_pause:
             gate_evaluation = evaluate_gate_conditions_detailed(
                 [condition.expression for condition in gate.conditions],
                 step_outputs=state.step_outputs,
@@ -3425,13 +3575,9 @@ class WorkflowEngine:
             if raw:
                 gate_context[input_name] = raw
 
-        existing_pause_payload = state.pending_pause_payload or {}
-        reuse_pause = (
-            state.pending_pause_type == "gate"
-            and state.status == "paused"
-            and str(existing_pause_payload.get("step_name") or "") == step_def.name
-        )
         pause_id = str(existing_pause_payload.get("pause_id") or "").strip() if reuse_pause else ""
+        if reuse_pause and not pause_id:
+            raise StepInterrupted(task.task_id)
         if not pause_id:
             pause_id = f"gate_{uuid.uuid4().hex[:12]}"
 
@@ -3439,6 +3585,10 @@ class WorkflowEngine:
         if reuse_pause and self._notification_service is not None:
             existing_notification = await self._notification_service.get(pause_id)
             if existing_notification is None:
+                # A legacy pause without a recoverable original deadline must not
+                # silently create a fresh approval window.
+                if not existing_pause_payload.get("expires_at"):
+                    raise StepInterrupted(task.task_id)
                 reuse_pause = False
             elif existing_notification.status == "resolved":
                 resolution = existing_notification.resolution or {}
@@ -3456,8 +3606,27 @@ class WorkflowEngine:
                 if instruction and action != "cancel":
                     state.last_operator_instruction = instruction
                 task.status = TaskStatus.RUNNING
-                await self._persist_workflow_state(task, sync_status=True)
+                # The caller commits this consumption with its destination/retry
+                state.last_consumed_gate_id = pause_id
+                # transition. Until then the durable pause remains replayable.
                 return action
+
+        expires_at = existing_pause_payload.get("expires_at")
+        if existing_notification is not None:
+            expires_at = (
+                existing_notification.expires_at.isoformat()
+                if existing_notification.expires_at
+                else existing_notification.payload.get("expires_at") or expires_at
+            )
+        if not expires_at:
+            if reuse_pause:
+                raise StepInterrupted(task.task_id)
+            expires_at = (
+                datetime.now(UTC) + timedelta(seconds=max(1, gate.timeout_seconds))
+            ).isoformat()
+        deadline = datetime.fromisoformat(str(expires_at)).replace(
+            tzinfo=datetime.fromisoformat(str(expires_at)).tzinfo or UTC
+        )
 
         # Pause workflow — write status + workflow_state atomically
         state.status = "paused"
@@ -3471,6 +3640,12 @@ class WorkflowEngine:
             "message": gate.message,
             "context": gate_context,
             "options": gate_options,
+            "gate_definition": gate.model_dump(mode="json"),
+            "origin_step": workflow.steps[state.current_step_index].name,
+            "origin_step_index": state.current_step_index,
+            "task_attempt": task.attempt_number,
+            "expires_at": deadline.isoformat(),
+            "timeout_action": gate.timeout_action,
         }
         task.status = TaskStatus.PAUSED
         await self._persist_workflow_state(task, sync_status=True)
@@ -3502,9 +3677,9 @@ class WorkflowEngine:
                     "context": gate_context,
                     "options": gate_options,
                     "question": gate.message,
-                    "expires_at": (
-                        datetime.now(UTC) + timedelta(seconds=max(1, gate.timeout_seconds))
-                    ).isoformat(),
+                    "expires_at": deadline.isoformat(),
+                    "timeout_action": gate.timeout_action,
+                    "task_attempt": task.attempt_number,
                 },
             )
         elif self._pause_waiter.get(pause_id) is None:
@@ -3589,7 +3764,7 @@ class WorkflowEngine:
             )
 
         # Wait for resolution
-        timeout_seconds = float(max(1, gate.timeout_seconds))
+        timeout_seconds = max(0.001, (deadline - datetime.now(UTC)).total_seconds())
         try:
             wait_for_resolution = getattr(self._notification_service, "wait_for_resolution", None)
             if callable(wait_for_resolution):
@@ -3621,10 +3796,22 @@ class WorkflowEngine:
                     pause_id,
                     gate.timeout_action,
                     {"reason": "timeout"},
-                    user_email=task.created_by,
                 )
-            action = gate.timeout_action
-            instruction = ""
+                # A concurrent operator may have won. Consume the durable winner,
+                # never the timeout proposal merely because our local wait expired.
+                try:
+                    resolution = await self._notification_service.wait_for_resolution(
+                        pause_id, timeout=60.0
+                    )
+                except TimeoutError:
+                    raise StepInterrupted(task.task_id) from None
+                action = resolution.decision
+                instruction = str(
+                    resolution.data.get("note") or resolution.data.get("feedback") or ""
+                ).strip()
+            else:
+                action = gate.timeout_action
+                instruction = ""
 
         GATES_TOTAL.labels(action=action).inc()
         gate_evaluation.update({"action_taken": action, "branch": "operator_decision"})
@@ -3650,7 +3837,8 @@ class WorkflowEngine:
         if instruction and action != "cancel":
             state.last_operator_instruction = instruction
         task.status = TaskStatus.RUNNING
-        await self._persist_workflow_state(task, sync_status=True)
+        # Persist only in the caller together with the gate's resulting transition.
+        state.last_consumed_gate_id = pause_id
 
         return action
 
@@ -3803,6 +3991,85 @@ class WorkflowEngine:
         # Stay on the same step — the main loop will re-execute it
         return True
 
+    async def _resume_derived_gate(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        state: WorkflowState,
+        workflow: Workflow,
+    ) -> bool:
+        """Resume persisted derived gates without re-entering step execution.
+
+        Legacy pauses have only a derived name. Reconstruct those from the pinned
+        workflow and saved output; unknown/ambiguous records remain paused.
+        """
+        payload = state.pending_pause_payload or {}
+        name = payload.get("step_name")
+        if (
+            payload.get("task_attempt", task.attempt_number) != task.attempt_number
+            or payload.get("origin_step", step_def.name) != step_def.name
+            or payload.get("origin_step_index", state.current_step_index)
+            != state.current_step_index
+        ):
+            return False
+        if name == f"{step_def.name}_outcome_gate":
+            raw_output = state.step_outputs.get(step_def.name)
+            if not raw_output:
+                return False
+            output = StepOutput.model_validate(raw_output)
+            route = self._resolve_outcome_route(
+                step_def, output.outcome.status if output.outcome else "success"
+            )
+            if route is None or route.action != "gate":
+                return False
+            result = await self._handle_step_outcome(task, step_def, output, state, workflow)
+            if result in {"failed", "cancelled"}:
+                state.status = cast(Any, result)
+            return True
+        if name == f"{step_def.name}_exhausted":
+            handled = await self._handle_exhausted(
+                task,
+                step_def,
+                state,
+                workflow,
+                "gate",
+                last_error=state.last_evaluation_feedback,
+            )
+            if not handled:
+                state.status = "failed"
+            return True
+        if name == f"{step_def.name}:error":
+            result = await self._pause_for_deterministic_error(
+                task,
+                step_def,
+                state,
+                workflow,
+                str((state.step_outputs.get(step_def.name) or {}).get("error") or ""),
+            )
+            if result == "paused":
+                return False
+            if result in {"cancel", "fail"}:
+                state.status = "cancelled" if result == "cancel" else "failed"
+            else:
+                target = payload.get("next_step_index")
+                if not isinstance(target, int):
+                    target = (
+                        self._find_step_index(workflow, step_def.next)
+                        if step_def.next
+                        else state.current_step_index + 1
+                    )
+                if target is None:
+                    state.status = "failed"
+                else:
+                    state.current_step_index = target
+                    await self._persist_workflow_state(task, sync_status=True)
+            return True
+        logger.error(
+            "Unknown persisted gate continuation",
+            extra={"extra_data": {"task_id": task.task_id, "step_name": name}},
+        )
+        return False
+
     async def _handle_step_outcome(
         self,
         task: TaskModel,
@@ -3847,7 +4114,10 @@ class WorkflowEngine:
         if action == "cancel":
             return "cancelled"
         if action == "gate":
-            if (task.interaction_mode_override or workflow.interaction.mode) == "none":
+            if (
+                state.pending_pause_type != "gate"
+                and (task.interaction_mode_override or workflow.interaction.mode) == "none"
+            ):
                 logger.warning(
                     "Outcome gate requested in autonomous mode, failing workflow",
                     extra={
@@ -4323,12 +4593,15 @@ class WorkflowEngine:
             )
             return
 
+        from cognis.core.project_task_delivery import fan_out_project_result
+
         if (
             applied_mode == "direct"
             and target_conversation
             and target_conversation.context_type != "web"
         ):
             await self._deliver_task_result_direct(task, target_conversation_id)
+            await fan_out_project_result(task, self._session_factory, self._channel_delivery)
             return
         if applied_mode == "direct":
             logger.info(
@@ -4367,6 +4640,7 @@ class WorkflowEngine:
         )
 
         await self._deliver_task_result_default(task, target_conversation_id)
+        await fan_out_project_result(task, self._session_factory, self._channel_delivery)
 
     async def _publish_task_terminal_event(self, task: TaskModel, **extra_data: object) -> None:
         """Publish the internal terminal task lifecycle event.
@@ -4683,20 +4957,17 @@ class WorkflowEngine:
 
                     if sess is not None:
                         delivery_session_id = sess.session_id
-                    if sess and sess.intaris_session_id:
-                        await self._providers.guardrails.record_events(
-                            session_id=sess.intaris_session_id,
-                            events=with_session_events_turn_id([event], None),
-                            source="cognis",
-                            # Idempotency key: the provider retries internally
-                            # and this loop retries once more — a lost response
-                            # after a successful server-side append must not
-                            # duplicate the task-result message on reload.
-                            idempotency_key=(
-                                f"{sess.intaris_session_id}:task_delivery:"
-                                f"{task.task_id}:{task.status}"
-                            ),
-                        )
+                    intaris_session_id = sess.intaris_session_id if sess else None
+                if intaris_session_id:
+                    await self._providers.guardrails.record_events(
+                        session_id=intaris_session_id,
+                        events=with_session_events_turn_id([event], None),
+                        source="cognis",
+                        # Both provider and delivery retries reuse this key after a lost response.
+                        idempotency_key=(
+                            f"{intaris_session_id}:task_delivery:{task.task_id}:{task.status}"
+                        ),
+                    )
                 break  # Success
             except Exception:
                 if attempt == 0:
@@ -4837,6 +5108,12 @@ class WorkflowEngine:
 
         # Check for external mutations (cancel, fail) before overwriting
         db_status = await self._read_task_status(task.task_id)
+        consume_gate = (
+            db_status == TaskStatus.PAUSED
+            and task.status == TaskStatus.RUNNING
+            and task.workflow_state.pending_pause_type is None
+            and task.workflow_state.last_consumed_gate_id is not None
+        )
         if db_status in {TaskStatus.CANCELLED, TaskStatus.FAILED} and task.status not in {
             TaskStatus.CANCELLED,
             TaskStatus.FAILED,
@@ -4852,6 +5129,18 @@ class WorkflowEngine:
         task.workflow_state.version += 1
         async with self._session_factory() as db_session:
             await assert_task_execution_fence(db_session)
+            if consume_gate:
+                resumed = await update_task_status(
+                    db_session,
+                    task.task_id,
+                    TaskStatus.RUNNING,
+                    expected_status="paused",
+                    expected_attempt=task.attempt_number,
+                    expected_pause_id=task.workflow_state.last_consumed_gate_id,
+                )
+                if not resumed:
+                    await db_session.rollback()
+                    raise StaleTaskExecutionOwner(f"Gate changed for {task.task_id}")
             ok = await update_task_workflow_state(
                 db_session,
                 task.task_id,
@@ -4868,17 +5157,49 @@ class WorkflowEngine:
                         }
                     },
                 )
+                await db_session.rollback()
+                raise StaleTaskExecutionOwner(f"Workflow state changed for {task.task_id}")
             if sync_status:
                 await update_task_status(db_session, task.task_id, task.status)
             await db_session.commit()
 
     async def _persist_task_final(self, task: TaskModel) -> None:
         """Persist final task state (completed/failed)."""
+        if task.workflow_state and task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            task.workflow_state.status = (
+                "completed"
+                if task.status == TaskStatus.COMPLETED
+                else "cancelled"
+                if task.status == TaskStatus.CANCELLED
+                else "failed"
+            )
+            task.workflow_state.pending_pause_type = None
+            task.workflow_state.pending_pause_payload = None
+            task.workflow_state.current_step_status = None
         fence = current_task_execution_fence()
         if fence is not None:
             fence.mark_terminal(str(task.status))
         async with self._session_factory() as db_session:
             await assert_task_execution_fence(db_session)
+            if (
+                task.workflow_state
+                and task.workflow_state.pending_pause_type is None
+                and task.workflow_state.last_consumed_gate_id is not None
+            ):
+                # A terminal gate decision consumes paused->running->terminal in
+                # one transaction; never expose an intermediate runnable task.
+                await update_task_status(
+                    db_session,
+                    task.task_id,
+                    TaskStatus.RUNNING,
+                    expected_status="paused",
+                    expected_attempt=task.attempt_number,
+                    expected_pause_id=task.workflow_state.last_consumed_gate_id,
+                )
             updated = await update_task_status(
                 db_session,
                 task.task_id,
@@ -5153,12 +5474,28 @@ class WorkflowEngine:
         resolve the task's primary agent.
         """
         from cognis.core.agent_registry import AgentRegistry
-        from cognis.store.queries import get_active_agent_grant
+        from cognis.core.project_access import resolve_agent_use_grant
 
         registry = AgentRegistry(self._session_factory)
         primary_agent = await registry.get(task.agent_id, owner_email=task.created_by)
         if primary_agent is None or primary_agent.status != "active":
             return None, None
+        if not primary_agent.is_system and primary_agent.owner_email != task.created_by:
+            # Re-authorize on every step: shares and project memberships can be
+            # revoked after a task or schedule was created.
+            async with self._session_factory() as db_session:
+                primary_grant = await resolve_agent_use_grant(
+                    db_session,
+                    agent_id=primary_agent.agent_id,
+                    user_email=task.created_by,
+                    project_id=task.project_id,
+                )
+            if primary_grant is None:
+                logger.warning(
+                    "task agent is no longer accessible to task owner",
+                    extra={"extra_data": {"task_id": task.task_id, "agent_id": task.agent_id}},
+                )
+                return None, None
 
         if step_def.agent_override:
             override_agent = await registry.get(
@@ -5179,10 +5516,11 @@ class WorkflowEngine:
 
             if not override_agent.is_system and override_agent.owner_email != task.created_by:
                 async with self._session_factory() as db_session:
-                    grant = await get_active_agent_grant(
+                    grant = await resolve_agent_use_grant(
                         db_session,
-                        override_agent.agent_id,
-                        task.created_by,
+                        agent_id=override_agent.agent_id,
+                        user_email=task.created_by,
+                        project_id=task.project_id,
                     )
                 if grant is None:
                     logger.warning(
@@ -5250,6 +5588,7 @@ class WorkflowEngine:
         task_active_executor_assigned_at = None
         task_active_executor_expires_at = None
         task_active_executor_source = None
+        task_active_executor_generation = 0
         try:
             async with self._session_factory() as db_session:
                 from cognis.store.queries import get_task
@@ -5264,6 +5603,7 @@ class WorkflowEngine:
                         task_row, "active_executor_expires_at", None
                     )
                     task_active_executor_source = getattr(task_row, "active_executor_source", None)
+                    task_active_executor_generation = task_row.active_executor_generation
         except Exception:
             logger.debug(
                 "stage36: failed to read task.active_executor_id",
@@ -5281,6 +5621,7 @@ class WorkflowEngine:
                 task_id=task.task_id,
                 step_name=step_def.name,
                 workflow_step=True,
+                interaction_mode_override=task.interaction_mode_override,
                 session_policy=session_policy or {},
             ),
         ):
@@ -5299,6 +5640,7 @@ class WorkflowEngine:
                 initial_active_executor_assigned_at=task_active_executor_assigned_at,
                 initial_active_executor_expires_at=task_active_executor_expires_at,
                 initial_active_executor_source=task_active_executor_source,
+                initial_active_executor_generation=task_active_executor_generation,
                 project_id=task.project_id,
             )
         return conversation, session
@@ -5358,6 +5700,7 @@ class WorkflowEngine:
                                     step_name=step_def.name,
                                     step_run_id=prior_run.step_run_id,
                                     workflow_step=True,
+                                    interaction_mode_override=task.interaction_mode_override,
                                     session_policy=session_policy or {},
                                 )
                             ):
@@ -5567,6 +5910,7 @@ class WorkflowEngine:
                 step_name=step_def.name,
                 step_run_id=source_run.step_run_id,
                 workflow_step=True,
+                interaction_mode_override=task.interaction_mode_override,
                 session_policy=session_policy or {},
             )
         ):
@@ -5856,10 +6200,9 @@ class WorkflowEngine:
     ) -> Deliverable | None:
         """Return the final approved deliverable for a workflow, if any."""
 
-        for step in reversed(workflow.steps):
-            if step.type != "run" or not step.require_deliverable:
-                continue
+        from cognis.core.workflow_output_contract import required_output_producers
 
+        for step in reversed(required_output_producers(workflow.steps)):
             raw_output = state.step_outputs.get(step.name)
             step_executed = isinstance(raw_output, dict)
             deliverable_id = (

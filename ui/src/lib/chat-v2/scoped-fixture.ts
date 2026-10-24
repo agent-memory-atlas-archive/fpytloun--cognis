@@ -95,6 +95,22 @@ function fixtureTool(scope: TimelineScope, index: number, toolName: string, argu
   };
 }
 
+const LONG_TOKEN = `ERR_PERMISSION_DENIED:${'/var/lib/cognis/executors/maitrea/sessions/sess_5b92da9e5fcd46abbf58fa5d3a05ca99'.repeat(4)}`;
+
+/** Opt-in (`?layout-cases`) width and overflow cases; not part of the default stream. */
+function layoutCaseItems(scope: TimelineScope): TimelineItem[] {
+  const header = '| Station | Script SHA-256 | Probe | Sync started | Last failure | Status |';
+  const row = (index: number) => `| BI-${String(index).padStart(2, '0')} | 9f2c41d07a6be3e5c1d8a4b2f0e9c7d6 | absent | October 21 at 12:25 UTC | none after deployment | verified |`;
+  return [
+    item(`${scope.key}:layout-assistant`, '0001:layout', [
+      'The deployment is verified across all stations. This paragraph is intentionally long so its line length shows the reading measure applied to assistant prose in every theme, while tables below may use the full width where the theme has no message bubble.',
+      '',
+      [header, '| --- | --- | --- | --- | --- | --- |', ...Array.from({ length: 4 }, (_, index) => row(index + 1))].join('\n'),
+    ].join('\n')),
+    { ...item(`${scope.key}:layout-notice`, '0002:layout', `Executor failure ${LONG_TOKEN}`, 'system') },
+  ];
+}
+
 function visualFixtureItems(scope: TimelineScope): TimelineItem[] {
   return [
     item(`${scope.key}:visual-user`, '0000:user', 'Please inspect the native presentation.', 'user'),
@@ -128,7 +144,7 @@ function visualFixtureItems(scope: TimelineScope): TimelineItem[] {
     fixtureTool(scope, 12, 'skill_load', { skill_id: 'cognis-coding' }, '{"name":"Cognis Coding"}'),
     fixtureTool(scope, 13, 'request_user_input', { title: 'Release input', questions: [] }, '{"status":"waiting"}'),
     fixtureTool(scope, 14, 'mcp:unknown-provider:custom_operation', { query: 'generic integration' }, '{"ok":true}'),
-    fixtureTool(scope, 15, 'mcp:slack-lumilens:conversations_search_messages', { query: 'release' }, '{"matches":2}'),
+    fixtureTool(scope, 15, 'mcp:slack-example:conversations_search_messages', { query: 'museum catalogue' }, '{"matches":2}'),
     {
       id: `${scope.key}:artifact`,
       kind: 'artifact',
@@ -201,12 +217,13 @@ export class ScopedFixtureController {
   private resetNextSync = false;
   private holdNextSnapshotFor: string | null = null;
   private heldSnapshot: { response: ChatSnapshot; resolve: (response: ChatSnapshot) => void } | null = null;
+  layoutCases = false;
   constructor() {
     (globalThis as typeof globalThis & { WebSocket: unknown }).WebSocket = FixtureWebSocket as unknown as typeof WebSocket;
     FixtureWebSocket.handler = (socket, payload) => this.handleClientPayload(socket, payload);
     this.client = new CognisWebSocketClient({
       getSnapshot: () => ({ status: 'authenticated', initialized: true, expiresAt: null, error: null, user: { email: 'fixture@example.com', name: 'Fixture', role: 'user' } }),
-      clear: () => undefined,
+      clear: async () => undefined,
     });
   }
 
@@ -321,6 +338,7 @@ export class ScopedFixtureController {
   private snapshot(scope: TimelineScope): Promise<ChatSnapshot> {
     const missing = scope.missing_stream === true;
     const items = missing ? [] : [
+      ...(this.layoutCases ? layoutCaseItems(scope) : []),
       ...visualFixtureItems(scope),
       ...Array.from({ length: 70 }, (_, index) => scopeItem(scope, index + 20)),
     ];

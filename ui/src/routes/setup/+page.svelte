@@ -1,4 +1,5 @@
 <script lang="ts">
+  import CognisLogo from '$lib/components/CognisLogo.svelte';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
 
@@ -81,7 +82,7 @@
       }
 
       await auth.login(form.email, form.password);
-      await goto('/chat', { replaceState: true });
+      await goto('/getting-started', { replaceState: true });
     } catch (caughtError) {
       error = caughtError instanceof Error ? caughtError.message : 'Unable to complete setup.';
     } finally {
@@ -107,46 +108,46 @@
 <div class="app-fullscreen-safe mx-auto flex max-w-5xl items-center justify-center overflow-y-auto">
   <Card class="w-full max-w-2xl p-8">
     {#if loading}
-      <p class="text-sm text-slate-300">Loading setup status…</p>
+      <p class="text-sm text-secondary">Loading setup status…</p>
     {:else if setupComplete && !setupAvailable}
       <div class="space-y-4">
-        <img alt="" class="h-16 w-16 rounded-3xl shadow-card" src="/pwa/icon-192.png" />
-        <p class="text-sm uppercase tracking-[0.3em] text-sky-300">Setup complete</p>
-        <h1 class="text-3xl font-semibold text-white">Cognis is already configured</h1>
-        <p class="text-sm leading-6 text-slate-400">Open the login page to sign in with an existing account.</p>
+        <CognisLogo class="h-16 w-16" />
+        <p class="text-sm uppercase tracking-[0.3em] text-accent">Setup complete</p>
+        <h1 class="text-3xl font-semibold text-strong">Cognis is already configured</h1>
+        <p class="text-sm leading-6 text-muted">Open the login page to sign in with an existing account.</p>
         <Button onclick={() => goto('/login')}>Go to login</Button>
       </div>
     {:else}
       <div class="space-y-6">
         <div>
-          <img alt="" class="mb-5 h-16 w-16 rounded-3xl shadow-card" src="/pwa/icon-192.png" />
-          <p class="text-sm uppercase tracking-[0.3em] text-sky-300">First run</p>
-          <h1 class="mt-3 text-3xl font-semibold text-white">Create the first admin account</h1>
-          <p class="mt-3 text-sm leading-6 text-slate-400">
+          <CognisLogo class="mb-5 h-16 w-16" />
+          <p class="text-sm uppercase tracking-[0.3em] text-accent">First run</p>
+          <h1 class="mt-3 text-3xl font-semibold text-strong">Create the first admin account</h1>
+          <p class="mt-3 text-sm leading-6 text-muted">
             This creates the initial administrator for your Cognis instance. If the setup token expired, restart Cognis or run <code>cognis admin create-user</code> locally.
           </p>
         </div>
 
         <form class="space-y-4" onsubmit={handleSubmit} novalidate>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Email <span class="text-rose-300">*</span></span>
+          <label class="block space-y-2 text-sm font-medium text-foreground">
+            <span>Email <span class="text-danger">*</span></span>
             <Input bind:value={form.email} type="email" placeholder="admin@example.com" />
           </label>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
+          <label class="block space-y-2 text-sm font-medium text-foreground">
             <span>Name</span>
             <Input bind:value={form.name} placeholder="Admin" />
           </label>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Password <span class="text-rose-300">*</span></span>
+          <label class="block space-y-2 text-sm font-medium text-foreground">
+            <span>Password <span class="text-danger">*</span></span>
             <Input bind:value={form.password} type="password" placeholder="••••••••" />
           </label>
-          <label class="block space-y-2 text-sm font-medium text-slate-200">
-            <span>Confirm password <span class="text-rose-300">*</span></span>
+          <label class="block space-y-2 text-sm font-medium text-foreground">
+            <span>Confirm password <span class="text-danger">*</span></span>
             <Input bind:value={form.confirmPassword} type="password" placeholder="••••••••" />
           </label>
 
           {#if error}
-            <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+            <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
           {/if}
 
           <Button class="w-full justify-center" type="submit" disabled={submitting}>

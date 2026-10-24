@@ -20,11 +20,15 @@ from typing import Any, Protocol
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
+from cognis.logging import get_logger
 from cognis.store.coordination import DatabaseLeaseStore, Lease
 from cognis.store.observability import (
+    InventoryCollectionError,
     ObservabilitySnapshot,
     collect_observability_snapshot,
 )
+
+logger = get_logger(__name__)
 
 OBSERVABILITY_LEASE_KEY = "cognis:observability:v2"
 OBSERVABILITY_REFRESH_SECONDS = 30.0
@@ -522,13 +526,16 @@ class ObservabilityService:
             return False
         self._lease = lease
         _metric_set(OBSERVABILITY_INVENTORY_OWNER, 1)
+        stage = "inventory"
         try:
             async with self._session_factory() as session:
                 snapshot = await collect_observability_snapshot(
                     session,
                     max_family_cardinality=self._max_family_cardinality,
                 )
+            stage = "lsp"
             lsp = await self._collect_lsp(snapshot)
+            stage = "renew"
             pre_renew = monotonic()
             renew_deadline = pre_renew + min(self._lease_ttl_seconds / 3.0, 10.0)
             if pre_renew >= renew_deadline:
@@ -573,9 +580,17 @@ class ObservabilityService:
             return True
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             self._clear_ownership()
-            _metric_inc(OBSERVABILITY_ERRORS, stage="refresh")
+            failed_stage = exc.stage if isinstance(exc, InventoryCollectionError) else stage
+            category = (
+                exc.category if isinstance(exc, InventoryCollectionError) else type(exc).__name__
+            )
+            _metric_inc(OBSERVABILITY_ERRORS, stage=failed_stage)
+            logger.warning(
+                "observability inventory collection failed",
+                extra={"extra_data": {"stage": failed_stage, "category": category}},
+            )
             _metric_inc(OBSERVABILITY_REFRESH_TOTAL, outcome="error")
             return False
         finally:

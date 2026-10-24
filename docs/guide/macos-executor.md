@@ -57,6 +57,30 @@ Homebrew prefix, including `/opt/homebrew` and `/usr/local`.
 
 ## Upgrade and uninstall
 
+### Optional companion controls (M2 developer preview)
+
+The native companion can inspect an **existing** conventional Homebrew
+installation, and explicitly start/stop/restart its current-user service. It
+never installs, enrolls, upgrades, uses sudo, or probes the saved controller.
+Service-running and controller-connected are different facts; the companion
+reports controller connection as **not verified**.
+
+The backwards-compatible machine interface is `status|start|stop|restart --json`
+and `logs --json`. Schema 1 returns `state`, `owned`, `ok`, `code`, and
+`controller: "unknown"`. Older executors are unsupported: install a compatible
+release externally and refresh. Human CLI output is unchanged and never parsed.
+
+JSON operations require an installed formula and known current-user service
+scope. Start/restart retain existing local configuration validation. Commands
+are fixed argument arrays with deadlines; uncertain mutations are not retried.
+Refresh status to reconcile them. The app never exposes these operations to web
+content.
+
+The safe log preview reads bounded regular-file tails owned by the current user,
+rejects symlinks, and returns **severity counts only**. Free-form lines are
+withheld because arbitrary log text cannot be perfectly redacted. This is a
+limited diagnostic preview, not complete logs or proof of connectivity.
+
 Upgrade after a new immutable release is available:
 
 ```bash

@@ -8,19 +8,19 @@ import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
 
   const variants = {
     success: {
-      className: 'border-emerald-500/40 bg-emerald-500/15 text-emerald-50',
+      className: 'border-success-border bg-success-subtle text-success',
       icon: CheckCircle2
     },
     error: {
-      className: 'border-rose-500/40 bg-rose-500/15 text-rose-50',
+      className: 'border-danger-border bg-danger-subtle text-danger',
       icon: AlertCircle
     },
     warning: {
-      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
+      className: 'border-accent/40 bg-accent-subtle text-accent',
       icon: TriangleAlert
     },
     info: {
-      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
+      className: 'border-accent/40 bg-accent-subtle text-accent',
       icon: Info
     }
   } as const;

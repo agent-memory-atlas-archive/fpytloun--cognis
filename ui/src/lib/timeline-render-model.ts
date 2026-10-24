@@ -30,6 +30,8 @@ export interface AssistantDeliverableTimelineItem {
   createdAt?: string;
   updatedAt?: string;
   deliverableId: string;
+  lineageId?: string | null;
+  revision?: number | null;
   format: string;
   title?: string | null;
   content?: string | null;
@@ -95,6 +97,8 @@ export interface MessageTimelineItem {
   turnId?: string | null;
   messageId?: string;
   streaming?: boolean;
+  /** New volatile live content, never a persisted historical partial reply. */
+  arrivalEligible?: boolean;
   attachments?: AttachmentRef[];
   optimistic?: boolean;
   deliveryStatus?: 'sending' | 'queued' | 'failed';
@@ -275,6 +279,7 @@ export interface NoticeTimelineItem {
 }
 
 export interface SystemMessageTimelineItem {
+  turnId?: string | null;
   id: string;
   kind: 'system_message';
   text: string;
@@ -312,6 +317,7 @@ export interface CompactionTimelineItem {
   summary?: string;
   method: string;
   turnsCompacted: number;
+  eventsCompacted?: number;
   trigger?: string;
   reason?: string;
   previousUsagePercentage?: number | null;

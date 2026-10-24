@@ -5,6 +5,7 @@
 
   import { apiUrl } from '$lib/config';
   import { auth } from '$lib/stores/auth';
+  import { connectivity, onConnectivityRestored } from '$lib/connectivity';
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
 
@@ -111,19 +112,29 @@
     URL.revokeObjectURL(url);
   }
 
-  onMount(() => {
-    void load().catch((caught: unknown) => {
+  // A failed status load is hidden while the global connection banner
+  // applies and reloads when the connection is restored.
+  let statusLoadFailed = false;
+
+  function loadStatus(): void {
+    void load().then(() => { statusLoadFailed = false; }, (caught: unknown) => {
+      statusLoadFailed = true;
       error = caught instanceof Error ? caught.message : 'Unable to load MFA status.';
     });
+  }
+
+  onMount(() => {
+    loadStatus();
+    return onConnectivityRestored(() => { if (statusLoadFailed) loadStatus(); });
   });
 </script>
 
-<div class="space-y-4 border-t border-slate-800 pt-5">
+<div class="space-y-4 border-t border-separator pt-5">
   <div>
-    <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Multi-factor authentication</p>
-    <h3 class="mt-1 font-semibold text-white">Authenticator app</h3>
+    <p class="text-xs uppercase tracking-[0.25em] text-muted">Multi-factor authentication</p>
+    <h3 class="mt-1 font-semibold text-strong">Authenticator app</h3>
     {#if status}
-      <p class="text-sm text-slate-400">
+      <p class="text-sm text-muted">
         {status.enabled ? `Enabled · ${status.recovery_codes_remaining} recovery codes remain` : 'Not enabled'}
         · Policy: {status.policy}
       </p>
@@ -131,18 +142,18 @@
   </div>
 
   {#if recoveryCodes.length > 0}
-    <div class="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4">
-      <p class="font-medium text-emerald-100">Save these recovery codes now</p>
-      <pre class="mt-3 text-sm text-emerald-50">{recoveryCodes.join('\n')}</pre>
+    <div class="rounded-2xl border border-success-border bg-success-subtle p-4">
+      <p class="font-medium text-success">Save these recovery codes now</p>
+      <pre class="mt-3 text-sm text-success">{recoveryCodes.join('\n')}</pre>
       <div class="mt-3 flex gap-2">
         <Button size="sm" variant="secondary" onclick={downloadRecoveryCodes}>Download</Button>
         <Button size="sm" onclick={async () => { recoveryCodes = []; await auth.logout(); await goto('/login'); }}>I saved them</Button>
       </div>
     </div>
   {:else if setup}
-    <div class="space-y-3 rounded-2xl border border-slate-700 p-4">
+    <div class="space-y-3 rounded-2xl border border-control-border p-4">
       {#if qrDataUrl}<img class="mx-auto rounded-xl bg-white p-2" src={qrDataUrl} alt="TOTP setup QR code" />{/if}
-      <p class="break-all font-mono text-xs text-slate-400">{setup.secret}</p>
+      <p class="break-all font-mono text-xs text-muted">{setup.secret}</p>
       <Input bind:value={code} autocomplete="one-time-code" inputmode="numeric" placeholder="123456" />
       <Button onclick={confirmEnrollment} disabled={busy}>Confirm and enable</Button>
     </div>
@@ -171,7 +182,7 @@
     </div>
   {/if}
 
-  {#if error}
-    <p class="rounded-2xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{error}</p>
+  {#if error && !(statusLoadFailed && $connectivity.degraded)}
+    <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
   {/if}
 </div>

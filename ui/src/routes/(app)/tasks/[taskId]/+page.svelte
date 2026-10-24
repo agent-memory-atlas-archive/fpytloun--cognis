@@ -1,4 +1,5 @@
 <script lang="ts">
+import { DEFAULT_INTARIS_EVALUATION } from '$lib/session-policy';
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
@@ -54,13 +55,14 @@ import Target from 'lucide-svelte/icons/target';
   import {
     isTaskRerunnable,
     loadTaskPageData,
+    loadTaskPageOptions,
     refreshTaskPageData,
     shouldClearTaskFromError
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { taskPrimaryAction, taskPrimaryActionLabel, type TaskPrimaryAction } from '$lib/task-actions';
-  import { policyFromText, policyText } from '$lib/session-policy';
+  import { policyFromText, policyText, policyEvaluation } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
   import type {
@@ -102,6 +104,7 @@ import Target from 'lucide-svelte/icons/target';
   let commentsRef = $state<TaskComments | null>(null);
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
+  let savedEditForm = $state('');
   let taskActionsOpen = $state(false);
   let outputModalStepRun = $state<StepRun | null>(null);
   let loadingStepRunId = $state<string | null>(null);
@@ -150,6 +153,7 @@ import Target from 'lucide-svelte/icons/target';
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
     escalation_timeout_seconds: '',
     allow_policy_text: '',
+    intaris_evaluation: '' as '' | 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy',
     deny_policy_text: ''
   });
   let projects = $state<Project[]>([]);
@@ -159,15 +163,15 @@ import Target from 'lucide-svelte/icons/target';
   let lastProjectWorkflowKey = $state('');
 
   const statusColors: Record<string, string> = {
-    pending: 'border-slate-600 text-slate-400',
-    running: 'border-sky-600 text-sky-300',
-    evaluating: 'border-violet-600 text-violet-300',
-    approved: 'border-emerald-700 text-emerald-300',
-    completed: 'border-emerald-700 text-emerald-300',
-    failed: 'border-rose-700 text-rose-300',
-    cancelled: 'border-slate-600 text-slate-500',
-    paused: 'border-yellow-700 text-yellow-300',
-    rejected: 'border-sky-700 text-sky-300',
+    pending: 'border-control-border text-muted',
+    running: 'border-accent text-accent',
+    evaluating: 'border-violet-border text-violet-tone',
+    approved: 'border-success-border text-success',
+    completed: 'border-success-border text-success',
+    failed: 'border-danger-border text-danger',
+    cancelled: 'border-control-border text-quiet',
+    paused: 'border-warning-border text-warning',
+    rejected: 'border-accent text-accent',
   };
 
   const statusHints: Record<string, string> = {
@@ -239,9 +243,9 @@ import Target from 'lucide-svelte/icons/target';
   }
 
   function priorityTone(priority: number): string {
-    if (priority >= 80) return 'border-rose-500/40 bg-rose-500/10 text-rose-200';
-    if (priority >= 50) return 'border-sky-500/40 bg-sky-500/10 text-sky-200';
-    return 'border-slate-700 bg-slate-900/80 text-slate-300';
+    if (priority >= 80) return 'border-danger-border bg-danger-subtle text-danger';
+    if (priority >= 50) return 'border-accent/40 bg-accent-subtle text-accent';
+    return 'border-control-border bg-surface/80 text-secondary';
   }
 
   function completionModeLabel(taskDetail: TaskDetail): string {
@@ -781,9 +785,9 @@ import Target from 'lucide-svelte/icons/target';
   }
 
   function todoPriorityClass(priority: string): string {
-    if (priority === 'high') return 'text-rose-300';
-    if (priority === 'low') return 'text-slate-500';
-    return 'text-slate-400';
+    if (priority === 'high') return 'text-danger';
+    if (priority === 'low') return 'text-quiet';
+    return 'text-muted';
   }
 
   function openSessionLogs(stepRun: StepRun): void {
@@ -1112,6 +1116,7 @@ import Target from 'lucide-svelte/icons/target';
   });
 
   $effect(() => {
+    if (taskOptionsLoading || !selectedEditAgent) return;
     editForm.agent_profile_id = normalizeSelectedAgentProfileId(
       selectedEditAgent,
       editForm.agent_profile_id
@@ -1424,18 +1429,19 @@ import Target from 'lucide-svelte/icons/target';
   // Data loading
   // ---------------------------------------------------------------------------
 
+  let taskOptionsGeneration = 0;
+  let taskOptionsLoading = $state(true);
+
   async function loadTask(): Promise<void> {
     const refreshGeneration = ++taskRefreshGeneration;
+    const optionsGeneration = ++taskOptionsGeneration;
+    taskOptionsLoading = true;
     loading = true;
     error = '';
     try {
       const data = await loadTaskPageData(api, taskIdFromRoute());
       if (refreshGeneration !== taskRefreshGeneration) return;
       task = preserveLoadedStepRuns(data.task, task?.step_runs ?? []);
-      agents = data.agents;
-      workflows = data.workflows;
-      conversations = data.conversations;
-      allTasks = data.allTasks;
       error = data.auxiliaryError;
       editForm = {
         title: task.title,
@@ -1453,14 +1459,25 @@ import Target from 'lucide-svelte/icons/target';
         interaction_mode_override: task.interaction_mode_override ?? '',
         escalation_timeout_seconds: task.escalation_timeout_seconds?.toString() ?? '',
         allow_policy_text: policyText(task.session_policy, 'allow_policies'),
+        intaris_evaluation: policyEvaluation(task.session_policy),
         deny_policy_text: policyText(task.session_policy, 'deny_policies')
       };
+      savedEditForm = JSON.stringify(editForm);
       selectedStepName = defaultStepSelection(task, selectedStepName);
-      try {
-        projects = await api.projects.list();
-      } catch {
-        projects = [];
-      }
+      loading = false;
+      void Promise.all([
+        loadTaskPageOptions(api, data.task),
+        api.projects.list().catch(() => [] as Project[])
+      ]).then(([options, nextProjects]) => {
+        if (optionsGeneration !== taskOptionsGeneration) return;
+        agents = options.agents;
+        workflows = options.workflows;
+        conversations = options.conversations;
+        allTasks = options.allTasks;
+        projects = nextProjects;
+        if (options.auxiliaryError) error = options.auxiliaryError;
+        taskOptionsLoading = false;
+      });
       void loadProjectWorkflowOptions(editForm.project_id);
       try {
         await refreshTaskEscalations();
@@ -1563,9 +1580,10 @@ import Target from 'lucide-svelte/icons/target';
         escalation_timeout_seconds: editForm.escalation_timeout_seconds
           ? Number(editForm.escalation_timeout_seconds)
           : null,
-        session_policy: policyFromText(editForm.allow_policy_text, editForm.deny_policy_text)
+        session_policy: policyFromText(editForm.allow_policy_text, editForm.deny_policy_text, editForm.intaris_evaluation)
       });
       task = await api.tasks.detail(updatedTask.task_id);
+      savedEditForm = JSON.stringify(editForm);
       addToast('Task updated.', 'success');
       return true;
     } catch (caughtError) {
@@ -1612,6 +1630,7 @@ import Target from 'lucide-svelte/icons/target';
     if (!task) return false;
     try {
       await api.tasks.gateResponse(task.task_id, {
+        pause_id: task.pending_pause?.pause_id,
         step_name: task.pending_pause?.step_name,
         action,
         feedback: gateFeedback || undefined
@@ -1621,6 +1640,7 @@ import Target from 'lucide-svelte/icons/target';
       return true;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      await refreshTaskOnly({ force: true });
       return false;
     }
   }
@@ -1787,34 +1807,34 @@ import Target from 'lucide-svelte/icons/target';
             class="h-11 w-11 rounded-2xl"
           />
           <div class="min-w-0">
-            <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task Cockpit</p>
-            <h1 class="mt-1 break-words text-2xl font-semibold text-white" title={task.title}>{task.title}</h1>
+            <p class="text-sm uppercase tracking-[0.25em] text-muted">Task Cockpit</p>
+            <h1 class="mt-1 break-words text-2xl font-semibold text-strong" title={task.title}>{task.title}</h1>
             {#if task.expected_output}
-              <div class="prose prose-sm prose-invert mt-2 max-w-3xl text-slate-300" data-testid="task-cockpit-objective">
+              <div class="prose prose-sm prose-invert mt-2 max-w-3xl text-secondary" data-testid="task-cockpit-objective">
                 {@html renderMarkdown(task.expected_output)}
               </div>
             {/if}
-            <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-400">
+            <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted">
               <span>Owner agent</span>
-              <span class="font-medium text-slate-200">{agentName(task.agent_id)}</span>
+              <span class="font-medium text-foreground">{agentName(task.agent_id)}</span>
               <span class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] {priorityTone(task.priority)}">P{task.priority}</span>
               {#if task.attempt_number > 1}
-                <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-amber-200" title="Task has been revised">Attempt #{task.attempt_number}</span>
+                <span class="rounded-full border border-warning-border bg-warning-subtle px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-warning" title="Task has been revised">Attempt #{task.attempt_number}</span>
               {/if}
               {#if task.project_id}
-                <a href="/projects/{task.project_id}" class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2.5 py-1 text-[11px] font-medium tracking-wide text-violet-200 hover:border-violet-400/60 hover:text-violet-100">Project</a>
+                <a href="/projects/{task.project_id}" class="rounded-full border border-violet-border bg-violet-subtle px-2.5 py-1 text-[11px] font-medium tracking-wide text-violet-tone hover:border-violet-border hover:text-violet-tone">Project</a>
               {/if}
-              <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{deliveryModeLabel(task.delivery.mode)}</span>
-              <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{completionModeFamilyLabel(task.completion_mode_family)}</span>
+              <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">{deliveryModeLabel(task.delivery.mode)}</span>
+              <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">{completionModeFamilyLabel(task.completion_mode_family)}</span>
               {#if task.allow_silent_completion}
-                <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">Silent allowed</span>
+                <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">Silent allowed</span>
               {/if}
             </div>
           </div>
         </div>
       </div>
       <div class="flex w-full flex-col items-start gap-3 sm:w-auto sm:items-end">
-        <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-slate-700 text-slate-200'}">
+        <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-control-border text-foreground'}">
           {completionModeLabel(task)}
         </span>
         <div class="flex w-full flex-wrap gap-2 sm:w-auto sm:justify-end">
@@ -1860,7 +1880,7 @@ import Target from 'lucide-svelte/icons/target';
     </div>
 
     {#if error}
-      <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+      <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
     {/if}
 
     {#if activePause && taskAgentDock.state === 'minimized'}
@@ -1882,19 +1902,19 @@ import Target from 'lucide-svelte/icons/target';
       <div class="flex min-w-0 flex-col gap-5">
         <!-- Backend-owned workflow cockpit -->
         <Card class="order-2 overflow-hidden p-0">
-            <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
+            <div class="border-b border-separator/80 px-4 py-3 sm:px-5 sm:py-4">
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Phase workflow</p>
-                  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-300">
+                  <p class="text-xs uppercase tracking-[0.25em] text-muted">Phase workflow</p>
+                  <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-secondary">
                     {#if task.status === 'running' || task.status === 'evaluating'}
-                      <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-500/30 bg-sky-500/10 text-sky-300">
+                      <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-accent/30 bg-accent-subtle text-accent">
                         <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
                       </span>
                     {/if}
-                    <span class="font-medium text-white">{executionSummary?.activeLabel ?? 'Workflow status'}</span>
+                    <span class="font-medium text-strong">{executionSummary?.activeLabel ?? 'Workflow status'}</span>
                     {#if executionSummary?.activeStepName}
-                      <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-xs text-slate-300">
+                      <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-xs text-secondary">
                         {executionSummary.activeStepName}
                       </span>
                     {/if}
@@ -1914,7 +1934,7 @@ import Target from 'lucide-svelte/icons/target';
                       </Button>
                     {:else}
                       <Tooltip text="No step session recorded yet.">
-                        <button type="button" aria-disabled="true" class="inline-flex items-center justify-center rounded-xl border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-sm font-medium text-slate-500 cursor-not-allowed">
+                        <button type="button" aria-disabled="true" class="inline-flex items-center justify-center rounded-xl border border-control-border bg-surface/60 px-3 py-1.5 text-sm font-medium text-quiet cursor-not-allowed">
                           Ask
                         </button>
                       </Tooltip>
@@ -1933,21 +1953,21 @@ import Target from 'lucide-svelte/icons/target';
                 {/if}
               </div>
               {#if dependencyTasks.length > 0}
-                <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
-                  <p class="text-[11px] font-medium uppercase tracking-[0.25em] text-slate-500">Direct dependencies</p>
+                <div class="mt-4 rounded-2xl border border-separator bg-canvas/50 p-3">
+                  <p class="text-[11px] font-medium uppercase tracking-[0.25em] text-quiet">Direct dependencies</p>
                   <div class="mt-3 flex flex-wrap items-center gap-2">
                     {#each dependencyTasks as dependency}
                       <button
-                        class="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-950/80 px-3.5 py-2 text-sm text-slate-200 transition hover:border-slate-600 hover:text-white md:py-1.5 md:text-xs"
+                        class="inline-flex items-center gap-2 rounded-full border border-control-border bg-canvas/80 px-3.5 py-2 text-sm text-foreground transition hover:border-control-border hover:text-strong md:py-1.5 md:text-xs"
                         onclick={() => goto(`/tasks/${dependency.taskId}`)}
                         type="button"
                       >
                         <span class="truncate max-w-[12rem]">{dependency.title}</span>
-                        <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wide {statusColors[dependency.status] ?? 'border-slate-700 text-slate-400'}">{dependency.status}</span>
+                        <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wide {statusColors[dependency.status] ?? 'border-control-border text-muted'}">{dependency.status}</span>
                       </button>
-                      <ArrowRight class="h-3.5 w-3.5 text-slate-600" />
+                      <ArrowRight class="h-3.5 w-3.5 text-quiet" />
                     {/each}
-                    <span class="inline-flex items-center rounded-full border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100">{task.title}</span>
+                    <span class="inline-flex items-center rounded-full border border-accent/30 bg-accent-subtle px-3 py-1.5 text-xs font-medium text-accent">{task.title}</span>
                   </div>
                 </div>
               {/if}
@@ -1963,8 +1983,8 @@ import Target from 'lucide-svelte/icons/target';
             </div>
         </Card>
 
-        <details open={revisionTargetSeed !== null} id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
-          <summary class="cursor-pointer text-sm font-medium text-white">Collaboration, revisions, and notes</summary>
+        <details open={revisionTargetSeed !== null} id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-separator bg-canvas/40 p-4">
+          <summary class="cursor-pointer text-sm font-medium text-strong">Collaboration, revisions, and notes</summary>
           <div class="mt-4">
             <TaskComments
               bind:this={commentsRef}
@@ -2000,12 +2020,12 @@ import Target from 'lucide-svelte/icons/target';
         {/if}
 
         {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest}
-          <Card class="border-rose-500/30 bg-rose-500/5 p-4">
-            <p class="text-xs font-semibold uppercase tracking-[0.25em] text-rose-300">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
+          <Card class="border-danger-border bg-danger-subtle p-4">
+            <p class="text-xs font-semibold uppercase tracking-[0.25em] text-danger">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
             {#if task.result_summary || task.applied_completion_reason}
-              <div class="prose prose-sm prose-invert mt-2 max-w-none text-slate-200">{@html renderMarkdown(task.result_summary || task.applied_completion_reason || '')}</div>
+              <div class="prose prose-sm prose-invert mt-2 max-w-none text-foreground">{@html renderMarkdown(task.result_summary || task.applied_completion_reason || '')}</div>
             {:else}
-              <p class="mt-2 text-sm text-slate-200">The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.</p>
+              <p class="mt-2 text-sm text-foreground">The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.</p>
             {/if}
           </Card>
         {/if}
@@ -2036,40 +2056,40 @@ import Target from 'lucide-svelte/icons/target';
           bottom sheet so the page keeps one clear detail pattern.
         -->
         <Card class="order-6 hidden overflow-hidden p-0 lg:block">
-          <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
+          <div class="border-b border-separator/80 px-4 py-3 sm:px-5 sm:py-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div class="min-w-0">
-                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step detail</p>
-                <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup?.stepName ?? workflowName(task.workflow_id)}</h2>
+                <p class="text-xs uppercase tracking-[0.25em] text-muted">Step detail</p>
+                <h2 class="mt-1 text-lg font-semibold text-strong">{selectedStepGroup?.stepName ?? workflowName(task.workflow_id)}</h2>
                 {#if !selectedStepGroup?.latest}
-                  <p class="mt-1 text-sm text-slate-400">Pick a step from the Live workflow above to focus it here.</p>
+                  <p class="mt-1 text-sm text-muted">Pick a step from the Live workflow above to focus it here.</p>
                 {/if}
               </div>
               {#if selectedStepGroup && selectedStepGroup.attempts.length > 1}
                 <div class="flex max-w-full flex-wrap items-center gap-2 overflow-x-auto">
-                  <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
+                  <span class="text-xs uppercase tracking-[0.2em] text-quiet">Attempts</span>
                   {#each selectedStepGroup.attempts as run (run.step_run_id)}
                     {@const isSelected = (selectedAttempt?.step_run_id ?? selectedStepGroup.latest?.step_run_id) === run.step_run_id}
                     {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
                     {@const status = displayStepStatus(run)}
                     <button
                       type="button"
-                      class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                      class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-accent/60 bg-accent-subtle text-accent' : 'border-control-border bg-canvas/70 text-secondary hover:border-control-border hover:text-strong'}`}
                       onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
                       aria-pressed={isSelected}
                     >
                       <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
-                      {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
-                      {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
-                      <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
+                      {#if stepTryLabel(run)}<span class="text-[10px] text-quiet">{stepTryLabel(run)}</span>{/if}
+                      {#if isLatestRun}<span class="rounded-full border border-accent/30 bg-accent-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-accent">latest</span>{/if}
+                      <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-control-border text-muted'}">{status}</span>
                     </button>
                   {/each}
                   {#if !isLatestAttemptSelected}
-                    <button type="button" class="text-xs text-sky-300 hover:text-sky-200" onclick={() => clearAttemptOverride(selectedStepGroup.stepName)}>Show latest</button>
+                    <button type="button" class="text-xs text-accent hover:text-accent-hover" onclick={() => clearAttemptOverride(selectedStepGroup.stepName)}>Show latest</button>
                   {/if}
                 </div>
               {:else if selectedStepGroup?.latest}
-                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1 text-xs text-slate-300">
+                <span class="rounded-full border border-control-border bg-canvas/80 px-3 py-1 text-xs text-secondary">
                   {attemptLabel(selectedStepGroup.latest)}
                 </span>
               {/if}
@@ -2088,23 +2108,23 @@ import Target from 'lucide-svelte/icons/target';
                   {@const visibleStatus = displayStepStatus(attempt)}
                   {@const feedback = stepEvalFeedback(attempt)}
                   {@const isLatest = isLatestAttemptSelected}
-                  <article class="rounded-3xl border border-slate-800 bg-slate-950/60 p-4 sm:p-5">
+                  <article class="rounded-3xl border border-separator bg-canvas/60 p-4 sm:p-5">
                     <div class="flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div class="flex flex-wrap items-center gap-2">
-                          <h3 class="text-lg font-semibold text-white">{attempt.step_name}</h3>
+                          <h3 class="text-lg font-semibold text-strong">{attempt.step_name}</h3>
                           {#if selectedStepGroup.attempts.length > 1 && isLatest}
-                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                            <span class="rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-accent">Latest attempt</span>
                           {:else if !isLatest}
-                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-amber-200">Earlier attempt</span>
+                            <span class="rounded-full border border-warning-border bg-warning-subtle px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-warning">Earlier attempt</span>
                           {/if}
-                          <span class="text-xs text-slate-500">{attemptLabel(attempt)}</span>
-                          {#if stepTryLabel(attempt)}<span class="text-xs text-slate-500">{stepTryLabel(attempt)}</span>{/if}
+                          <span class="text-xs text-quiet">{attemptLabel(attempt)}</span>
+                          {#if stepTryLabel(attempt)}<span class="text-xs text-quiet">{stepTryLabel(attempt)}</span>{/if}
                         </div>
-                        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+                        <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-quiet">
                           <span>{attempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
                           {#if attempt.agent_id}
-                            <span class="inline-flex items-center gap-2 text-slate-300">
+                            <span class="inline-flex items-center gap-2 text-secondary">
                               <AgentAvatar name={agentName(attempt.agent_id)} avatarUrl={agentFor(attempt.agent_id)?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />
                               {agentName(attempt.agent_id)}
                             </span>
@@ -2115,7 +2135,7 @@ import Target from 'lucide-svelte/icons/target';
                             </Tooltip>
                           {/if}
                           {#if attempt.started_at}
-                            <span class="font-mono text-slate-300">{formatDuration(attempt.started_at, attempt.completed_at, tickNow)}</span>
+                            <span class="font-mono text-secondary">{formatDuration(attempt.started_at, attempt.completed_at, tickNow)}</span>
                           {/if}
                         </div>
                       </div>
@@ -2137,116 +2157,116 @@ import Target from 'lucide-svelte/icons/target';
                           <Button size="sm" variant="secondary" onclick={() => startRevisionForStep(selectedStepGroup.stepName)}>Revise</Button>
                         {/if}
                         <Tooltip text={displayStepStatusHint(attempt)}>
-                          <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
+                          <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-control-border text-muted'}">{visibleStatus}</span>
                         </Tooltip>
                       </div>
                     </div>
 
                     {#if outcomeStatus !== 'success'}
-                      <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-                        <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Outcome marker</p>
+                      <div class="mt-4 rounded-2xl border border-accent/20 bg-accent-subtle px-4 py-3 text-sm text-accent">
+                        <p class="font-medium uppercase tracking-wide text-[11px] text-accent">Outcome marker</p>
                         <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
                       </div>
                     {/if}
 
                     {#if gateEvaluation(attempt)}
-                      <details class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3" open>
+                      <details class="mt-4 rounded-2xl border border-warning-border bg-warning-subtle px-4 py-3" open>
                         <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
-                          <span class="text-xs uppercase tracking-[0.25em] text-amber-200">Gate evaluation</span>
+                          <span class="text-xs uppercase tracking-[0.25em] text-warning">Gate evaluation</span>
                           <span class="flex flex-wrap items-center gap-2">
                             {#each gateSummaryRows(attempt) as row}
-                              <span class="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-100">
+                              <span class="rounded-full border border-warning-border bg-warning-subtle px-2 py-0.5 text-[11px] text-warning">
                                 {row.label}: <span class="font-mono">{row.value}</span>
                               </span>
                             {/each}
-                            <ChevronDown class="h-4 w-4 shrink-0 text-amber-200/70" />
+                            <ChevronDown class="h-4 w-4 shrink-0 text-warning/70" />
                           </span>
                         </summary>
                         {#if gateConditionRows(attempt).length > 0}
                           <div class="mt-3 space-y-3 text-xs">
                             {#each gateConditionRows(attempt) as row}
-                              <div class="rounded-xl border border-amber-400/20 bg-slate-950/60 px-3 py-2">
+                              <div class="rounded-xl border border-warning-border bg-canvas/60 px-3 py-2">
                                 <div class="flex flex-wrap items-center justify-between gap-2">
-                                  <code class="break-all text-amber-100">{row.expression}</code>
-                                  <span class={`rounded-full border px-2 py-0.5 uppercase tracking-wider ${row.passed ? 'border-emerald-400/40 text-emerald-200' : 'border-rose-400/40 text-rose-200'}`}>{row.passed ? 'passed' : 'failed'}</span>
+                                  <code class="break-all text-warning">{row.expression}</code>
+                                  <span class={`rounded-full border px-2 py-0.5 uppercase tracking-wider ${row.passed ? 'border-success-border text-success' : 'border-danger-border text-danger'}`}>{row.passed ? 'passed' : 'failed'}</span>
                                 </div>
                                 <dl class="mt-2 grid gap-2 sm:grid-cols-3">
-                                  <div><dt class="text-slate-500">Operator</dt><dd class="mt-1 font-mono text-slate-200">{row.operator}</dd></div>
-                                  <div><dt class="text-slate-500">Actual values</dt><dd class="mt-1 truncate font-mono text-slate-200" title={row.actual}>{row.actual}</dd></div>
-                                  <div><dt class="text-slate-500">Expected / thresholds</dt><dd class="mt-1 truncate font-mono text-slate-200" title={row.expected}>{row.expected}</dd></div>
+                                  <div><dt class="text-quiet">Operator</dt><dd class="mt-1 font-mono text-foreground">{row.operator}</dd></div>
+                                  <div><dt class="text-quiet">Actual values</dt><dd class="mt-1 truncate font-mono text-foreground" title={row.actual}>{row.actual}</dd></div>
+                                  <div><dt class="text-quiet">Expected / thresholds</dt><dd class="mt-1 truncate font-mono text-foreground" title={row.expected}>{row.expected}</dd></div>
                                 </dl>
-                                {#if row.error}<p class="mt-2 text-rose-200">{row.error}</p>{/if}
+                                {#if row.error}<p class="mt-2 text-danger">{row.error}</p>{/if}
                               </div>
                             {/each}
                           </div>
                         {:else}
-                          <p class="mt-3 text-sm text-amber-100">No condition expressions were recorded for this gate.</p>
+                          <p class="mt-3 text-sm text-warning">No condition expressions were recorded for this gate.</p>
                         {/if}
                       </details>
                     {/if}
 
                     {#if stepSpecRows(selectedStepGroup, attempt).length > 0}
-                      <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                      <details class="mt-4 rounded-2xl border border-separator bg-canvas/70 px-4 py-3">
                         <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
-                          <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
+                          <span class="text-xs uppercase tracking-[0.25em] text-quiet">Current workflow spec</span>
                           <span class="flex flex-wrap items-center gap-2">
                             {#each stepSpecSummaryRows(selectedStepGroup) as row}
-                              <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
-                                {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                              <span class="rounded-full border border-control-border bg-surface/70 px-2 py-0.5 text-[11px] text-secondary">
+                                {row.label}: <span class="font-mono text-foreground">{row.value}</span>
                               </span>
                             {/each}
-                            <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                            <ChevronDown class="h-4 w-4 shrink-0 text-quiet" />
                           </span>
                         </summary>
-                        <p class="mt-3 text-xs text-slate-500">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
+                        <p class="mt-3 text-xs text-quiet">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each stepSpecRows(selectedStepGroup, attempt) as row}
-                            <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
-                              <dt class="text-slate-500">{row.label}</dt>
-                              <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                            <div class="min-w-0 rounded-lg border border-separator/70 bg-surface/40 px-2.5 py-2">
+                              <dt class="text-quiet">{row.label}</dt>
+                              <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
                             </div>
                           {/each}
                         </dl>
                       </details>
                     {/if}
 
-                    <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                    <details class="mt-4 rounded-2xl border border-separator bg-canvas/70 px-4 py-3">
                       <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
-                        <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
+                        <span class="text-xs uppercase tracking-[0.25em] text-quiet">Runtime and model</span>
                         <span class="flex flex-wrap items-center gap-2">
                           {#each runtimeCompactRows(attempt) as row}
-                            <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
-                              {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                            <span class="rounded-full border border-control-border bg-surface/70 px-2 py-0.5 text-[11px] text-secondary">
+                              {row.label}: <span class="font-mono text-foreground">{row.value}</span>
                             </span>
                           {/each}
-                          <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                          <ChevronDown class="h-4 w-4 shrink-0 text-quiet" />
                         </span>
                       </summary>
                       {#if runtimeRows(attempt).length > 0}
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each runtimeRows(attempt) as row}
-                            <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
-                              <dt class="text-slate-500">{row.label}</dt>
-                              <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                            <div class="min-w-0 rounded-lg border border-separator/70 bg-surface/40 px-2.5 py-2">
+                              <dt class="text-quiet">{row.label}</dt>
+                              <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
                             </div>
                           {/each}
                         </dl>
                       {:else}
-                        <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(attempt)}</p>
+                        <p class="mt-3 text-sm text-warning">{runtimeMissingMessage(attempt)}</p>
                       {/if}
                     </details>
 
                     {#if stepError}
-                      <div class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                      <div class="mt-4 rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">
                         <p class="font-medium">Error</p>
-                        <pre class="mt-2 whitespace-pre-wrap text-xs text-rose-300">{stepError}</pre>
+                        <pre class="mt-2 whitespace-pre-wrap text-xs text-danger">{stepError}</pre>
                       </div>
                     {/if}
 
                     {#if summary && !stepError}
                       <div>
-                        <p class="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">Summary</p>
-                        <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">
+                        <p class="mt-4 text-xs uppercase tracking-[0.25em] text-quiet">Summary</p>
+                        <div class="prose prose-sm prose-invert mt-3 max-w-none text-secondary">
                           {@html renderMarkdown(summary)}
                         </div>
                       </div>
@@ -2254,44 +2274,44 @@ import Target from 'lucide-svelte/icons/target';
 
                     {#if attempt.deliverables.length > 0}
                       {@const deliverable = latestDeliverable(attempt)}
-                      <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
+                      <div class="mt-4 rounded-2xl border border-accent/20 bg-accent-subtle px-4 py-4">
                         <div class="flex flex-wrap items-center justify-between gap-3">
                           <div>
-                            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Deliverable</p>
+                            <p class="text-xs uppercase tracking-[0.25em] text-quiet">Deliverable</p>
                             {#if deliverable?.title}
-                              <p class="mt-1 text-sm font-medium text-white">{deliverable.title}</p>
+                              <p class="mt-1 text-sm font-medium text-strong">{deliverable.title}</p>
                             {/if}
                           </div>
-                          <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
+                          <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-secondary">
                             {#each attempt.deliverables as item}
-                              <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : item.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : item.status === 'rejected' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
+                              <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-success-border bg-success-subtle text-success' : item.status === 'approved' ? 'border-accent/30 bg-accent-subtle text-accent' : item.status === 'rejected' ? 'border-accent/30 bg-accent-subtle text-accent' : 'border-control-border bg-surface/80 text-secondary'}`}>
                                 v{item.version} {item.status}
                               </span>
                             {/each}
                           </div>
                         </div>
-                        <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+                        <div class="mt-4 flex flex-wrap gap-2 text-xs text-muted">
                           {#if deliverable?.format}
-                            <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {deliverable.format}</span>
+                            <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">Format {deliverable.format}</span>
                           {/if}
                           {#if deliverable?.content}
-                            <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{deliverable.content.length.toLocaleString()} chars</span>
+                            <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">{deliverable.content.length.toLocaleString()} chars</span>
                           {/if}
                         </div>
-                        <p class="mt-4 text-sm text-slate-400">Deliverable content is hidden here so large outputs do not overwhelm the task view. Open the full output below to inspect it.</p>
+                        <p class="mt-4 text-sm text-muted">Deliverable content is hidden here so large outputs do not overwhelm the task view. Open the full output below to inspect it.</p>
                       </div>
                     {/if}
 
                     {#if activeStepTodos(attempt).length > 0}
                       {@const todos = activeStepTodos(attempt)}
-                      <div class="mt-4 rounded-xl border border-slate-800/60 bg-slate-900/40">
-                        <div class="border-b border-slate-800/60 px-3 py-1.5 text-xs font-medium text-slate-400">
+                      <div class="mt-4 rounded-xl border border-separator/60 bg-surface/40">
+                        <div class="border-b border-separator/60 px-3 py-1.5 text-xs font-medium text-muted">
                           Open todos
-                          <span class="text-slate-500"> · {todos.length}</span>
+                          <span class="text-quiet"> · {todos.length}</span>
                         </div>
-                        <ul class="divide-y divide-slate-800/40">
+                        <ul class="divide-y divide-separator/40">
                           {#each todos as todo}
-                            <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
+                            <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-foreground">
                               <TodoStatusDot status={todo.status} />
                               <span class="min-w-0 flex-1 truncate">{todo.content}</span>
                               {#if todo.priority !== 'medium'}
@@ -2303,25 +2323,25 @@ import Target from 'lucide-svelte/icons/target';
                       </div>
                     {/if}
 
-                    <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
+                    <div class="mt-4 rounded-2xl border border-separator bg-surface/60 px-4 py-3">
+                      <p class="text-xs uppercase tracking-[0.25em] text-quiet">Completion metadata</p>
                       {#if claims.length > 0}
-                        <ul class="mt-3 space-y-1 text-sm text-slate-400">
+                        <ul class="mt-3 space-y-1 text-sm text-muted">
                           {#each claims as claim}
                             <li class="flex items-start gap-2">
-                              <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                              <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-muted"></span>
                               <span>{claim}</span>
                             </li>
                           {/each}
                         </ul>
                       {:else if outcomeStatus === 'success' && !stepError && !attempt.evaluation}
-                        <p class="mt-3 text-sm text-slate-400">No extra completion metadata was recorded for this attempt.</p>
+                        <p class="mt-3 text-sm text-muted">No extra completion metadata was recorded for this attempt.</p>
                       {/if}
 
                       {#if hasRecordedStepOutput(attempt)}
-                        <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
+                        <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-separator pt-3">
                           <Button size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
-                          <span class="text-xs text-slate-500">Includes deliverable versions, completion metadata, and any recorded reasoning.</span>
+                          <span class="text-xs text-quiet">Includes deliverable versions, completion metadata, and any recorded reasoning.</span>
                         </div>
                       {/if}
                     </div>
@@ -2329,28 +2349,28 @@ import Target from 'lucide-svelte/icons/target';
                     {#if attempt.evaluation}
                       {@const evalDecision = String(attempt.evaluation.decision ?? '')}
                       {@const evalReasoning = String(attempt.evaluation.reasoning ?? '')}
-                      {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-sky-400'}
-                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
-                        <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
-                        <p class="mt-1 text-sm text-slate-300">
+                      {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-success' : evalDecision === 'revise' ? 'text-accent' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-danger' : 'text-accent'}
+                      <div class="mt-4 rounded-2xl border border-separator bg-canvas/80 px-4 py-3">
+                        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Evaluation</p>
+                        <p class="mt-1 text-sm text-secondary">
                           <span class="font-medium {evalColor}">{evalDecision}</span>
                           {#if evalReasoning} - {evalReasoning}{/if}
                         </p>
                         {#if feedback}
-                          <p class="mt-2 rounded-lg border border-slate-700/50 bg-slate-900/50 px-2 py-1.5 text-xs text-slate-400"><span class="font-medium text-slate-500">Feedback:</span> {feedback}</p>
+                          <p class="mt-2 rounded-lg border border-control-border/50 bg-surface/50 px-2 py-1.5 text-xs text-muted"><span class="font-medium text-quiet">Feedback:</span> {feedback}</p>
                         {/if}
                       </div>
                     {/if}
                   </article>
                 {:else}
-                  <div class="rounded-3xl border border-dashed border-slate-700 bg-slate-950/40 px-5 py-10 text-center">
-                    <Target class="mx-auto h-10 w-10 text-slate-600" />
-                    <p class="mt-4 text-sm text-slate-300">This step has not produced an attempt yet.</p>
-                    <p class="mt-1 text-xs text-slate-500">When the workflow reaches it, execution details and logs will appear here.</p>
+                  <div class="rounded-3xl border border-dashed border-control-border bg-canvas/40 px-5 py-10 text-center">
+                    <Target class="mx-auto h-10 w-10 text-quiet" />
+                    <p class="mt-4 text-sm text-secondary">This step has not produced an attempt yet.</p>
+                    <p class="mt-1 text-xs text-quiet">When the workflow reaches it, execution details and logs will appear here.</p>
                   </div>
                  {/if}
                 {:else}
-                 <p class="text-sm text-slate-400">No steps have been executed yet.</p>
+                 <p class="text-sm text-muted">No steps have been executed yet.</p>
                {/if}
              </div>
          </Card>
@@ -2358,57 +2378,57 @@ import Target from 'lucide-svelte/icons/target';
         </div>
 
        <div class="space-y-4 lg:hidden">
-        <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4" open>
-          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
+        <details class="group rounded-3xl border border-separator bg-canvas/40 p-4" open>
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-strong">
             Task meta
-            <ChevronDown class="h-4 w-4 text-slate-500 transition group-open:rotate-180" />
+            <ChevronDown class="h-4 w-4 text-quiet transition group-open:rotate-180" />
           </summary>
-          <div class="mt-4 grid gap-4 text-sm text-slate-300 sm:grid-cols-2">
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Origin</p>
+          <div class="mt-4 grid gap-4 text-sm text-secondary sm:grid-cols-2">
+            <div class="rounded-2xl border border-separator bg-canvas/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Origin</p>
               <dl class="mt-3 space-y-2">
-                <div class="flex justify-between gap-3"><dt class="text-slate-500">Source</dt><dd>{sourceLabel}</dd></div>
+                <div class="flex justify-between gap-3"><dt class="text-quiet">Source</dt><dd>{sourceLabel}</dd></div>
                 {#if sourceConversation}
-                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
+                  <div class="flex justify-between gap-3"><dt class="text-quiet">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-accent hover:text-accent-hover hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
                 {/if}
                 {#if task.created_by_agent_id}
-                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Creator agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd></div>
+                  <div class="flex justify-between gap-3"><dt class="text-quiet">Creator agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd></div>
                 {/if}
-                <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
-                <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
+                <div class="flex justify-between gap-3"><dt class="text-quiet">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
+                <div class="flex justify-between gap-3"><dt class="text-quiet">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
               </dl>
             </div>
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Timing</p>
+            <div class="rounded-2xl border border-separator bg-canvas/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Timing</p>
               <dl class="mt-3 space-y-2">
-                {#if task.created_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Created</dt><dd>{formatRelativeTime(task.created_at)}</dd></div>{/if}
-                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Started</dt><dd>{formatRelativeTime(task.started_at)}</dd></div>{/if}
-                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-slate-500">Duration</dt><dd class="font-mono">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd></div>{/if}
+                {#if task.created_at}<div class="flex justify-between gap-3"><dt class="text-quiet">Created</dt><dd>{formatRelativeTime(task.created_at)}</dd></div>{/if}
+                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-quiet">Started</dt><dd>{formatRelativeTime(task.started_at)}</dd></div>{/if}
+                {#if task.started_at}<div class="flex justify-between gap-3"><dt class="text-quiet">Duration</dt><dd class="font-mono">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd></div>{/if}
               </dl>
             </div>
           </div>
         </details>
 
-        <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
-          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
+        <details class="group rounded-3xl border border-separator bg-canvas/40 p-4">
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-strong">
             Result
-            <ChevronDown class="h-4 w-4 text-slate-500 transition group-open:rotate-180" />
+            <ChevronDown class="h-4 w-4 text-quiet transition group-open:rotate-180" />
           </summary>
-          <div class="mt-4 space-y-4 text-sm text-slate-300">
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
+          <div class="mt-4 space-y-4 text-sm text-secondary">
+            <div class="rounded-2xl border border-separator bg-canvas/60 p-4">
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Result</p>
               {#if task.result_summary}
-                <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(task.result_summary)}</div>
+                <div class="prose prose-sm prose-invert mt-3 max-w-none text-secondary">{@html renderMarkdown(task.result_summary)}</div>
               {:else}
-                <p class="mt-3 leading-6 text-slate-300">No final result is available for this task state.</p>
+                <p class="mt-3 leading-6 text-secondary">No final result is available for this task state.</p>
               {/if}
               {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
-                <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+                <div class="mt-4 flex flex-wrap gap-2 text-xs text-muted">
                   {#if finalTaskResultTitle(task)}
-                    <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
+                    <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
                   {/if}
                   {#if finalTaskResultFormat(task)}
-                    <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
+                    <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
                   {/if}
                 </div>
               {/if}
@@ -2416,7 +2436,7 @@ import Target from 'lucide-svelte/icons/target';
                 <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
               {/if}
               {#if hasFinalTaskOutput(task)}
-                 <a class="mt-4 inline-block text-xs text-sky-300 hover:text-sky-200" href="#result">Go to the canonical result</a>
+                 <a class="mt-4 inline-block text-xs text-accent hover:text-accent-hover" href="#result">Go to the canonical result</a>
               {/if}
             </div>
           </div>
@@ -2427,76 +2447,76 @@ import Target from 'lucide-svelte/icons/target';
       <div class="min-w-0 hidden space-y-5 lg:block">
         <!-- Origin -->
         <Card class="p-5">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Origin</p>
+          <p class="text-xs uppercase tracking-[0.25em] text-muted">Origin</p>
           <dl class="mt-3 space-y-2 text-sm">
             <div class="flex justify-between gap-3">
-              <dt class="text-slate-500">Source</dt>
-              <dd class="text-slate-300">{sourceLabel}</dd>
+              <dt class="text-quiet">Source</dt>
+              <dd class="text-secondary">{sourceLabel}</dd>
             </div>
             {#if sourceConversation}
               <div class="flex justify-between gap-3">
-                <dt class="text-slate-500">Conversation</dt>
+                <dt class="text-quiet">Conversation</dt>
                 <dd>
-                  <a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">
+                  <a href="/chat/{sourceConversation.conversation_id}" class="text-accent hover:text-accent-hover hover:underline">
                     {sourceConversation.title ?? 'Untitled'}
                   </a>
                 </dd>
               </div>
             {:else if task.source_ref}
               <div class="flex justify-between gap-3">
-                <dt class="text-slate-500">Reference</dt>
-                <dd class="truncate text-slate-400" title={task.source_ref}>{task.source_ref}</dd>
+                <dt class="text-quiet">Reference</dt>
+                <dd class="truncate text-muted" title={task.source_ref}>{task.source_ref}</dd>
               </div>
             {/if}
             {#if task.created_by}
               <div class="flex justify-between gap-3">
-                <dt class="text-slate-500">Created by</dt>
-                <dd class="truncate text-slate-300" title={task.created_by}>{task.created_by}</dd>
+                <dt class="text-quiet">Created by</dt>
+                <dd class="truncate text-secondary" title={task.created_by}>{task.created_by}</dd>
               </div>
             {/if}
             {#if task.created_by_agent_id}
               <div class="flex justify-between gap-3">
-                <dt class="text-slate-500">Creator agent</dt>
-                <dd class="inline-flex items-center gap-2 text-slate-300"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd>
+                <dt class="text-quiet">Creator agent</dt>
+                <dd class="inline-flex items-center gap-2 text-secondary"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd>
               </div>
             {/if}
             <div class="flex justify-between gap-3">
-              <dt class="text-slate-500">Agent</dt>
-              <dd class="inline-flex items-center gap-2 text-slate-300"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd>
+              <dt class="text-quiet">Agent</dt>
+              <dd class="inline-flex items-center gap-2 text-secondary"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd>
             </div>
             <div class="flex justify-between gap-3">
-              <dt class="text-slate-500">Workflow</dt>
-              <dd class="text-slate-300">{workflowName(task.workflow_id)}</dd>
+              <dt class="text-quiet">Workflow</dt>
+              <dd class="text-secondary">{workflowName(task.workflow_id)}</dd>
             </div>
           </dl>
         </Card>
 
         <!-- Timing -->
         <Card class="p-5">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Timing</p>
+          <p class="text-xs uppercase tracking-[0.25em] text-muted">Timing</p>
           <dl class="mt-3 space-y-2 text-sm">
             {#if task.created_at}
               <div class="flex justify-between">
-                <dt class="text-slate-500">Created</dt>
-                <dd class="text-slate-300" title={formatAbsoluteTime(task.created_at)}>{formatRelativeTime(task.created_at)}</dd>
+                <dt class="text-quiet">Created</dt>
+                <dd class="text-secondary" title={formatAbsoluteTime(task.created_at)}>{formatRelativeTime(task.created_at)}</dd>
               </div>
             {/if}
             {#if task.started_at}
               <div class="flex justify-between">
-                <dt class="text-slate-500">Started</dt>
-                <dd class="text-slate-300" title={formatAbsoluteTime(task.started_at)}>{formatRelativeTime(task.started_at)}</dd>
+                <dt class="text-quiet">Started</dt>
+                <dd class="text-secondary" title={formatAbsoluteTime(task.started_at)}>{formatRelativeTime(task.started_at)}</dd>
               </div>
             {/if}
             {#if task.completed_at}
               <div class="flex justify-between">
-                <dt class="text-slate-500">Completed</dt>
-                <dd class="text-slate-300" title={formatAbsoluteTime(task.completed_at)}>{formatRelativeTime(task.completed_at)}</dd>
+                <dt class="text-quiet">Completed</dt>
+                <dd class="text-secondary" title={formatAbsoluteTime(task.completed_at)}>{formatRelativeTime(task.completed_at)}</dd>
               </div>
             {/if}
             {#if task.started_at}
               <div class="flex justify-between">
-                <dt class="text-slate-500">Duration</dt>
-                <dd class="font-mono text-slate-200">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd>
+                <dt class="text-quiet">Duration</dt>
+                <dd class="font-mono text-foreground">{formatDuration(task.started_at, task.completed_at, tickNow)}</dd>
               </div>
             {/if}
           </dl>
@@ -2505,64 +2525,64 @@ import Target from 'lucide-svelte/icons/target';
         <!-- Run health -->
         {#if stats && stats.totalAttempts > 0}
           <Card class="p-5">
-             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Run health</p>
+             <p class="text-xs uppercase tracking-[0.25em] text-muted">Run health</p>
             <dl class="mt-3 space-y-2 text-sm">
               <div class="flex justify-between">
-                <dt class="text-slate-500">Steps completed</dt>
-                <dd class="font-mono text-slate-200">{stats.completedSteps} / {stats.uniqueSteps}</dd>
+                <dt class="text-quiet">Steps completed</dt>
+                <dd class="font-mono text-foreground">{stats.completedSteps} / {stats.uniqueSteps}</dd>
               </div>
               <div class="flex justify-between">
-                <dt class="inline-flex items-center gap-1 text-slate-500">
+                <dt class="inline-flex items-center gap-1 text-quiet">
                    Steps
                   <Tooltip text="Total number of step execution attempts, including retries. Higher than step count when steps are retried after evaluation rejection.">
-                    <span class="cursor-help text-slate-600">(?)</span>
+                    <span class="cursor-help text-quiet">(?)</span>
                   </Tooltip>
                 </dt>
-                <dd class="font-mono text-slate-200">{stats.totalAttempts}</dd>
+                <dd class="font-mono text-foreground">{stats.totalAttempts}</dd>
               </div>
               {#if stats.evalRevisions > 0}
                 <div class="flex justify-between">
-                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                  <dt class="inline-flex items-center gap-1 text-quiet">
                      Retries
                     <Tooltip text="Times the evaluator sent a step back for revision. The agent retries within the same step run.">
-                      <span class="cursor-help text-slate-600">(?)</span>
+                      <span class="cursor-help text-quiet">(?)</span>
                     </Tooltip>
                   </dt>
-                  <dd class="font-mono text-sky-300">{stats.evalRevisions}</dd>
+                  <dd class="font-mono text-accent">{stats.evalRevisions}</dd>
                 </div>
               {/if}
               {#if stats.evalFailures > 0}
                 <div class="flex justify-between">
-                  <dt class="text-slate-500">Eval failures</dt>
-                  <dd class="font-mono text-rose-300">{stats.evalFailures}</dd>
+                  <dt class="text-quiet">Eval failures</dt>
+                  <dd class="font-mono text-danger">{stats.evalFailures}</dd>
                 </div>
               {/if}
               {#if stats.totalLoops > 0}
                 <div class="flex justify-between">
-                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                  <dt class="inline-flex items-center gap-1 text-quiet">
                     Review loops
                     <Tooltip text="Times a review loop sent execution back to an earlier step (e.g. code review rejecting implementation back to the plan step).">
-                      <span class="cursor-help text-slate-600">(?)</span>
+                      <span class="cursor-help text-quiet">(?)</span>
                     </Tooltip>
                   </dt>
-                  <dd class="font-mono text-sky-300">{stats.totalLoops}</dd>
+                  <dd class="font-mono text-accent">{stats.totalLoops}</dd>
                 </div>
               {/if}
               {#if stats.multiAttemptSteps > 0}
                 <div class="flex justify-between">
-                  <dt class="inline-flex items-center gap-1 text-slate-500">
+                  <dt class="inline-flex items-center gap-1 text-quiet">
                     Re-executed steps
                     <Tooltip text="Steps that were executed more than once (full re-execution, not just in-place revision). Happens when a review loop sends execution back to an earlier step.">
-                      <span class="cursor-help text-slate-600">(?)</span>
+                      <span class="cursor-help text-quiet">(?)</span>
                     </Tooltip>
                   </dt>
-                  <dd class="font-mono text-slate-200">{stats.multiAttemptSteps}</dd>
+                  <dd class="font-mono text-foreground">{stats.multiAttemptSteps}</dd>
                 </div>
               {/if}
               {#if stats.skipped > 0}
                 <div class="flex justify-between">
-                  <dt class="text-slate-500">Skipped steps</dt>
-                  <dd class="font-mono text-slate-400">{stats.skipped}</dd>
+                  <dt class="text-quiet">Skipped steps</dt>
+                  <dd class="font-mono text-muted">{stats.skipped}</dd>
                 </div>
               {/if}
             </dl>
@@ -2571,22 +2591,22 @@ import Target from 'lucide-svelte/icons/target';
 
         <!-- Result -->
         <Card class="p-5">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Result</p>
+          <p class="text-xs uppercase tracking-[0.25em] text-muted">Result</p>
           {#if task.applied_completion_reason}
-            <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(task.applied_completion_reason)}</div>
+            <div class="prose prose-sm prose-invert mt-3 max-w-none text-quiet">{@html renderMarkdown(task.applied_completion_reason)}</div>
           {/if}
           {#if task.result_summary}
-            <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(task.result_summary)}</div>
+            <div class="prose prose-sm prose-invert mt-3 max-w-none text-secondary">{@html renderMarkdown(task.result_summary)}</div>
           {:else}
-            <p class="mt-3 text-sm leading-6 text-slate-300">No final result is available for this task state.</p>
+            <p class="mt-3 text-sm leading-6 text-secondary">No final result is available for this task state.</p>
           {/if}
           {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
-            <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
+            <div class="mt-4 flex flex-wrap gap-2 text-xs text-muted">
               {#if finalTaskResultTitle(task)}
-                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
+                <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">{finalTaskResultTitle(task)}</span>
               {/if}
               {#if finalTaskResultFormat(task)}
-                <span class="rounded-full border border-slate-700 bg-slate-950/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
+                <span class="rounded-full border border-control-border bg-canvas/80 px-2.5 py-1">Format {finalTaskResultFormat(task)}</span>
               {/if}
             </div>
           {/if}
@@ -2594,7 +2614,7 @@ import Target from 'lucide-svelte/icons/target';
             <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
           {/if}
           {#if hasFinalTaskOutput(task)}
-             <a class="mt-4 inline-block text-xs text-sky-300 hover:text-sky-200" href="#result">Go to the canonical result</a>
+             <a class="mt-4 inline-block text-xs text-accent hover:text-accent-hover" href="#result">Go to the canonical result</a>
           {/if}
         </Card>
       </div>
@@ -2606,9 +2626,9 @@ import Target from 'lucide-svelte/icons/target';
       {#snippet header()}
         <div class="flex min-w-0 items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
-            <h2 class="mt-1 break-words text-lg font-semibold text-white">{selectedStepGroup.stepName}</h2>
-            <p class="mt-1 text-sm text-slate-400">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}.</p>
+            <p class="text-xs uppercase tracking-[0.25em] text-quiet">Step detail</p>
+            <h2 class="mt-1 break-words text-lg font-semibold text-strong">{selectedStepGroup.stepName}</h2>
+            <p class="mt-1 text-sm text-muted">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}.</p>
           </div>
           <Button class="shrink-0" size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
         </div>
@@ -2622,28 +2642,28 @@ import Target from 'lucide-svelte/icons/target';
           {@const visibleStatus = displayStepStatus(attempt)}
           {#if selectedStepGroup.attempts.length > 1}
             <div class="-mx-1 mb-3 flex flex-wrap items-center gap-2 overflow-x-auto px-1 pb-1">
-              <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
+              <span class="text-xs uppercase tracking-[0.2em] text-quiet">Attempts</span>
               {#each selectedStepGroup.attempts as run (run.step_run_id)}
                 {@const isSelected = attempt.step_run_id === run.step_run_id}
                 {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
                 {@const status = displayStepStatus(run)}
                 <button
                   type="button"
-                  class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                  class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-accent/60 bg-accent-subtle text-accent' : 'border-control-border bg-canvas/70 text-secondary hover:border-control-border hover:text-strong'}`}
                   onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
                   aria-pressed={isSelected}
                 >
                   <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
-                  {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
-                  {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
-                  <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
+                  {#if stepTryLabel(run)}<span class="text-[10px] text-quiet">{stepTryLabel(run)}</span>{/if}
+                  {#if isLatestRun}<span class="rounded-full border border-accent/30 bg-accent-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-accent">latest</span>{/if}
+                  <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-control-border text-muted'}">{status}</span>
                 </button>
               {/each}
             </div>
           {/if}
-          <div class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
+          <div class="rounded-3xl border border-separator bg-surface/60 p-4">
             <div class="flex items-center justify-between gap-3">
-              <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
+              <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-control-border text-muted'}">{visibleStatus}</span>
               <div class="flex items-center gap-2">
                 {#if attempt.output?.session_id || attempt.session_id}
                   <Button size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={() => openStepChat(attempt)}>
@@ -2659,85 +2679,85 @@ import Target from 'lucide-svelte/icons/target';
               </div>
             </div>
             {#if summary}
-              <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
+              <div class="prose prose-sm prose-invert mt-4 max-w-none text-secondary">{@html renderMarkdown(summary)}</div>
             {/if}
             {#if stepSpecRows(selectedStepGroup, attempt).length > 0}
-              <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <details class="mt-4 rounded-2xl border border-separator bg-canvas/70 px-4 py-3">
                 <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
-                  <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
+                  <span class="text-xs uppercase tracking-[0.25em] text-quiet">Current workflow spec</span>
                   <span class="flex flex-wrap items-center gap-2">
                     {#each stepSpecSummaryRows(selectedStepGroup) as row}
-                      <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
-                        {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                      <span class="rounded-full border border-control-border bg-surface/70 px-2 py-0.5 text-[11px] text-secondary">
+                        {row.label}: <span class="font-mono text-foreground">{row.value}</span>
                       </span>
                     {/each}
-                    <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                    <ChevronDown class="h-4 w-4 shrink-0 text-quiet" />
                   </span>
                 </summary>
                 <dl class="mt-3 grid gap-2 text-xs">
                   {#each stepSpecRows(selectedStepGroup, attempt) as row}
-                    <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
-                      <dt class="text-slate-500">{row.label}</dt>
-                      <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                    <div class="min-w-0 rounded-lg border border-separator/70 bg-surface/40 px-2.5 py-2">
+                      <dt class="text-quiet">{row.label}</dt>
+                      <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
                     </div>
                   {/each}
                 </dl>
               </details>
             {/if}
-            <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+            <details class="mt-4 rounded-2xl border border-separator bg-canvas/70 px-4 py-3">
               <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
-                <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
+                <span class="text-xs uppercase tracking-[0.25em] text-quiet">Runtime and model</span>
                 <span class="flex flex-wrap items-center gap-2">
                   {#each runtimeCompactRows(attempt) as row}
-                    <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
-                      {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                    <span class="rounded-full border border-control-border bg-surface/70 px-2 py-0.5 text-[11px] text-secondary">
+                      {row.label}: <span class="font-mono text-foreground">{row.value}</span>
                     </span>
                   {/each}
-                  <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                  <ChevronDown class="h-4 w-4 shrink-0 text-quiet" />
                 </span>
               </summary>
               {#if runtimeSummaryRows(attempt).length > 0}
                 <dl class="mt-3 grid gap-2 text-xs">
                   {#each runtimeSummaryRows(attempt) as row}
-                    <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
-                      <dt class="text-slate-500">{row.label}</dt>
-                      <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                    <div class="min-w-0 rounded-lg border border-separator/70 bg-surface/40 px-2.5 py-2">
+                      <dt class="text-quiet">{row.label}</dt>
+                      <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
                     </div>
                   {/each}
                 </dl>
                 {#if runtimeDebugRows(attempt).length > 0}
-                  <details class="mt-3 rounded-xl border border-slate-800/70 bg-slate-900/30 px-3 py-2">
-                    <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-medium text-slate-300">
+                  <details class="mt-3 rounded-xl border border-separator/70 bg-surface/30 px-3 py-2">
+                    <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-medium text-secondary">
                       Debug runtime details
-                      <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                      <ChevronDown class="h-4 w-4 shrink-0 text-quiet" />
                     </summary>
                     <dl class="mt-3 grid gap-2 text-xs">
                       {#each runtimeDebugRows(attempt) as row}
-                        <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-950/50 px-2.5 py-2">
-                          <dt class="text-slate-500">{row.label}</dt>
-                          <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                        <div class="min-w-0 rounded-lg border border-separator/70 bg-canvas/50 px-2.5 py-2">
+                          <dt class="text-quiet">{row.label}</dt>
+                          <dd class="mt-1 truncate font-mono text-secondary" title={row.value}>{row.value}</dd>
                         </div>
                       {/each}
                     </dl>
                   </details>
                 {/if}
               {:else}
-                <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(attempt)}</p>
+                <p class="mt-3 text-sm text-warning">{runtimeMissingMessage(attempt)}</p>
               {/if}
             </details>
-            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
+            <div class="mt-4 rounded-2xl border border-separator bg-canvas/70 px-4 py-3">
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Completion metadata</p>
               {#if claims.length > 0}
-                <ul class="mt-3 space-y-1 text-sm text-slate-400">
+                <ul class="mt-3 space-y-1 text-sm text-muted">
                   {#each claims as claim}
                     <li class="flex items-start gap-2">
-                      <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-600"></span>
+                      <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-muted"></span>
                       <span>{claim}</span>
                     </li>
                   {/each}
                 </ul>
               {:else}
-                <p class="mt-3 text-sm text-slate-400">Open the full output to inspect completion metadata and the finalized assistant output.</p>
+                <p class="mt-3 text-sm text-muted">Open the full output to inspect completion metadata and the finalized assistant output.</p>
               {/if}
               {#if hasRecordedStepOutput(attempt)}
                 <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
@@ -2745,36 +2765,39 @@ import Target from 'lucide-svelte/icons/target';
             </div>
           </div>
         {:else}
-          <div class="rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
+          <div class="rounded-3xl border border-dashed border-control-border px-4 py-8 text-center text-sm text-muted">This step has not produced an attempt yet.</div>
         {/if}
       {/snippet}
     </Sheet>
   {/if}
 
   {#if configModalOpen}
-    <BlockingDialog open={configModalOpen} onClose={closeConfigModal} label="Task configuration" titleId="task-config-title" panelClass="max-w-4xl">
+    <BlockingDialog open={configModalOpen} onClose={closeConfigModal} label="Task configuration" titleId="task-config-title" panelClass="max-w-4xl" dismissible={!saving} backdropDismissible={JSON.stringify(editForm) === savedEditForm}>
       {#snippet header()}
         <div class="flex items-start justify-between gap-4">
           <div>
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Task configuration</p>
-            <h2 class="mt-1 text-xl font-semibold text-white" id="task-config-title">{task?.title ?? 'Task configuration'}</h2>
-            <p class="mt-2 text-sm text-slate-400">Configuration is secondary to live execution, so edits live here while the main page stays focused on workflow progress.</p>
+            <p class="text-xs uppercase tracking-[0.25em] text-quiet">Task configuration</p>
+            <h2 class="mt-1 text-xl font-semibold text-strong" id="task-config-title">{task?.title ?? 'Task configuration'}</h2>
+            <p class="mt-2 text-sm text-muted">Configuration is secondary to live execution, so edits live here while the main page stays focused on workflow progress.</p>
           </div>
           <Button size="sm" variant="secondary" onclick={closeConfigModal}>Close</Button>
         </div>
       {/snippet}
 
       {#snippet children()}
+        {#if taskOptionsLoading}
+          <LoadingState label="Loading configuration choices" />
+        {:else}
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Title</span>
             <Input bind:value={editForm.title} disabled={!isEditable} />
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Priority</span>
             <Input bind:value={editForm.priority} type="number" disabled={!isEditable} />
           </label>
-          <div class="space-y-2 text-sm font-medium text-slate-200">
+          <div class="space-y-2 text-sm font-medium text-foreground">
             <span>Agent</span>
             <AgentSelect
               agents={agents.filter((a) => a.agent_type === 'primary')}
@@ -2789,21 +2812,21 @@ import Target from 'lucide-svelte/icons/target';
             bind:value={editForm.agent_profile_id}
             disabled={!isEditable}
           />
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Workflow</span>
-            <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+            <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
               <option value="">Auto{editForm.project_id ? ' (project-aware)' : ''}</option>
               {#each (projectWorkflowOptionsLoaded ? projectWorkflowOptions : workflows) as workflow}
                 <option value={workflow.workflow_id}>{workflow.name}</option>
               {/each}
             </select>
             {#if editForm.project_id && projectWorkflowOptionsLoaded && projectWorkflowOptions.length === 0}
-              <span class="block text-xs text-slate-500">No workflows are bound to this project. Pick "Auto" or bind a workflow on the project page.</span>
+              <span class="block text-xs text-quiet">No workflows are bound to this project. Pick "Auto" or bind a workflow on the project page.</span>
             {/if}
           </label>
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Project</span>
-            <select bind:value={editForm.project_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+            <select bind:value={editForm.project_id} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
               <option value="">None</option>
               {#each projects as project}
                 <option value={project.project_id}>{project.name}</option>
@@ -2812,20 +2835,20 @@ import Target from 'lucide-svelte/icons/target';
           </label>
         </div>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+        <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Description</span>
-          <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
+          <textarea bind:value={editForm.description} disabled={!isEditable} class="min-h-[110px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet disabled:opacity-50"></textarea>
         </label>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+        <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Expected output</span>
-          <textarea bind:value={editForm.expected_output} disabled={!isEditable} class="min-h-[60px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500 disabled:opacity-50"></textarea>
+          <textarea bind:value={editForm.expected_output} disabled={!isEditable} class="min-h-[60px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet disabled:opacity-50"></textarea>
         </label>
 
         <div class="mt-4 grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm font-medium text-slate-200">
+          <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Delivery mode</span>
-            <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+            <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
               {#if (task?.source_type === 'chat' || task?.source_type === 'agent') && task.source_ref}
                 <option value="same_conversation">Same conversation</option>
               {/if}
@@ -2835,9 +2858,9 @@ import Target from 'lucide-svelte/icons/target';
             </select>
           </label>
           {#if editForm.delivery_mode === 'specific_conversation'}
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+            <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Delivery target</span>
-              <select bind:value={editForm.delivery_target} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              <select bind:value={editForm.delivery_target} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
                 <option value="">Select conversation</option>
                 {#each conversations as conversation}
                   <option value={conversation.conversation_id}>{conversation.title ?? conversation.conversation_id}</option>
@@ -2847,32 +2870,32 @@ import Target from 'lucide-svelte/icons/target';
           {/if}
         </div>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+        <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Completion notification behavior</span>
           <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+            <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
               <option value="default">Default delivery</option>
               <option value="direct">Direct channel delivery</option>
             </select>
-            <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
-              <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+            <label class="inline-flex items-center gap-2 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground disabled:opacity-50">
+              <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" />
               <span>Allow silent completion</span>
             </label>
           </div>
         </label>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+        <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Interaction policy</span>
-          <select bind:value={editForm.interaction_mode_override} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+          <select bind:value={editForm.interaction_mode_override} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
             <option value="">Workflow default</option>
             <option value="step_requests">Allow planning questions</option>
             <option value="explicit_gates">Gates only</option>
             <option value="none">Fully autonomous</option>
           </select>
-          <span class="block text-xs text-slate-500">Fully autonomous disables dynamic clarification questions for this task.</span>
+          <span class="block text-xs text-quiet">Fully autonomous disables dynamic clarification questions for this task.</span>
         </label>
 
-        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+        <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Escalation timeout (seconds)</span>
           <input
             type="number"
@@ -2882,13 +2905,16 @@ import Target from 'lucide-svelte/icons/target';
             bind:value={editForm.escalation_timeout_seconds}
             disabled={!isEditable}
             placeholder="Inherit agent or global timeout"
-            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50"
+            class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50"
           />
-          <span class="block text-xs text-slate-500">Pending approvals are denied at this deadline. Empty inherits the agent or global timeout; fully autonomous tasks deny immediately.</span>
+          <span class="block text-xs text-quiet">Pending approvals are denied at this deadline. Empty inherits the agent or global timeout; fully autonomous tasks deny immediately.</span>
         </label>
 
         <div class="mt-4">
           <SessionPolicyEditor
+            showEvaluation
+            bind:evaluation={editForm.intaris_evaluation}
+            inheritedEvaluation={agents.find((agent) => agent.agent_id === editForm.agent_id)?.capabilities?.intaris_evaluation ?? DEFAULT_INTARIS_EVALUATION}
             bind:allowText={editForm.allow_policy_text}
             bind:denyText={editForm.deny_policy_text}
             disabled={!isEditable}
@@ -2896,28 +2922,28 @@ import Target from 'lucide-svelte/icons/target';
           />
         </div>
 
-        <div class="mt-6 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
+        <div class="mt-6 rounded-3xl border border-separator bg-canvas/40 p-4">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Dependencies</p>
-              <p class="mt-1 text-sm text-slate-400">Only direct dependencies are shown in the live workflow. Manage them here.</p>
+              <p class="text-xs uppercase tracking-[0.25em] text-quiet">Dependencies</p>
+              <p class="mt-1 text-sm text-muted">Only direct dependencies are shown in the live workflow. Manage them here.</p>
             </div>
           </div>
           <div class="mt-4 space-y-3">
             {#each task?.dependencies ?? [] as dependency}
-              <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-                <button class="min-w-0 break-words text-left text-sm text-slate-200 hover:text-white" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-separator bg-canvas/60 px-4 py-3">
+                <button class="min-w-0 break-words text-left text-sm text-foreground hover:text-strong" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
                 {#if isEditable}
                   <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
                 {/if}
               </div>
             {/each}
             {#if (task?.dependencies?.length ?? 0) === 0}
-              <p class="text-sm text-slate-400">No dependencies configured.</p>
+              <p class="text-sm text-muted">No dependencies configured.</p>
             {/if}
             {#if isEditable}
-              <div class="grid gap-3 border-t border-slate-800 pt-4 md:grid-cols-[minmax(0,1fr)_auto]">
-                <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <div class="grid gap-3 border-t border-separator pt-4 md:grid-cols-[minmax(0,1fr)_auto]">
+                <select bind:value={dependencyTaskId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
                   <option value="">Add dependency...</option>
                   {#each allTasks.filter((candidate) => candidate.task_id !== taskIdFromRoute()) as candidate}
                     <option value={candidate.task_id}>{candidate.title}</option>
@@ -2928,13 +2954,13 @@ import Target from 'lucide-svelte/icons/target';
             {/if}
           </div>
         </div>
-
+        {/if}
       {/snippet}
 
       {#snippet footer()}
         <div class="flex flex-col-reverse justify-end gap-3 sm:flex-row">
           <Button variant="secondary" onclick={closeConfigModal}>Close</Button>
-          <Button disabled={saving || !isEditable} onclick={async () => { if (await saveTask()) closeConfigModal(); }}>{saving ? 'Saving...' : 'Save task'}</Button>
+          <Button disabled={saving || taskOptionsLoading || !isEditable} onclick={async () => { if (await saveTask()) closeConfigModal(); }}>{saving ? 'Saving...' : 'Save task'}</Button>
         </div>
       {/snippet}
     </BlockingDialog>
@@ -3004,5 +3030,5 @@ import Target from 'lucide-svelte/icons/target';
     {/key}
   {/if}
 {:else}
-  <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error || 'Task not found.'}</p>
+  <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error || 'Task not found.'}</p>
 {/if}

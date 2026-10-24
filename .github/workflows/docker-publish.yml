@@ -19,7 +19,14 @@ env:
   RELEASE_CREATED: ${{ github.event.release.published_at || github.event.repository.updated_at }}
 
 jobs:
+  release-gate:
+    uses: ./.github/workflows/project-release-gate.yml
+    with:
+      tag: ${{ github.event.release.tag_name || inputs.release_tag }}
+
   controller-publish:
+    needs: release-gate
+    if: needs.release-gate.outputs.project == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -76,6 +83,8 @@ jobs:
           path: docker-image-artifacts/controller.txt
 
   executor-publish:
+    needs: release-gate
+    if: needs.release-gate.outputs.project == 'true'
     runs-on: ubuntu-latest
 
     steps:

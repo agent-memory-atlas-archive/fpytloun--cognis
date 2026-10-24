@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from cognis.core.context_projection import (
+    PROJECTION_RENDERING_POLICY_VERSION,
+    PressureMode,
+    project_messages,
+)
 from cognis.core.tool_output_prune import (
     PRUNE_PROTECT,
     PRUNE_PROTECTED_TOOL_NAMES,
@@ -136,7 +141,7 @@ def test_cleared_marker_includes_call_id_recovery_hint() -> None:
     assert "cleared" in text.lower()
 
 
-def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> None:
+def test_events_to_messages_replays_a_durable_tool_result_projection() -> None:
     """Pruned tool results render as the clearance marker, not their content."""
 
     from cognis.core.context import events_to_messages
@@ -166,7 +171,17 @@ def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> Non
         },
     ]
 
-    messages = events_to_messages(events, pruned_call_ids={"old-1"})
+    messages = events_to_messages(
+        events,
+        projection_decisions={
+            "old-1": [
+                {
+                    "operation": "compact_result",
+                    "rendering_policy_version": PROJECTION_RENDERING_POLICY_VERSION,
+                }
+            ]
+        },
+    )
 
     tool_messages = [m for m in messages if m.get("role") == "tool"]
     by_id = {m["tool_call_id"]: m for m in tool_messages}
@@ -174,14 +189,14 @@ def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> Non
     assert "ORIGINAL CONTENT" not in by_id["old-1"]["content"]
     assert "stored-old-1" in by_id["old-1"]["content"]
     assert "read_tool_output" in by_id["old-1"]["content"]
-    assert by_id["old-1"].get("_pruned_view") is True
+    assert by_id["old-1"].get("_projected_compacted") is True
 
     # Untouched results must still render their original content.
     assert by_id["fresh-1"]["content"] == "FRESH CONTENT"
-    assert by_id["fresh-1"].get("_pruned_view") is False
+    assert by_id["fresh-1"].get("_projected_compacted", False) is False
 
 
-def test_events_to_messages_keeps_unrecoverable_pruned_ids_inline() -> None:
+def test_unrecoverable_results_are_ineligible_and_replay_inline() -> None:
     from cognis.core.context import events_to_messages
 
     events = [
@@ -195,15 +210,16 @@ def test_events_to_messages_keeps_unrecoverable_pruned_ids_inline() -> None:
         },
     ]
 
-    messages = events_to_messages(events, pruned_call_ids={"old-1"})
+    assert prune_candidate_from_event_data(events[1]["data"]) is None
+    messages = events_to_messages(events)
     tool_message = next(message for message in messages if message.get("role") == "tool")
 
     assert tool_message["content"] == "ORIGINAL CONTENT"
-    assert tool_message.get("_pruned_view") is False
+    assert tool_message.get("_projected_compacted", False) is False
 
 
-def test_events_to_messages_respects_protect_from_pruning_flag() -> None:
-    """``protect_from_pruning=True`` overrides any prune set membership."""
+def test_replayed_protected_results_survive_critical_projection() -> None:
+    """Replay retains the protection consumed by the canonical projection policy."""
 
     from cognis.core.context import events_to_messages
 
@@ -217,14 +233,23 @@ def test_events_to_messages_respects_protect_from_pruning_flag() -> None:
             "data": {
                 "call_id": "skill-1",
                 "name": "skill_load",
-                "result": "PROTECTED CONTENT",
+                "result": "PROTECTED CONTENT" * 1000,
                 "protect_from_pruning": True,
             },
         },
     ]
 
-    messages = events_to_messages(events, pruned_call_ids={"skill-1"})
+    messages = events_to_messages(events)
+    protected = next(message for message in messages if message.get("role") == "tool")
+    assert protected["_protected_tool_output"] is True
+    messages = project_messages(
+        messages,
+        preserve_recent_completed_tool_groups=0,
+        pressure_mode=PressureMode.critical,
+        required_savings_tokens=100_000,
+        allow_unrecoverable_projection=True,
+    ).messages
     tool_message = next(m for m in messages if m.get("role") == "tool")
 
-    assert tool_message["content"] == "PROTECTED CONTENT"
-    assert tool_message.get("_pruned_view") is False
+    assert tool_message["content"] == "PROTECTED CONTENT" * 1000
+    assert tool_message.get("_projected_compacted", False) is False

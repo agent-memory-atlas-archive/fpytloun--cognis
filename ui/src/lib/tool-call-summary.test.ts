@@ -13,6 +13,19 @@ import {
 } from './tool-call-summary';
 
 describe('tool call summaries', () => {
+  it('presents a structured memory failure once without modifying its diagnostic envelope', () => {
+    const result = JSON.stringify({ error: {
+      code: 'memory_validation_error', status_code: 422,
+      detail: "Unknown category 'cognis'.",
+      retry: { automatic: false, action: 'correct_arguments_then_retry', guidance: 'Choose a valid category.' },
+    } });
+    const item = { toolName: 'memory_add', isError: true, result, arguments: { content: 'Remember this.' } };
+    const presentation = memoryToolPresentation(item)!;
+    expect(presentation.error).toBe("Unknown category 'cognis'.");
+    expect(presentation.resultSummary).toBe('');
+    expect(item.result).toBe(result);
+    expect(JSON.parse(item.result).error.retry.guidance).toBe('Choose a valid category.');
+  });
   it('keeps early reconciliation distinct from a successful resend', () => {
     const presentation = managedConversationToolPresentation({
       toolName: 'agent_conversation_recover_channel',
@@ -1275,7 +1288,7 @@ describe('tool call summaries', () => {
       title: 'Read memory artifact',
       resultLabel: 'Problem',
       error: 'Memory operation failed: artifact not found',
-      resultSummary: 'Memory operation failed: artifact not found'
+      resultSummary: ''
     });
   });
 });

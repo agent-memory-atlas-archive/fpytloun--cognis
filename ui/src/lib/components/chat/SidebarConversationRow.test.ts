@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Conversation } from '$lib/types/api';
@@ -45,6 +45,7 @@ describe('SidebarConversationRow', () => {
     render(SidebarConversationRow, {
       ...commonProps,
       dense: true,
+      active: true,
       showTodoProgress: true,
       todoProgress: [{ content: 'Verify layout', status: 'pending', priority: 'normal' }],
     });
@@ -62,5 +63,55 @@ describe('SidebarConversationRow', () => {
   it('omits the agent-name metadata from comfortable rows', () => {
     render(SidebarConversationRow, { ...commonProps, dense: false });
     expect(screen.queryByText('LaForge')).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])('shows the outline only after navigation selects the row (dense=%s)', async (dense) => {
+    const onNavigate = vi.fn();
+    const { rerender } = render(SidebarConversationRow, { ...commonProps, dense, onNavigate });
+    const indicators = screen.getByTestId(dense ? 'sidebar-dense-indicators' : 'sidebar-row-indicators');
+    const spacer = indicators.querySelector('span.pointer-events-none');
+    expect(spacer).toHaveClass('h-6', 'w-6');
+    expect(spacer).toHaveAttribute('aria-hidden', 'true');
+    expect(spacer).not.toHaveAttribute('tabindex');
+    expect(screen.queryByRole('button', { name: 'Star conversation' })).not.toBeInTheDocument();
+    await fireEvent.mouseOver(screen.getByRole('link'));
+    await fireEvent.focus(screen.getByRole('link'));
+    expect(screen.queryByRole('button', { name: 'Star conversation' })).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('link'));
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    await rerender({ active: true });
+    expect(indicators.querySelector('span.pointer-events-none')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Star conversation' })).toBeVisible();
+    await rerender({ active: false });
+    expect(screen.queryByRole('button', { name: 'Star conversation' })).not.toBeInTheDocument();
+  });
+
+  it('always shows the filled star on a starred inactive row', () => {
+    render(SidebarConversationRow, {
+      ...commonProps, dense: false,
+      conversation: { ...conversation, starred_at: '2026-10-17T00:00:00Z' },
+    });
+    expect(screen.getByRole('button', { name: 'Unstar conversation' })).toBeVisible();
+  });
+
+  it.each([false, true])('keeps the title untouched and metadata in trailing indicators (dense=%s)', (dense) => {
+    render(SidebarConversationRow, {
+      ...commonProps, dense,
+      conversation: {
+        ...conversation, is_readonly_for_caller: true, agent_display_name: 'Private agent',
+        agent_avatar_url: '/api/v1/images/avatar?conversation_id=conversation-1',
+        project_name: 'Cognis', project_color: '#38bdf8',
+      },
+    });
+    expect(screen.getByTestId('conversation-project-badge')).toHaveTextContent('Cognis');
+    expect(screen.queryByLabelText('Read-only')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Star conversation' })).not.toBeInTheDocument();
+    const title = screen.getByText('Stable conversation row');
+    expect(title.textContent).toBe(conversation.title);
+    expect(title.children).toHaveLength(0);
+    const indicators = screen.getByTestId(dense ? 'sidebar-dense-indicators' : 'sidebar-row-indicators');
+    expect(indicators).toContainElement(screen.getByTestId('conversation-project-badge'));
+    expect(screen.getByRole('link')).not.toContainElement(indicators);
+    expect(screen.getByRole('img')).toHaveAttribute('src', '/api/v1/images/avatar?conversation_id=conversation-1');
   });
 });

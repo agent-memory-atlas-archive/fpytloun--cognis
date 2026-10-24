@@ -324,6 +324,7 @@ class TaskQueue:
         expected_output: str | None = None,
         priority: int = 0,
         created_by_agent_id: str | None = None,
+        creation_origin: str | None = None,
         source_type: str = "api",
         source_ref: str | None = None,
         source_session_id: str | None = None,
@@ -386,6 +387,7 @@ class TaskQueue:
                 status=status,
                 priority=priority,
                 created_by_agent_id=created_by_agent_id,
+                creation_origin="agent_composed" if created_by_agent_id else creation_origin,
                 source_type=source_type,
                 source_ref=source_ref,
                 source_session_id=source_session_id,
@@ -491,6 +493,7 @@ class TaskQueue:
         expected_output: str | None = None,
         priority: int = 0,
         created_by_agent_id: str | None = None,
+        creation_origin: str | None = None,
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         interaction_mode_override: str | None = None,
@@ -514,6 +517,7 @@ class TaskQueue:
             expected_output=expected_output,
             priority=priority,
             created_by_agent_id=created_by_agent_id,
+            creation_origin=creation_origin,
             delivery=delivery,
             completion_delivery=completion_delivery,
             interaction_mode_override=interaction_mode_override,
@@ -876,6 +880,7 @@ class TaskQueue:
 
         draft = await self.create_draft(
             created_by=source_task.created_by,
+            creation_origin=source_task.creation_origin,
             agent_id=source_task.agent_id,
             title=source_task.title,
             description=source_task.description,
@@ -926,6 +931,8 @@ class TaskQueue:
         expected_attempt: int | None = None,
     ) -> TaskModel:
         """Cancel a task in any mutable state."""
+        from cognis.store.models import Task as TaskRow
+
         pending_pause = self._get_pending_interaction(task_id)
         step_runs: list[Any] = []
         transitioned = False
@@ -935,9 +942,11 @@ class TaskQueue:
                 db_session, task_id, expected_attempt
             ):
                 raise ValueError("Task attempt changed; refresh before mutating")
-            task_row = await get_task(db_session, task_id)
+            task_row = await db_session.get(TaskRow, task_id, with_for_update=True)
             if task_row is None:
                 raise ValueError("Task not found")
+            if expected_attempt is not None and task_row.attempt_number != expected_attempt:
+                raise ValueError("Task attempt changed; refresh before mutating")
             if task_row.status in {"completed", "failed"}:
                 return _row_to_task_model(task_row)
             step_runs = await list_step_runs_for_task(db_session, task_id)
@@ -959,7 +968,19 @@ class TaskQueue:
                     final_status="cancelled",
                 )
                 await self._execution_store.invalidate_task_lease(db_session, task_id)
-                await db_session.commit()
+            # Clear the durable interaction before fencing workers out of cleanup.
+            # Also repair stale pauses on idempotent cancellation of legacy tasks.
+            if task_row.workflow_state:
+                state = dict(task_row.workflow_state)
+                state.update(
+                    status="cancelled",
+                    current_step_status=None,
+                    pending_pause_type=None,
+                    pending_pause_payload=None,
+                    version=int(state.get("version", 0)) + 1,
+                )
+                task_row.workflow_state = state
+            await db_session.commit()
             task = _row_to_task_model(task_row)
 
         if pending_pause is not None:
@@ -1924,6 +1945,7 @@ def _row_to_task_model(row: Any) -> TaskModel:
         agent_id=row.agent_id,
         agent_profile_id=getattr(row, "agent_profile_id", None),
         created_by_agent_id=getattr(row, "created_by_agent_id", None),
+        creation_origin=getattr(row, "creation_origin", None),
         source_type=row.source_type,
         source_ref=row.source_ref,
         source_session_id=getattr(row, "source_session_id", None),

@@ -95,7 +95,7 @@
 {#if visible}
   <nav
     bind:this={navEl}
-    class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 lg:hidden"
+    class="fixed inset-x-0 bottom-0 z-[60] border-t border-separator/80 lg:hidden"
     style="background: var(--app-bottom-chrome-bg); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); padding-bottom: var(--app-bottom-control-inset);"
     aria-label="Primary"
   >
@@ -107,10 +107,10 @@
           <a
             class={`flex min-h-[48px] flex-col items-center justify-end gap-0.5 px-2 pb-0 pt-1 text-[10px] leading-none transition ${
               active
-                ? 'text-sky-300'
+                ? 'text-accent'
                 : isOnTabRoute
-                  ? 'text-slate-400 hover:text-white'
-                  : 'text-slate-500 hover:text-slate-300'
+                  ? 'text-muted hover:text-strong'
+                  : 'text-quiet hover:text-secondary'
             }`}
             href={tab.href}
             aria-current={active ? 'page' : undefined}

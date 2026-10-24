@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import httpx
-import typer
+# Must run before litellm/tiktoken/huggingface_hub are imported anywhere.
+from cognis.offline_runtime import configure_offline_runtime
 
-from cognis.cli.admin import admin_app, print_env_template
-from cognis.cli.database import database_app
-from cognis.cli.executor import executor_app
-from cognis.cli.serve import serve
-from cognis.config import load_config
+configure_offline_runtime()
+
+import httpx  # noqa: E402
+import typer  # noqa: E402
+
+from cognis.cli.admin import admin_app, print_env_template  # noqa: E402
+from cognis.cli.database import database_app  # noqa: E402
+from cognis.cli.executor import executor_app  # noqa: E402
+from cognis.cli.serve import serve  # noqa: E402
+from cognis.config import load_config  # noqa: E402
 
 app = typer.Typer(invoke_without_command=True, help="Cognis controller")
 config_app = typer.Typer(help="Configuration helpers")

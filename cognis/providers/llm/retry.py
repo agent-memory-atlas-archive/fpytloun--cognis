@@ -319,6 +319,15 @@ async def with_llm_retry[T](
     Raises:
         The last exception if all retries are exhausted.
     """
+    from cognis.providers.llm.recovery import active_attempt_budget
+
+    budget = active_attempt_budget.get()
+    if budget is not None:
+        # The service owns recovery, including compatibility resubmissions.
+        # Keep this transport seam for standalone adapter callers only.
+        await budget.before_dispatch()
+        budget.before_transport()
+        return await fn(*args, **kwargs)
     last_exc: Exception | None = None
 
     for attempt in range(max_retries + 1):

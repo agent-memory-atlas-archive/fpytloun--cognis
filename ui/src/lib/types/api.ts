@@ -1,4 +1,22 @@
 export type UserRole = 'admin' | 'user' | 'viewer' | 'service';
+
+export interface NavigationChatGroup {
+  active_session_status: string | null;
+  active_session_completion_reason: string | null;
+  session_observed: boolean;
+  has_unread: boolean;
+  /** Missing on older backends; unsupported groups do not contribute a badge. */
+  is_active?: boolean;
+  pending_notification_types: string[];
+  count: number;
+}
+
+export interface NavigationSummary {
+  chat_groups: NavigationChatGroup[];
+  dashboard: DashboardIssuesResponse['summary'];
+  schedules: number;
+  tasks: number;
+}
 export type ChatMode = 'default' | 'plan' | 'build';
 export type ChatModeSource = 'one_shot' | 'conversation_override' | 'agent_default' | 'system_default';
 
@@ -36,9 +54,13 @@ export type UserThemePreference = 'system' | 'dark' | 'light';
 
 export interface UserDisplayPreferences {
   theme: UserThemePreference;
+  theme_family: import('$lib/theme/catalog').ThemeFamily;
   language: string;
   dashboard_workspace_windows: boolean;
+  pinned_agents_collapsed: boolean;
+  pinned_agents_order_by_activity: boolean;
   conversation_sidebar_sections: boolean;
+  conversation_project_badge?: 'name' | 'icon' | 'monochrome' | 'hidden';
   conversation_sidebar_dense: boolean;
 }
 
@@ -163,10 +185,12 @@ export type DashboardIssueKind =
   | 'schedule_failed'
   | 'schedule_auto_disabled'
   | 'provider_unavailable'
+  | 'provider_health'
+  | 'provider_quota'
   | 'getting_started';
 
 export interface DashboardIssueResource {
-  type: 'executor' | 'mcp_server' | 'schedule' | 'provider' | 'setup';
+  type: 'executor' | 'mcp_server' | 'schedule' | 'provider' | 'setup' | 'llm_provider';
   id: string;
   label: string;
 }
@@ -182,6 +206,8 @@ export interface DashboardIssue {
   action_url: string;
   action_label?: string;
   dismiss_token?: string | null;
+  task_id?: string | null;
+  task_retry_available?: boolean;
 }
 
 export interface DashboardIssuesSummary {
@@ -315,12 +341,22 @@ export interface ConversationStateDelta {
 }
 
 export interface Conversation {
+  project_icon?: string | null;
+  project_name?: string | null;
+  project_color?: string | null;
+  project_avatar_url?: string | null;
+  agent_display_name?: string | null;
+  agent_avatar_url?: string | null;
+  can_continue?: boolean;
   conversation_id: string;
   root_controller_conversation_id?: string | null;
   user_email: string;
   agent_id: string;
     agent_profile_id?: string | null;
     project_id: string | null;
+    visibility?: ResourceVisibility;
+    is_readonly_for_caller?: boolean;
+    project_assignable?: boolean;
     title: string | null;
     title_source: string;
     context: ConversationContext;
@@ -409,6 +445,22 @@ export interface BackgroundWorkItem {
   todos: BackgroundWorkTodo[];
 }
 
+export interface BackgroundCommandDetail {
+  shell_id: string;
+  executor_id: string;
+  session_id: string | null;
+  command: string;
+  cwd: string | null;
+  pid: number | null;
+  status: string;
+  runtime_seconds: number;
+  idle_seconds: number;
+  exit_code: number | null;
+  output_tail: string;
+  output_chars: number;
+  trimmed_chars: number;
+}
+
 export interface BackgroundWorkProjection {
   items: BackgroundWorkItem[];
   active_count: number;
@@ -416,10 +468,27 @@ export interface BackgroundWorkProjection {
   generated_at: string;
 }
 
+export interface WaitingConversationPage {
+  conversations: CursorPage<Conversation>;
+  active_conversation_ids: string[];
+  /** Omitted by controllers predating the degraded-activity response contract. */
+  activity_complete?: boolean;
+}
+
+export interface BackgroundWorkRead {
+  background_work: BackgroundWorkProjection;
+  background_work_changed: boolean;
+  agent_direct_chats: AgentDirectChat[];
+}
+
 export interface SidebarProjection {
   agents: Agent[];
   agent_direct_chats: AgentDirectChat[];
   conversations: CursorPage<Conversation>;
+  /** Complete filtered Waiting snapshot hydrated independently of history. */
+  waiting_conversations?: Conversation[];
+  /** Supplemental failure must not discard successful history/agents. */
+  waiting_error?: string | null;
   context_types: string[];
   removed_conversation_ids?: string[];
   full_resync_required?: boolean;
@@ -490,6 +559,7 @@ export interface ProjectGrant {
 }
 
 export interface Project {
+  color?: string;
   project_id: string;
   owner_email: string;
   name: string;
@@ -504,12 +574,94 @@ export interface Project {
   workflow_ids: string[];
   active_schedule_count: number;
   grants: ProjectGrant[];
+  agents?: ProjectAgent[];
   is_shared_with_me: boolean;
   shared_by_email: string | null;
   granted_permission: string | null;
+  caller_role?: ProjectRole | null;
   is_readonly_for_caller: boolean;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export type ResourceVisibility = 'project' | 'private';
+export type ProjectRole = 'owner' | 'manager' | 'member' | 'viewer';
+export type ProjectGrantRole = Exclude<ProjectRole, 'owner'>;
+export type ExecutorScope = 'owner_executor' | 'grantee_executor';
+
+export interface ProjectAgent {
+  project_id: string;
+  agent_id: string;
+  agent_name: string;
+  agent_display_name: string | null;
+  agent_description: string | null;
+  agent_avatar_url: string | null;
+  agent_owner_email: string;
+  is_default: boolean;
+  executor_scope: ExecutorScope;
+  added_by: string;
+  is_owned_by_caller: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AgentProjectAssignment {
+  project_id: string;
+  project_name: string;
+  project_avatar_url: string | null;
+  project_status: string;
+  is_default: boolean;
+  executor_scope: ExecutorScope;
+  caller_role: ProjectRole | null;
+}
+
+export interface ProjectTaskSummary {
+  task_id: string;
+  title: string | null;
+  status: string;
+  agent_id: string | null;
+  workflow_id: string | null;
+  created_by: string;
+  visibility: ResourceVisibility;
+  is_readonly_for_caller: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  priority: number;
+  source_type: string;
+  source_ref: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result_summary: string | null;
+}
+
+export interface ProjectActivity {
+  deliverables: Array<{
+    deliverable_id: string;
+    title: string | null;
+    format: string;
+    status: string;
+    conversation_id: string | null;
+    task_id: string | null;
+    step_run_id?: string | null;
+    is_readonly_for_caller?: boolean;
+    content_preview?: string | null;
+    created_at: string | null;
+    lineage_id?: string | null;
+    revision?: number;
+  }>;
+  artifacts: Array<{
+    artifact_id: string;
+    filename: string;
+    mime_type: string;
+    size_bytes: number;
+    kind: string;
+    purpose: string;
+    conversation_id: string | null;
+    owner_email: string | null;
+    created_at: string | null;
+    lineage_id?: string | null;
+    revision?: number;
+  }>;
 }
 
 export interface MessageEvent {
@@ -540,6 +692,15 @@ export interface AttachmentRef {
    * before sending and strips it from the outgoing turn payload.
    */
   voice_recording?: boolean;
+  /**
+   * Client-only upload tracking. Present while a picked file is uploading in
+   * the background (`artifact_id` is then a `local:` placeholder). Stripped
+   * before attachments are sent to the server.
+   */
+  local_id?: string;
+  upload_state?: 'uploading' | 'uploaded' | 'failed';
+  upload_progress?: number;
+  upload_error?: string | null;
 }
 
 export interface FileDiff {
@@ -779,6 +940,7 @@ export interface Session {
 }
 
 export interface IntarisSessionDetail {
+  inference_target?: { provider_id: string; model: string; requested: string; reason: string } | null;
   session_id: string;
   intaris_session_id: string;
   title: string | null;
@@ -822,6 +984,9 @@ export interface AgentRuntimeProfile {
   memory_backend_options?: Record<string, unknown>;
   enabled?: boolean;
   agent_switchable?: boolean;
+  quick_switch?: boolean;
+  quick_switch_index?: number;
+  quick_switch_color?: 'neutral' | 'blue' | 'teal' | 'amber' | 'violet' | 'rose';
 }
 
 export interface AgentCapabilities {
@@ -830,8 +995,11 @@ export interface AgentCapabilities {
   memory_backend_options?: Record<string, unknown>;
   /** Guardrails backend: "intaris" (default) | "none" */
   guardrails_backend: string;
+  intaris_evaluation?: IntarisEvaluation;
   minimum_outcome?: 'deny' | 'escalate' | 'approve' | null;
   maximum_outcome?: 'deny' | 'escalate' | 'approve' | null;
+  /** "unattended" denies Intaris escalations instead of asking the user. */
+  approval_mode?: 'ask' | 'unattended';
   escalation_timeout_seconds?: number | null;
 }
 
@@ -892,6 +1060,7 @@ export interface Agent {
   granted_permission: string | null;
   executor_scope: string | null;
   is_readonly_for_caller: boolean;
+  shared_via_project_ids?: string[];
   status: string;
   created_at: string | null;
   updated_at: string | null;
@@ -2240,7 +2409,10 @@ export interface TaskDelivery {
   target: string | null;
 }
 
+export type IntarisEvaluation = 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy';
+
 export interface SessionPolicy {
+  intaris_evaluation?: IntarisEvaluation | null;
   allow_policies: Array<string | Record<string, unknown>>;
   deny_policies: Array<string | Record<string, unknown>>;
 }
@@ -2318,6 +2490,13 @@ export interface Deliverable {
   turn_id?: string | null;
   version: number;
   attempt_number: number;
+  lineage_id?: string | null;
+  revision?: number;
+  supersedes_deliverable_id?: string | null;
+  latest_deliverable_id?: string | null;
+  latest_revision?: number | null;
+  revision_count?: number | null;
+  is_latest?: boolean | null;
   content: string;
   format: 'markdown' | 'plain' | 'html' | 'rich' | string;
   title: string | null;
@@ -2333,9 +2512,52 @@ export interface Deliverable {
   updated_at: string | null;
 }
 
+export interface DeliverableRevisionSummary {
+  deliverable_id: string;
+  revision: number;
+  title: string | null;
+  format: string;
+  status: string;
+  step_run_id: string | null;
+  task_id: string | null;
+  conversation_id: string | null;
+  created_at: string | null;
+  is_latest: boolean;
+}
+
+export interface DeliverableRevisions {
+  lineage_id: string;
+  latest_deliverable_id: string;
+  revisions: DeliverableRevisionSummary[];
+}
+
+export interface ArtifactRevisionSummary {
+  artifact_id: string;
+  revision: number;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  owner_email: string | null;
+  project_id: string | null;
+  created_at: string | null;
+  is_latest: boolean;
+}
+
+export interface ArtifactRevisions {
+  lineage_id: string;
+  latest_artifact_id: string;
+  latest_revision: number;
+  revisions: ArtifactRevisionSummary[];
+}
+
 export interface DeliverableShareLink {
   url: string;
   expires_at: string;
+}
+
+export interface DeliverableShareOptions {
+  ttl_seconds?: number;
+  expires_at?: string;
 }
 
 export interface StepRun {
@@ -2785,6 +3007,8 @@ export interface ModelEntry {
   max_context_window?: number | null;
   max_output_tokens: number;
   supports_tools: boolean;
+  supports_parallel_tools?: boolean;
+  supports_structured_output?: boolean;
   supports_streaming: boolean;
   supports_vision: boolean;
   supports_audio_input: boolean;
@@ -2797,6 +3021,9 @@ export interface ModelEntry {
   fast_mode_parameter?: 'speed' | 'service_tier' | null;
   reasoning_efforts: string[];
   supports_prompt_caching: boolean;
+  primary_cache_ttl?: '5m' | '1h';
+  auxiliary_cache_ttl?: '5m' | '1h';
+  supported_cache_ttls?: ('5m' | '1h')[];
   supports_tool_search: boolean;
   supports_defer_loading: boolean;
   supports_openai_namespace_tools: boolean;
@@ -2805,12 +3032,19 @@ export interface ModelEntry {
   supports_responses_api: boolean;
   supports_extended_thinking: boolean;
   supports_image_generation: boolean;
+  supports_video_generation?: boolean;
+  supports_video_input?: boolean;
+  video_capabilities?: Record<string, unknown>;
   supported_image_mime_types: string[];
   supported_audio_mime_types: string[];
   supported_openai_params: string[];
   max_tools?: number;
   input_cost_per_mtok?: number;
   output_cost_per_mtok?: number;
+  cache_read_cost_per_mtok?: number | null;
+  cache_write_cost_per_mtok?: number | null;
+  model_mode?: string | null;
+  pricing?: Record<string, unknown>;
   tier: string;
   source?: string;
   confidence?: string;
@@ -2914,6 +3148,28 @@ export type ProviderUsageSource =
   | 'unsupported'
   | string;
 
+export interface ProviderMonitoringOptions {
+  enabled: boolean;
+  interval_minutes: number;
+  warning_percent: number;
+  critical_percent: number;
+}
+
+export interface ProviderMonitor {
+  provider_id: string;
+  display_name: string;
+  monitoring: ProviderMonitoringOptions;
+  health_status: string;
+  health_detail: string;
+  health_checked_at: string | null;
+  checked_at: string | null;
+  next_refresh_at: string | null;
+  usage: ProviderUsage | null;
+  error: string | null;
+  alert_severity: 'warning' | 'critical' | null;
+  stale: boolean;
+}
+
 export interface ProviderUsage {
   provider_id: string;
   ok: boolean;
@@ -2941,6 +3197,19 @@ export interface ModelRoutingEntry {
 }
 
 export interface ModelRouting {
+  companion_lite?: ModelRoutingEntry;
+  companion_smart?: ModelRoutingEntry;
+  companion_embedding?: ModelRoutingEntry;
+  intaris_evaluation?: ModelRoutingEntry;
+  intaris_judge?: ModelRoutingEntry;
+  intaris_analysis?: ModelRoutingEntry;
+  intaris_analysis_deep?: ModelRoutingEntry;
+  intaris_embedding?: ModelRoutingEntry;
+  mnemory_extraction?: ModelRoutingEntry;
+  mnemory_retrieval?: ModelRoutingEntry;
+  mnemory_consolidation?: ModelRoutingEntry;
+  mnemory_maintenance?: ModelRoutingEntry;
+  mnemory_embedding?: ModelRoutingEntry;
   default: ModelRoutingEntry;
   classifier: ModelRoutingEntry;
   compaction: ModelRoutingEntry;
@@ -2948,6 +3217,9 @@ export interface ModelRouting {
   speech_to_text: ModelRoutingEntry;
   text_to_speech: ModelRoutingEntry;
   image_generation: ModelRoutingEntry;
+  video_generation?: ModelRoutingEntry;
+  video_editing?: ModelRoutingEntry;
+  video_analysis?: ModelRoutingEntry;
   attachment_analysis: ModelRoutingEntry;
   embedding: ModelRoutingEntry;
 }
@@ -3205,6 +3477,8 @@ export interface VapidPublicKeyResponse {
 export interface PushSubscriptionResponse {
   subscription_id: string;
   enabled: boolean;
+  /** Endpoint permanently rejected by the push service; resubscribe. */
+  gone?: boolean;
 }
 
 export interface PushSubscriptionStatusResponse {
@@ -3635,6 +3909,7 @@ export interface QueuedMessage {
   updated_at?: string | null;
   status?: 'queued' | 'recoverable' | 'committing';
   cancel_requested?: boolean;
+  can_edit?: boolean;
   position: number;
 }
 
@@ -3657,11 +3932,16 @@ export interface WebSocketReconnectedEvent {
   missed_events_count: number;
   last_seq?: number;
   has_active_turn?: boolean;
+  /** Emitted by the web client itself after a socket re-authenticates. */
+  client_resync?: boolean;
 }
 
 export interface WebSocketScopeInvalidatedEvent {
   type: 'scope_invalidated';
+  /** Server-proven metadata refresh, never an access-revocation signal. */
+  metadata_only?: boolean;
   reason:
+    | 'event_store_session_invalidated'
     | 'chat_scope_changed'
     | 'task_progress_changed'
     | 'notification_state_changed'
@@ -3669,11 +3949,24 @@ export interface WebSocketScopeInvalidatedEvent {
     | 'sidebar_changed'
     | 'schedule_action_changed';
   revision: string;
+  scope_key?: string;
   conversation_id?: string;
   session_id?: string;
   task_id?: string;
   schedule_id?: string;
   step_run_id?: string;
+}
+
+export interface WebSocketExecutorMonitorEvent {
+  type: 'executor_monitor_update';
+  executor_id: string;
+  details_revision: string | null;
+  status: string;
+  runtime_state: string;
+  desired_config_version: number;
+  applied_config_version: number;
+  last_observed_at: string | null;
+  resource_snapshot: ExecutorResourceSnapshot | null;
 }
 
 export interface WebSocketWorkInvalidatedEvent {
@@ -3916,6 +4209,7 @@ export interface WebSocketSessionCompactedEvent {
   summary_preview: string;
   method: string;
   turns_compacted: number;
+  events_compacted?: number | null;
   trigger?: string;
   reason?: string;
   tokens_before?: number;
@@ -3940,6 +4234,11 @@ export interface WebSocketSessionCompactedEvent {
 
 export interface WebSocketRecapAvailableEvent {
   type: 'recap_available';
+  conversation_id: string;
+}
+
+export interface WebSocketHandoffAvailableEvent {
+  type: 'handoff_available';
   conversation_id: string;
 }
 
@@ -4033,6 +4332,7 @@ export interface WebSocketSidebarConversationUpsertEvent {
   conversation_id: string;
   revision?: string;
   conversation?: Conversation;
+  completed_reply?: { message_id: string; preview: string } | null;
 }
 
 export interface WebSocketSidebarConversationRemovedEvent {
@@ -4041,6 +4341,8 @@ export interface WebSocketSidebarConversationRemovedEvent {
 }
 
 export type CognisWebSocketEvent =
+  | WebSocketExecutorMonitorEvent
+  | { type: 'inbox_changed' }
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
   | WebSocketAssistantStreamSnapshotEvent
@@ -4085,6 +4387,7 @@ export type CognisWebSocketEvent =
   | WebSocketSessionCompactionFinishedEvent
   | WebSocketSessionCompactedEvent
   | WebSocketRecapAvailableEvent
+  | WebSocketHandoffAvailableEvent
   | WebSocketSessionResetEvent
   | WebSocketHistoryRebasedEvent
   | WebSocketConversationCreatedEvent
@@ -4101,6 +4404,22 @@ export type CognisWebSocketEvent =
   | WebSocketSidebarConversationRemovedEvent
   | WebSocketErrorEvent
   | WebSocketPongEvent;
+
+export interface InboxItem {
+  notification_id: string;
+  kind: string;
+  title: string;
+  body: string;
+  href: string;
+  created_at: string;
+  read_at: string | null;
+}
+
+export interface InboxPage {
+  items: InboxItem[];
+  unread_count: number;
+  next_cursor: string | null;
+}
 
 export interface WebSocketTtsSentenceReadyEvent {
   type: 'tts_sentence_ready';

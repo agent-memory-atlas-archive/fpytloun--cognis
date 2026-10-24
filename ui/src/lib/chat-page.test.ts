@@ -91,7 +91,6 @@ import {
   nextPollDelayMs,
   nextConversationLoadId,
   shouldReconcileAfterReconnect,
-  shouldRecoverChatV2ForInvalidation,
   shouldSnapshotAfterChatV2Sync,
   ChatV2CanonicalRecoveryCoalescer,
   beginCanonicalTimelineAuthority,
@@ -783,9 +782,10 @@ describe('chat page helpers', () => {
       reconcile: true,
     });
     expect(admission.admitProjection('41')).toEqual({
-      apply: false,
+      apply: true,
       reconcile: true,
     });
+    expect(admission.newerConversationIds('41')).toEqual(new Set(['conversation-a']));
     expect(admission.observedDurableHighWatermark).toBe('42');
   });
 
@@ -793,7 +793,8 @@ describe('chat page helpers', () => {
     const admission = new SidebarRevisionAdmission();
     expect(admission.admitPush('conversation-a', '42').apply).toBe(true);
     expect(admission.admitPush('conversation-a', '41').apply).toBe(false);
-    expect(admission.admitProjection('41').apply).toBe(false);
+    expect(admission.admitProjection('41').apply).toBe(true);
+    expect(admission.newerConversationIds('41')).toEqual(new Set(['conversation-a']));
     expect(admission.admitPush('conversation-a', '43').apply).toBe(true);
   });
 
@@ -809,6 +810,22 @@ describe('chat page helpers', () => {
     });
     expect(admission.authoritativeRestCursor).toBe('41');
     expect(admission.needsReconciliation).toBe(true);
+  });
+
+  it('refreshes unapplied work revisions but ignores hints covered by an applied snapshot', () => {
+    const admission = new SidebarRevisionAdmission();
+    expect(admission.observeInvalidation('41')).toBe(true);
+    admission.recordProjection('41', []);
+    expect(admission.observeInvalidation('41')).toBe(false);
+    expect(admission.observeInvalidation('40')).toBe(false);
+    expect(admission.observeInvalidation('42')).toBe(true);
+    // Failed or in-flight reads must not consume the newer revision.
+    expect(admission.observeInvalidation('42')).toBe(true);
+    admission.recordProjection('42', []);
+    expect(admission.observeInvalidation('42')).toBe(false);
+    expect(admission.observeInvalidation(undefined)).toBe(true);
+    const replacement = new SidebarRevisionAdmission();
+    expect(replacement.observeInvalidation('42')).toBe(true);
   });
 
   describe('sidebar invalidation coalescing', () => {
@@ -841,6 +858,42 @@ describe('chat page helpers', () => {
       expect(calls).toBe(2);
     });
 
+    it('spaces bursts by the minimum interval and lets urgent invalidations through', async () => {
+      let clock = 0;
+      const sleeps: Array<{ ms: number; resolve: () => void }> = [];
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(
+        async () => { calls += 1; },
+        4_000,
+        (ms) => new Promise<void>((resolve) => { sleeps.push({ ms, resolve }); }),
+        () => clock,
+      );
+
+      coalescer.invalidate();
+      await coalescer.whenIdle();
+      expect(calls).toBe(1);
+
+      clock = 1_000;
+      coalescer.invalidate();
+      coalescer.invalidate();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      expect(sleeps.at(-1)?.ms).toBe(3_000);
+
+      // A user-driven change skips the remaining wait.
+      coalescer.invalidate(true);
+      await coalescer.whenIdle();
+      expect(calls).toBe(2);
+
+      // After a quiet period the next invalidation runs immediately.
+      clock = 10_000;
+      const sleepCount = sleeps.length;
+      coalescer.invalidate();
+      await coalescer.whenIdle();
+      expect(calls).toBe(3);
+      expect(sleeps.length).toBe(sleepCount);
+    });
+
     it('applies the trailing response after a stale first response', async () => {
       const admission = new SidebarRevisionAdmission();
       admission.observeInvalidation('42');
@@ -867,7 +920,7 @@ describe('chat page helpers', () => {
       await coalescer.whenIdle();
 
       expect(calls).toBe(2);
-      expect(applied).toEqual(['42']);
+      expect(applied).toEqual(['41', '42']);
       expect(admission.authoritativeRestCursor).toBe('42');
     });
 
@@ -2029,6 +2082,23 @@ describe('chat page helpers', () => {
     })).toBe(true);
   });
 
+  it('applies the sidebar project filter to socket upserts', () => {
+    const inHome = {
+      conversation_id: 'conv-home',
+      agent_id: 'agent-a',
+      project_id: 'proj_home',
+      status: 'active',
+      starred_at: null,
+      context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+    } as unknown as SidebarProjection['conversations']['items'][number];
+    const base = { selectedChannels: [], selectedAgentIds: [], selectedConversationStatus: 'active' as const };
+
+    expect(conversationMatchesSidebarProjectionFilter(inHome, { ...base, selectedProjectId: 'proj_home' })).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(inHome, { ...base, selectedProjectId: 'proj_work' })).toBe(false);
+    expect(conversationMatchesSidebarProjectionFilter({ ...inHome, project_id: null }, { ...base, selectedProjectId: 'proj_home' })).toBe(false);
+    expect(conversationMatchesSidebarProjectionFilter(inHome, { ...base, selectedProjectId: '' })).toBe(true);
+  });
+
   it('isolates task-control socket upserts and sidebar resync rows by status filter', () => {
     const normal = {
       conversation_id: 'conv-normal',
@@ -2187,6 +2257,25 @@ describe('chat page helpers', () => {
     expect(sync).not.toHaveBeenCalled();
   });
 
+  it('uses only a cursor sync when the restored view is a trusted base', async () => {
+    const sync = vi.fn(async () => undefined);
+    const snapshot = vi.fn(async () => undefined);
+    const probe = vi.fn(async () => null);
+
+    await expect(refreshCachedTimeline({
+      captureWatermark: () => ({ cursor: 'cached' }),
+      probe,
+      applyIfUnchanged: () => true,
+      snapshot,
+      sync,
+      trustedBase: true,
+    })).resolves.toBe('sync');
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(probe).not.toHaveBeenCalled();
+    expect(snapshot).not.toHaveBeenCalled();
+  });
+
   it('falls back to current-cursor sync when a cache hit loses a live-state race', async () => {
     const sync = vi.fn(async () => undefined);
     const snapshot = vi.fn(async () => undefined);
@@ -2254,7 +2343,9 @@ describe('chat page helpers', () => {
       active_session_completion_reason: 'compacted',
     })).toBe('default');
 
-    expect(conversationAttentionDotClass('rose')).toBe('bg-rose-400');
+    expect(conversationAttentionDotClass('rose')).toBe('bg-danger');
+    expect(conversationAttentionDotClass('amber')).toBe('bg-warning');
+    expect(conversationAttentionDotClass('default')).toBe('bg-info');
     expect(conversationAttentionOrbitClass('amber')).toBe('conversation-turn-orbit--amber');
     expect(conversationAttentionLabel('default')).toBe('unread');
   });
@@ -3066,20 +3157,6 @@ describe('chat page helpers', () => {
     ).toBe(true);
   });
 
-  it('recovers canonical state only for matching or global invalidations', () => {
-    expect(shouldRecoverChatV2ForInvalidation({
-      activeConversationId: 'conv-1',
-      invalidatedConversationId: 'conv-1'
-    })).toBe(true);
-    expect(shouldRecoverChatV2ForInvalidation({
-      activeConversationId: 'conv-1'
-    })).toBe(true);
-    expect(shouldRecoverChatV2ForInvalidation({
-      activeConversationId: 'conv-1',
-      invalidatedConversationId: 'conv-2'
-    })).toBe(false);
-  });
-
   it('coalesces invalidations during sync into one awaited bounded rerun', async () => {
     const coalescer = new ChatV2CanonicalRecoveryCoalescer();
     let releaseFirst: (() => void) | undefined;
@@ -3365,12 +3442,6 @@ describe('chat page helpers', () => {
       resetRequired: false,
       outcome: 'applied'
     })).toBe(false);
-  });
-
-  it('requests canonical recovery after reconnect even without a sequence gap', () => {
-    expect(shouldRecoverChatV2ForInvalidation({
-      activeConversationId: 'conv-1'
-    })).toBe(true);
   });
 
   it('reconciles after reconnect when a stale local turn remains active', () => {

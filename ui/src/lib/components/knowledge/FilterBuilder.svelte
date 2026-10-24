@@ -80,26 +80,26 @@
   {#each drafts as row (row.id)}
     {@const schema = option(row.field)?.schema}
     {@const choices = values(row)}
-    <fieldset class="grid gap-2 rounded-xl border border-slate-800 p-3 sm:grid-cols-[1fr_1fr_2fr_auto]">
+    <fieldset class="grid gap-2 rounded-xl border border-separator p-3 sm:grid-cols-[1fr_1fr_2fr_auto]">
       <legend class="sr-only">Filter</legend>
-      <label class="text-xs text-slate-400">Field<select aria-label="Filter field" class="mt-1 w-full rounded-lg bg-slate-950 p-2" value={row.field}
+      <label class="text-xs text-muted">Field<select aria-label="Filter field" class="mt-1 w-full rounded-lg bg-canvas p-2" value={row.field}
         onchange={(e) => { const field = e.currentTarget.value; const nextSchema = option(field)?.schema; update(row.id, { field, op: operatorsForField(nextSchema)[0] ?? 'eq', raw: '', selected: [] }); void loadFacets(field); }}>
         {#each fieldOptions as item}<option value={item.field}>{item.field}</option>{/each}</select></label>
-      <label class="text-xs text-slate-400">Operator<select aria-label="Filter operator" class="mt-1 w-full rounded-lg bg-slate-950 p-2" value={row.op}
+      <label class="text-xs text-muted">Operator<select aria-label="Filter operator" class="mt-1 w-full rounded-lg bg-canvas p-2" value={row.op}
         onchange={(e) => updateOperator(row.id, e.currentTarget.value)}>
         {#each operatorsForField(schema) as op}<option value={op}>{op}</option>{/each}</select></label>
-      <label class="text-xs text-slate-400">Value
+      <label class="text-xs text-muted">Value
         {#if schema?.type === 'boolean'}
-          <select aria-label="Filter value" class="mt-1 w-full rounded-lg bg-slate-950 p-2" value={row.raw} onchange={(e) => update(row.id, { raw: e.currentTarget.value })}><option value="">Select…</option><option value="true">True</option><option value="false">False</option></select>
+          <select aria-label="Filter value" class="mt-1 w-full rounded-lg bg-canvas p-2" value={row.raw} onchange={(e) => update(row.id, { raw: e.currentTarget.value })}><option value="">Select…</option><option value="true">True</option><option value="false">False</option></select>
         {:else if choices.length > 0 && (row.op === 'in' || row.op === 'overlap')}
-          <select aria-label="Filter values" multiple class="mt-1 min-h-24 w-full rounded-lg bg-slate-950 p-2" onchange={(e) => {
+          <select aria-label="Filter values" multiple class="mt-1 min-h-24 w-full rounded-lg bg-canvas p-2" onchange={(e) => {
             const selected = Array.from(e.currentTarget.selectedOptions).map((o) => o.value);
             update(row.id, { selected, raw: selected.join(', ') });
           }}>
             {#each choices as choice}<option value={String(choice)} selected={row.selected.includes(String(choice))}>{String(choice)}{facets[row.field]?.find((v) => v.value === choice) ? ` (${facets[row.field].find((v) => v.value === choice)?.count})` : ''}</option>{/each}
           </select>
         {:else if choices.length > 0}
-          <select aria-label="Filter value" class="mt-1 w-full rounded-lg bg-slate-950 p-2" value={row.raw} onchange={(e) => update(row.id, { raw: e.currentTarget.value })}><option value="">Select…</option>{#each choices as choice}<option value={String(choice)}>{String(choice)}</option>{/each}</select>
+          <select aria-label="Filter value" class="mt-1 w-full rounded-lg bg-canvas p-2" value={row.raw} onchange={(e) => update(row.id, { raw: e.currentTarget.value })}><option value="">Select…</option>{#each choices as choice}<option value={String(choice)}>{String(choice)}</option>{/each}</select>
         {:else if row.op === 'between'}
           <div class="mt-1 grid grid-cols-2 gap-2"><Input aria-label="Minimum value" value={row.raw.split(',')[0] ?? ''} oninput={(e) => update(row.id, { raw: `${e.currentTarget.value},${row.raw.split(',')[1] ?? ''}` })}/><Input aria-label="Maximum value" value={row.raw.split(',')[1] ?? ''} oninput={(e) => update(row.id, { raw: `${row.raw.split(',')[0] ?? ''},${e.currentTarget.value}` })}/></div>
         {:else}

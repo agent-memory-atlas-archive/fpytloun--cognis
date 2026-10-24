@@ -1,6 +1,7 @@
 name: Executor release assets
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -18,7 +19,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          test "$GITHUB_REF_TYPE" = tag
           version="${RELEASE_TAG#v}"
+          test "$RELEASE_TAG" = "v${version}"
           python3 - "$version" <<'PY'
           import pathlib
           import sys

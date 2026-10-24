@@ -15,7 +15,8 @@ describe('ImageLightbox', () => {
 
     const dialog = screen.getByRole('dialog', { name: 'portrait.png' });
     await waitFor(() => expect(dialog.parentElement).toBe(document.body));
-    expect(screen.getByRole('link', { name: 'Download' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Download portrait.png' })).toBeInTheDocument();
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
     const close = screen.getByRole('button', { name: 'Close image viewer' });
     expect(close).toBeInTheDocument();
     await fireEvent.click(close);

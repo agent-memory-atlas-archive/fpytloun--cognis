@@ -36,7 +36,6 @@ from cognis.store.queries import (
     get_conversation,
     get_schedule,
     list_schedules,
-    list_visible_agents,
     list_workflows,
     update_schedule,
 )
@@ -127,6 +126,12 @@ _BASE_SCHEMA: dict[str, Any] = {
         "workflow_id": {
             "type": "string",
             "description": "Workflow to use for the task (optional).",
+        },
+        "project_id": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": "Project for create or list filtering. On update, omitted preserves it; "
+            "null removes assignment. Use an exact known project ID; never guess.",
         },
         "task_title": {
             "type": "string",
@@ -296,6 +301,7 @@ _DEFINITION_FIELDS = (
     "agent_id",
     "agent_profile_id",
     "workflow_id",
+    "project_id",
     "task_title",
     "task_description",
     "task_priority",
@@ -353,7 +359,7 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
         _operation(
             "list",
             kind=ToolMutationKind.READ,
-            fields=("include_definition",),
+            fields=("include_definition", "project_id"),
             example={"action": "list"},
         ),
         _operation(
@@ -451,6 +457,11 @@ async def handle_schedule_tool(
     agent_id: str | None = None,
 ) -> ToolResult:
     """Handle a schedule management tool call."""
+    from cognis.core.intaris_policy import profile_mutation_error
+
+    profile_error = profile_mutation_error(arguments)
+    if profile_error is not None:
+        return profile_error
     arguments = strip_empty_optional_values(dict(arguments), MANAGE_SCHEDULES_TOOL.parameters)
     action = arguments.get("action", "")
 
@@ -490,7 +501,9 @@ async def _handle_list(
 ) -> ToolResult:
     """List schedules for the current user."""
     async with session_factory() as db:
-        rows = await list_schedules(db, created_by=user_email)
+        rows = await list_schedules(
+            db, created_by=user_email, project_id=arguments.get("project_id")
+        )
 
     if not rows:
         return ToolResult(output="No schedules found.")
@@ -512,6 +525,7 @@ async def _handle_list(
                     "enabled": r.enabled,
                     "agent_id": r.agent_id,
                     "agent_profile_id": getattr(r, "agent_profile_id", None),
+                    "project_id": getattr(r, "project_id", None),
                     "next_fire_at": _iso(r.next_fire_at),
                     "last_run_status": r.last_run_status,
                 }
@@ -599,6 +613,7 @@ async def _handle_create(
             user_email,
             target_agent=target_agent,
             workflow_id=arguments.get("workflow_id"),
+            project_id=arguments.get("project_id"),
         )
         if validation_error is not None:
             return validation_error
@@ -607,6 +622,7 @@ async def _handle_create(
             user_email,
             target_agent=target_agent,
             agent_profile_id=target_agent_profile,
+            project_id=arguments.get("project_id"),
         )
         if profile_error is not None:
             return profile_error
@@ -652,6 +668,7 @@ async def _handle_create(
             agent_profile_id=target_agent_profile,
             workflow_id=arguments.get("workflow_id"),
             task_template=task_template,
+            project_id=arguments.get("project_id"),
             enabled=arguments.get("enabled", True),
             max_concurrent_runs=arguments.get("max_concurrent_runs", 1),
             delete_after_run=arguments.get("delete_after_run", False),
@@ -662,6 +679,7 @@ async def _handle_create(
             interaction_mode_override=arguments.get("interaction_mode_override", "none"),
             next_fire_at=next_fire,
             created_by=user_email,
+            creation_origin="agent_composed",
         )
         await db.commit()
         schedule_id = row.schedule_id
@@ -735,15 +753,19 @@ async def _handle_update(
             if timing_error is not None:
                 return timing_error
             fields.update(timing_fields)
+        if "project_id" in arguments:
+            fields["project_id"] = arguments["project_id"]
 
-        validation_error = await _validate_agent_and_workflow(
-            db,
-            user_email,
-            target_agent=fields.get("agent_id"),
-            workflow_id=fields.get("workflow_id"),
-        )
-        if validation_error is not None:
-            return validation_error
+        if {"agent_id", "project_id", "workflow_id"} & fields.keys():
+            validation_error = await _validate_agent_and_workflow(
+                db,
+                user_email,
+                target_agent=fields.get("agent_id", existing.agent_id),
+                workflow_id=fields.get("workflow_id", existing.workflow_id),
+                project_id=fields.get("project_id", existing.project_id),
+            )
+            if validation_error is not None:
+                return validation_error
         if "agent_id" in fields and "agent_profile_id" not in fields:
             fields["agent_profile_id"] = None
         effective_agent_id = fields.get("agent_id", existing.agent_id)
@@ -752,6 +774,7 @@ async def _handle_update(
             user_email,
             target_agent=effective_agent_id,
             agent_profile_id=fields.get("agent_profile_id"),
+            project_id=fields.get("project_id", existing.project_id),
         )
         if profile_error is not None:
             return profile_error
@@ -776,10 +799,11 @@ async def _handle_update(
             if arguments.get("expected_output") is not None:
                 template["expected_output"] = arguments["expected_output"]
             if "session_policy" in arguments:
-                if arguments["session_policy"] is None:
-                    template.pop("session_policy", None)
-                elif isinstance(arguments["session_policy"], dict):
-                    template["session_policy"] = arguments["session_policy"]
+                from cognis.core.intaris_policy import tool_session_policy
+
+                template["session_policy"] = tool_session_policy(
+                    arguments["session_policy"], template.get("session_policy")
+                )
             if arguments.get("delivery_mode") or arguments.get("delivery_target") is not None:
                 existing_delivery = template.get("delivery")
                 if not isinstance(existing_delivery, dict):
@@ -809,6 +833,7 @@ async def _handle_update(
         if _requires_next_fire_recompute(fields):
             fields["next_fire_at"] = _compute_next_fire_for_update(existing, fields)
 
+        fields["creation_origin"] = "agent_composed"
         row = await update_schedule(db, schedule_id, **fields)
         active_tasks = await count_active_tasks_for_schedule(db, schedule_id)
         output = _schedule_definition_payload(row or existing, active_tasks=active_tasks)
@@ -1102,6 +1127,7 @@ async def _validate_agent_profile(
     *,
     target_agent: str | None,
     agent_profile_id: str | None,
+    project_id: str | None = None,
 ) -> ToolResult | None:
     if agent_profile_id is None:
         return None
@@ -1109,16 +1135,13 @@ async def _validate_agent_profile(
         return ToolResult(
             output="'agent_id' is required when agent_profile_id is set.", is_error=True
         )
-    visible_agents = await list_visible_agents(db, user_email)
-    agent_row = next(
-        (
-            row
-            for row, _grant in visible_agents
-            if row.agent_id == target_agent and getattr(row, "status", "active") == "active"
-        ),
-        None,
-    )
-    if agent_row is None:
+    from cognis.core.project_access import agent_usable_in_project
+    from cognis.store.queries import get_agent
+
+    agent_row = await get_agent(db, target_agent)
+    if agent_row is None or not await agent_usable_in_project(
+        db, agent=agent_row, user_email=user_email, project_id=project_id
+    ):
         return ToolResult(
             output=f"Agent {target_agent} not found or not available to this user.",
             is_error=True,
@@ -1137,14 +1160,35 @@ async def _validate_agent_and_workflow(
     *,
     target_agent: str | None,
     workflow_id: str | None,
+    project_id: str | None = None,
 ) -> ToolResult | None:
+    from cognis.core.project_access import (
+        agent_usable_in_project,
+        resolve_project_role_by_id,
+        role_satisfies,
+    )
+    from cognis.store.queries import get_agent, list_bound_workflow_ids, list_project_workflow_ids
+
+    if workflow_id is not None and workflow_id not in SYSTEM_WORKFLOWS:
+        workflows = await list_workflows(db, owner_email=user_email, include_system=False)
+        if workflow_id not in {row.workflow_id for row in workflows}:
+            return ToolResult(
+                output=f"Workflow {workflow_id} not found or not available to this user.",
+                is_error=True,
+            )
+    if project_id is not None:
+        project, access = await resolve_project_role_by_id(db, project_id, user_email)
+        if project is None or project.status != "active" or not role_satisfies(access.role, "use"):
+            return ToolResult(output="Project not found or not accessible.", is_error=True)
     if target_agent is not None:
-        visible_agents = await list_visible_agents(db, user_email)
-        if target_agent not in {
-            row.agent_id
-            for row, _grant in visible_agents
-            if getattr(row, "status", "active") == "active"
-        }:
+        agent = await get_agent(db, target_agent)
+        if (
+            agent is None
+            or getattr(agent, "status", "active") != "active"
+            or not await agent_usable_in_project(
+                db, agent=agent, user_email=user_email, project_id=project_id
+            )
+        ):
             return ToolResult(
                 output=f"Agent {target_agent} not found or not available to this user.",
                 is_error=True,
@@ -1152,15 +1196,14 @@ async def _validate_agent_and_workflow(
 
     if workflow_id is None:
         return None
+    if workflow_id in set(await list_bound_workflow_ids(db)) and (
+        project_id is None
+        or workflow_id not in set(await list_project_workflow_ids(db, project_id))
+    ):
+        return ToolResult(output="Workflow not available in the selected project.", is_error=True)
     if workflow_id in SYSTEM_WORKFLOWS:
         return None
 
-    workflows = await list_workflows(db, owner_email=user_email, include_system=False)
-    if workflow_id not in {row.workflow_id for row in workflows}:
-        return ToolResult(
-            output=f"Workflow {workflow_id} not found or not available to this user.",
-            is_error=True,
-        )
     return None
 
 

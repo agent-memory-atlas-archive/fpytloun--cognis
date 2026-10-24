@@ -37,6 +37,7 @@
     children: Snippet;
     header?: Snippet;
     dismissible?: boolean;
+    backdropDismissible?: boolean;
     panelId?: string;
     restoreFocusOnClose?: boolean;
   }
@@ -51,6 +52,7 @@
     children,
     header,
     dismissible = true,
+    backdropDismissible = true,
     panelId,
     restoreFocusOnClose = true
   }: Props = $props();
@@ -78,7 +80,7 @@
   $effect(() => {
     if (open) {
       previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
+      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false, root: () => panelEl });
       overlayId = handle.id;
       unregisterOverlay = handle.unregister;
       requestAnimationFrame(() => focusPanel());
@@ -127,7 +129,7 @@
   // --- Drag-to-dismiss (bottom sheet only) --------------------------------
 
   function onPointerDown(event: PointerEvent): void {
-    if (side !== 'bottom' || !dismissible) return;
+    if (side !== 'bottom' || !dismissible || !backdropDismissible || !isTopOverlay(overlayId)) return;
     if (event.pointerType === 'mouse') return;
     dragStartY = event.clientY;
     dragging = true;
@@ -148,7 +150,7 @@
     } catch {
       /* ignore */
     }
-    if (dragOffsetY > 96) {
+    if (dragOffsetY > 96 && dismissible && backdropDismissible && isTopOverlay(overlayId)) {
       onClose();
     } else {
       dragOffsetY = 0;
@@ -184,8 +186,8 @@
          rubber-band-scrolling the page behind when the user drags
          across the dimmed area. -->
     <button
-      class="absolute inset-0 touch-none bg-slate-950/75 backdrop-blur-sm"
-      onclick={dismissible ? onClose : undefined}
+      class="absolute inset-0 touch-none bg-scrim/75 backdrop-blur-sm"
+      onclick={() => { if (dismissible && backdropDismissible && isTopOverlay(overlayId)) onClose(); }}
       type="button"
       aria-label="Dismiss"
       tabindex="-1"
@@ -197,7 +199,7 @@
       bind:this={panelEl}
       tabindex="-1"
       class={cn(
-        'absolute flex flex-col border border-slate-800/80 bg-slate-950 shadow-card',
+        'absolute flex flex-col border border-separator/80 bg-elevated shadow-overlay',
         sideClasses,
         side === 'bottom' ? 'w-full' : '',
         className
@@ -224,17 +226,17 @@
           onpointerup={onPointerUp}
           onpointercancel={onPointerUp}
         >
-          <span aria-hidden="true" class="h-1.5 w-10 rounded-full bg-slate-700"></span>
+          <span aria-hidden="true" class="h-1.5 w-10 rounded-full bg-inset"></span>
         </div>
       {/if}
 
       {#if header}
-        <div class="shrink-0 border-b border-slate-800/80 bg-slate-950 px-5 py-4" data-testid="sheet-header-surface">
+        <div class="shrink-0 border-b border-separator/80 bg-elevated px-5 py-4" data-testid="sheet-header-surface">
           {@render header()}
         </div>
       {/if}
 
-      <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-slate-950 px-5 pb-5 pt-4" data-testid="sheet-content-surface">
+      <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-elevated px-5 pb-5 pt-4" data-testid="sheet-content-surface">
         {@render children()}
       </div>
     </div>

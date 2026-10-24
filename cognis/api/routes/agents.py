@@ -30,6 +30,7 @@ from cognis.api.models import (
     AgentGrantOverrideUpdateRequest,
     AgentGrantResponse,
     AgentGrantUpdateRequest,
+    AgentProjectAssignmentResponse,
     AgentResponse,
     AgentUpdateRequest,
     CursorPage,
@@ -39,22 +40,33 @@ from cognis.core.agent_management import live_agent_profile_references
 from cognis.core.agent_profiles import resolve_agent_profile, validate_agent_profile_configuration
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.json_utils import extract_text_from_response
+from cognis.core.project_access import resolve_project_role
+from cognis.core.system_agent_overrides import (
+    SystemAgentOverrideError,
+    require_overridable_system_agent,
+    require_system_agent,
+    reset_system_agent_override,
+    set_system_agent_disabled,
+    update_system_agent_override,
+)
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition, AgentPermissions, AgentRuntimeProfile
+from cognis.models.agent import AgentDefinition
 from cognis.ownership import normalize_executor_scope
 from cognis.providers.backends import get_backend
 from cognis.providers.memory.policy import memory_backend_descriptors
 from cognis.store.models import Schedule, Task
+from cognis.store.project_queries import (
+    list_agent_project_assignments,
+    list_project_shared_agents_for_user,
+)
 from cognis.store.queries import (
     add_secondary_binding,
     create_agent,
     create_agent_grant,
-    delete_system_agent_override,
     get_agent,
     get_agent_grant,
     get_agent_grant_for_user,
     get_executor_row,
-    get_system_agent_override,
     get_user,
     list_agent_grants,
     list_secondary_bindings,
@@ -64,22 +76,11 @@ from cognis.store.queries import (
     set_secondary_bindings,
     update_agent,
     update_agent_grant,
-    upsert_system_agent_override,
 )
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
-
-_SYSTEM_AGENT_LLM_FIELDS = {
-    "provider_id",
-    "model",
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "reasoning_effort",
-    "fast_mode",
-}
 
 
 @router.get("/memory-backends")
@@ -279,6 +280,7 @@ async def agent_list(
         include_hidden=include_hidden,
         include_system=include_system,
         include_disabled=include_disabled,
+        include_project_shared=True,
     )
     items = [agent_to_response(agent) for agent in agents]
 
@@ -409,7 +411,50 @@ async def agent_detail(request: Request, agent_id: str) -> AgentResponse:
         raise api_exception(404, "not_found", "Agent not found")
     access = await check_agent_access(request, row, required="view")
     apply_agent_access_metadata(row, access)
+    if access.grant is not None and getattr(access.grant, "project_id", None):
+        # Project-only access: report every project that shares this agent.
+        async with request.app.state.session_factory() as session:
+            shared = await list_project_shared_agents_for_user(session, user.email)
+        row.shared_via_project_ids = [  # type: ignore[attr-defined]
+            str(project.project_id)
+            for agent, _assignment, project in shared
+            if agent.agent_id == row.agent_id
+        ]
     return agent_to_response(row)
+
+
+@router.get("/{agent_id}/projects", response_model=list[AgentProjectAssignmentResponse])
+async def agent_projects(request: Request, agent_id: str) -> list[AgentProjectAssignmentResponse]:
+    """Projects the agent is assigned to that the caller can see."""
+
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    await check_agent_access(request, row, required="view")
+    items: list[AgentProjectAssignmentResponse] = []
+    async with request.app.state.session_factory() as session:
+        for assignment, project in await list_agent_project_assignments(session, agent_id):
+            resolution = await resolve_project_role(session, project, user.email)
+            if resolution.role is None:
+                continue
+            items.append(
+                AgentProjectAssignmentResponse(
+                    project_id=project.project_id,
+                    project_name=project.name,
+                    project_avatar_url=(
+                        f"/api/v1/images/{project.avatar_image_id}"
+                        if project.avatar_image_id
+                        else project.avatar_url
+                    ),
+                    project_status=project.status,
+                    is_default=bool(assignment.is_default),
+                    executor_scope=normalize_executor_scope(str(assignment.executor_scope)),
+                    caller_role=resolution.role,
+                )
+            )
+    return items
 
 
 @router.put("/{agent_id}", response_model=AgentResponse)
@@ -431,6 +476,13 @@ async def update_agent_route(
         await check_agent_access(request, row, required="edit")
         previous_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
         updates = payload.model_dump(exclude_unset=True)
+        if isinstance(updates.get("capabilities"), dict):
+            updates["capabilities"].setdefault(
+                "intaris_evaluation", previous_definition.capabilities.intaris_evaluation
+            )
+            updates["capabilities"].setdefault(
+                "approval_mode", previous_definition.capabilities.approval_mode
+            )
         profile_fields = {"name", "display_name", "avatar_image_id"}
         identity_fields = {"system_prompt", "personality"}
         profile_changed = bool(profile_fields & updates.keys())
@@ -544,170 +596,30 @@ async def _update_system_agent_route(
     payload: AgentUpdateRequest,
 ) -> AgentResponse:
     user = require_current_user(request)
-    base = request.app.state.agent_registry.get_system_agent(agent_id)
-    if base is None:
-        raise api_exception(404, "not_found", "Agent not found")
-    if not base.allow_user_override:
-        raise api_exception(403, "forbidden", "This system agent cannot be overridden")
-
-    updates = payload.model_dump(exclude_unset=True)
-    allowed_top_level = {
-        "llm_config",
-        "skills",
-        "tools",
-        "permissions",
-        "agent_profiles",
-        "default_agent_profile_id",
-    }
-    forbidden = sorted(key for key in updates if key not in allowed_top_level)
-    if forbidden:
-        raise api_exception(
-            403,
-            "forbidden",
-            f"System agent overrides only allow runtime tuning fields: {', '.join(forbidden)}",
-        )
-
-    raw_llm = updates.get("llm_config")
-    llm_override = raw_llm if isinstance(raw_llm, dict) else {}
-    invalid_llm = sorted(key for key in llm_override if key not in _SYSTEM_AGENT_LLM_FIELDS)
-    if invalid_llm:
-        raise api_exception(
-            403,
-            "forbidden",
-            f"Unsupported system agent override fields: {', '.join(invalid_llm)}",
-        )
-
-    raw_skills = updates.get("skills")
-    if raw_skills is not None and not isinstance(raw_skills, dict):
-        raise api_exception(403, "forbidden", "System agent skill overrides must be an object")
-    raw_tools = updates.get("tools")
-    if raw_tools is not None and not isinstance(raw_tools, dict):
-        raise api_exception(403, "forbidden", "System agent tool overrides must be an object")
-    raw_permissions = updates.get("permissions")
-    if raw_permissions is not None and not isinstance(raw_permissions, dict):
-        raise api_exception(403, "forbidden", "System agent permission overrides must be an object")
-    if isinstance(raw_permissions, dict):
-        try:
-            AgentPermissions.model_validate(raw_permissions)
-        except ValidationError as exc:
-            raise api_exception(400, "validation_error", str(exc)) from exc
-
-    raw_profiles = updates.get("agent_profiles")
-    profiles_override: dict[str, dict[str, Any]] | None = None
-    if raw_profiles is not None:
-        if not isinstance(raw_profiles, dict):
-            raise api_exception(
-                403, "forbidden", "System agent runtime profile overrides must be an object"
+    try:
+        base = require_overridable_system_agent(agent_id)
+        async with request.app.state.session_factory() as session:
+            await update_system_agent_override(
+                session,
+                base=base,
+                owner_email=user.email,
+                updates=payload.model_dump(exclude_unset=True),
             )
-        for profile_id in raw_profiles:
-            if (
-                not isinstance(profile_id, str)
-                or not profile_id.strip()
-                or profile_id != profile_id.strip()
-                or "/" in profile_id
-            ):
-                raise api_exception(
-                    400,
-                    "validation_error",
-                    "Runtime profile keys must be non-empty, trimmed, and must not contain '/'",
-                )
-        try:
-            profiles_override = {
-                profile_id: AgentRuntimeProfile.model_validate(profile).model_dump(
-                    mode="json", exclude_none=True
-                )
-                for profile_id, profile in raw_profiles.items()
-            }
-        except ValidationError as exc:
-            raise api_exception(400, "validation_error", str(exc)) from exc
-        for profile_id, profile in profiles_override.items():
-            embedded_id = profile.get("profile_id")
-            if embedded_id is not None and embedded_id != profile_id:
-                raise api_exception(
-                    400,
-                    "validation_error",
-                    (
-                        f"Runtime profile key '{profile_id}' does not match embedded "
-                        f"profile_id '{embedded_id}'"
-                    ),
-                )
+            await session.commit()
+    except SystemAgentOverrideError as exc:
+        raise _system_override_exception(exc) from exc
+    return await _effective_system_agent_response(request, agent_id, user.email)
 
-    raw_default_profile_id = updates.get("default_agent_profile_id")
-    default_profile_override = (
-        raw_default_profile_id.strip()
-        if isinstance(raw_default_profile_id, str) and raw_default_profile_id.strip()
-        else None
-    )
-    if default_profile_override and "/" in default_profile_override:
-        raise api_exception(
-            400, "validation_error", "default_agent_profile_id must not contain '/'"
-        )
 
-    async with request.app.state.session_factory() as session:
-        existing = await get_system_agent_override(
-            session, owner_email=user.email, agent_id=agent_id
-        )
-        llm_override_to_store = (
-            (llm_override or None)
-            if "llm_config" in updates
-            else (existing.llm_config_override if existing else None)
-        )
-        skills_override_to_store = (
-            (raw_skills if isinstance(raw_skills, dict) else None)
-            if "skills" in updates
-            else (existing.skills_override if existing else None)
-        )
-        tools_override_to_store = (
-            (raw_tools if isinstance(raw_tools, dict) else None)
-            if "tools" in updates
-            else (existing.tools_override if existing else None)
-        )
-        permissions_override_to_store = (
-            (raw_permissions if isinstance(raw_permissions, dict) else None)
-            if "permissions" in updates
-            else (existing.permissions_override if existing else None)
-        )
-        profiles_override_to_store = (
-            profiles_override
-            if "agent_profiles" in updates
-            else (existing.agent_profiles_override if existing else None)
-        )
-        default_profile_override_to_store = (
-            default_profile_override
-            if "default_agent_profile_id" in updates
-            else (existing.default_agent_profile_id_override if existing else None)
-        )
-        candidate_profiles = (
-            profiles_override_to_store
-            if isinstance(profiles_override_to_store, dict)
-            else {
-                profile_id: profile.model_dump(mode="json", exclude_none=True)
-                for profile_id, profile in base.agent_profiles.items()
-            }
-        )
-        candidate_default = default_profile_override_to_store or base.default_agent_profile_id
-        if candidate_default and candidate_default not in candidate_profiles:
-            raise api_exception(
-                400,
-                "validation_error",
-                f"Default runtime profile '{candidate_default}' is not defined",
-            )
-        await upsert_system_agent_override(
-            session,
-            owner_email=user.email,
-            agent_id=agent_id,
-            llm_config_override=llm_override_to_store,
-            skills_override=skills_override_to_store,
-            tools_override=tools_override_to_store,
-            permissions_override=permissions_override_to_store,
-            execution_override=None,
-            agent_profiles_override=profiles_override_to_store,
-            default_agent_profile_id_override=default_profile_override_to_store,
-        )
-        await session.commit()
+def _system_override_exception(exc: SystemAgentOverrideError) -> Exception:
+    return api_exception(exc.status_code, exc.code, str(exc))
 
+
+async def _effective_system_agent_response(
+    request: Request, agent_id: str, owner_email: str
+) -> AgentResponse:
     agent = await request.app.state.agent_registry.get(
-        agent_id, owner_email=user.email, include_disabled=True
+        agent_id, owner_email=owner_email, include_disabled=True
     )
     assert agent is not None
     return agent_to_response(agent)
@@ -819,83 +731,41 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
 async def reset_system_agent_overrides(request: Request, agent_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
-    base = request.app.state.agent_registry.get_system_agent(agent_id)
-    if base is None:
-        raise api_exception(404, "not_found", "Agent not found")
-    async with request.app.state.session_factory() as session:
-        ok = await delete_system_agent_override(session, owner_email=user.email, agent_id=agent_id)
-        await session.commit()
+    try:
+        base = require_system_agent(agent_id)
+        async with request.app.state.session_factory() as session:
+            ok = await reset_system_agent_override(session, base=base, owner_email=user.email)
+            await session.commit()
+    except SystemAgentOverrideError as exc:
+        raise _system_override_exception(exc) from exc
     return {"ok": ok}
+
+
+async def _set_system_agent_disabled_route(
+    request: Request, agent_id: str, *, disabled: bool
+) -> AgentResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    try:
+        base = require_system_agent(agent_id)
+        async with request.app.state.session_factory() as session:
+            await set_system_agent_disabled(
+                session, base=base, owner_email=user.email, disabled=disabled
+            )
+            await session.commit()
+    except SystemAgentOverrideError as exc:
+        raise _system_override_exception(exc) from exc
+    return await _effective_system_agent_response(request, agent_id, user.email)
 
 
 @router.post("/{agent_id}/disable", response_model=AgentResponse)
 async def disable_system_agent(request: Request, agent_id: str) -> AgentResponse:
-    forbid_mutation_for_viewer(request)
-    user = require_current_user(request)
-    base = request.app.state.agent_registry.get_system_agent(agent_id)
-    if base is None:
-        raise api_exception(404, "not_found", "Agent not found")
-    if not base.allow_user_disable:
-        raise api_exception(403, "forbidden", "This system agent cannot be disabled")
-    async with request.app.state.session_factory() as session:
-        existing = await get_system_agent_override(
-            session, owner_email=user.email, agent_id=agent_id
-        )
-        await upsert_system_agent_override(
-            session,
-            owner_email=user.email,
-            agent_id=agent_id,
-            disabled=True,
-            llm_config_override=(existing.llm_config_override if existing else None),
-            skills_override=(existing.skills_override if existing else None),
-            tools_override=(existing.tools_override if existing else None),
-            permissions_override=(existing.permissions_override if existing else None),
-            execution_override=(existing.execution_override if existing else None),
-            agent_profiles_override=(existing.agent_profiles_override if existing else None),
-            default_agent_profile_id_override=(
-                existing.default_agent_profile_id_override if existing else None
-            ),
-        )
-        await session.commit()
-    agent = await request.app.state.agent_registry.get(
-        agent_id, owner_email=user.email, include_disabled=True
-    )
-    assert agent is not None
-    return agent_to_response(agent)
+    return await _set_system_agent_disabled_route(request, agent_id, disabled=True)
 
 
 @router.post("/{agent_id}/enable", response_model=AgentResponse)
 async def enable_system_agent(request: Request, agent_id: str) -> AgentResponse:
-    forbid_mutation_for_viewer(request)
-    user = require_current_user(request)
-    base = request.app.state.agent_registry.get_system_agent(agent_id)
-    if base is None:
-        raise api_exception(404, "not_found", "Agent not found")
-    async with request.app.state.session_factory() as session:
-        existing = await get_system_agent_override(
-            session, owner_email=user.email, agent_id=agent_id
-        )
-        await upsert_system_agent_override(
-            session,
-            owner_email=user.email,
-            agent_id=agent_id,
-            disabled=False,
-            llm_config_override=(existing.llm_config_override if existing else None),
-            skills_override=(existing.skills_override if existing else None),
-            tools_override=(existing.tools_override if existing else None),
-            permissions_override=(existing.permissions_override if existing else None),
-            execution_override=(existing.execution_override if existing else None),
-            agent_profiles_override=(existing.agent_profiles_override if existing else None),
-            default_agent_profile_id_override=(
-                existing.default_agent_profile_id_override if existing else None
-            ),
-        )
-        await session.commit()
-    agent = await request.app.state.agent_registry.get(
-        agent_id, owner_email=user.email, include_disabled=True
-    )
-    assert agent is not None
-    return agent_to_response(agent)
+    return await _set_system_agent_disabled_route(request, agent_id, disabled=False)
 
 
 @router.post("/{agent_id}/activate", response_model=AgentResponse)
@@ -1277,7 +1147,14 @@ async def create_agent_share(
 ) -> AgentGrantResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    from typing import Literal
+
+    from cognis.core.inbox import stage_share_notification
+
     async with request.app.state.session_factory() as session:
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(session, resource_type="agent", resource_id=agent_id)
         agent = await get_agent(session, agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
@@ -1290,6 +1167,13 @@ async def create_agent_share(
         if grantee is None:
             raise api_exception(404, "not_found", "Grantee user not found")
         existing = await get_agent_grant_for_user(session, agent_id, str(payload.grantee_email))
+        change: Literal["shared", "updated"] | None = (
+            "shared"
+            if existing is None or existing.revoked_at is not None
+            else "updated"
+            if existing.executor_scope != payload.executor_scope
+            else None
+        )
         if existing is not None:
             row = await update_agent_grant(
                 session,
@@ -1313,7 +1197,21 @@ async def create_agent_share(
                 granted_by=user.email,
                 note=payload.note,
             )
+        notice = (
+            stage_share_notification(
+                session,
+                recipient=str(payload.grantee_email),
+                actor=user.email,
+                resource_type="agent",
+                resource_id=agent_id,
+                resource_name=agent.name,
+                change=change,
+            )
+            if change
+            else None
+        )
         await session.commit()
+    await request.app.state.inbox_service.publish(notice)
     return _grant_to_response(row)
 
 
@@ -1325,7 +1223,12 @@ async def update_agent_share(
     payload: AgentGrantUpdateRequest,
 ) -> AgentGrantResponse:
     forbid_mutation_for_viewer(request)
+    from cognis.core.inbox import stage_share_notification
+
     async with request.app.state.session_factory() as session:
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(session, resource_type="agent", resource_id=agent_id)
         agent = await get_agent(session, agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
@@ -1333,6 +1236,9 @@ async def update_agent_share(
         row = await get_agent_grant(session, grant_id)
         if row is None or row.agent_id != agent_id or row.revoked_at is not None:
             raise api_exception(404, "not_found", "Grant not found")
+        changed = (
+            payload.executor_scope is not None and row.executor_scope != payload.executor_scope
+        )
         updated = await update_agent_grant(
             session,
             grant_id,
@@ -1343,14 +1249,33 @@ async def update_agent_share(
             ),
         )
         assert updated is not None
+        notice = (
+            stage_share_notification(
+                session,
+                recipient=row.grantee_user_email,
+                actor=require_current_user(request).email,
+                resource_type="agent",
+                resource_id=agent_id,
+                resource_name=agent.name,
+                change="updated",
+            )
+            if changed
+            else None
+        )
         await session.commit()
+    await request.app.state.inbox_service.publish(notice)
     return _grant_to_response(updated)
 
 
 @router.delete("/{agent_id}/shares/{grant_id}", response_model=dict)
 async def revoke_agent_share(request: Request, agent_id: str, grant_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
+    from cognis.core.inbox import stage_share_notification
+
     async with request.app.state.session_factory() as session:
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(session, resource_type="agent", resource_id=agent_id)
         agent = await get_agent(session, agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
@@ -1391,7 +1316,17 @@ async def revoke_agent_share(request: Request, agent_id: str, grant_id: str) -> 
                 if not task.result_summary:
                     task.result_summary = "Access to the shared agent was revoked."
 
+        notice = stage_share_notification(
+            session,
+            recipient=grantee_email,
+            actor=require_current_user(request).email,
+            resource_type="agent",
+            resource_id=agent_id,
+            resource_name=agent.name,
+            change="revoked",
+        )
         await session.commit()
+    await request.app.state.inbox_service.publish(notice)
     task_queue = getattr(request.app.state, "task_queue", None)
     if task_queue is not None:
         for task_id in running_task_ids:

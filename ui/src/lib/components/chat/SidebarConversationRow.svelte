@@ -1,5 +1,6 @@
 <script lang="ts">
   import Star from 'lucide-svelte/icons/star';
+  import ConversationProjectBadge from '$lib/components/projects/ConversationProjectBadge.svelte';
 
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
@@ -29,6 +30,8 @@
     onNavigate: () => void;
     onToggleStar: (event: MouseEvent) => void;
     onOpenAttention: (action: AttentionActionSummary, origin: HTMLElement) => void;
+    selectedProjectId?: string;
+    onToggleProject?: (projectId: string) => void;
   }
 
   let {
@@ -49,6 +52,8 @@
     onNavigate,
     onToggleStar,
     onOpenAttention,
+    selectedProjectId = '',
+    onToggleProject,
   }: Props = $props();
 
   function openAttention(event: MouseEvent, action: AttentionActionSummary): void {
@@ -64,7 +69,7 @@
       <button
         type="button"
         aria-label={`${action.title} for ${conversation.title ?? 'conversation'}`}
-        class={`shrink-0 rounded-lg border border-amber-400/40 bg-amber-400/10 font-medium text-amber-100 hover:bg-amber-400/20 ${denseMode ? 'px-1.5 py-1 text-[10px]' : 'px-2 py-1.5 text-xs'}`}
+        class={`shrink-0 rounded-lg border border-warning-border bg-warning-subtle font-medium text-warning hover:bg-surface-hover ${denseMode ? 'px-1.5 py-1 text-[10px]' : 'px-2 py-1.5 text-xs'}`}
         data-testid={`sidebar-attention-${action.action_id}`}
         onclick={(event) => openAttention(event, action)}
       >{action.title}</button>
@@ -78,20 +83,17 @@
       todos={todoProgress}
       size="sm"
       placement="bottom-right"
-      class="text-emerald-300"
+      class="text-success"
       label="Conversation todo progress"
     />
   {/if}
 {/snippet}
 
-{#snippet rowIndicators(todoFirst: boolean)}
-  {#if todoFirst}
-    {@render todoIndicator()}
-  {/if}
-  {#if canStar}
+{#snippet starIndicator()}
+  {#if canStar && !conversation.is_readonly_for_caller && (active || conversation.starred_at)}
     <button
       aria-label={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-      class={`rounded-lg p-1 transition hover:bg-slate-800 ${conversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-600 hover:text-slate-200'}`}
+      class={`rounded-lg p-1 transition hover:bg-surface-hover ${conversation.starred_at ? 'text-orange-tone' : 'text-quiet hover:text-foreground'}`}
       disabled={starBusy}
       onclick={onToggleStar}
       title={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
@@ -99,31 +101,33 @@
     >
       <Star class={`h-4 w-4 ${conversation.starred_at ? 'fill-current' : ''}`} />
     </button>
-  {/if}
-  {#if !todoFirst}
-    {@render todoIndicator()}
+  {:else if canStar && !conversation.is_readonly_for_caller}
+    <!-- Reserve the button's geometry without an invisible interactive target. -->
+    <span class="pointer-events-none block h-6 w-6 shrink-0" aria-hidden="true"></span>
   {/if}
 {/snippet}
 
 <div
-  class={`group flex min-w-0 items-center rounded-xl transition ${dense ? 'gap-2 px-2 py-1.5' : 'gap-2 px-2 py-2'} ${active ? 'bg-sky-500/15 text-white' : waitingReason ? 'border border-amber-500/20 bg-amber-500/5 text-slate-200 hover:border-amber-400/40' : 'text-slate-200 hover:bg-slate-900/60'}`}
+  class={`group flex min-w-0 items-center rounded-xl transition ${dense ? 'gap-2 px-2 py-1.5' : 'gap-2 px-2 py-2'} ${active ? 'bg-accent-subtle text-strong' : waitingReason ? 'border border-warning-border bg-warning-subtle text-foreground hover:border-border-strong' : 'text-foreground hover:bg-surface-hover'}`}
   data-testid={`sidebar-conversation-row-${conversation.conversation_id}`}
 >
   {#if dense}
     <a class="flex min-w-0 flex-1 items-center gap-2" {href} onclick={onNavigate} title={conversation.title ?? 'Untitled conversation'}>
       <ActivityAvatar
-        name={agentName}
-        avatarUrl={agentAvatarUrl}
+        name={conversation.agent_display_name ?? agentName}
+        avatarUrl={conversation.agent_avatar_url ?? agentAvatarUrl}
         state={avatarState}
         class="h-7 w-7 shrink-0"
       />
-      <p class={`min-w-0 overflow-x-auto whitespace-nowrap text-xs [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${unread ? 'font-semibold text-white' : 'font-medium text-white'}`}>
+      <p class={`min-w-0 overflow-x-auto whitespace-nowrap text-xs [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${unread ? 'font-semibold text-strong' : 'font-medium text-strong'}`}>
         {conversation.title ?? 'Untitled conversation'}
       </p>
     </a>
     {@render attentionActions(true)}
     <div class="relative z-10 flex shrink-0 items-center gap-0.5" data-testid="sidebar-dense-indicators">
-      {@render rowIndicators(true)}
+      <ConversationProjectBadge {conversation} selected={selectedProjectId === conversation.project_id} onToggle={onToggleProject && conversation.project_id ? () => onToggleProject?.(conversation.project_id!) : undefined} />
+      {@render todoIndicator()}
+      {@render starIndicator()}
     </div>
   {:else}
     <a
@@ -133,32 +137,40 @@
       title={conversation.title ?? 'Untitled conversation'}
     >
     <ActivityAvatar
-      name={agentName}
-      avatarUrl={agentAvatarUrl}
+      name={conversation.agent_display_name ?? agentName}
+      avatarUrl={conversation.agent_avatar_url ?? agentAvatarUrl}
       state={avatarState}
       class="h-8 w-8 shrink-0"
     />
     <div class="min-w-0 flex-1">
       <p
-        class={`line-clamp-2 break-words text-sm leading-5 ${unread ? 'font-semibold text-white' : 'font-medium text-white'}`}
+        class={`line-clamp-2 break-words text-sm leading-5 ${unread ? 'font-semibold text-strong' : 'font-medium text-strong'}`}
       >{conversation.title ?? 'Untitled conversation'}</p>
       {#if contextBadge || waitingReason}
       <div class="mt-0.5 flex items-center gap-2">
         {#if contextBadge}
-          <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-slate-500">
+          <span class="shrink-0 rounded-full border border-control-border bg-raised/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-quiet">
             {contextBadge}
           </span>
         {/if}
         {#if waitingReason}
-          <span class="truncate text-xs text-amber-200">{waitingReason}</span>
+          <span class="truncate text-xs text-warning">{waitingReason}</span>
         {/if}
       </div>
       {/if}
     </div>
     </a>
     {@render attentionActions(false)}
-    <div class="relative z-10 flex shrink-0 flex-col items-center justify-center gap-1">
-      {@render rowIndicators(false)}
+    <div class="relative z-10 grid shrink-0 grid-cols-[auto_minmax(1.5rem,auto)] items-center gap-0.5" data-testid="sidebar-row-indicators">
+      <div class="col-start-2 row-start-1 flex justify-center">
+        <ConversationProjectBadge {conversation} selected={selectedProjectId === conversation.project_id} onToggle={onToggleProject && conversation.project_id ? () => onToggleProject?.(conversation.project_id!) : undefined} />
+      </div>
+      <div class="col-start-1 row-start-2 flex justify-center">
+        {@render todoIndicator()}
+      </div>
+      <div class="col-start-2 row-start-2 flex justify-center">
+        {@render starIndicator()}
+      </div>
     </div>
   {/if}
 </div>

@@ -58,26 +58,26 @@
 </script>
 
 {#if todos.length > 0}
-  <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
+  <div class="rounded-xl border border-separator bg-surface/40">
     <button
-      class="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm transition hover:bg-slate-800/40"
+      class="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm transition hover:bg-surface-hover"
       onclick={() => { open = !open; }}
       type="button"
     >
-      <span class="scrollbar-hidden-x min-w-0 text-slate-300">
-        <span class="font-medium text-slate-200">Todos</span>
-        <span class="text-slate-500"> · {activeTodos.length} active{#if todoCounts.inProgress > 0} · {todoCounts.inProgress} in progress{/if}{#if todoCounts.pending > 0} · {todoCounts.pending} pending{/if}</span>
+      <span class="scrollbar-hidden-x min-w-0 text-secondary">
+        <span class="font-medium text-foreground">Todos</span>
+        <span class="text-quiet"> · {activeTodos.length} active{#if todoCounts.inProgress > 0} · {todoCounts.inProgress} in progress{/if}{#if todoCounts.pending > 0} · {todoCounts.pending} pending{/if}</span>
       </span>
       {#if open}
-        <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        <ChevronUp class="h-3.5 w-3.5 shrink-0 text-quiet" />
       {:else}
-        <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        <ChevronDown class="h-3.5 w-3.5 shrink-0 text-quiet" />
       {/if}
     </button>
     {#if open}
-      <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
+      <ul class="divide-y divide-separator border-t border-separator">
         {#each todos as todo}
-          <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
+          <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-foreground">
             <TodoStatusDot status={todo.status} />
             <span class="scrollbar-hidden-x min-w-0 flex-1">{todo.content}</span>
           </li>

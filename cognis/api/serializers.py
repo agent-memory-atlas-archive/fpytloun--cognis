@@ -19,6 +19,7 @@ from cognis.api.models import (
     MCPServerResponse,
     MessageEventResponse,
     PendingPauseResponse,
+    ProjectAgentResponse,
     ProjectGrantResponse,
     ProjectResponse,
     ProjectSourceResponse,
@@ -37,12 +38,16 @@ from cognis.api.models import (
     WorkflowRunResponse,
 )
 from cognis.core.anchored_output import markdown_heading_anchors
+from cognis.core.event_timestamps import history_event_timestamp
 from cognis.core.managed_conversations import project_managed_conversation_state
+from cognis.core.project_access import normalize_project_role, project_assignment_refusal
+from cognis.core.questions import user_visible_workflow_state
 from cognis.logging import get_logger
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskModel
 from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
+from cognis.ownership import normalize_executor_scope
 from cognis.providers.llm.fast_mode import enrich_fast_mode
 from cognis.providers.llm.reasoning import enrich_model_entry
 
@@ -119,6 +124,7 @@ def conversation_to_response(
     conversation_state: ConversationStateEnvelope | None = None,
     managed_link: Any | None = None,
     root_controller_conversation_id: str | None = None,
+    viewer_email: str | None = None,
 ) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
@@ -136,12 +142,15 @@ def conversation_to_response(
         if managed_link is not None
         else None
     )
-    return ConversationResponse(
+    response = ConversationResponse(
         conversation_id=row.conversation_id,
         user_email=row.user_email,
         agent_id=row.agent_id,
         agent_profile_id=getattr(row, "agent_profile_id", None),
         project_id=getattr(row, "project_id", None),
+        visibility=str(getattr(row, "visibility", None) or "private"),
+        is_readonly_for_caller=viewer_email is not None and viewer_email != row.user_email,
+        project_assignable=project_assignment_refusal(row) is None,
         title=row.title,
         title_source=getattr(row, "title_source", "unset"),
         context=ConversationContextModel(
@@ -228,6 +237,34 @@ def conversation_to_response(
         updated_at=getattr(row, "updated_at", None),
         conversation_state=conversation_state,
     )
+    if response.is_readonly_for_caller:
+        for field in (
+            "active_session_id",
+            "active_executor_id",
+            "active_executor_assigned_at",
+            "active_executor_expires_at",
+            "active_executor_source",
+            "active_session_status",
+            "active_session_completion_reason",
+            "active_session_updated_at",
+            "active_turn_chat_mode",
+            "active_turn_chat_mode_source",
+            "starred_at",
+            "last_read_at",
+            "managed_agent",
+            "root_controller_conversation_id",
+            "conversation_state",
+        ):
+            setattr(response, field, None)
+        response.has_unread = False
+        response.has_active_turn = False
+        response.pending_notification_types = []
+        response.attention_actions = []
+        response.project_assignable = False
+        response.context.ref = None
+        response.context.platform_data = {}
+        response.context.memory_labels = {}
+    return response
 
 
 def session_to_response(row: Any, *, include_result_content: bool = False) -> SessionResponse:
@@ -340,10 +377,35 @@ def agent_to_response(row: Any) -> AgentResponse:
         granted_permission=getattr(row, "granted_permission", None),
         executor_scope=getattr(row, "executor_scope", None),
         is_readonly_for_caller=bool(getattr(row, "is_readonly_for_caller", False)),
+        shared_via_project_ids=list(getattr(row, "shared_via_project_ids", None) or []),
         sync_metadata=sync_metadata if sync_metadata else None,
         status=row.status,
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
+    )
+
+
+def project_agent_to_response(
+    assignment: Any, agent: Any, *, viewer_email: str | None = None
+) -> ProjectAgentResponse:
+    return ProjectAgentResponse(
+        project_id=assignment.project_id,
+        agent_id=assignment.agent_id,
+        agent_name=str(agent.name),
+        agent_display_name=getattr(agent, "display_name", None),
+        agent_description=getattr(agent, "description", None),
+        agent_avatar_url=(
+            f"/api/v1/images/{agent.avatar_image_id}"
+            if getattr(agent, "avatar_image_id", None)
+            else getattr(agent, "avatar_url", None)
+        ),
+        agent_owner_email=str(agent.owner_email),
+        is_default=bool(assignment.is_default),
+        executor_scope=normalize_executor_scope(str(assignment.executor_scope)),
+        added_by=str(assignment.added_by),
+        is_owned_by_caller=viewer_email is not None and viewer_email == agent.owner_email,
+        created_at=getattr(assignment, "created_at", None),
+        updated_at=getattr(assignment, "updated_at", None),
     )
 
 
@@ -370,7 +432,7 @@ def project_grant_to_response(row: Any) -> ProjectGrantResponse:
         grantee_type=row.grantee_type,
         grantee_user_email=row.grantee_user_email,
         grantee_group_id=row.grantee_group_id,
-        permission=row.permission,
+        permission=normalize_project_role(row.permission) or str(row.permission),
         granted_by=row.granted_by,
         granted_at=row.granted_at,
         revoked_at=row.revoked_at,
@@ -385,8 +447,12 @@ def project_to_response(
     workflow_ids: list[str] | None = None,
     active_schedule_count: int = 0,
     grants: list[Any] | None = None,
+    agents: list[ProjectAgentResponse] | None = None,
 ) -> ProjectResponse:
+    from cognis.core.project_identity import project_color
+
     return ProjectResponse(
+        color=project_color(row.project_id, getattr(row, "metadata_json", None)),
         project_id=row.project_id,
         owner_email=row.owner_email,
         name=row.name,
@@ -405,9 +471,11 @@ def project_to_response(
         workflow_ids=workflow_ids or [],
         active_schedule_count=active_schedule_count,
         grants=[project_grant_to_response(grant) for grant in grants or []],
+        agents=agents or [],
         is_shared_with_me=bool(getattr(row, "is_shared_with_me", False)),
         shared_by_email=getattr(row, "shared_by_email", None),
         granted_permission=getattr(row, "granted_permission", None),
+        caller_role=getattr(row, "caller_role", None),
         is_readonly_for_caller=bool(getattr(row, "is_readonly_for_caller", False)),
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
@@ -438,6 +506,8 @@ def setting_to_response(row: Any, spec: Any | None = None) -> SettingResponse:
 
 
 def llm_provider_to_response(row: Any) -> LLMProviderResponse:
+    from cognis.providers.llm.cache_policy import supported_cache_ttls
+
     config = dict(row.config or {})
     last_test = getattr(row, "last_test", None)
     preset = str(config.get("preset", "") or "").lower()
@@ -446,11 +516,17 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
     if isinstance(raw_models, list):
         for entry in raw_models:
             if isinstance(entry, dict):
-                enriched_models.append(
-                    enrich_fast_mode(
-                        enrich_model_entry(dict(entry), provider_preset=preset), preset, config
-                    )
+                enriched = enrich_fast_mode(
+                    enrich_model_entry(dict(entry), provider_preset=preset), preset, config
                 )
+                enriched["supported_cache_ttls"] = supported_cache_ttls(
+                    str(enriched.get("model_id", "")),
+                    preset,
+                    bool(enriched.get("supports_prompt_caching")),
+                )
+                enriched.setdefault("primary_cache_ttl", "1h")
+                enriched.setdefault("auxiliary_cache_ttl", "5m")
+                enriched_models.append(enriched)
             else:
                 enriched_models.append(entry)
     return LLMProviderResponse(
@@ -494,7 +570,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         attempt_number=task.attempt_number,
         workspace_root=task.workspace_root,
         working_directory=task.working_directory,
-        workflow_state=task.workflow_state,
+        workflow_state=user_visible_workflow_state(task.workflow_state),
         queue_name=task.queue_name,
         scheduled_for=task.scheduled_for,
         created_at=task.created_at,
@@ -551,11 +627,27 @@ def task_comment_to_response(row: Any) -> TaskCommentResponse:
     )
 
 
-def deliverable_to_response(row: Any, *, include_rich_payload: bool = True) -> DeliverableResponse:
+def deliverable_to_response(
+    row: Any,
+    *,
+    include_rich_payload: bool = True,
+    lineage: Any | None = None,
+) -> DeliverableResponse:
+    """Serialize a deliverable row; ``lineage`` adds latest-revision facts."""
+
     from cognis.models.deliverable import rich_payload_for_projection
 
     rich_payload = _coerce_dict_or_none(getattr(row, "rich_payload", None))
     return DeliverableResponse(
+        lineage_id=getattr(row, "lineage_id", None) or row.deliverable_id,
+        revision=getattr(row, "revision", None) or 1,
+        supersedes_deliverable_id=getattr(row, "supersedes_deliverable_id", None),
+        latest_deliverable_id=lineage.latest_deliverable_id if lineage is not None else None,
+        latest_revision=lineage.latest_revision if lineage is not None else None,
+        revision_count=lineage.revision_count if lineage is not None else None,
+        is_latest=(
+            lineage.latest_deliverable_id == row.deliverable_id if lineage is not None else None
+        ),
         deliverable_id=row.deliverable_id,
         step_run_id=row.step_run_id,
         conversation_id=getattr(row, "conversation_id", None),
@@ -723,7 +815,7 @@ def workflow_run_to_response(
         workflow_id=task.workflow_id,
         project_id=task.project_id,
         attempt_number=task.attempt_number,
-        workflow_state=task.workflow_state,
+        workflow_state=user_visible_workflow_state(task.workflow_state),
         current_step_name=current_step_name,
         pending_pause=pending_pause,
     )
@@ -809,7 +901,7 @@ def event_to_response(row: Mapping[str, Any]) -> MessageEventResponse:
         seq=row.get("seq"),
         type=str(row.get("type", "")),
         data=normalized_data,
-        timestamp=row.get("ts") or row.get("timestamp"),
+        timestamp=history_event_timestamp(normalized_data, row.get("ts") or row.get("timestamp")),
     )
 
 

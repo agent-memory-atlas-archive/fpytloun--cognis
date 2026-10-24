@@ -33,26 +33,26 @@
 
 <div class="space-y-3">
   <div class="flex items-center justify-between gap-3">
-    <span class="text-sm text-slate-200">{title}</span>
+    <span class="text-sm text-foreground">{title}</span>
     <Button size="sm" variant="secondary" type="button" onclick={addRow}>{addLabel}</Button>
   </div>
 
   {#if envVars.length === 0}
-    <div class="rounded-2xl border border-slate-800 bg-slate-950/40 px-4 py-3 text-sm text-slate-400">
+    <div class="rounded-2xl border border-separator bg-canvas/40 px-4 py-3 text-sm text-muted">
       {emptyMessage}
     </div>
   {/if}
 
   {#each envVars as entry, index}
-    <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 space-y-3">
+    <div class="rounded-2xl border border-separator bg-canvas/40 p-4 space-y-3">
       <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px]">
-        <label class="space-y-1 text-sm text-slate-200">
+        <label class="space-y-1 text-sm text-foreground">
           <span>{keyLabel}</span>
           <Input value={entry.key} placeholder={keyPlaceholder} oninput={(event) => updateAt(index, { key: (event.currentTarget as HTMLInputElement).value })} />
         </label>
-        <label class="space-y-1 text-sm text-slate-200">
+        <label class="space-y-1 text-sm text-foreground">
           <span>Source</span>
-          <select bind:value={entry.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" onchange={() => updateAt(index, { type: entry.type, value: entry.type === 'secret' ? entry.value : entry.value })}>
+          <select bind:value={entry.type} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" onchange={() => updateAt(index, { type: entry.type, value: entry.type === 'secret' ? entry.value : entry.value })}>
             <option value="literal">Custom value</option>
             <option value="secret">Credential store</option>
           </select>
@@ -63,7 +63,7 @@
         {@const availableSecrets = secrets.filter((s) => s.scope === 'global' || s.scope === 'user')}
         {@const currentInList = !entry.value || availableSecrets.some((s) => s.name === entry.value)}
         <div class="flex gap-2">
-          <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" bind:value={entry.value} onchange={() => updateAt(index, { value: entry.value })}>
+          <select class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" bind:value={entry.value} onchange={() => updateAt(index, { value: entry.value })}>
             <option value="">{secretPlaceholder}</option>
             {#if !currentInList}
               <option value={entry.value}>{entry.value} (saved)</option>
@@ -75,7 +75,7 @@
           <Button size="sm" variant="secondary" type="button" onclick={() => onCreateSecret(entry.key)}>New</Button>
         </div>
       {:else}
-        <label class="space-y-1 text-sm text-slate-200 block">
+        <label class="space-y-1 text-sm text-foreground block">
           <span>{valueLabel}</span>
           <Input value={entry.value} placeholder={valuePlaceholder} oninput={(event) => updateAt(index, { value: (event.currentTarget as HTMLInputElement).value })} />
         </label>

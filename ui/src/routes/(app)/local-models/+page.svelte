@@ -698,37 +698,37 @@
 <svelte:head><title>Local Models · Cognis</title></svelte:head>
 
 <section class="mx-auto flex w-full max-w-7xl flex-col gap-6 p-4 pb-24 sm:p-6">
-  <header class="relative overflow-hidden rounded-3xl border border-sky-500/20 bg-gradient-to-br from-slate-900 via-slate-900 to-sky-950/60 p-6 sm:p-8">
+  <header class="relative overflow-hidden rounded-3xl border border-accent/20 bg-gradient-to-br from-surface via-surface to-accent-subtle p-6 sm:p-8">
     <div class="relative z-10 max-w-3xl">
-      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-sky-300">Private inference</p>
-      <h1 class="mt-3 text-3xl font-semibold text-white sm:text-4xl">Local Models</h1>
-      <p class="mt-3 max-w-2xl text-sm leading-6 text-slate-300">
+      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-accent">Private inference</p>
+      <h1 class="mt-3 text-3xl font-semibold text-strong sm:text-4xl">Local Models</h1>
+      <p class="mt-3 max-w-2xl text-sm leading-6 text-secondary">
         Choose a model, deploy it through one Ollama provider, and track rollout. The provider owns hosts and routing; a deployment manages one model within that provider. Cognis never swaps quantization or silently reduces context.
       </p>
     </div>
-    <Database class="absolute -bottom-10 -right-8 h-48 w-48 text-sky-400/5" aria-hidden="true" />
+    <Database class="absolute -bottom-10 -right-8 h-48 w-48 text-accent/5" aria-hidden="true" />
   </header>
 
   <Card class="grid gap-4 p-4 sm:grid-cols-3">
     <div class="flex gap-3">
-      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sky-500/15 text-sm font-bold text-sky-200">1</span>
-      <div><h2 class="text-sm font-medium text-white">Choose an artifact</h2><p class="mt-1 text-xs text-slate-400">Curated Ollama or public Hugging Face GGUF.</p></div>
+      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent-subtle text-sm font-bold text-accent">1</span>
+      <div><h2 class="text-sm font-medium text-strong">Choose an artifact</h2><p class="mt-1 text-xs text-muted">Curated Ollama or public Hugging Face GGUF.</p></div>
     </div>
     <div class="flex gap-3">
-      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-violet-500/15 text-sm font-bold text-violet-200">2</span>
-      <div><h2 class="text-sm font-medium text-white">Check capacity</h2><p class="mt-1 text-xs text-slate-400">Current and static memory, per executor.</p></div>
+      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-violet-subtle text-sm font-bold text-violet-tone">2</span>
+      <div><h2 class="text-sm font-medium text-strong">Check capacity</h2><p class="mt-1 text-xs text-muted">Current and static memory, per executor.</p></div>
     </div>
     <div class="flex gap-3">
-      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-sm font-bold text-emerald-200">3</span>
-      <div><h2 class="text-sm font-medium text-white">Create desired state</h2><p class="mt-1 text-xs text-slate-400">Track targets and operations without fake success.</p></div>
+      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-success-subtle text-sm font-bold text-success">3</span>
+      <div><h2 class="text-sm font-medium text-strong">Create desired state</h2><p class="mt-1 text-xs text-muted">Track targets and operations without fake success.</p></div>
     </div>
   </Card>
 
-  <nav class="flex gap-1 overflow-x-auto rounded-2xl border border-slate-800 bg-slate-900/70 p-1" aria-label="Local model sections">
+  <nav class="flex gap-1 overflow-x-auto rounded-2xl border border-separator bg-surface/70 p-1" aria-label="Local model sections">
     {#each tabs as tab}
       <button
         type="button"
-        class={`flex min-h-11 shrink-0 items-center gap-2 rounded-xl px-4 text-sm font-medium transition ${activeTab === tab.id ? 'bg-sky-500 text-slate-950' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+        class={`flex min-h-11 shrink-0 items-center gap-2 rounded-xl px-4 text-sm font-medium transition ${activeTab === tab.id ? 'bg-accent text-on-accent' : 'text-secondary hover:bg-raised hover:text-strong'}`}
         aria-current={activeTab === tab.id ? 'page' : undefined}
         onclick={() => (activeTab = tab.id)}
       >
@@ -738,81 +738,81 @@
   </nav>
 
   {#if error}
-    <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" role="alert">{error}</div>
+    <div class="rounded-2xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" role="alert">{error}</div>
   {/if}
   {#if notice}
-    <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 p-4 text-sm text-sky-100" role="status">{notice}</div>
+    <div class="rounded-2xl border border-accent/30 bg-accent-subtle p-4 text-sm text-accent" role="status">{notice}</div>
   {/if}
 
   {#if loading}
-    <Card class="p-8 text-center text-slate-400">Loading local model workspace…</Card>
+    <Card class="p-8 text-center text-muted">Loading local model workspace…</Card>
   {:else if activeTab === 'catalog'}
     <div class="space-y-6">
       <Card class="p-4">
         <form class="grid gap-3 md:grid-cols-[10rem_1fr_auto]" onsubmit={(event) => { event.preventDefault(); void searchCatalog(); }}>
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Source
-            <select value={catalogSource} onchange={changeCatalogSource} class="mt-1 min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100" aria-label="Catalog source">
+            <select value={catalogSource} onchange={changeCatalogSource} class="mt-1 min-h-11 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground" aria-label="Catalog source">
               <option value="ollama">Curated Ollama</option>
               <option value="huggingface">Hugging Face GGUF</option>
               <option value="installed">Installed / live</option>
             </select>
           </label>
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Search
-            <Input bind:value={searchQuery} class="mt-1" placeholder={catalogSource === 'huggingface' ? 'Model or publisher' : 'Chat, reasoning, vision…'} aria-label="Search local model catalog" />
+            <Input find bind:value={searchQuery} class="mt-1" placeholder={catalogSource === 'huggingface' ? 'Model or publisher' : 'Chat, reasoning, vision…'} aria-label="Search local model catalog" />
           </label>
           <Button type="submit" class="self-end" disabled={searching}>{searching ? 'Searching…' : 'Search'}</Button>
         </form>
         <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Parameters
-            <select bind:value={parameterRange} class="mt-1 min-h-10 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100">
+            <select bind:value={parameterRange} class="mt-1 min-h-10 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground">
               <option value="">Any</option>
               <option value="le4b">≤ 4B</option><option value="4b_8b">4–8B</option>
               <option value="8b_14b">8–14B</option><option value="14b_32b">14–32B</option>
               <option value="32b_70b">32–70B</option><option value="70b_plus">70B+</option>
             </select>
           </label>
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Selected quant size
-            <select bind:value={downloadSizeRange} class="mt-1 min-h-10 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100">
+            <select bind:value={downloadSizeRange} class="mt-1 min-h-10 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground">
               <option value="">Any</option>
               <option value="le4gib">≤ 4 GiB</option><option value="4gib_8gib">4–8 GiB</option>
               <option value="8gib_16gib">8–16 GiB</option><option value="16gib_32gib">16–32 GiB</option>
               <option value="32gib_plus">32+ GiB</option>
             </select>
           </label>
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Quantization
             <Input bind:value={quantizationFilter} class="mt-1" placeholder="Q4_K_M" aria-label="Quantization filter" />
           </label>
-          <label class="text-xs font-medium text-slate-300">
+          <label class="text-xs font-medium text-secondary">
             Minimum context
-            <select bind:value={minContext} class="mt-1 min-h-10 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100">
+            <select bind:value={minContext} class="mt-1 min-h-10 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground">
               <option value="">Any</option>
               <option value="8192">8k+</option><option value="16384">16k+</option>
               <option value="32768">32k+</option><option value="65536">64k+</option>
               <option value="131072">128k+</option>
             </select>
           </label>
-          <label class="flex min-h-10 items-center gap-2 self-end rounded-xl border border-slate-700 bg-slate-950 px-3 text-xs text-slate-300">
-            <input type="checkbox" bind:checked={includeUnknown} class="accent-sky-400" />
+          <label class="flex min-h-10 items-center gap-2 self-end rounded-xl border border-control-border bg-canvas px-3 text-xs text-secondary">
+            <input type="checkbox" bind:checked={includeUnknown} class="accent-accent" />
             Include unknown metadata
           </label>
         </div>
         {#each catalog?.sources ?? [] as sourceStatus}
           {#if sourceStatus.source === catalogSource && sourceStatus.detail}
-            <p class={`mt-3 text-xs ${sourceStatus.available ? 'text-slate-400' : 'text-amber-200'}`}>{sourceStatus.detail}</p>
+            <p class={`mt-3 text-xs ${sourceStatus.available ? 'text-muted' : 'text-warning'}`}>{sourceStatus.detail}</p>
           {/if}
         {/each}
         {#if catalog?.pagination_note}
-          <p class="mt-2 text-xs text-slate-500">{catalog.pagination_note}</p>
+          <p class="mt-2 text-xs text-quiet">{catalog.pagination_note}</p>
         {/if}
       </Card>
 
-      <details class="rounded-2xl border border-slate-800 bg-slate-900/50 p-4">
-        <summary class="cursor-pointer text-sm font-medium text-slate-200">Use an exact model reference</summary>
+      <details class="rounded-2xl border border-separator bg-surface/50 p-4">
+        <summary class="cursor-pointer text-sm font-medium text-foreground">Use an exact model reference</summary>
         <form class="mt-3 flex flex-col gap-2 sm:flex-row" onsubmit={(event) => { event.preventDefault(); void resolveDirectReference(); }}>
           <Input bind:value={directRef} placeholder="llama3.2:3b or hf.co/org/repo:Q4_K_M" aria-label="Exact local model reference" />
           <Button type="submit" variant="secondary" disabled={!directRef.trim() || searching}>Resolve</Button>
@@ -835,8 +835,8 @@
         {/if}
       {:else}
         <Card class="p-8 text-center">
-          <p class="text-sm text-slate-300">No deployable models are available from this source.</p>
-          <p class="mt-1 text-xs text-slate-500">Installed inventory remains a placeholder until the runtime adapter is present.</p>
+          <p class="text-sm text-secondary">No deployable models are available from this source.</p>
+          <p class="mt-1 text-xs text-quiet">Installed inventory remains a placeholder until the runtime adapter is present.</p>
         </Card>
       {/if}
 
@@ -845,21 +845,21 @@
         <Card class="space-y-6 p-5 sm:p-6">
           <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <p class="text-xs uppercase tracking-[0.2em] text-sky-300">Deployment plan</p>
-              <h2 class="mt-2 text-2xl font-semibold text-white">{selectedModel.title}</h2>
-              <code class="mt-2 block break-all text-xs text-slate-400">{selectedRef}</code>
+              <p class="text-xs uppercase tracking-[0.2em] text-accent">Deployment plan</p>
+              <h2 class="mt-2 text-2xl font-semibold text-strong">{selectedModel.title}</h2>
+              <code class="mt-2 block break-all text-xs text-muted">{selectedRef}</code>
             </div>
           </div>
-          <details class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
-            <summary class="cursor-pointer text-sm font-medium text-slate-200">Advanced model and reproducibility details</summary>
+          <details class="rounded-xl border border-separator bg-canvas/50 p-3">
+            <summary class="cursor-pointer text-sm font-medium text-foreground">Advanced model and reproducibility details</summary>
             <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-              <div><dt class="text-slate-500">Metadata revision</dt><dd class="break-all font-mono text-slate-300">{selectedModel.revision_sha ?? 'Not reported'}</dd></div>
-              <div><dt class="text-slate-500">Architecture</dt><dd class="text-slate-300">{selectedModel.architecture_name ?? 'Not reported'}</dd></div>
-              <div><dt class="text-slate-500">Pipeline</dt><dd class="text-slate-300">{selectedModel.pipeline_tag ?? 'Not reported'}</dd></div>
-              <div><dt class="text-slate-500">Base model</dt><dd class="text-slate-300">{selectedModel.base_models.join(', ') || 'Not reported'}</dd></div>
+              <div><dt class="text-quiet">Metadata revision</dt><dd class="break-all font-mono text-secondary">{selectedModel.revision_sha ?? 'Not reported'}</dd></div>
+              <div><dt class="text-quiet">Architecture</dt><dd class="text-secondary">{selectedModel.architecture_name ?? 'Not reported'}</dd></div>
+              <div><dt class="text-quiet">Pipeline</dt><dd class="text-secondary">{selectedModel.pipeline_tag ?? 'Not reported'}</dd></div>
+              <div><dt class="text-quiet">Base model</dt><dd class="text-secondary">{selectedModel.base_models.join(', ') || 'Not reported'}</dd></div>
             </dl>
             {#if selectedModel.reference_integrity !== 'pinned'}
-              <p class="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
+              <p class="mt-3 rounded-lg border border-warning-border bg-warning-subtle p-3 text-xs text-warning">
                 Hugging Face metadata was read at the revision above, but the pull remains <code>{selectedRef}</code>. It follows the repository quantization reference and is not pinned to that commit or an exact file list.
               </p>
             {/if}
@@ -867,14 +867,14 @@
 
           <div class="grid gap-5 lg:grid-cols-2">
             <section aria-labelledby="provider-heading">
-              <h3 id="provider-heading" class="text-base font-semibold text-white">1. Ollama provider</h3>
-              <label class="mt-3 block text-xs font-medium text-slate-300">
+              <h3 id="provider-heading" class="text-base font-semibold text-strong">1. Ollama provider</h3>
+              <label class="mt-3 block text-xs font-medium text-secondary">
                 Provider and routing scope
                 <select
                   value={providerId}
                   onchange={changeProvider}
                   disabled={providerLocked || recommendingProvider}
-                  class="mt-1 min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100 disabled:cursor-not-allowed disabled:opacity-70"
+                  class="mt-1 min-h-11 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground disabled:cursor-not-allowed disabled:opacity-70"
                   aria-label="Ollama provider"
                 >
                   {#if !providerId}<option value="">Loading recommendation…</option>{/if}
@@ -892,25 +892,25 @@
                 </select>
               </label>
               {#if providerId === AUTO_PROVIDER}
-                <p class="mt-3 rounded-xl border border-sky-500/30 bg-sky-500/10 p-3 text-xs leading-5 text-sky-100">
+                <p class="mt-3 rounded-xl border border-accent/30 bg-accent-subtle p-3 text-xs leading-5 text-accent">
                   No existing provider will be changed. Provider creation and deployment are one atomic operation, and the provider is reused by host selector—not by model.
                 </p>
               {:else if selectedCandidate}
-                <p class="mt-3 text-xs leading-5 text-slate-400">
+                <p class="mt-3 text-xs leading-5 text-muted">
                   {providerId === providerRecommendation?.recommended_provider_id ? 'Recommended because ' : 'Selected because '}
                   {selectedCandidate.reason_codes.map(reasonLabel).join(', ')}.
                 </p>
               {/if}
               {#if providerLocked}
-                <p class="mt-2 text-xs text-amber-200">Provider scope is locked by the <code>provider</code> query parameter.</p>
+                <p class="mt-2 text-xs text-warning">Provider scope is locked by the <code>provider</code> query parameter.</p>
               {/if}
-              <p class="mt-3 text-xs leading-5 text-slate-400">
+              <p class="mt-3 text-xs leading-5 text-muted">
                 Provider = host scope and inference routing. Deployment = this model's rollout, default visibility, and status inside that provider.
               </p>
             </section>
 
             <section aria-labelledby="target-heading">
-              <h3 id="target-heading" class="text-base font-semibold text-white">2. Host subset</h3>
+              <h3 id="target-heading" class="text-base font-semibold text-strong">2. Host subset</h3>
               <div class="mt-3 flex gap-2">
                 <Button size="sm" variant={targetMode === 'ids' ? 'primary' : 'secondary'} onclick={() => { targetMode = 'ids'; invalidatePlan(); }}>Exact IDs</Button>
                 <Button size="sm" variant={targetMode === 'labels' ? 'primary' : 'secondary'} onclick={() => { targetMode = 'labels'; invalidatePlan(); }}>Label selector</Button>
@@ -919,19 +919,19 @@
                 <fieldset class="mt-3 space-y-2">
                   <legend class="sr-only">Select executor IDs</legend>
                    {#each providerExecutors as executor}
-                     <label class={`flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/50 p-3 ${managedHostDisabledReason(executor) ? 'cursor-not-allowed opacity-65' : 'cursor-pointer'}`}>
-                       <input type="checkbox" class="mt-1 accent-sky-400" checked={selectedExecutorIds.includes(executor.executor_id)} disabled={Boolean(managedHostDisabledReason(executor))} onchange={() => toggleExecutor(executor.executor_id)} />
+                     <label class={`flex items-start gap-3 rounded-xl border border-separator bg-canvas/50 p-3 ${managedHostDisabledReason(executor) ? 'cursor-not-allowed opacity-65' : 'cursor-pointer'}`}>
+                       <input type="checkbox" class="mt-1 accent-accent" checked={selectedExecutorIds.includes(executor.executor_id)} disabled={Boolean(managedHostDisabledReason(executor))} onchange={() => toggleExecutor(executor.executor_id)} />
                        <span>
-                         <span class="block text-sm text-slate-200">{executor.name}</span>
-                         <span class="block font-mono text-xs text-slate-500">{executor.executor_id}</span>
+                         <span class="block text-sm text-foreground">{executor.name}</span>
+                         <span class="block font-mono text-xs text-quiet">{executor.executor_id}</span>
                          {#if managedHostDisabledReason(executor)}
-                           <span class="mt-1 block text-xs text-amber-200">{managedHostDisabledReason(executor)} <a class="underline" href="/settings?tab=executors">Open executor settings</a></span>
+                           <span class="mt-1 block text-xs text-warning">{managedHostDisabledReason(executor)} <a class="underline" href="/settings?tab=executors">Open executor settings</a></span>
                          {/if}
                        </span>
                      </label>
                    {/each}
                    {#if providerExecutors.length === 0}
-                     <p class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">This provider currently resolves no visible hosts. Check its executor selector and executor capability settings.</p>
+                     <p class="rounded-xl border border-warning-border bg-warning-subtle p-3 text-xs text-warning">This provider currently resolves no visible hosts. Check its executor selector and executor capability settings.</p>
                    {/if}
                 </fieldset>
               {:else}
@@ -940,15 +940,15 @@
                   <Input bind:value={labelValue} placeholder="Label value" aria-label="Executor label value" oninput={invalidatePlan} />
                 </div>
               {/if}
-              <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/50 p-3">
-                <p class="text-xs font-medium text-slate-300">{matched.length} matched executor{matched.length === 1 ? '' : 's'}</p>
-                 <p class="mt-1 text-xs text-slate-500">{matched.map((executor) => executor.name).join(', ') || 'No selectable provider host matches yet.'}</p>
+              <div class="mt-3 rounded-xl border border-separator bg-canvas/50 p-3">
+                <p class="text-xs font-medium text-secondary">{matched.length} matched executor{matched.length === 1 ? '' : 's'}</p>
+                 <p class="mt-1 text-xs text-quiet">{matched.map((executor) => executor.name).join(', ') || 'No selectable provider host matches yet.'}</p>
               </div>
               {#if hiddenExecutorCount > 0}
-                <p class="mt-2 text-xs text-amber-200">{hiddenExecutorCount} shared or non-mutable executor{hiddenExecutorCount === 1 ? ' is' : 's are'} hidden for this private deployment.</p>
+                <p class="mt-2 text-xs text-warning">{hiddenExecutorCount} shared or non-mutable executor{hiddenExecutorCount === 1 ? ' is' : 's are'} hidden for this private deployment.</p>
               {/if}
               {#if autoSelectorUnsupported}
-                <p class="mt-2 text-xs text-amber-200">A new provider can use one exact host or a reusable label selector. Existing providers may expose a larger host scope.</p>
+                <p class="mt-2 text-xs text-warning">A new provider can use one exact host or a reusable label selector. Existing providers may expose a larger host scope.</p>
               {/if}
             </section>
           </div>
@@ -963,21 +963,21 @@
           />
 
           {#if plan}
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+            <div class="rounded-2xl border border-separator bg-canvas/50 p-4">
               {#if overrideRequired}
-                <label class="flex items-start gap-3 text-sm text-rose-100">
-                  <input type="checkbox" class="mt-1 accent-rose-400" bind:checked={overrideAcknowledged} />
+                <label class="flex items-start gap-3 text-sm text-danger">
+                  <input type="checkbox" class="mt-1 accent-danger" bind:checked={overrideAcknowledged} />
                   <span>
                     <strong class="block">Deploy this exact artifact and context assessment anyway</strong>
-                    <span class="mt-1 block text-xs text-rose-200/80">I understand that one or more machines may not load it. Cognis will persist this acknowledgement and will not change the quantization.</span>
+                    <span class="mt-1 block text-xs text-danger/80">I understand that one or more machines may not load it. Cognis will persist this acknowledgement and will not change the quantization.</span>
                   </span>
                 </label>
               {:else}
-                <div class="flex items-center gap-2 text-sm text-emerald-200"><CheckCircle2 class="h-4 w-4" aria-hidden="true" /> Current capacity estimate is green on every matched executor.</div>
+                <div class="flex items-center gap-2 text-sm text-success"><CheckCircle2 class="h-4 w-4" aria-hidden="true" /> Current capacity estimate is green on every matched executor.</div>
               {/if}
               <div class="mt-4 flex flex-col gap-2 sm:flex-row sm:justify-end">
                 {#if selectedModel.reference_integrity !== 'pinned'}
-                  <p class="mr-auto max-w-xl self-center text-xs text-amber-200">Final confirmation: this pull reference is floating and is not pinned to the displayed metadata SHA.</p>
+                  <p class="mr-auto max-w-xl self-center text-xs text-warning">Final confirmation: this pull reference is floating and is not pinned to the displayed metadata SHA.</p>
                 {/if}
                 {#if plan.recommended_context_tokens && plan.recommended_context_tokens !== contextTokens}
                   <Button variant="secondary" onclick={() => { contextTokens = plan?.recommended_context_tokens ?? contextTokens; invalidatePlan(); }}>Use safe {formatContext(plan.recommended_context_tokens)}</Button>
@@ -986,7 +986,7 @@
                   {creating ? 'Creating desired state…' : overrideRequired ? 'Create anyway' : 'Create deployment'}
                 </Button>
               </div>
-              {#if !canCreateDeployment}<p class="mt-2 text-right text-xs text-amber-200">Viewer accounts can inspect this plan but cannot create deployments.</p>{/if}
+              {#if !canCreateDeployment}<p class="mt-2 text-right text-xs text-warning">Viewer accounts can inspect this plan but cannot create deployments.</p>{/if}
             </div>
           {/if}
         </Card>
@@ -996,19 +996,19 @@
   {:else if activeTab === 'deployments'}
     <div class="space-y-4">
       {#if deployments.length === 0}
-        <Card class="p-8 text-center"><p class="text-slate-300">No local model deployments yet.</p><Button class="mt-4" onclick={() => (activeTab = 'catalog')}>Browse catalog</Button></Card>
+        <Card class="p-8 text-center"><p class="text-secondary">No local model deployments yet.</p><Button class="mt-4" onclick={() => (activeTab = 'catalog')}>Browse catalog</Button></Card>
       {:else}
         {#each deployments as deployment}
           <Card class="p-5">
             <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <div class="flex flex-wrap items-center gap-2">
-                   <h2 class="font-mono text-sm font-semibold text-white">{deployment.runtime_name}</h2>
-                   <span class="rounded-full border border-slate-700 px-2 py-1 text-[10px] uppercase tracking-wider text-slate-300">{deployment.desired_state}</span>
-                   <span class={`rounded-full border px-2 py-1 text-[10px] ${deployment.lifecycle_state === 'needs_provider' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : 'border-sky-500/30 bg-sky-500/10 text-sky-100'}`}>{deployment.lifecycle_state === 'needs_provider' ? 'Needs provider' : 'Managed'}</span>
-                  {#if deployment.capacity_override_acknowledged}<span class="rounded-full border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">Capacity override</span>{/if}
+                   <h2 class="font-mono text-sm font-semibold text-strong">{deployment.runtime_name}</h2>
+                   <span class="rounded-full border border-control-border px-2 py-1 text-[10px] uppercase tracking-wider text-secondary">{deployment.desired_state}</span>
+                   <span class={`rounded-full border px-2 py-1 text-[10px] ${deployment.lifecycle_state === 'needs_provider' ? 'border-warning-border bg-warning-subtle text-warning' : 'border-accent/30 bg-accent-subtle text-accent'}`}>{deployment.lifecycle_state === 'needs_provider' ? 'Needs provider' : 'Managed'}</span>
+                  {#if deployment.capacity_override_acknowledged}<span class="rounded-full border border-danger-border bg-danger-subtle px-2 py-1 text-[10px] text-danger">Capacity override</span>{/if}
                 </div>
-                 <p class="mt-2 text-xs text-slate-500">Generation {deployment.generation} · {Object.keys(deployment.selector.match_labels ?? {}).length ? `labels ${JSON.stringify(deployment.selector.match_labels)}` : `${deployment.selector.executor_ids?.length ?? 0} exact targets`} · Provider {deployment.provider_id ?? 'not attached'}</p>
+                 <p class="mt-2 text-xs text-quiet">Generation {deployment.generation} · {Object.keys(deployment.selector.match_labels ?? {}).length ? `labels ${JSON.stringify(deployment.selector.match_labels)}` : `${deployment.selector.executor_ids?.length ?? 0} exact targets`} · Provider {deployment.provider_id ?? 'not attached'}</p>
                </div>
                {#if deployment.lifecycle_state === 'needs_provider'}
                  <Button variant="secondary" size="sm" disabled={!canManageDeployment(deployment)} onclick={() => prepareRepair(deployment)}>Repair provider</Button>
@@ -1017,9 +1017,9 @@
                {/if}
              </div>
              {#if deployment.lifecycle_state === 'needs_provider'}
-               <div class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
-                 <p class="text-sm font-medium text-amber-100">This pre-provider deployment cannot reconcile.</p>
-                 <p class="mt-1 text-xs text-amber-100/80">Attach a compatible existing Ollama provider, or explicitly create one keyed to this deployment's host selector.</p>
+               <div class="mt-4 rounded-xl border border-warning-border bg-warning-subtle p-4">
+                 <p class="text-sm font-medium text-warning">This pre-provider deployment cannot reconcile.</p>
+                 <p class="mt-1 text-xs text-warning/80">Attach a compatible existing Ollama provider, or explicitly create one keyed to this deployment's host selector.</p>
                  {#if repairRecommendation(deployment.deployment_id)}
                    <div class="mt-3 flex flex-col gap-2 sm:flex-row">
                      <label class="sr-only" for={`repair-provider-${deployment.deployment_id}`}>Repair provider</label>
@@ -1032,7 +1032,7 @@
                            [deployment.deployment_id]: event.currentTarget.value
                          };
                        }}
-                       class="min-h-11 flex-1 rounded-xl border border-amber-500/30 bg-slate-950 px-3 text-sm text-slate-100"
+                       class="min-h-11 flex-1 rounded-xl border border-warning-border bg-canvas px-3 text-sm text-foreground"
                      >
                        {#each repairRecommendation(deployment.deployment_id)?.candidates ?? [] as candidate}
                          <option value={candidate.provider_id}>{candidate.display_name}{candidate.provider_id === repairRecommendation(deployment.deployment_id)?.recommended_provider_id ? ' · Recommended' : ''}</option>
@@ -1044,19 +1044,19 @@
                      <Button disabled={creating || !repairProviderIds[deployment.deployment_id]} onclick={() => repairDeployment(deployment)}>Attach and repair</Button>
                    </div>
                    {#if !repairSupportsAutoCreate(deployment) && repairRecommendation(deployment.deployment_id)?.candidates.length === 0}
-                     <p class="mt-2 text-xs text-amber-100">No existing provider spans these exact hosts, and auto-created providers cannot use multiple exact IDs. Change the legacy selector to one host or a reusable label selector first.</p>
+                     <p class="mt-2 text-xs text-warning">No existing provider spans these exact hosts, and auto-created providers cannot use multiple exact IDs. Change the legacy selector to one host or a reusable label selector first.</p>
                    {/if}
                  {/if}
                </div>
              {/if}
             <div class="mt-4 grid gap-2 sm:grid-cols-3">
               {#each targets[deployment.deployment_id] ?? [] as target}
-                <div class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
-                  <p class="font-mono text-xs text-slate-300">{target.executor_id}</p>
-                   <p class={`mt-1 text-sm capitalize ${target.state === 'ready' ? 'text-emerald-300' : target.state === 'error' || target.state === 'blocked' ? 'text-rose-300' : 'text-amber-200'}`}>{target.state.replaceAll('_', ' ')}</p>
-                   {#if target.last_error}<p class="mt-1 text-xs text-rose-200">{target.last_error}</p>{/if}
+                <div class="rounded-xl border border-separator bg-canvas/50 p-3">
+                  <p class="font-mono text-xs text-secondary">{target.executor_id}</p>
+                   <p class={`mt-1 text-sm capitalize ${target.state === 'ready' ? 'text-success' : target.state === 'error' || target.state === 'blocked' ? 'text-danger' : 'text-warning'}`}>{target.state.replaceAll('_', ' ')}</p>
+                   {#if target.last_error}<p class="mt-1 text-xs text-danger">{target.last_error}</p>{/if}
                    {#if target.state === 'blocked'}
-                     <a class="mt-2 inline-block text-xs text-sky-300 underline" href="/settings?tab=executors">Check local inference and model-management settings</a>
+                     <a class="mt-2 inline-block text-xs text-accent underline" href="/settings?tab=executors">Check local inference and model-management settings</a>
                    {/if}
                  </div>
               {/each}
@@ -1068,27 +1068,27 @@
   {:else if activeTab === 'installed'}
     <div class="space-y-4">
       {#if !runtimeViewsAvailable}
-        <Card class="border-amber-500/30 p-4 text-sm text-amber-100">Runtime inventory endpoints are not available yet. Desired-state data remains usable; no installed state is being inferred.</Card>
+        <Card class="border-warning-border p-4 text-sm text-warning">Runtime inventory endpoints are not available yet. Desired-state data remains usable; no installed state is being inferred.</Card>
       {/if}
       <div class="grid gap-4 lg:grid-cols-2">
         {#each executors as executor}
           <Card class="p-5">
             <div class="flex items-start justify-between gap-3">
-              <div><h2 class="font-medium text-white">{executor.name}</h2><p class="mt-1 font-mono text-xs text-slate-500">{executor.executor_id}</p></div>
-              <span class={`rounded-full border px-2 py-1 text-[10px] uppercase tracking-wider ${executor.resource_snapshot?.ollama?.status === 'reachable' ? 'border-emerald-500/30 text-emerald-200' : 'border-slate-700 text-slate-400'}`}>{executor.resource_snapshot?.ollama?.status ?? 'unknown'}</span>
+              <div><h2 class="font-medium text-strong">{executor.name}</h2><p class="mt-1 font-mono text-xs text-quiet">{executor.executor_id}</p></div>
+              <span class={`rounded-full border px-2 py-1 text-[10px] uppercase tracking-wider ${executor.resource_snapshot?.ollama?.status === 'reachable' ? 'border-success-border text-success' : 'border-control-border text-muted'}`}>{executor.resource_snapshot?.ollama?.status ?? 'unknown'}</span>
             </div>
             <dl class="mt-4 grid grid-cols-2 gap-3 text-xs">
-              <div><dt class="text-slate-500">{executor.resource_snapshot?.memory?.unified ? 'Unified memory available' : 'RAM available'}</dt><dd class="mt-1 text-slate-200">{formatBytes(executor.resource_snapshot?.memory?.available_bytes)}</dd></div>
-              <div><dt class="text-slate-500">Installed models</dt><dd class="mt-1 text-slate-200">{executor.resource_snapshot?.ollama?.installed_model_count ?? 'Not reported'}</dd></div>
+              <div><dt class="text-quiet">{executor.resource_snapshot?.memory?.unified ? 'Unified memory available' : 'RAM available'}</dt><dd class="mt-1 text-foreground">{formatBytes(executor.resource_snapshot?.memory?.available_bytes)}</dd></div>
+              <div><dt class="text-quiet">Installed models</dt><dd class="mt-1 text-foreground">{executor.resource_snapshot?.ollama?.installed_model_count ?? 'Not reported'}</dd></div>
             </dl>
             {#if executor.resource_snapshot?.ollama?.running_models?.length}
               <div class="mt-4 flex flex-wrap gap-1">
-                {#each executor.resource_snapshot.ollama.running_models as model}<span class="rounded-md bg-emerald-500/10 px-2 py-1 font-mono text-[11px] text-emerald-200">{model}</span>{/each}
+                {#each executor.resource_snapshot.ollama.running_models as model}<span class="rounded-md bg-success-subtle px-2 py-1 font-mono text-[11px] text-success">{model}</span>{/each}
               </div>
             {:else}
-              <p class="mt-4 text-xs text-slate-500">No running model names reported.</p>
+              <p class="mt-4 text-xs text-quiet">No running model names reported.</p>
             {/if}
-            <a class="mt-4 inline-block text-xs text-sky-300 hover:text-sky-200" href="/settings?tab=executors">Open executor health →</a>
+            <a class="mt-4 inline-block text-xs text-accent hover:text-accent-hover" href="/settings?tab=executors">Open executor health →</a>
           </Card>
         {/each}
       </div>
@@ -1096,18 +1096,18 @@
   {:else}
     <div class="space-y-3">
       {#if !runtimeViewsAvailable}
-        <Card class="border-amber-500/30 p-4 text-sm text-amber-100">Runtime operation APIs are not present. Cognis will not display placeholder progress or report success.</Card>
+        <Card class="border-warning-border p-4 text-sm text-warning">Runtime operation APIs are not present. Cognis will not display placeholder progress or report success.</Card>
       {:else if allOperations.length === 0}
-        <Card class="p-8 text-center"><p class="text-slate-300">No runtime operations have been recorded.</p><p class="mt-1 text-xs text-slate-500">Queued pulls and removals will appear here when reconciliation creates durable operation rows.</p></Card>
+        <Card class="p-8 text-center"><p class="text-secondary">No runtime operations have been recorded.</p><p class="mt-1 text-xs text-quiet">Queued pulls and removals will appear here when reconciliation creates durable operation rows.</p></Card>
       {:else}
         {#each allOperations as item (item.operation.operation_id)}
           <Card class="p-4">
             <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div><p class="font-mono text-sm text-white">{item.deployment.runtime_name}</p><p class="mt-1 text-xs text-slate-500">{item.operation.executor_id} · {item.operation.action}</p></div>
-              <span class="rounded-full border border-slate-700 px-3 py-1 text-xs capitalize text-slate-300">{item.operation.state.replaceAll('_', ' ')}</span>
+              <div><p class="font-mono text-sm text-strong">{item.deployment.runtime_name}</p><p class="mt-1 text-xs text-quiet">{item.operation.executor_id} · {item.operation.action}</p></div>
+              <span class="rounded-full border border-control-border px-3 py-1 text-xs capitalize text-secondary">{item.operation.state.replaceAll('_', ' ')}</span>
             </div>
-            <p class="mt-3 text-xs text-slate-400">{item.operation.phase ?? 'Waiting for runtime progress'} · {formatBytes(item.operation.progress_bytes)}</p>
-            {#if item.operation.sanitized_error}<p class="mt-2 text-xs text-rose-200">{item.operation.sanitized_error}</p>{/if}
+            <p class="mt-3 text-xs text-muted">{item.operation.phase ?? 'Waiting for runtime progress'} · {formatBytes(item.operation.progress_bytes)}</p>
+            {#if item.operation.sanitized_error}<p class="mt-2 text-xs text-danger">{item.operation.sanitized_error}</p>{/if}
           </Card>
         {/each}
       {/if}

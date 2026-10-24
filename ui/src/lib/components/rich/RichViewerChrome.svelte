@@ -1,16 +1,41 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import RichIcon from './RichIcon.svelte';
   import ViewerIcon from './ViewerIcon.svelte';
-  import { viewerTheme, setViewerTheme } from './viewer-theme';
+  import DownloadMenu from './DownloadMenu.svelte';
+  import { viewerTheme, setViewerTheme, type ViewerTheme } from './viewer-theme';
 
   export let title = '';
+  export let surface: 'embedded' | 'standalone' = 'standalone';
+  export let exportMode = false;
   export let identity: unknown = undefined;
   export let pdfUrl = '';
+  export let htmlUrl = '';
+  export let markdownUrl = '';
   export let copied = false;
   export let onCopy: () => void;
-  export let onDownload: () => void = () => {};
+  export let onClose: (() => void) | null = null;
   export let progress = 0;
   export let showProgress = true;
+  export let showTocControl = false;
+  export let tocOpen = false;
+  export let tocLayout: 'sidebar' | 'drawer' | 'auto' = 'auto';
+  export let onOpenToc: () => void = () => {};
+  let wideViewport = false;
+  let nextTheme: ViewerTheme;
+  $: tocOnLeft = tocLayout === 'sidebar' || (tocLayout === 'auto' && wideViewport);
+  $: tocTriggerVisible = showTocControl && (!tocOnLeft || !tocOpen);
+  $: currentTheme = $viewerTheme === 'app' ? 'system' : $viewerTheme ?? 'system';
+  $: nextTheme = currentTheme === 'system' ? 'light' : currentTheme === 'light' ? 'dark' : 'system';
+  $: themeLabel = `Theme: ${currentTheme}. Switch to ${nextTheme} theme`;
+  onMount(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia('(min-width: 960px)');
+    const update = () => wideViewport = query.matches;
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  });
   $: authored = identity && typeof identity === 'object' ? identity as Record<string, unknown> : {};
   $: label = typeof authored.label === 'string' ? authored.label.trim() : '';
   const icons = new Set(['activity', 'alert', 'calendar', 'check', 'clock', 'external', 'info', 'trend_down', 'trend_up', 'arrow_up_right']);
@@ -25,6 +50,9 @@
 
 <header class="viewer-chrome" data-testid="rich-viewer-chrome">
   <div class="viewer-chrome-inner">
+  {#if tocTriggerVisible && tocOnLeft}
+    <button class="toc-control toc-left" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={onOpenToc}><ViewerIcon name="expand" /></button>
+  {/if}
   {#if label || icon}
     <span class="viewer-identity" data-testid="rich-viewer-identity">
       {#if icon}<RichIcon {icon} label={label ? '' : iconAlt} />{/if}
@@ -33,41 +61,47 @@
   {/if}
   <span class="viewer-title" title={title}>{title}</span>
   <nav aria-label="Viewer controls">
-    <div class="theme-controls" role="group" aria-label="Viewer theme">
-      {#each ['light', 'dark', 'system'] as theme}
-        <button class="theme-control" type="button" aria-label={theme === 'system' ? 'Follow system theme' : `${theme === 'light' ? 'Light' : 'Dark'} theme`} aria-pressed={$viewerTheme === theme} title={theme} on:click={() => setViewerTheme(theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : 'system')}>
-          <ViewerIcon name={theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : 'system'} />
-        </button>
-      {/each}
-    </div>
-    {#if pdfUrl}<a class="download-control" href={pdfUrl} aria-label="Download PDF" title="Download PDF"><ViewerIcon name="download" /></a>
-    {:else}<button class="download-control" type="button" aria-label="Download markdown" title="Download markdown" on:click={onDownload}><ViewerIcon name="download" /></button>{/if}
+    {#if !exportMode}
+    {#if surface === 'standalone'}
+    <button class="theme-control" type="button" data-theme-mode={currentTheme} aria-label={themeLabel} title={themeLabel} on:click={() => setViewerTheme(nextTheme)}>
+      <ViewerIcon name={currentTheme} />
+    </button>
+    {/if}
+    {#if pdfUrl || htmlUrl || markdownUrl}<DownloadMenu {pdfUrl} {htmlUrl} {markdownUrl} />{/if}
     <button class="copy-control" type="button" aria-label={copied ? 'Copied' : 'Copy document'} title={copied ? 'Copied' : 'Copy document'} on:click={onCopy}><ViewerIcon name={copied ? 'check' : 'copy'} /></button>
-    <slot />
+    {/if}
+    {#if tocTriggerVisible && !tocOnLeft}
+      <button class="toc-control" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={onOpenToc}><ViewerIcon name="contents" /></button>
+    {/if}
+    {#if onClose && !exportMode}
+      <button type="button" aria-label="Close preview" title="Close preview" on:click={onClose}><ViewerIcon name="close" /></button>
+    {/if}
+    {#if !exportMode}<slot />{/if}
   </nav>
   </div>
   <div class="viewer-progress" role={showProgress ? 'progressbar' : undefined} aria-label={showProgress ? 'Reading progress' : undefined} aria-valuemin={showProgress ? 0 : undefined} aria-valuemax={showProgress ? 100 : undefined} aria-valuenow={showProgress ? progress : undefined}><span style={`width:${progress}%`}></span></div>
 </header>
 
 <style>
+  @media print {
+    .viewer-chrome { display: none !important; }
+  }
   .viewer-chrome { position: relative; min-width: 0; padding-top: env(safe-area-inset-top); background: var(--rich-surface); color: var(--rich-text-secondary); }
   .viewer-chrome-inner { box-sizing: border-box; max-width: 1320px; height: 62px; margin: auto; padding: 9px max(40px, env(safe-area-inset-right)) 9px max(40px, env(safe-area-inset-left)); display: flex; align-items: center; gap: 14px; }
   .viewer-title { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13.5px; line-height: 1.3; font-weight: 500; }
   .viewer-identity { display: flex; align-items: center; gap: 4px; max-width: 12rem; flex: none; font: 500 10.5px/1 var(--rich-font-mono); letter-spacing: .14em; color: var(--rich-accent); border: 1px solid color-mix(in srgb, var(--rich-accent) 35%, transparent); border-radius: 4px; padding: 5px 7px; }
   .viewer-identity > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  nav, .theme-controls { display: flex; align-items: center; flex-shrink: 0; }
+  nav { display: flex; align-items: center; flex-shrink: 0; }
   nav { gap: 8px; }
-  .theme-controls { gap: 2px; }
-  button, a { position: relative; display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--rich-line); border-radius: 7px; background: transparent; color: var(--rich-text-secondary); text-decoration: none; cursor: pointer; }
-  button::after, a::after { content: ''; position: absolute; width: 44px; height: 44px; }
-  .theme-control { width: 27px; height: 26px; border: 0; border-radius: 6px; }
-  .theme-control::after { width: 29px; }
-  .theme-control[aria-pressed="true"] { background: var(--rich-control-active); color: var(--rich-text); }
+  button { position: relative; display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid var(--rich-line); border-radius: 7px; background: transparent; color: var(--rich-text-secondary); text-decoration: none; cursor: pointer; }
+  button::after { content: ''; position: absolute; width: 44px; height: 44px; }
+  .theme-control, .toc-control { border: 0; flex-shrink: 0; }
+  .toc-left { color: var(--rich-text-secondary); }
   .copy-control { background: #159fef; border-color: #159fef; color: #061826; }
-  button:hover, a:hover { filter: brightness(1.12); }
-  button:focus-visible, a:focus-visible { outline: 2px solid var(--rich-accent); outline-offset: 3px; }
+  button:hover { filter: brightness(1.12); }
+  button:focus-visible { outline: 2px solid var(--rich-accent); outline-offset: 3px; }
   .viewer-progress { height: 1px; background: var(--rich-line); }
   .viewer-progress span { display: block; height: 2px; background: var(--rich-accent); }
-  @media (pointer: coarse), (max-width: 600px) { .theme-control, button, a { width: 44px; height: 44px; } .theme-control::after { width: 44px; } }
+  @media (pointer: coarse), (max-width: 600px) { button { width: 44px; height: 44px; } }
   @media (max-width: 600px) { .viewer-chrome-inner { padding: 8px 12px; gap: 8px; flex-wrap: wrap; height: auto; min-height: 106px; } .viewer-identity { max-width: 7rem; } .viewer-title { flex-basis: 50%; } nav { width: 100%; gap: 2px; justify-content: flex-end; } }
 </style>

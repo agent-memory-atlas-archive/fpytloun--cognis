@@ -174,9 +174,9 @@
   <section class="space-y-5 overflow-x-hidden">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent inventory</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">Available agents</h1>
-        <p class="mt-1 max-w-2xl text-sm text-slate-400">Choose an agent to chat with, inspect, or configure. Active agents are listed first, then sorted alphabetically.</p>
+        <p class="text-sm uppercase tracking-[0.25em] text-muted">Agent inventory</p>
+        <h1 class="mt-1 text-2xl font-semibold text-strong">Available agents</h1>
+        <p class="mt-1 max-w-2xl text-sm text-muted">Choose an agent to chat with, inspect, or configure. Active agents are listed first, then sorted alphabetically.</p>
       </div>
       <Button onclick={() => goto('/agents/new')}>
         <Plus class="mr-2 h-4 w-4" />
@@ -185,7 +185,7 @@
     </div>
 
     {#if error}
-      <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+      <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
     {/if}
 
     <!-- Primary Agents -->
@@ -195,13 +195,13 @@
         onclick={() => (primaryExpanded = !primaryExpanded)}
       >
         <svg
-          class="h-4 w-4 text-slate-400 transition-transform {primaryExpanded ? 'rotate-0' : '-rotate-90'}"
+          class="h-4 w-4 text-muted transition-transform {primaryExpanded ? 'rotate-0' : '-rotate-90'}"
           fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
         >
           <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
         </svg>
-        <h2 class="text-lg font-semibold text-white">Primary Agents</h2>
-        <span class="rounded-full bg-slate-700/60 px-2 py-0.5 text-xs text-slate-300">{primaryAgents.length}</span>
+        <h2 class="text-lg font-semibold text-strong">Primary Agents</h2>
+        <span class="rounded-full bg-inset/60 px-2 py-0.5 text-xs text-secondary">{primaryAgents.length}</span>
       </button>
 
       {#if primaryExpanded}
@@ -209,7 +209,7 @@
           {#each primaryAgents as agent (agent.agent_id)}
             {@render agentCard(agent)}
           {:else}
-            <p class="text-sm text-slate-500">No primary agents yet. Create one to get started.</p>
+            <p class="text-sm text-quiet">No primary agents yet. Create one to get started.</p>
           {/each}
         </div>
       {/if}
@@ -222,13 +222,13 @@
         onclick={() => (secondaryExpanded = !secondaryExpanded)}
       >
         <svg
-          class="h-4 w-4 text-slate-400 transition-transform {secondaryExpanded ? 'rotate-0' : '-rotate-90'}"
+          class="h-4 w-4 text-muted transition-transform {secondaryExpanded ? 'rotate-0' : '-rotate-90'}"
           fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"
         >
           <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
         </svg>
-        <h2 class="text-lg font-semibold text-white">Secondary Agents</h2>
-        <span class="rounded-full bg-slate-700/60 px-2 py-0.5 text-xs text-slate-300">{secondaryAgents.length}</span>
+        <h2 class="text-lg font-semibold text-strong">Secondary Agents</h2>
+        <span class="rounded-full bg-inset/60 px-2 py-0.5 text-xs text-secondary">{secondaryAgents.length}</span>
       </button>
 
       {#if secondaryExpanded}
@@ -236,7 +236,7 @@
           {#each secondaryAgents as agent (agent.agent_id)}
             {@render agentCard(agent)}
           {:else}
-            <p class="text-sm text-slate-500">No secondary agents.</p>
+            <p class="text-sm text-quiet">No secondary agents.</p>
           {/each}
         </div>
       {/if}
@@ -257,46 +257,46 @@
         {/if}
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
-            <h2 class="truncate text-lg font-semibold text-white">{displayName(agent)}</h2>
+            <h2 class="truncate text-lg font-semibold text-strong">{displayName(agent)}</h2>
             {#if agent.is_system}
-              <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-sky-300">System</span>
+              <span class="rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-accent">System</span>
             {/if}
             {#if agent.is_shared_with_me}
-              <span class="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-cyan-300">Shared</span>
+              <span class="rounded-full border border-cyan-border bg-cyan-subtle px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-cyan-tone">Shared</span>
             {/if}
           </div>
-          <p class="break-all text-sm text-slate-400">{agent.agent_id}</p>
+          <p class="break-all text-sm text-muted">{agent.agent_id}</p>
           {#if agent.is_shared_with_me}
-            <p class="mt-1 text-xs text-cyan-300/80">Shared by {agent.shared_by_email ?? agent.owner_email}</p>
+            <p class="mt-1 text-xs text-cyan-tone/80">Shared by {agent.shared_by_email ?? agent.owner_email}</p>
           {/if}
-          <p class="mt-3 text-sm leading-6 text-slate-300">{agent.description ?? 'No description yet.'}</p>
+          <p class="mt-3 text-sm leading-6 text-secondary">{agent.description ?? 'No description yet.'}</p>
         </div>
       </div>
-      <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
+      <span class="shrink-0 rounded-full border border-control-border bg-raised px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-foreground">
         {agentStatusLabel(agent)}
       </span>
     </div>
 
     <div class="mt-4 flex flex-wrap items-start justify-between gap-4">
       {#if agent.agent_type === 'primary'}
-        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-slate-300 md:grid-cols-2">
+        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-secondary md:grid-cols-2">
           <div class="min-w-0">
-            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Default workflow</dt>
+            <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Default workflow</dt>
             <dd class="mt-1 truncate">{defaultWorkflowLabel(agent)}</dd>
           </div>
           <div class="min-w-0">
-            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
+            <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Model</dt>
             <dd class="mt-1 truncate">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>
           </div>
         </dl>
       {:else}
-        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-slate-300 md:grid-cols-2">
+        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-secondary md:grid-cols-2">
           <div class="min-w-0">
-            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
+            <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Model</dt>
             <dd class="mt-1 truncate">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit from caller'}</dd>
           </div>
           <div class="min-w-0">
-            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Tools</dt>
+            <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Tools</dt>
             <dd class="mt-1 truncate">{Array.isArray((agent.tools as Record<string, unknown>)?.builtin_tools) ? ((agent.tools as Record<string, unknown>).builtin_tools as string[]).join(', ') : 'default'}</dd>
           </div>
         </dl>
@@ -336,9 +336,9 @@
     </div>
 
     {#if !agent.personality_synced && agent.agent_type === 'primary'}
-      <div class="mt-4 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+      <div class="mt-4 rounded-2xl border border-accent/30 bg-accent-subtle px-4 py-3 text-sm text-accent">
         <p class="font-medium">Personality was not synced to Mnemory.</p>
-        <p class="mt-1 text-sky-50/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
+        <p class="mt-1 text-accent/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
       </div>
     {/if}
 

@@ -59,15 +59,15 @@
 
 <article
   bind:this={cardElement}
-  class={`flex h-full flex-col rounded-2xl border p-4 transition ${selected ? 'border-sky-400/70 bg-sky-500/10' : 'border-slate-800 bg-slate-900/65 hover:border-slate-600'}`}
+  class={`flex h-full flex-col rounded-2xl border p-4 transition ${selected ? 'border-accent/70 bg-accent-subtle' : 'border-separator bg-surface/65 hover:border-control-border'}`}
   aria-label={model.title}
 >
   <div class="flex items-start justify-between gap-3">
     <div class="min-w-0">
-      <h3 class="truncate text-base font-semibold text-white">
+      <h3 class="truncate text-base font-semibold text-strong">
         {#if model.repository_url}
           <a
-            class="hover:text-sky-200"
+            class="hover:text-accent-hover"
             href={model.repository_url}
             target="_blank"
             rel="noreferrer"
@@ -77,45 +77,45 @@
           {model.title}
         {/if}
       </h3>
-      <p class="mt-1 text-xs text-slate-400">{model.publisher ?? 'Unknown publisher'} · {model.license ?? 'License not listed'}</p>
+      <p class="mt-1 text-xs text-muted">{model.publisher ?? 'Unknown publisher'} · {model.license ?? 'License not listed'}</p>
     </div>
-    <span class={`shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-wider ${model.source === 'huggingface' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-violet-500/30 bg-violet-500/10 text-violet-200'}`}>
+    <span class={`shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold uppercase tracking-wider ${model.source === 'huggingface' ? 'border-warning-border bg-warning-subtle text-warning' : 'border-violet-border bg-violet-subtle text-violet-tone'}`}>
       {model.source === 'huggingface' ? 'HF GGUF' : 'Ollama'}
     </span>
   </div>
 
-  <p class="mt-3 line-clamp-2 min-h-10 text-sm leading-5 text-slate-300">
+  <p class="mt-3 line-clamp-2 min-h-10 text-sm leading-5 text-secondary">
     {model.description ?? 'Catalog metadata is limited. Review the model source before deployment.'}
   </p>
 
   <div class="mt-3 flex flex-wrap gap-1.5">
     {#each model.capabilities as capability}
-      <span class="rounded-md bg-slate-800 px-2 py-1 text-[11px] capitalize text-slate-300">{capability}</span>
+      <span class="rounded-md bg-raised px-2 py-1 text-[11px] capitalize text-secondary">{capability}</span>
     {/each}
   </div>
 
   <dl class="mt-3 grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-    <div><dt class="sr-only">Parameters</dt><dd class="text-slate-400">{formatParameters(model.parameter_count)}</dd></div>
-    <div><dt class="sr-only">Context</dt><dd class="text-right text-slate-400">{model.advertised_max_context ? `${formatContext(model.advertised_max_context)} context` : 'Unknown context'}</dd></div>
+    <div><dt class="sr-only">Parameters</dt><dd class="text-muted">{formatParameters(model.parameter_count)}</dd></div>
+    <div><dt class="sr-only">Context</dt><dd class="text-right text-muted">{model.advertised_max_context ? `${formatContext(model.advertised_max_context)} context` : 'Unknown context'}</dd></div>
     {#if model.downloads != null}
-      <div><dt class="sr-only">Downloads</dt><dd class="text-slate-400">{model.downloads.toLocaleString()} downloads</dd></div>
+      <div><dt class="sr-only">Downloads</dt><dd class="text-muted">{model.downloads.toLocaleString()} downloads</dd></div>
     {/if}
     {#if model.likes != null}
-      <div><dt class="sr-only">Likes</dt><dd class="text-right text-slate-400">{model.likes.toLocaleString()} likes</dd></div>
+      <div><dt class="sr-only">Likes</dt><dd class="text-right text-muted">{model.likes.toLocaleString()} likes</dd></div>
     {/if}
   </dl>
 
   {#if model.metadata_status === 'basic' && model.source === 'huggingface'}
-    <p class="mt-3 text-xs text-slate-500">Loading repository details when visible…</p>
+    <p class="mt-3 text-xs text-quiet">Loading repository details when visible…</p>
   {:else if model.metadata_diagnostics.length}
-    <p class="mt-3 text-xs text-amber-200">{model.metadata_diagnostics[0]}</p>
+    <p class="mt-3 text-xs text-warning">{model.metadata_diagnostics[0]}</p>
   {:else if model.warnings.length}
-    <p class="mt-3 text-xs text-amber-200">{model.warnings[0]}</p>
+    <p class="mt-3 text-xs text-warning">{model.warnings[0]}</p>
   {/if}
 
   {#if model.model_card_url}
     <a
-      class="mt-3 text-xs text-sky-300 hover:text-sky-200"
+      class="mt-3 text-xs text-accent hover:text-accent-hover"
       href={model.model_card_url}
       target="_blank"
       rel="noreferrer"
@@ -124,11 +124,11 @@
   {/if}
 
   <div class="mt-auto pt-4">
-    <label class="text-xs font-medium text-slate-300">
+    <label class="text-xs font-medium text-secondary">
       Quantization / reference
       <select
         bind:value={requestedRef}
-        class="mt-1 min-h-10 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 text-sm text-slate-100"
+        class="mt-1 min-h-10 w-full rounded-xl border border-control-border bg-canvas px-3 text-sm text-foreground"
         aria-label={`${model.title} quantization`}
       >
         {#each model.quantizations as quantization}

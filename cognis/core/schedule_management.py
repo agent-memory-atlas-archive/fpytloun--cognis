@@ -113,6 +113,7 @@ async def create_user_schedule(
             interaction_mode_override=request_model.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=owner_email,
+            creation_origin="agent_composed",
         )
         await db.commit()
         row = await get_schedule(db, created_row.schedule_id)

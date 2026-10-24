@@ -14,10 +14,10 @@
   <div
     class={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs ${
       presentation.kind === 'error'
-        ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+        ? 'border-danger-border bg-danger-subtle text-danger'
         : presentation.kind === 'warning'
-          ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
-          : 'border-sky-500/20 bg-sky-500/10 text-sky-100'
+          ? 'border-warning-border bg-warning-subtle text-warning'
+          : 'border-accent/20 bg-accent-subtle text-accent'
     }`}
     role={presentation.kind === 'error' ? 'alert' : 'status'}
     aria-live="polite"

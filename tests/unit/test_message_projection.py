@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from cognis.providers.llm.anthropic.integration import _convert_messages
 from cognis.providers.llm.message_projection import (
     SYSTEM_NOTICE_INSTRUCTION,
     project_messages_for_provider,
     resolve_message_projection_policy,
 )
+from cognis.providers.llm.responses_bridge import messages_to_responses_input
 
 
 def test_anthropic_projection_wraps_developer_and_follow_up_messages() -> None:
@@ -59,6 +61,109 @@ def test_anthropic_projection_wraps_developer_and_follow_up_messages() -> None:
     assert result.diagnostics["follow_up_context_present_before_projection"] is True
     assert result.diagnostics["follow_up_notice_present_after_projection"] is True
     assert result.diagnostics["final_projected_non_system_role"] == "user"
+
+
+def test_provider_projection_strips_message_annotations_for_every_api() -> None:
+    message = {
+        "role": "user",
+        "content": "first turn",
+        "_candidate_current_turn": True,
+        "metadata": {"_schema_extension": "preserve"},
+        "tool_calls": [{"id": "call_1", "_provider_extension": "preserve"}],
+    }
+    messages = [message]
+
+    for api in ("chat_completions", "responses"):
+        result = project_messages_for_provider(
+            messages,
+            provider=SimpleNamespace(config={}),
+            llm_api=api,
+        )
+
+        assert result.messages == [
+            {
+                "role": "user",
+                "content": "first turn",
+                "metadata": {"_schema_extension": "preserve"},
+                "tool_calls": [{"id": "call_1", "_provider_extension": "preserve"}],
+            }
+        ]
+        assert "_candidate_current_turn" in messages[0]
+        assert messages[0]["metadata"]["_schema_extension"] == "preserve"
+
+
+def test_responses_projection_retains_replay_snapshot_until_bridge_consumes_it() -> None:
+    snapshot = [
+        {"type": "reasoning", "id": "rs_replay", "encrypted_content": "sealed"},
+        {"type": "message", "id": "msg_replay", "content": []},
+    ]
+    projected = project_messages_for_provider(
+        [
+            {
+                "role": "assistant",
+                "content": "Answer",
+                "_candidate_current_turn": True,
+                "_responses_output_items": snapshot,
+            }
+        ],
+        provider=SimpleNamespace(config={}),
+        llm_api="responses",
+        preserve_internal_fields=frozenset({"_responses_output_items"}),
+    ).messages
+
+    assert projected[0]["_responses_output_items"] == snapshot
+    assert "_candidate_current_turn" not in projected[0]
+    responses_input = messages_to_responses_input(projected)
+    assert responses_input == [
+        {"type": "reasoning", "id": "rs_replay", "encrypted_content": "sealed"},
+        {"type": "message", "id": "msg_replay", "content": []},
+    ]
+    assert all(not key.startswith("_") for item in responses_input for key in item)
+
+
+def test_anthropic_projection_retains_native_adapters_until_payload_conversion() -> None:
+    envelope = {"continuation_status": "continuable", "native_blocks": []}
+    thinking = [{"type": "thinking", "thinking": "reasoning", "signature": "sig"}]
+    projected = project_messages_for_provider(
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "_candidate_current_turn": True,
+                "_anthropic_native_envelope": envelope,
+                "_anthropic_thinking_blocks": thinking,
+                "_cache_control": {"type": "ephemeral"},
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "denied",
+                "_tool_is_error": True,
+                "_cache_control": {"type": "ephemeral"},
+            },
+        ],
+        provider=SimpleNamespace(config={"preset": "anthropic"}),
+        llm_api="chat_completions",
+        preserve_internal_fields=frozenset(
+            {
+                "_anthropic_native_envelope",
+                "_anthropic_thinking_blocks",
+                "_tool_is_error",
+                "_cache_control",
+            }
+        ),
+    ).messages
+
+    assert projected[0]["_anthropic_native_envelope"] == envelope
+    assert projected[0]["_anthropic_thinking_blocks"] == thinking
+    assert "_candidate_current_turn" not in projected[0]
+    assert projected[0]["_cache_control"] == {"type": "ephemeral"}
+    system, native_messages = _convert_messages(projected)
+    assert system == []
+    assert native_messages[0]["content"][0] == thinking[0]
+    assert native_messages[1]["content"][0]["is_error"] is True
+    assert native_messages[1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert all(not key.startswith("_") for message in native_messages for key in message)
 
 
 def test_anthropic_projection_detects_stripped_follow_up_content() -> None:

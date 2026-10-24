@@ -290,18 +290,9 @@ async def ensure_active_executor_pin(
 
     target = pool.by_id(active_executor_id)
     if target is not None and _target_ready(target, ws_provider):
-        if active_executor_unavailable_since is not None:
-            from cognis.store.queries import clear_executor_unavailable
-
-            async with session_factory() as session:
-                await clear_executor_unavailable(
-                    session,
-                    conversation_id=conversation_id,
-                    task_id=task_id,
-                    expected_executor_id=active_executor_id,
-                    expected_generation=active_executor_generation,
-                )
-                await session.commit()
+        # Transport readiness precedes inventory admission. The runtime owner
+        # clears recovery only after admission succeeds, preserving the deadline
+        # across repeated reconnect/discovery failures and controller restarts.
         return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
     return ExecutorPinLifecycleResult(
         active_executor_id=active_executor_id,

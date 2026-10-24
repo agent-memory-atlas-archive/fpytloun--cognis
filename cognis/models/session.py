@@ -81,6 +81,10 @@ class ConversationModel(BaseModel):
     title_source: str = "unset"
     context: ConversationContext
     project_id: str | None = None
+    visibility: str = "private"
+    # Runtime-only: project derived for this turn (stored project or agent
+    # default for long-lived chats). Never persisted or serialized.
+    effective_project_id: str | None = Field(default=None, exclude=True)
     active_session_id: str | None = None
     active_executor_id: str | None = None
     active_executor_assigned_at: datetime | None = None
@@ -236,6 +240,8 @@ class IntarisSession(BaseModel):
     intention: str | None = None
     details: dict[str, Any] | None = None
     policy: dict[str, Any] | None = None
+    policy_revision: int | None = None
+    active_policy: dict[str, Any] | None = None
     status: str
     status_reason: str | None = None
     total_calls: int = 0

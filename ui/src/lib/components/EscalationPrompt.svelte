@@ -65,26 +65,26 @@
   }
 </script>
 
-<article class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 shadow-card">
+<article class="rounded-3xl border border-info-border bg-info-subtle px-4 py-4 text-foreground shadow-card">
   <div class="flex flex-wrap items-center justify-between gap-4">
     <div>
-      <p class="text-xs font-medium uppercase tracking-[0.25em] text-sky-200">Approval required</p>
-      <h3 class="mt-1 text-base font-semibold text-white">{item.tool_name ?? 'Escalated action'}</h3>
+      <p class="text-xs font-medium uppercase tracking-[0.25em] text-info">Approval required</p>
+      <h3 class="mt-1 text-base font-semibold text-strong">{item.tool_name ?? 'Escalated action'}</h3>
     </div>
     <div class="flex items-center gap-2">
       {#if queuedCount > 0}
-        <span class="rounded-full border border-sky-300/40 px-2.5 py-0.5 text-xs font-medium text-sky-200">
+        <span class="rounded-full border border-info-border px-2.5 py-0.5 text-xs font-medium text-info">
           +{queuedCount} queued
         </span>
       {/if}
-      <span class="rounded-full border border-sky-300/40 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-sky-100">
+      <span class="rounded-full border border-info-border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-info">
         {expired ? 'Expired' : `${Math.max(secondsRemaining, 0)}s left`}
       </span>
     </div>
   </div>
 
   {#if item.session_id}
-    <p class="mt-1 text-xs text-sky-300/60">Session: {item.session_id.slice(0, 12)}...</p>
+    <p class="mt-1 text-xs text-muted">Session: {item.session_id.slice(0, 12)}...</p>
   {/if}
 
   <ToolInvocationPreview
@@ -93,13 +93,16 @@
     reasoning={item.reasoning}
     risk={item.risk}
   />
+  <p class="mt-2 break-all text-xs text-secondary">
+    Approval ID: <code class="select-all">{item.call_id}</code>
+  </p>
 
-  <label class="mt-3 block text-xs text-sky-200/80" for="escalation-note-{item.call_id}">
+  <label class="mt-3 block text-xs text-secondary" for="escalation-note-{item.call_id}">
     Note (optional)
   </label>
   <textarea
     id="escalation-note-{item.call_id}"
-    class="mt-1 w-full resize-none rounded-2xl border border-sky-400/25 bg-slate-950/40 px-3 py-2 text-sm text-sky-50 outline-none placeholder:text-sky-100/40 focus:border-sky-300/60"
+    class="request-prose mt-1 w-full resize-none rounded-2xl border border-control-border bg-surface px-3 py-2 text-foreground outline-none placeholder:text-muted focus:border-accent"
     rows="2"
     maxlength={ESCALATION_NOTE_MAX_LENGTH}
     placeholder="Add context for this decision…"
@@ -108,8 +111,11 @@
     oninput={(event) => { note = event.currentTarget.value; }}
   ></textarea>
 
-  <p class="mt-3 text-xs text-sky-200/70">
-    You can also type <code class="rounded bg-sky-900/40 px-1 py-0.5">/approve</code> or <code class="rounded bg-sky-900/40 px-1 py-0.5">/deny</code> in the chat input.
+  <p class="mt-3 text-xs text-secondary">
+    Resolve this action in chat with
+    <code class="block select-all break-all rounded bg-inset px-1 py-0.5 mt-1">/approve --id {item.call_id}</code>
+    or <code class="block select-all break-all rounded bg-inset px-1 py-0.5 mt-1">/deny --id {item.call_id}</code>.
+    Add an optional note after the ID. Bare commands only work when one approval is pending.
   </p>
 
   <div class="mt-4 flex flex-wrap gap-2">

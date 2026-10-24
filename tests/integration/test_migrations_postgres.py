@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import uuid
 from datetime import UTC, datetime
@@ -9,11 +10,14 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from cognis.bootstrap import run_schema_bootstrap, seed_system_agents
 from cognis.store.database import create_session_factory
+from cognis.store.models import VideoBudgetRow
 from cognis.store.queries import (
     create_agent,
     create_user,
@@ -21,6 +25,7 @@ from cognis.store.queries import (
     list_secondary_bindings,
     set_secondary_bindings,
 )
+from tests.bootstrap_preservation import read_bootstrap_data, seed_bootstrap_data
 from tests.schema_parity import assert_schema_matches_metadata
 
 pytestmark = [
@@ -141,6 +146,67 @@ async def test_fresh_postgresql_upgrade_to_head() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing", ["empty", "partial", "bootstrap"])
+async def test_postgresql_video_migration_preserves_existing_tables(
+    monkeypatch: pytest.MonkeyPatch, existing: str
+) -> None:
+    schema_name = f"cognis_video_migration_{uuid.uuid4().hex}"
+    admin = create_async_engine(_url())
+    async with admin.begin() as connection:
+        await connection.execute(sa.schema.CreateSchema(schema_name))
+    engine = create_async_engine(
+        _url(), connect_args={"server_settings": {"search_path": f'"{schema_name}"'}}
+    )
+    migration = importlib.import_module("cognis.store.migrations.versions.167_video_provider_jobs")
+    tables = {"video_jobs", "video_attempts", "video_budgets", "video_mutations", "video_transfers"}
+    try:
+        if existing == "bootstrap":
+            await run_schema_bootstrap(engine)
+            await run_schema_bootstrap(engine)
+        async with engine.begin() as connection:
+            if existing == "partial":
+                await connection.run_sync(VideoBudgetRow.__table__.create)
+            if existing != "empty":
+                await connection.execute(
+                    VideoBudgetRow.__table__.insert().values(
+                        owner_email="owner@example.com", day="2026-01-01", exposure_microusd=12345
+                    )
+                )
+
+            def exercise(sync: Any) -> None:
+                monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(sync)))
+                migration.upgrade()
+                migration.upgrade()
+                inspector = sa.inspect(sync)
+                assert tables <= set(inspector.get_table_names())
+                assert {"ix_video_due", "ix_video_owner_conversation"} <= {
+                    index["name"] for index in inspector.get_indexes("video_jobs")
+                }
+                assert "ix_video_transfers_job_id" in {
+                    index["name"] for index in inspector.get_indexes("video_transfers")
+                }
+
+            await connection.run_sync(exercise)
+            if existing != "empty":
+                assert (
+                    await connection.scalar(sa.select(VideoBudgetRow.exposure_microusd))
+                ) == 12345
+
+            def roundtrip(sync: Any) -> None:
+                migration.downgrade()
+                assert not tables & set(sa.inspect(sync).get_table_names())
+                migration.upgrade()
+                assert tables <= set(sa.inspect(sync).get_table_names())
+
+            await connection.run_sync(roundtrip)
+    finally:
+        await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(sa.schema.DropSchema(schema_name, cascade=True))
+        await admin.dispose()
+
+
+@pytest.mark.asyncio
 async def test_postgresql_bootstrap_at_113_upgrades_and_downgrades() -> None:
     url = _url()
     schema_name = f"cognis_migration_bootstrap_{uuid.uuid4().hex}"
@@ -222,7 +288,8 @@ async def test_postgresql_bootstrap_at_113_upgrades_and_downgrades() -> None:
 
 
 @pytest.mark.asyncio
-async def test_postgresql_bootstrap_at_129_then_upgrade_to_head() -> None:
+@pytest.mark.parametrize("partial_tables", [False, True])
+async def test_postgresql_bootstrap_at_129_then_upgrade_to_head(partial_tables: bool) -> None:
     url = _url()
     schema_name = f"cognis_work_cache_bootstrap_{uuid.uuid4().hex}"
     admin = create_async_engine(url)
@@ -238,6 +305,11 @@ async def test_postgresql_bootstrap_at_129_then_upgrade_to_head() -> None:
             await connection.run_sync(_run_upgrade, "129_work_record_file_metadata")
         await run_schema_bootstrap(engine)
         await run_schema_bootstrap(engine)
+        async with engine.begin() as connection:
+            preserved = await connection.run_sync(seed_bootstrap_data)
+            if partial_tables:
+                await connection.execute(sa.text("DROP TABLE inference_bindings"))
+                await connection.execute(sa.text("DROP TABLE agent_hook_turns"))
         async with engine.connect() as connection:
             bootstrap_metadata = await connection.run_sync(
                 lambda sync_connection: {
@@ -271,6 +343,7 @@ async def test_postgresql_bootstrap_at_129_then_upgrade_to_head() -> None:
                     )
                 )
             await connection.run_sync(_run_upgrade)
+            assert await connection.run_sync(read_bootstrap_data) == preserved
             revision = await connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
             upgraded_work_record_types = await connection.run_sync(
                 lambda sync_connection: {

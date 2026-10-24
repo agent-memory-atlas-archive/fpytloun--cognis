@@ -4,6 +4,7 @@ import { ApiError } from '$lib/api/client';
 import {
   isTaskRerunnable,
   loadTaskPageData,
+  loadTaskPageOptions,
   refreshTaskPageData,
   shouldClearTaskFromError
 } from '$lib/task-detail';
@@ -75,10 +76,21 @@ describe('task detail helpers', () => {
     });
 
     const data = await loadTaskPageData(api as never, 'task-1');
+    const options = await loadTaskPageOptions(api as never, data.task);
 
     expect(data.task.task_id).toBe('task-1');
-    expect(data.workflows).toEqual([{ workflow_id: 'wf-1', name: 'Workflow' }]);
-    expect(data.auxiliaryError).toBe('Workflow registry unavailable');
+    expect(options.workflows).toEqual([{ workflow_id: 'wf-1', name: 'Workflow' }]);
+    expect(options.auxiliaryError).toBe('Workflow registry unavailable');
+  });
+
+  it('loads the task without starting or waiting for configuration registries', async () => {
+    const api = buildApi();
+    api.agents.listAll.mockReturnValue(new Promise(() => {}));
+    const data = await loadTaskPageData(api as never, 'task-1');
+    expect(data.task.task_id).toBe('task-1');
+    expect(api.agents.listAll).not.toHaveBeenCalled();
+    expect(api.conversations.list).not.toHaveBeenCalled();
+    expect(api.tasks.list).not.toHaveBeenCalled();
   });
 
   it('fails the whole load when task detail is missing', async () => {

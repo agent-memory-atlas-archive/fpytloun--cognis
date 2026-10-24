@@ -659,6 +659,13 @@ asynchronously for executor readiness. If ownership changes, the fenced
 recovery path resumes the wait with the original deadline. Executor waiting
 does not create a user pause.
 
+Transport failures during runtime `tool.list` discovery use this same admission
+recovery path, including when the transport's short replay-safe retry expires.
+The controller re-resolves the selected executor and rebuilds its inventory;
+RPC application errors and invalid catalogs remain failures. A response whose
+waiter expires during the ownership fence is ignored without closing the
+physical executor connection.
+
 If the deadline expires, the controller records one terminal
 `executor_recovery_timeout` error. It includes the executor ID, first
 unavailable timestamp, deadline, wait duration, and execution phase.

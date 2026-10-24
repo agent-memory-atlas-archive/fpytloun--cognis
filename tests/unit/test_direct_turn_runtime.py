@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,17 +16,20 @@ from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.controller_runtime import ControllerLifecycleState, ControllerRuntime
 from cognis.core.direct_turn_runtime import (
+    BackgroundDirectTurnFence,
     DirectTurnExecutionFence,
     DurableDirectTurnRuntime,
     StaleDirectTurnOwner,
     UnboundToolDispatch,
 )
+from cognis.core.events import EventBus
 from cognis.core.executor_recovery import (
     EXECUTOR_RECOVERY_WINDOW_SECONDS,
     ExecutorRecoveryTimeout,
     begin_executor_recovery,
     clear_executor_recovery,
 )
+from cognis.core.notifications import NotificationService
 from cognis.core.turn_scheduler import TurnScheduler
 from cognis.models.tool import ExecutorCapabilities
 from cognis.providers.executor.websocket import WebSocketExecutorConnection
@@ -39,7 +43,7 @@ from cognis.store.direct_turns import (
     conversation_lease_key,
     read_tool_dispatch_groups,
 )
-from cognis.store.models import DirectTurnRequestRow
+from cognis.store.models import ArtifactGrantRow, DirectTurnRequestRow, NotificationRow
 from cognis.store.queries import (
     create_agent,
     create_artifact_record,
@@ -120,7 +124,84 @@ async def _admit(
 
 
 @pytest.mark.asyncio
-async def test_child_materializes_parent_owned_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "parent_outcome", ["completed", "failed", "cancelled", "ambiguous", "lost"]
+)
+async def test_background_child_fence_survives_only_successful_parent_completion(
+    tmp_path: Path, parent_outcome: str
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    try:
+        request_id, lease = await _running_tool_turn(store, leases, "background-child")
+        parent = DirectTurnExecutionFence(store=store, request_id=request_id, lease=lease)
+        child = BackgroundDirectTurnFence(parent)
+        before = await store.get(request_id)
+        assert before is not None
+        await child.assert_current()
+        await child.checkpoint("intaris_append", session_id="sess-child")
+        await child.record_tool_dispatch(
+            session_id="sess-child",
+            turn_id="turn-child",
+            descriptors=[_pending_descriptor("child")],
+        )
+        await child.complete_tool_dispatch(
+            session_id="sess-child", turn_id="turn-child", call_ids=["child"]
+        )
+        after = await store.get(request_id)
+        assert after is not None
+        assert after.outcome == before.outcome
+
+        if parent_outcome != "lost":
+            assert await store.mark_terminal(
+                request_id, lease=lease, status=DirectTurnStatus(parent_outcome)
+            )
+        assert await leases.release(lease)
+        with pytest.raises(StaleDirectTurnOwner):
+            await parent.assert_current()
+        if parent_outcome == "completed":
+            await child.assert_current()
+            await child.checkpoint("intaris_append")
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await child.assert_current()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field", ["fencing_token", "owner_incarnation_id", "conversation_id"]
+)
+async def test_background_child_fence_rejects_completion_by_another_owner(
+    changed_field: str,
+) -> None:
+    row = SimpleNamespace(
+        status="completed",
+        cancel_requested_at=None,
+        fencing_token=1,
+        owner_controller_id="controller",
+        owner_incarnation_id="incarnation",
+        conversation_id="conv-a",
+    )
+    setattr(row, changed_field, 2 if changed_field == "fencing_token" else "other")
+    parent = DirectTurnExecutionFence(
+        store=SimpleNamespace(
+            has_fence=AsyncMock(return_value=False), get=AsyncMock(return_value=row)
+        ),
+        request_id="dtr-parent",
+        lease=SimpleNamespace(
+            fencing_token=1,
+            owner_id="controller:incarnation",
+            resource_key=conversation_lease_key("conv-a"),
+        ),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await BackgroundDirectTurnFence(parent).assert_current()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grant_child", [False, True])
+async def test_child_materializes_parent_owned_artifact(tmp_path: Path, grant_child: bool) -> None:
     engine, store, leases = await _stores(tmp_path)
     factory = store._session_factory  # noqa: SLF001
     async with factory() as session:
@@ -163,6 +244,14 @@ async def test_child_materializes_parent_owned_artifact(tmp_path: Path) -> None:
             size_bytes=7,
             status="attached",
         )
+        if grant_child:
+            session.add(
+                ArtifactGrantRow(
+                    owner_email="user@example.com",
+                    content_ref="att-parent",
+                    agent_id="agent-child",
+                )
+            )
         await session.commit()
 
     admitted = await store.admit(
@@ -200,10 +289,18 @@ async def test_child_materializes_parent_owned_artifact(tmp_path: Path) -> None:
         incarnation_id="boot",
     )
 
+    if not grant_child:
+        # Parent ownership alone must not expose input bytes to a child.
+        with pytest.raises(PermanentDirectTurnPayloadError, match="Attachment access denied"):
+            await store.materialize_claimed_payload(
+                admitted.request.request_id,
+                lease=lease,
+                artifact_store=_ArtifactStore(),
+            )
+        await engine.dispose()
+        return
     materialized = await store.materialize_claimed_payload(
-        admitted.request.request_id,
-        lease=lease,
-        artifact_store=_ArtifactStore(),
+        admitted.request.request_id, lease=lease, artifact_store=_ArtifactStore()
     )
 
     assert materialized is not None
@@ -218,6 +315,62 @@ async def _wait_for(predicate, *, timeout: float = 3.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition was not reached before timeout")
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_new_turn_resets_outage_but_reclaim_and_blocked_claim_preserve_it(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    factory = store._session_factory  # noqa: SLF001
+    try:
+        async with factory() as session:
+            conversation = await get_conversation(session, "conv-a")
+            conversation.active_executor_id = "maitrea_riker"
+            await session.commit()
+        first = await _admit(store, "outage-first", "First turn")
+        second = await _admit(store, "outage-second", "Next turn")
+        lease = await leases.acquire(
+            conversation_lease_key("conv-a"), "controller:boot", ttl_seconds=60
+        )
+        assert lease is not None
+
+        async def claim(request_id):
+            return await store.claim(
+                request_id, lease=lease, controller_id="controller", incarnation_id="boot"
+            )
+
+        assert await claim(first.request.request_id)
+        original = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        assert original.remaining_seconds() == 0
+        assert await claim(second.request.request_id) is None
+        assert await store.mark_recoverable(first.request.request_id, lease=lease)
+        reclaimed = await claim(first.request.request_id)
+        assert reclaimed.attempt_count == 2
+        preserved = await begin_executor_recovery(
+            factory, conversation_id="conv-a", task_id=None, executor_id="maitrea_riker"
+        )
+        assert preserved.deadline == original.deadline
+        assert await store.mark_terminal(
+            first.request.request_id,
+            lease=lease,
+            status=DirectTurnStatus.FAILED,
+            outcome={"error_code": "executor_recovery_timeout"},
+        )
+        assert await claim(second.request.request_id)
+        fresh = await begin_executor_recovery(
+            factory, conversation_id="conv-a", task_id=None, executor_id="maitrea_riker"
+        )
+        assert fresh.unavailable_since > original.deadline
+        assert fresh.remaining_seconds() > 890
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -434,13 +587,7 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
             source="selector_primary",
         )
         await session.commit()
-    original_window = await begin_executor_recovery(
-        factory,
-        conversation_id="conv-a",
-        task_id=None,
-        executor_id="maitrea_riker",
-        observed_at=unavailable_since,
-    )
+    original_window = None
 
     old_started = asyncio.Event()
     old_fence_rejected = asyncio.Event()
@@ -458,8 +605,15 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
         successful_dispatches += 1
 
     async def old_execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
-        nonlocal old_fence
+        nonlocal old_fence, original_window
         assert await store.mark_running(row.request_id, lease=fence.lease)
+        original_window = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=unavailable_since,
+        )
         old_fence = fence
         old_started.set()
         try:
@@ -539,6 +693,7 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
         assert terminal.status == DirectTurnStatus.FAILED.value
         assert terminal.outcome["error_code"] == "executor_recovery_timeout"
         assert reclaimed_window is not None
+        assert original_window is not None
         assert reclaimed_window.unavailable_since == original_window.unavailable_since
         assert reclaimed_window.deadline == original_window.deadline
         assert terminal_projections == 1
@@ -1727,6 +1882,413 @@ async def test_escalation_blocked_request_survives_restart_and_takeover(
         await first.stop()
         await second.stop()
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_restored_escalation_resolved_on_other_replica_allows_fifo_claim(
+    tmp_path: Path, decision: str
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    factory = create_session_factory(engine)
+    first = await _admit(store, "message-1", "first")
+    second = await _admit(store, "message-2", "second")
+    async with factory() as db:
+        db.add(
+            NotificationRow(
+                notification_id="esc-1",
+                notification_type="escalation",
+                user_email="user@example.com",
+                conversation_id="conv-a",
+                session_id="sess-child",
+                status="pending",
+            )
+        )
+        await db.commit()
+    waiter = PauseWaiter()
+    providers = SimpleNamespace(
+        guardrails=SimpleNamespace(
+            submit_decision=AsyncMock(),
+            record_events=AsyncMock(return_value=SimpleNamespace(ok=True)),
+        )
+    )
+    owner = NotificationService(
+        session_factory=factory, pause_waiter=waiter, event_bus=EventBus(), providers=providers
+    )
+    resolver = NotificationService(
+        session_factory=factory,
+        pause_waiter=PauseWaiter(),
+        event_bus=EventBus(),
+        providers=providers,
+    )
+    controller = SimpleNamespace(
+        controller_id="controller-a",
+        incarnation_id="boot-a",
+        schema_compatible=True,
+        state=ControllerLifecycleState.READY,
+    )
+    scheduler = TurnScheduler(
+        session_factory=factory,
+        workflow_engine=None,
+        decision_engine=None,
+        task_queue=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        agent_loop=None,
+        pause_waiter=waiter,
+        notification_service=owner,
+        providers=providers,
+        artifact_store=_ArtifactStore(),
+        workflow_registry=None,
+        event_bus=EventBus(),
+        controller_runtime=controller,
+    )
+    executed: list[str] = []
+
+    async def execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
+        executed.append(row.request_id)
+        assert await store.mark_running(row.request_id, lease=fence.lease)
+        assert await store.mark_terminal(
+            row.request_id, lease=fence.lease, status=DirectTurnStatus.COMPLETED
+        )
+
+    runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-a",
+        incarnation_id="boot-a",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        can_claim_turn=scheduler._can_claim_direct_turn,
+        simple_mode=True,
+    )
+    try:
+        assert await owner.reconcile_pending() == 1
+        runtime._accepting_claims = True
+        await runtime.run_once()
+        assert executed == []
+        assert (await store.get(first.request.request_id)).attempt_count == 0
+        assert await resolver.resolve("esc-1", decision, user_email="user@example.com")
+        assert waiter.find_pending(conversation_id="conv-a") is not None
+        await runtime.run_once()
+        await _wait_for(lambda: executed == [first.request.request_id])
+        await _wait_for(lambda: not runtime._active)
+        await runtime.run_once()
+        await _wait_for(lambda: executed == [first.request.request_id, second.request.request_id])
+        assert waiter.get("esc-1") is None
+        providers.guardrails.submit_decision.assert_awaited_once_with("esc-1", decision, None)
+    finally:
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.fixture
+async def restored_escalation(tmp_path: Path):
+    engine, store, leases = await _stores(tmp_path)
+    factory = create_session_factory(engine)
+    admitted = await _admit(store, "message-1", "blocked")
+    async with factory() as db:
+        db.add(
+            NotificationRow(
+                notification_id="esc-1",
+                notification_type="escalation",
+                user_email="user@example.com",
+                conversation_id="conv-a",
+                session_id="sess-child",
+                status="pending",
+            )
+        )
+        await db.commit()
+    waiter = PauseWaiter()
+    service = NotificationService(
+        session_factory=factory, pause_waiter=waiter, event_bus=EventBus(), providers=None
+    )
+    assert await service.reconcile_pending() == 1
+    async with factory() as db:
+        row = await db.get(NotificationRow, "esc-1")
+        row.status = "resolved"
+        row.resolution = {"decision": "deny"}
+        await db.commit()
+    controller = SimpleNamespace(schema_compatible=True, state=ControllerLifecycleState.READY)
+    # Exercise the production scheduler hook without unrelated turn dependencies.
+    scheduler = TurnScheduler.__new__(TurnScheduler)
+    scheduler._controller_runtime = controller
+    scheduler._active_turns = {}
+    scheduler._pause_waiter = waiter
+    scheduler._notification_service = service
+    execute = AsyncMock()
+    runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-a",
+        incarnation_id="boot-a",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        can_claim_turn=scheduler._can_claim_direct_turn,
+        simple_mode=True,
+    )
+    runtime._accepting_claims = True
+    harness = SimpleNamespace(
+        factory=factory,
+        store=store,
+        leases=leases,
+        row=admitted.request,
+        waiter=waiter,
+        service=service,
+        scheduler=scheduler,
+        controller=controller,
+        runtime=runtime,
+        execute=execute,
+    )
+    try:
+        yield harness
+    finally:
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "pending",
+        "resolving",
+        "missing",
+        "unknown",
+        "malformed",
+        "unknown_decision",
+        "malformed_decision",
+        "tenant",
+        "conversation",
+        "session",
+        "type",
+        "storage",
+        "live",
+    ],
+)
+async def test_restored_escalation_claim_fails_closed(
+    restored_escalation: Any, blocker: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = restored_escalation
+    if blocker == "storage":
+
+        def unavailable():
+            raise OSError("storage unavailable")
+
+        monkeypatch.setattr(h.service, "_session_factory", unavailable)
+    elif blocker != "live":
+        async with h.factory() as db:
+            row = await db.get(NotificationRow, "esc-1")
+            if blocker in {"pending", "resolving", "unknown"}:
+                row.status = blocker
+            elif blocker == "missing":
+                await db.delete(row)
+            elif blocker == "malformed":
+                row.resolution = None
+            elif blocker == "unknown_decision":
+                row.resolution = {"decision": "unknown"}
+            elif blocker == "malformed_decision":
+                row.resolution = {"decision": ["approve"]}
+            elif blocker == "tenant":
+                await create_user(db, email="other@example.com", name="Other", password_hash="hash")
+                row.user_email = "other@example.com"
+            elif blocker == "conversation":
+                row.conversation_id = "conv-child"
+            elif blocker == "session":
+                row.session_id = "sess-a"
+            elif blocker == "type":
+                row.notification_type = "gate"
+            await db.commit()
+    waiting = None
+    pause = h.waiter.get("esc-1")
+    if blocker == "live":
+        waiting = asyncio.create_task(h.waiter.wait("esc-1"))
+        await asyncio.sleep(0)
+    try:
+        assert not await h.scheduler._can_claim_direct_turn(h.row)
+        await h.runtime.run_once()
+        h.execute.assert_not_awaited()
+        assert h.waiter.get("esc-1") is pause
+        assert not pause.resolved
+        assert (await h.store.get(h.row.request_id)).attempt_count == 0
+        if waiting is not None:
+            assert not waiting.done()
+    finally:
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "race", ["drain", "schema", "active", "new_pause", "replacement", "live", "cancel"]
+)
+async def test_restored_escalation_rechecks_after_read(
+    restored_escalation: Any, race: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = restored_escalation
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    @asynccontextmanager
+    async def delayed_read():
+        async with h.factory() as db:
+            yield db
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(h.service, "_session_factory", delayed_read)
+    checking = asyncio.create_task(h.scheduler._can_claim_direct_turn(h.row))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    waiting = None
+    if race == "drain":
+        h.controller.state = ControllerLifecycleState.DRAINING
+    elif race == "schema":
+        h.controller.schema_compatible = False
+    elif race == "active":
+        waiting = asyncio.create_task(asyncio.Event().wait())
+        h.scheduler._active_turns["conv-a"] = waiting
+    elif race in {"new_pause", "replacement"}:
+        h.waiter.register(
+            PendingPause(
+                pause_id="esc-1" if race == "replacement" else "esc-2",
+                pause_type="escalation",
+                conversation_id="conv-a",
+                session_id="sess-child",
+            )
+        )
+    elif race == "live":
+        waiting = asyncio.create_task(h.waiter.wait("esc-1"))
+        await asyncio.sleep(0)
+    elif race == "cancel":
+        checking.cancel()
+    try:
+        if race == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await checking
+            assert h.waiter.get("esc-1") is not None
+        else:
+            release.set()
+            assert not await checking
+        if race in {"new_pause", "replacement", "live"}:
+            assert h.waiter.find_pending(conversation_id="conv-a") is not None
+    finally:
+        release.set()
+        checking.cancel()
+        await asyncio.gather(checking, return_exceptions=True)
+        if waiting is not None:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_no_local_escalation_skips_storage(
+    restored_escalation: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = restored_escalation
+    h.waiter.clear("esc-1")
+
+    def unexpected_read():
+        pytest.fail("no-pause path must not access storage")
+
+    monkeypatch.setattr(h.service, "_session_factory", unexpected_read)
+    assert await h.service.reconcile_escalation_pauses(
+        conversation_id="conv-a", user_email="user@example.com"
+    )
+    assert await h.scheduler._can_claim_direct_turn(h.row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "resolved"])
+async def test_multiple_restored_pauses_require_all_resolved(
+    restored_escalation: Any, status: str
+) -> None:
+    h = restored_escalation
+    h.waiter.register(
+        PendingPause(
+            pause_id="esc-2",
+            pause_type="escalation",
+            conversation_id="conv-a",
+            session_id="sess-child",
+        )
+    )
+    async with h.factory() as db:
+        db.add(
+            NotificationRow(
+                notification_id="esc-2",
+                notification_type="escalation",
+                user_email="user@example.com",
+                conversation_id="conv-a",
+                session_id="sess-child",
+                status=status,
+                resolution={"decision": "approve"} if status == "resolved" else None,
+            )
+        )
+        await db.commit()
+    assert await h.scheduler._can_claim_direct_turn(h.row) is (status == "resolved")
+    assert h.waiter.get("esc-1") is None
+    assert (h.waiter.get("esc-2") is None) is (status == "resolved")
+    assert h.waiter._resolutions == {}
+    async with h.factory() as db:
+        row = await db.get(NotificationRow, "esc-1")
+        assert row.status == "resolved"
+        assert row.resolution == {"decision": "deny"}
+        assert row.revision == 1
+
+
+@pytest.mark.asyncio
+async def test_restored_pause_read_timeout_fails_closed(
+    restored_escalation: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cognis.core.notifications as notifications_module
+
+    h = restored_escalation
+
+    @asynccontextmanager
+    async def stalled_storage():
+        await asyncio.Event().wait()
+        yield
+
+    monkeypatch.setattr(notifications_module, "_PAUSE_RECONCILE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(h.service, "_session_factory", stalled_storage)
+    assert not await asyncio.wait_for(h.scheduler._can_claim_direct_turn(h.row), timeout=1)
+    assert h.waiter.get("esc-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_async_claim_hook_rechecks_stop_claiming(restored_escalation: Any) -> None:
+    h = restored_escalation
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def can_claim(_row):
+        entered.set()
+        await release.wait()
+        return True
+
+    execute = AsyncMock()
+    runtime = DurableDirectTurnRuntime(
+        store=h.store,
+        lease_store=h.leases,
+        controller_id="controller-a",
+        incarnation_id="boot-a",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        can_claim_turn=can_claim,
+        simple_mode=True,
+    )
+    runtime._accepting_claims = True
+    checking = asyncio.create_task(runtime.run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await runtime.stop_claiming()
+        release.set()
+        await checking
+        assert (await h.store.get(h.row.request_id)).attempt_count == 0
+        execute.assert_not_awaited()
+    finally:
+        release.set()
+        await checking
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

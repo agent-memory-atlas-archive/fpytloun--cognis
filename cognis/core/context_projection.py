@@ -31,6 +31,7 @@ from cognis import json_codec as json
 from cognis.core.message_markers import (
     ANCHOR_NAMES,
     PROJECTED_COMPACTED,
+    PROJECTION_EVENT_SEQS,
     PROTECTED_TOOL_OUTPUT,
     RECOVERY_CALL_ID,
     SOURCE_CALL_ID,
@@ -54,6 +55,8 @@ DEFAULT_PRESERVED_TOOL_TOKENS = 50_000  # replaces old byte constant
 DEFAULT_MAX_HISTORICAL_TOOL_RESULT_TOKENS = 5_000  # replaces old byte constant
 # Backward-compatible alias used by existing call sites.
 DEFAULT_COMPACTED_TOOL_GROUPS = DEFAULT_PRESERVED_TOOL_GROUPS
+CROSS_TURN_TRIGGER_FRACTION = 0.75
+CROSS_TURN_TARGET_FRACTION = 0.35
 _ARG_CLEAR_THRESHOLD = 6_000
 _ARG_STRUCTURED_PREVIEW_CHARS = 500
 
@@ -221,6 +224,20 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
     )
 
 
+def compaction_shrinks_tool_result(message: dict[str, Any]) -> bool:
+    """Return whether a placeholder would at least halve a textual tool result.
+
+    Rewriting history invalidates the provider prompt cache from that point on,
+    so a result is replaced only when the placeholder is materially smaller.
+    Small outputs stay verbatim; non-text content keeps the existing behavior.
+    """
+
+    content = message.get("content")
+    if not isinstance(content, str):
+        return True
+    return len(content) >= 2 * len(build_compacted_tool_result_placeholder(message))
+
+
 def build_compacted_tool_attachment_placeholder(message: dict[str, Any]) -> str:
     """Build a deterministic placeholder for compacted tool attachment context."""
 
@@ -308,6 +325,7 @@ class ProjectionResult:
 
     messages: list[dict[str, Any]]
     mutable_start_index: int
+    decisions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def append_tail(self, new_tail: list[dict[str, Any]]) -> ProjectionResult:
         """Return a new result with *new_tail* appended verbatim.
@@ -319,7 +337,246 @@ class ProjectionResult:
         return ProjectionResult(
             messages=list(self.messages) + list(new_tail),
             mutable_start_index=self.mutable_start_index,
+            decisions=self.decisions,
         )
+
+
+PROJECTION_RENDERING_POLICY_VERSION = 1
+
+
+def projection_decision_batches(
+    decisions: dict[str, list[dict[str, Any]]],
+    *,
+    max_bytes: int = 64 * 1024,
+) -> list[dict[str, Any]]:
+    """Bound delta writes by encoded bytes without splitting a call's operations."""
+    batches: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    # Leave room for the SessionEvent envelope and JSON array used by Intaris.
+    size = 256
+    for call_id, operations in sorted(decisions.items()):
+        target: dict[str, Any] = (
+            {"event_seq": int(call_id.removeprefix("event:"))}
+            if call_id.startswith("event:")
+            else {"call_id": call_id}
+        )
+        group = [{**target, **operation} for operation in operations]
+        group_size = sum(
+            len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+            for item in group
+        )
+        if group_size + 256 > max_bytes:
+            raise ValueError("A projection decision group exceeds the event byte limit")
+        if current and size + group_size > max_bytes:
+            batches.append({"event": "context_projection", "decisions": current})
+            current, size = [], 256
+        current.extend(group)
+        size += group_size
+    if current:
+        batches.append({"event": "context_projection", "decisions": current})
+    return batches
+
+
+def projection_decisions_from_diff(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    *,
+    arg_clear_threshold: int = _ARG_CLEAR_THRESHOLD,
+) -> dict[str, list[dict[str, Any]]]:
+    """Describe only deterministic, call-scoped changes made by projection."""
+    if len(before) == len(after) and all(
+        old is new for old, new in zip(before, after, strict=True)
+    ):
+        return {}
+    before_calls: dict[str, str] = {}
+    after_calls: dict[str, str] = {}
+    for messages, destination in ((before, before_calls), (after, after_calls)):
+        for message in messages:
+            for call in message.get("tool_calls", []):
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id") or call.get("call_id")
+                function = call.get("function")
+                arguments = function.get("arguments") if isinstance(function, dict) else None
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, default=str)
+                if isinstance(call_id, str) and isinstance(arguments, str):
+                    destination[call_id] = arguments
+
+    decisions: dict[str, list[dict[str, Any]]] = {}
+
+    def add(call_id: Any, operation: str, parameters: dict[str, int] | None = None) -> None:
+        if not isinstance(call_id, str) or not call_id:
+            return
+        decision = {
+            "operation": operation,
+            "rendering_policy_version": PROJECTION_RENDERING_POLICY_VERSION,
+            "parameters": parameters or {},
+        }
+        call_decisions = decisions.setdefault(call_id, [])
+        if decision not in call_decisions:
+            call_decisions.append(decision)
+
+    omitted_group_indices: set[int] = set()
+    for group in _collect_tool_groups(before):
+        if group.call_ids and group.call_ids.isdisjoint(after_calls):
+            # One decision owns the entire parallel batch, including attachments.
+            add(min(group.call_ids), "omit_tool_group")
+            omitted_group_indices.update(group.message_indices)
+    for call_id, arguments in before_calls.items():
+        if call_id in after_calls and after_calls[call_id] != arguments:
+            add(call_id, "clear_arguments", {"threshold": arg_clear_threshold})
+    for message in after:
+        if not message.get(PROJECTED_COMPACTED):
+            continue
+        if message.get("_delegation_result_replay"):
+            add(message.get("_recovery_call_id"), "compact_delegation_result")
+        elif message.get("role") == "tool":
+            add(message.get("tool_call_id"), "compact_result")
+        elif message.get(TOOL_ATTACHMENT_CONTEXT):
+            add(message.get(TOOL_CALL_ID) or message.get("tool_call_id"), "compact_attachment")
+    before_event_seqs = {
+        seq
+        for index, message in enumerate(before)
+        if index not in omitted_group_indices
+        for seq in message.get(PROJECTION_EVENT_SEQS, [])
+        if isinstance(seq, int) and seq > 0
+    }
+    after_event_seqs = {
+        seq
+        for message in after
+        for seq in message.get(PROJECTION_EVENT_SEQS, [])
+        if isinstance(seq, int) and seq > 0
+    }
+    for event_seq in sorted(before_event_seqs - after_event_seqs):
+        add(f"event:{event_seq}", "omit_event", {"event_seq": event_seq})
+    return decisions
+
+
+def apply_projection_decisions(
+    messages: list[dict[str, Any]],
+    decisions: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Reapply durable call-scoped projections to original event messages."""
+    if not decisions:
+        return messages
+    omitted_calls = {
+        call_id
+        for call_id, operations in decisions.items()
+        if any(
+            operation.get("operation") == "omit_tool_group"
+            and operation.get("rendering_policy_version") == PROJECTION_RENDERING_POLICY_VERSION
+            for operation in operations
+        )
+    }
+    omitted_indices = (
+        {
+            index
+            for group in _collect_tool_groups(messages)
+            if group.call_ids & omitted_calls
+            for index in group.message_indices
+        }
+        if omitted_calls
+        else set()
+    )
+    omitted_event_seqs = {
+        event_seq
+        for key, call_decisions in decisions.items()
+        if key.startswith("event:")
+        for decision in call_decisions
+        if decision.get("operation") == "omit_event"
+        and isinstance(
+            (event_seq := decision.get("parameters", {}).get("event_seq"))
+            if isinstance(decision.get("parameters"), dict)
+            else None,
+            int,
+        )
+        and not isinstance(event_seq, bool)
+        and event_seq > 0
+    }
+    projected: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index in omitted_indices:
+            continue
+        source_event_seqs = message.get(PROJECTION_EVENT_SEQS)
+        if (
+            isinstance(source_event_seqs, list)
+            and source_event_seqs
+            and set(source_event_seqs).issubset(omitted_event_seqs)
+        ):
+            continue
+        updated = dict(message)
+        if message.get("_delegation_result_replay"):
+            call_id = message.get("_recovery_call_id")
+            for decision in decisions.get(call_id, []) if isinstance(call_id, str) else []:
+                if (
+                    decision.get("operation") != "compact_delegation_result"
+                    or decision.get("rendering_policy_version")
+                    != PROJECTION_RENDERING_POLICY_VERSION
+                ):
+                    continue
+                compacted, _ = _compact_prunable_delegation_replays(
+                    [message],
+                    max_historical_tool_result_tokens=1,
+                    force=True,
+                )
+                if compacted:
+                    updated = compacted[0]
+        elif message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            for decision in decisions.get(call_id, []) if isinstance(call_id, str) else []:
+                if (
+                    decision.get("operation") == "compact_result"
+                    and decision.get("rendering_policy_version")
+                    == PROJECTION_RENDERING_POLICY_VERSION
+                    and not updated.get(PROJECTED_COMPACTED)
+                ):
+                    updated["content"] = build_compacted_tool_result_placeholder(message)
+                    updated[PROJECTED_COMPACTED] = True
+        elif isinstance(message.get("tool_calls"), list):
+            calls = list(message["tool_calls"])
+            changed = False
+            for index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id") or call.get("call_id")
+                for decision in decisions.get(call_id, []) if isinstance(call_id, str) else []:
+                    if (
+                        decision.get("operation") != "clear_arguments"
+                        or decision.get("rendering_policy_version")
+                        != PROJECTION_RENDERING_POLICY_VERSION
+                    ):
+                        continue
+                    parameters = decision.get("parameters")
+                    threshold = (
+                        parameters.get("threshold") if isinstance(parameters, dict) else None
+                    )
+                    if not isinstance(threshold, int) or threshold < 1:
+                        continue
+                    single_call_message = clear_large_tool_call_arguments(
+                        {"role": "assistant", "tool_calls": [call]},
+                        arg_clear_threshold=threshold,
+                    )
+                    replacement = single_call_message.get("tool_calls", [call])[0]
+                    if replacement != call:
+                        calls[index] = replacement
+                        changed = True
+            if changed:
+                updated["tool_calls"] = calls
+        elif message.get(TOOL_ATTACHMENT_CONTEXT):
+            call_id = message.get(TOOL_CALL_ID) or message.get("tool_call_id")
+            for decision in decisions.get(call_id, []) if isinstance(call_id, str) else []:
+                if (
+                    decision.get("operation") == "compact_attachment"
+                    and decision.get("rendering_policy_version")
+                    == PROJECTION_RENDERING_POLICY_VERSION
+                    and not updated.get(PROJECTED_COMPACTED)
+                ):
+                    updated["role"] = "system"
+                    updated["content"] = build_compacted_tool_attachment_placeholder(message)
+                    updated[PROJECTED_COMPACTED] = True
+        projected.append(updated)
+    return projected
 
 
 # ── Projection policy ─────────────────────────────────────────────────────────
@@ -370,6 +627,7 @@ class ProjectionPolicy:
         *,
         max_context_tokens: int,
         available_prompt_tokens: int | None = None,
+        effective_input_tokens: int | None = None,
         phase: ProjectionPhase = "cross_turn",
         pressure_mode: PressureMode | ProjectionPressureMode = PressureMode.normal,
     ) -> ProjectionPolicy:
@@ -383,6 +641,10 @@ class ProjectionPolicy:
             available,
             max(burst_target, min(int(available * 0.98), max(int(burst_cap * 1.1), burst_target))),
         )
+        if phase == "cross_turn":
+            steady_target = max(
+                1, int((effective_input_tokens or available) * CROSS_TURN_TARGET_FRACTION)
+            )
 
         cross_tool_tokens = _clamp(int(steady_target * 0.18), 8_000, 70_000)
         within_tool_tokens = _clamp(int(burst_target * 0.38), 25_000, 250_000)
@@ -440,6 +702,37 @@ class ProjectionPolicy:
 
 
 # ── Pressure snapshot & decision ─────────────────────────────────────────────
+
+
+def projection_diagnostic_fields(
+    policy: ProjectionPolicy,
+    *,
+    reason: str,
+    before_prompt_tokens: int,
+    after_prompt_tokens: int,
+    trigger_tokens: int | None,
+    entry_trigger_tokens: int | None = None,
+    savings_target_tokens: int | None = None,
+) -> dict[str, str | int | None]:
+    """Return content-free sizing evidence; pressure mode is not a trigger reason."""
+    return {
+        "projection_phase": policy.phase,
+        "projection_reason": reason,
+        "projection_pressure_mode": str(policy.pressure_mode),
+        "projection_before_prompt_tokens": before_prompt_tokens,
+        "projection_after_prompt_tokens": after_prompt_tokens,
+        "projection_trigger_tokens": trigger_tokens,
+        "projection_entry_trigger_tokens": (
+            trigger_tokens if entry_trigger_tokens is None else entry_trigger_tokens
+        ),
+        "projection_savings_target_tokens": (
+            policy.steady_target_tokens if savings_target_tokens is None else savings_target_tokens
+        ),
+        "projection_available_prompt_tokens": policy.available_prompt_tokens,
+        "projection_steady_target_tokens": policy.steady_target_tokens,
+        "projection_burst_target_tokens": policy.burst_target_tokens,
+        "projection_hard_prompt_tokens": policy.hard_prompt_tokens,
+    }
 
 
 @dataclass(slots=True)
@@ -599,10 +892,8 @@ class ProjectionTurnState:
     # Monotonic preservation: anchors of groups already sent to the model.
     # Under non-critical pressure these are never demoted.
     committed_preservations: set[str] = field(default_factory=set)
-    # Prefix stability: once a group has been projected as a placeholder during
-    # this turn, never promote it back to verbatim content.  The placeholder
-    # builder is deterministic, so this keeps the already-demoted prefix
-    # byte-stable across pressure cycles.
+    # Only fully compacted groups may be reapplied as whole-group demotions.
+    # A partially pruned batch retains its per-result rendering and preservation.
     demoted_anchors: set[str] = field(default_factory=set)
 
     # Telemetry
@@ -797,7 +1088,7 @@ def projected_prefix_fingerprint(messages: list[dict[str, Any]], mutable_start_i
 
 
 def compacted_tool_group_anchors(messages: list[dict[str, Any]]) -> set[str]:
-    """Return anchors for tool groups whose result content is currently compacted."""
+    """Return anchors for complete groups with every result already compacted."""
 
     compacted_call_ids = {
         str(message.get("tool_call_id") or "")
@@ -809,7 +1100,7 @@ def compacted_tool_group_anchors(messages: list[dict[str, Any]]) -> set[str]:
     return {
         _group_anchor(group)
         for group in _collect_tool_groups(messages)
-        if bool(group.call_ids & compacted_call_ids)
+        if group.completed and group.call_ids.issubset(compacted_call_ids)
     }
 
 
@@ -943,8 +1234,9 @@ def _estimated_group_compaction_savings(
                 arg_clear_threshold=arg_clear_threshold,
             )
         elif message.get("role") == "tool":
-            projected_message["content"] = build_compacted_tool_result_placeholder(message)
-            projected_message[PROJECTED_COMPACTED] = True
+            if compaction_shrinks_tool_result(message):
+                projected_message["content"] = build_compacted_tool_result_placeholder(message)
+                projected_message[PROJECTED_COMPACTED] = True
         elif message.get(TOOL_ATTACHMENT_CONTEXT):
             projected_message["role"] = "system"
             projected_message["content"] = build_compacted_tool_attachment_placeholder(message)
@@ -1098,6 +1390,7 @@ def _compact_prunable_delegation_replays(
     *,
     max_historical_tool_result_tokens: int,
     token_counter: Callable[[str], int] | None = None,
+    force: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     if max_historical_tool_result_tokens <= 0:
         return messages, False
@@ -1107,7 +1400,11 @@ def _compact_prunable_delegation_replays(
         if not message.get("_delegation_result_replay"):
             projected.append(message)
             continue
-        if _get_message_token_estimate(message, token_counter) <= max_historical_tool_result_tokens:
+        if (
+            not force
+            and _get_message_token_estimate(message, token_counter)
+            <= max_historical_tool_result_tokens
+        ):
             projected.append(message)
             continue
         call_id = message.get("_recovery_call_id")
@@ -1402,7 +1699,11 @@ def project_messages(
                 clear_large_tool_call_arguments(message, arg_clear_threshold=arg_clear_threshold)
             )
             continue
-        if message.get("role") == "tool" and message.get("tool_call_id") in compacted_call_ids:
+        if (
+            message.get("role") == "tool"
+            and message.get("tool_call_id") in compacted_call_ids
+            and compaction_shrinks_tool_result(message)
+        ):
             projected.append(
                 {
                     **message,
@@ -1514,7 +1815,7 @@ def prune_projected_messages(
         tokens = count(content) if isinstance(content, str) else 0
         if protected_tokens + tokens <= protect_tokens:
             protected_tokens += tokens
-        else:
+        elif compaction_shrinks_tool_result(message):
             pruneable_result_indices.append(index)
             call_id = message.get("tool_call_id")
             if isinstance(call_id, str) and call_id:
@@ -1555,7 +1856,11 @@ def prune_projected_messages(
     total_savings = 0
     for index in pruneable_result_indices:
         content = result[index].get("content", "")
-        total_savings += count(content) if isinstance(content, str) else 0
+        if isinstance(content, str):
+            total_savings += max(
+                0,
+                count(content) - count(build_compacted_tool_result_placeholder(result[index])),
+            )
     for index in pruneable_call_indices:
         for tool_call in result[index].get("tool_calls", []):
             if isinstance(tool_call, dict):

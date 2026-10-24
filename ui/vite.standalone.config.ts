@@ -32,9 +32,25 @@ function enforceStandaloneDependencyBoundary(): Plugin {
   };
 }
 
-export default defineConfig({
-  base: standaloneBase,
-  plugins: [svelte(), enforceStandaloneDependencyBoundary()],
+function excludePrivateFavoriteControls(): Plugin {
+  return {
+    name: 'cognis-standalone-private-favorites',
+    enforce: 'pre',
+    resolveId(source) {
+      if (source.endsWith('/DocumentFavoriteButton.svelte')) {
+        return fileURLToPath(new URL('./src/lib/components/DocumentFavoriteButtonDisabled.svelte', import.meta.url));
+      }
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => ({
+  base: mode === 'offline' ? './' : standaloneBase,
+  // Offline publications deliberately include lazy renderers (Mermaid,
+  // charts, markdown) in one script; the hosted entry retains its budget.
+  plugins: mode === 'offline'
+    ? [excludePrivateFavoriteControls(), svelte()]
+    : [excludePrivateFavoriteControls(), svelte(), enforceStandaloneDependencyBoundary()],
   resolve: {
     alias: {
       $lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
@@ -46,10 +62,13 @@ export default defineConfig({
     emptyOutDir: true,
     manifest: true,
     modulePreload: { polyfill: false },
-    outDir: 'standalone-build',
+    outDir: mode === 'offline' ? 'standalone-build/offline' : 'standalone-build',
+    assetsInlineLimit: mode === 'offline' ? Number.MAX_SAFE_INTEGER : 4096,
+    cssCodeSplit: mode !== 'offline',
     rollupOptions: {
       input: fileURLToPath(new URL('./src/standalone.ts', import.meta.url)),
       output: {
+        ...(mode === 'offline' ? { format: 'iife' as const, inlineDynamicImports: true } : {}),
         assetFileNames: 'assets/[name]-[hash][extname]',
         chunkFileNames: 'assets/[name]-[hash].js',
         entryFileNames: 'assets/[name]-[hash].js',
@@ -57,4 +76,4 @@ export default defineConfig({
     },
     sourcemap: false,
   },
-});
+}));

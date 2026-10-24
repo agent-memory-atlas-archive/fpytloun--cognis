@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from cognis.models.config import ModelInfo, normalize_reasoning_level
+from cognis.providers.llm.anthropic.model_policy import (
+    anthropic_model_policy,
+    matches_anthropic_model_key,
+    validate_model_request,
+)
 
 _OPENAI_PRESETS = {"openai", "openai_compatible", "litellm_proxy", "azure", "chatgpt"}
 _GOOGLE_PRESETS = {"gemini", "google", "vertex_ai"}
@@ -25,6 +30,8 @@ _ANTHROPIC_ADAPTIVE_MODEL_KEYS = frozenset(
         "opus-5-5",
         "sonnet-4-6",
         "sonnet-5",
+        "sonnet-5-5",
+        "haiku-5-5",
     }
 )
 _ANTHROPIC_LEGACY_MODEL_KEYS = frozenset(
@@ -51,6 +58,8 @@ _ANTHROPIC_XHIGH_MODEL_KEYS = frozenset(
         "opus-5",
         "opus-5-5",
         "sonnet-5",
+        "sonnet-5-5",
+        "haiku-5-5",
     }
 )
 _THINKING_EFFORT_ORDER: tuple[str, ...] = (
@@ -161,6 +170,11 @@ def enrich_model_entry(
     if inferred_reasoning:
         entry["supports_reasoning"] = True
     existing_efforts = entry.get("reasoning_efforts")
+    if not anthropic_model_policy(model_id).supports_disabled_thinking and isinstance(
+        existing_efforts, list
+    ):
+        existing_efforts = [value for value in existing_efforts if value != "none"]
+        entry["reasoning_efforts"] = existing_efforts
     if supports_reasoning and (not isinstance(existing_efforts, list) or not existing_efforts):
         try:
             preview_source = {
@@ -226,6 +240,31 @@ def build_reasoning_profile(
         return ReasoningProfile(family="unsupported", supports_reasoning=False)
 
     family = detect_reasoning_family(model_id, provider_preset=provider_preset)
+    if provider_preset == "openrouter":
+        positive = [
+            effort
+            for effort in _positive_model_info_reasoning_efforts(model_info)
+            if effort in {"low", "medium", "high", "xhigh"}
+        ] or ["low", "medium", "high"]
+        native_efforts = ("none", *positive)
+        return ReasoningProfile(
+            family="openrouter",
+            supports_reasoning=True,
+            available_efforts=("default", *native_efforts),
+            native_efforts=native_efforts,
+        )
+    if provider_preset == "gemini" and "gemini-3" in model_id:
+        available = (
+            ("default", "low", "medium", "high")
+            if "flash" in model_id
+            else ("default", "low", "high")
+        )
+        return ReasoningProfile(
+            family="google_level",
+            supports_reasoning=True,
+            available_efforts=available,
+            native_efforts=available[1:],
+        )
     preset_family = _family_from_provider_preset(provider_preset)
     if (
         family in {"unsupported", "generic"}
@@ -248,15 +287,15 @@ def build_reasoning_profile(
             positive = ["low", "medium", "high"]
             if _supports_openai_xhigh(model_id, model_info):
                 positive.append("xhigh")
-        available = ["default"]
+        openai_available = ["default"]
         if _supports_openai_none(model_id, model_info):
-            available.append("none")
-        available.extend(positive)
+            openai_available.append("none")
+        openai_available.extend(positive)
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=tuple(available),
-            native_efforts=tuple(level for level in available if level != "default"),
+            available_efforts=tuple(openai_available),
+            native_efforts=tuple(level for level in openai_available if level != "default"),
         )
 
     if family == "anthropic_adaptive":
@@ -344,6 +383,7 @@ def apply_reasoning_config(
     """Translate normalized reasoning settings into provider-ready kwargs."""
 
     result = dict(request_kwargs)
+    validate_model_request(model_id, result)
     supports_reasoning = _supports_reasoning(model_info, model_id, provider_preset)
     profile = build_reasoning_profile(
         model_id,
@@ -366,6 +406,8 @@ def apply_reasoning_config(
     had_reasoning_effort = "reasoning_effort" in result
     raw_reasoning_effort = result.pop("reasoning_effort", None)
     requested = normalize_reasoning_effort(_coerce_reasoning_value(raw_reasoning_effort))
+    if profile.family == "google_level" and requested == "none":
+        raise ValueError("Gemini 3 does not support disabled thinking")
     if profile.family in {"anthropic", "anthropic_adaptive"} and "thinking" in result:
         # A native Anthropic thinking object is authoritative. The generic
         # Cognis effort shorthand must never rewrite it, but provider
@@ -416,6 +458,17 @@ def apply_reasoning_config(
     resolved = _resolve_requested_effort(requested, profile)
     stripped_params = _strip_sampling_params(result)
     effective = _apply_resolved_effort(result, resolved=resolved, profile=profile)
+    if provider_preset == "gemini" and profile.family == "google":
+        budget = result.pop("thinking_config", {}).get("thinking_budget")
+        if isinstance(budget, int):
+            result["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    if provider_preset == "gemini" and effective is not None:
+        # Catalog metadata can lag the native adapter. These controls have
+        # already been validated against the provider/model reasoning profile.
+        control = "thinking" if profile.family == "google" else "reasoning_effort"
+        result["allowed_openai_params"] = list(
+            dict.fromkeys([*result.get("allowed_openai_params", []), control])
+        )
     if profile.family == "anthropic":
         result = _enforce_anthropic_thinking_budget(result, model_info=model_info)
     return PreparedReasoningConfig(
@@ -481,6 +534,7 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
         return "openai"
     if (
         "gemini-2.5" in normalized_model
+        or "gemini-3" in normalized_model
         or "gemini_2.5" in normalized_model
         or "gemini-2_5" in normalized_model
         or (preset in _GOOGLE_PRESETS and "gemini-2.5" in normalized_model)
@@ -530,7 +584,7 @@ def _candidate_model_names(model_id: str, model_info: ModelInfo | None) -> list[
 
 def _is_known_anthropic_reasoning_model(normalized_model: str) -> bool:
     return any(
-        _matches_anthropic_model_key(normalized_model, key)
+        matches_anthropic_model_key(normalized_model, key)
         for key in _ANTHROPIC_ADAPTIVE_MODEL_KEYS | _ANTHROPIC_LEGACY_MODEL_KEYS
     )
 
@@ -541,38 +595,10 @@ def looks_like_anthropic_reasoning_model(model_id: str) -> bool:
     return _is_known_anthropic_reasoning_model(_normalize_model_name(model_id))
 
 
-def _normalized_anthropic_candidate(model_name: str) -> str:
-    return re.sub(r"[\s._/]+", "-", model_name.strip().lower())
-
-
-def _matches_anthropic_model_key(candidate: str, key: str) -> bool:
-    normalized = _normalized_anthropic_candidate(candidate)
-    for prefix in (f"claude-{key}", key):
-        start = 0
-        while True:
-            index = normalized.find(prefix, start)
-            if index < 0:
-                break
-            before = normalized[index - 1] if index > 0 else ""
-            if before and before.isalnum():
-                start = index + 1
-                continue
-            suffix = normalized[index + len(prefix) :]
-            if (
-                not suffix
-                or suffix == "-alias"
-                or re.fullmatch(r"-\d{8}(?:-[a-z0-9:-]+)?", suffix)
-                or re.fullmatch(r"-v\d+(?::\d+)?", suffix)
-            ):
-                return True
-            start = index + 1
-    return False
-
-
 def _adaptive_anthropic_model_key(model_id: str, model_info: ModelInfo | None) -> str | None:
     for candidate in _candidate_model_names(model_id, model_info):
         for key in _ANTHROPIC_ADAPTIVE_MODEL_KEYS:
-            if _matches_anthropic_model_key(candidate, key):
+            if matches_anthropic_model_key(candidate, key):
                 return key
     return None
 
@@ -587,7 +613,11 @@ def _supports_anthropic_xhigh(model_id: str, model_info: ModelInfo | None) -> bo
 
 def _supports_anthropic_disabled(model_id: str, model_info: ModelInfo | None) -> bool:
     key = _adaptive_anthropic_model_key(model_id, model_info)
-    return key is not None and key not in _ANTHROPIC_ALWAYS_ON_MODEL_KEYS
+    return (
+        key is not None
+        and key not in _ANTHROPIC_ALWAYS_ON_MODEL_KEYS
+        and anthropic_model_policy(f"claude-{key}").supports_disabled_thinking
+    )
 
 
 def reasoning_mode_for_model(
@@ -605,7 +635,7 @@ def reasoning_mode_for_model(
         return None
     requested = normalize_reasoning_effort(requested_effort)
     if requested == "none":
-        return "disabled" if key not in _ANTHROPIC_ALWAYS_ON_MODEL_KEYS else None
+        return "disabled" if _supports_anthropic_disabled(model_id, model_info) else None
     return "adaptive"
 
 
@@ -686,6 +716,18 @@ def _apply_resolved_effort(
 ) -> str | None:
     if resolved is None:
         return None
+    if profile.family == "openrouter":
+        if resolved != "default":
+            request_kwargs["reasoning"] = (
+                {"enabled": False} if resolved == "none" else {"effort": resolved}
+            )
+        return None if resolved == "default" else resolved
+    if profile.family == "google_level":
+        if resolved == "none":
+            raise ValueError("Gemini 3 does not support disabled thinking")
+        if resolved != "default":
+            request_kwargs["reasoning_effort"] = resolved
+        return None if resolved == "default" else resolved
     if resolved == "default":
         if profile.family == "anthropic_adaptive":
             request_kwargs["thinking"] = {"type": "adaptive"}

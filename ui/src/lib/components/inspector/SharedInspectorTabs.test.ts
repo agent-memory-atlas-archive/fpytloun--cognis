@@ -29,6 +29,8 @@ vi.mock('$lib/api/client', () => ({
 }));
 
 import SharedInspectorTabs from './SharedInspectorTabs.svelte';
+import * as workLoader from '$lib/components/work/work-view-loader';
+import * as sessionLoader from '$lib/components/session/session-details-loader';
 
 const scope: TimelineScope = {
   key: 'task_step:run-1',
@@ -102,6 +104,7 @@ function deferred<T>(): {
 
 describe('SharedInspectorTabs', () => {
   afterEach(cleanup);
+  afterEach(() => vi.restoreAllMocks());
 
   beforeEach(() => {
     clearActivityOverview();
@@ -132,6 +135,52 @@ describe('SharedInspectorTabs', () => {
     expect(screen.queryByRole('button', { name: 'Archive' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Restore' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+  });
+
+  it('loads the session renderer only on Session and ignores completion after leaving', async () => {
+    const pending = deferred();
+    const load = vi.spyOn(sessionLoader, 'loadSessionDetails').mockReturnValue(pending.promise);
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1' });
+    await waitFor(() => expect(mocks.activityOverview).toHaveBeenCalledOnce());
+    expect(load).not.toHaveBeenCalled();
+    const overviewTab = screen.getByRole('tab', { name: 'Overview' });
+    overviewTab.focus();
+    await fireEvent.keyDown(overviewTab, { key: 'End' });
+    const sessionTab = screen.getByRole('tab', { name: 'Session' });
+    await waitFor(() => expect(sessionTab).toHaveFocus());
+    expect(await screen.findByRole('status')).toHaveTextContent('Loading session details');
+    expect(load).toHaveBeenCalledOnce();
+    await fireEvent.keyDown(sessionTab, { key: 'Home' });
+    await waitFor(() => expect(overviewTab).toHaveFocus());
+    pending.resolve((await import('$lib/components/session/SessionDetailsBody.svelte')).default);
+    await pending.promise;
+    await Promise.resolve();
+    expect(screen.queryByTestId('session-details-content')).not.toBeInTheDocument();
+    expect(overviewTab).toHaveAttribute('aria-selected', 'true');
+    await fireEvent.click(sessionTab);
+    await screen.findByTestId('session-details-content');
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('opens optional Work by keyboard, keeps tab focus, and ignores a late module after leaving Work', async () => {
+    const pending = deferred();
+    const moduleLoad = vi.spyOn(workLoader, 'loadWorkView').mockReturnValue(pending.promise);
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1' });
+    const overviewTab = screen.getByRole('tab', { name: 'Overview' });
+    overviewTab.focus();
+    await fireEvent.keyDown(overviewTab, { key: 'ArrowRight' });
+    const workTab = screen.getByRole('tab', { name: 'Work' });
+    await waitFor(() => expect(workTab).toHaveFocus());
+    expect(workTab).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByText('Loading Work inspector…')).toBeInTheDocument();
+    expect(moduleLoad).toHaveBeenCalledTimes(1);
+    await fireEvent.keyDown(workTab, { key: 'ArrowRight' });
+    const sessionTab = screen.getByRole('tab', { name: 'Session' });
+    await waitFor(() => expect(sessionTab).toHaveFocus());
+    pending.resolve((await import('$lib/components/work/WorkView.svelte')).default);
+    await screen.findAllByText('Session summary');
+    expect(screen.queryByText('Loading Work inspector…')).toBeNull();
+    expect(sessionTab).toHaveAttribute('aria-selected', 'true');
   });
 
   it('reuses the same controlled tab header in the chat Inspector without duplicate loading', () => {

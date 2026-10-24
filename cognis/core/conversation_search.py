@@ -100,10 +100,14 @@ async def join_session_matches(
         if not _match_is_displayable(match.top_match, query=query, min_score=min_score):
             continue
         session_row = session_by_id.get(match.session_id)
-        if session_row is None:
+        if session_row is None or getattr(session_row, "delegation_mode", None) == "hook":
             continue
         conversation = conversation_by_id.get(session_row.conversation_id)
         if conversation is None:
+            from cognis.store.hook_visibility import is_internal_hook_conversation
+
+            if await is_internal_hook_conversation(db, session_row.conversation_id):
+                continue
             conversation = await get_conversation(db, session_row.conversation_id)
             if conversation is None:
                 continue
@@ -205,6 +209,10 @@ async def join_flat_matches(
     query: str | None = None,
 ) -> list[ConversationFlatSearchMatch]:
     """Join flat Intaris matches for one conversation with Cognis session rows."""
+    from cognis.store.hook_visibility import is_internal_hook_conversation
+
+    if await is_internal_hook_conversation(db, conversation_id):
+        return []
 
     conversation = await get_conversation(db, conversation_id)
     if conversation is None or conversation.user_email != user_email:
@@ -218,7 +226,11 @@ async def join_flat_matches(
         if not _match_is_displayable(match, query=query, min_score=min_score):
             continue
         session_row = session_by_id.get(match.session_id)
-        if session_row is None or session_row.conversation_id != conversation_id:
+        if (
+            session_row is None
+            or session_row.conversation_id != conversation_id
+            or getattr(session_row, "delegation_mode", None) == "hook"
+        ):
             continue
         output.append(
             ConversationFlatSearchMatch(

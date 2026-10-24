@@ -75,6 +75,30 @@ def test_codex_astra_catalog_exposes_required_capabilities() -> None:
     assert info["default_verbosity"] == "low"
 
 
+def test_codex_gpt61_sol_catalog_exposes_upstream_capabilities() -> None:
+    catalog = load_bundled_codex_catalog()
+    item = catalog["gpt-6.1-sol"]
+    info = codex_catalog_model_info("gpt-6.1-sol")
+
+    assert item["display_name"] == "GPT-6.1-Sol"
+    assert item["minimal_client_version"] == "0.153.0"
+    assert item["visibility"] == "list"
+    assert item["supported_in_api"] is True
+    assert item["priority"] == 1
+    assert item["default_reasoning_level"] == "low"
+    assert info is not None
+    assert info["reasoning_efforts"] == ["low", "medium", "high", "xhigh", "max", "ultra"]
+    assert info["max_input_tokens"] == 272_000
+    assert info["max_context_window"] == 1_000_000
+    assert info["max_output_tokens"] == 128_000
+    assert info["supports_vision"] is True
+    assert info["supports_tool_search"] is True
+    assert info["supports_openai_apply_patch"] is True
+    assert info["openai_apply_patch_tool_type"] == "freeform"
+    assert info["supports_verbosity"] is True
+    assert info["default_verbosity"] == "low"
+
+
 def test_codex_gpt6_sol_and_luna_expose_required_capabilities() -> None:
     catalog = load_bundled_codex_catalog()
 
@@ -107,7 +131,8 @@ def test_codex_gpt6_sol_and_luna_expose_required_capabilities() -> None:
 def test_codex_gpt6_models_are_first_visible_bundled_models() -> None:
     entries = bundled_codex_model_entries()
 
-    assert [entry["model_id"] for entry in entries[:3]] == [
+    assert [entry["model_id"] for entry in entries[:4]] == [
+        "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6-luna",

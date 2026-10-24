@@ -139,7 +139,7 @@
 
 <div class="flex flex-col gap-6">
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <h2 class="text-base font-semibold text-white">Documents</h2>
+    <h2 class="text-base font-semibold text-strong">Documents</h2>
     {#if canMutate}
       <Button onclick={() => (wizardOpen = true)} data-testid="knowledge-add-documents-button">
         <Plus class="mr-1.5 h-4 w-4" /> Add documents
@@ -148,17 +148,17 @@
   </div>
 
   {#if canMutate}
-    <details class="rounded-2xl border border-slate-800/80 bg-slate-900/40 px-4 py-3">
-      <summary class="cursor-pointer text-sm font-medium text-slate-200">Attach an existing artifact</summary>
+    <details class="rounded-2xl border border-separator/80 bg-surface/40 px-4 py-3">
+      <summary class="cursor-pointer text-sm font-medium text-foreground">Attach an existing artifact</summary>
       <form
         class="mt-3 grid gap-3 sm:grid-cols-[1fr_1fr_auto]"
         onsubmit={(event) => { event.preventDefault(); void attachExistingArtifact(); }}
       >
-        <label class="flex flex-col gap-1 text-xs text-slate-400">
+        <label class="flex flex-col gap-1 text-xs text-muted">
           Artifact ID
           <Input bind:value={artifactId} placeholder="art_…" required />
         </label>
-        <label class="flex flex-col gap-1 text-xs text-slate-400">
+        <label class="flex flex-col gap-1 text-xs text-muted">
           Source path (optional)
           <Input bind:value={artifactSourcePath} placeholder="folder/document.md" />
         </label>
@@ -170,7 +170,7 @@
   {/if}
 
   {#if documents.length === 0}
-    <div class="flex flex-col items-center gap-3 rounded-3xl border border-dashed border-slate-800/80 px-6 py-14 text-center text-sm text-slate-400">
+    <div class="flex flex-col items-center gap-3 rounded-3xl border border-dashed border-separator/80 px-6 py-14 text-center text-sm text-muted">
       <p>No documents yet.</p>
       {#if canMutate}
         <Button onclick={() => (wizardOpen = true)}>
@@ -184,16 +184,16 @@
 
   {#if failedJobs.length > 0}
     <div class="flex flex-col gap-2">
-      <h3 class="text-sm font-semibold text-white">Failed jobs</h3>
+      <h3 class="text-sm font-semibold text-strong">Failed jobs</h3>
       <ul class="flex flex-col gap-2">
         {#each failedJobs as job (job.job_id)}
-          <li class="flex items-center justify-between gap-3 rounded-xl border border-slate-800/80 bg-slate-900/60 px-4 py-3 text-sm">
+          <li class="flex items-center justify-between gap-3 rounded-xl border border-separator/80 bg-surface/60 px-4 py-3 text-sm">
             <div class="min-w-0">
               <span class={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium capitalize ${statusToneClass(jobStatusTone(job.status))}`}>
                 {job.job_type.replace('_', ' ')}
               </span>
-              <p class="mt-1 truncate text-slate-400">{job.error ?? 'Unknown error'}</p>
-              <p class="text-xs text-slate-500">{formatRelativeOrDate(job.completed_at ?? job.started_at)}</p>
+              <p class="mt-1 truncate text-muted">{job.error ?? 'Unknown error'}</p>
+              <p class="text-xs text-quiet">{formatRelativeOrDate(job.completed_at ?? job.started_at)}</p>
             </div>
             {#if canMutate}
               <Button size="sm" variant="secondary" disabled={retryingJobIds.has(job.job_id)} onclick={() => retryJob(job)}>
@@ -208,11 +208,11 @@
 
   {#if activeJobs.length > 0}
     <div class="flex flex-col gap-2">
-      <h3 class="text-sm font-semibold text-white">Active jobs</h3>
+      <h3 class="text-sm font-semibold text-strong">Active jobs</h3>
       <ul class="flex flex-col gap-2" aria-live="polite">
         {#each activeJobs as job (job.job_id)}
-          <li class="flex items-center justify-between gap-3 rounded-xl border border-slate-800/80 bg-slate-900/60 px-4 py-3 text-sm">
-            <span class="text-slate-300">{job.job_type.replaceAll('_', ' ')} · {job.status}</span>
+          <li class="flex items-center justify-between gap-3 rounded-xl border border-separator/80 bg-surface/60 px-4 py-3 text-sm">
+            <span class="text-secondary">{job.job_type.replaceAll('_', ' ')} · {job.status}</span>
             {#if canMutate}
               <Button size="sm" variant="ghost" disabled={retryingJobIds.has(job.job_id)} onclick={() => cancelJob(job)}>
                 Cancel

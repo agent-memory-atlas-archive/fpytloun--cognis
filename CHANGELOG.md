@@ -2,7 +2,206 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.17.1] - Unreleased
+<!-- towncrier release notes start -->
+
+## [0.18.0] - 2026-10-24
+
+### Highlights
+
+- **Cognis on your Mac.** Open agent chats from the menu bar, keep pinned conversations on your desktop, and review notifications or respond to simple tool approvals without returning to the main workspace.
+- **Reusable hooks for your agents.** Configure reminders, memory consolidation, and skill learning around agent activity. Customize bundled hooks in Tools and inspect their runs directly in chat.
+- **Continue elsewhere with `/handoff`.** Prepare a self-contained continuation brief—even during an active turn—then copy it or open a new-conversation draft. Add a focus to guide what the handoff preserves.
+- **A Library for ongoing work.** Organize documents by project, inspect revision history, manage sharing, and favorite useful artifacts and deliverables. Favorites follow revisions as your work evolves.
+- **Make the workspace yours.** Choose Porcelain, Classic, Gruvbox, or Paper, each with Light, Dark, and System modes that carry through chat, documents, and native chrome.
+- **Better continuity on unreliable connections.** Read cached PWA content offline, queue attachment uploads, and switch between cached chats faster. Recovery better preserves reading positions and live updates.
+- **Find your work with Spotlight.** Use Command-K or Control-K to search agents, conversations, projects, tasks, and Library documents, or jump straight to common actions.
+
+**Mac distribution:** Initial builds use ad-hoc signing, not Apple Developer ID signing or notarization. macOS or organizational policy may restrict installation. Notifications use the standard app icon rather than communication avatars.
+
+### Added
+
+- Add admin API-key controlled, bounded controller profiling with light, CPU, allocation and combined levels, HA incarnation targeting, finite boot configuration, automatic cleanup and bounded structured reports instead of verbose diagnostic logs.
+- Assign reusable agent lifecycle hooks for reminders, background actions, and idle skill learning. Manage hooks in Tools, inspect their outcomes in chat, and run detached prompts in internal child sessions without adding separate user notifications.
+- Added account-aware light, dark and system appearance across application surfaces, chat, tools, documents and settings, with semantic colors, themed prose and syntax, live browser/native chrome updates, and system-matched loading, recovery and Apple launch screens. Embedded rich documents now follow application appearance by default while preserving explicit viewer Light, Dark and operating-system System choices. Standalone image viewers have a safe-area fallback, and printed documents hide viewer controls.
+- Cognis now includes Porcelain, Classic, Gruvbox and Paper appearance families, each with independent Light, Dark and System modes. Classic is the default, Gruvbox restores its original warm yellow Light surfaces, and Paper provides warm neutral styling with compact chat text. Embedded readers retain the selected family when overriding their mode, and native chrome updates when the family changes.
+- Export metadata-only chat diagnostics from the conversation inspector to investigate device-specific history ordering without sharing message text or tool inputs and outputs.
+- Command-F and Ctrl-F focus and select the current view's existing search field. Full conversation search opens when collapsed; dialogs keep search focus inside their own content.
+- Add disabled-by-default, pod-selectable controller resource attribution with delayed bounded CPU stack sampling, content-free session memory estimates, and automatic cleanup.
+- Star artifacts and deliverables from chat, tasks, previews, or Library and filter Library to personal favorites. Favorites follow document revisions without granting access.
+- Add `/handoff [focus]` to prepare a self-contained continuation brief with the current model and effective context, including during an active turn. Handoffs persist in the source session and appear as collapsed cards with copy and new-conversation draft actions.
+- Include read-only allocator and Python-block accounting in explicitly requested resource captures to distinguish live allocation pressure from retained free arena space.
+- Use an authenticated OpenAI-compatible inference API and reusable Cognis routes with operation-aware targets, fallback and recovery policies, executor selection, and provenance-backed model capacity information.
+- Agents can manage model providers, custom inference routes, task model bindings, typed system settings, workflow profiles, and executors through dedicated action tools and bundled management skills. QuickStart enables full instance-management access for the first agent by default, with explicit opt-out and existing authorization, policy evaluation, and approval checks preserved.
+- Browse the Library, author versioned artifacts, revise deliverables, and inspect revision history. Organize documents by project and manage public links and explicit agent access from the shared document viewer.
+- Add an explicit public ad-hoc Mac distribution class with sealed bundles, truthful trust metadata, dual-architecture verification and post-publication Homebrew cask generation, while retaining strict Developer ID and notarization requirements for trusted releases.
+- Add macOS companion packaging with whole-bundle development signing, gated Developer ID and notarized DMG builds for Apple Silicon and Intel, and checksum-verified Homebrew cask generation. Developer ID and notarized distribution remain gated on signing credentials and release qualification.
+- Configure Claude prompt-cache lifetimes per provider model: primary conversations default to one hour; task steps, delegates, compaction, hooks and background requests default to five minutes. Supported TTL choices follow the backend. Route sessions may probe a higher-priority target after the shorter of their cache lifetime and the new one-hour idle-failback timeout, without interrupting active requests.
+- The macOS companion now lists available agents independently of pins, provides native local Settings, aligns desktop avatars with the web rail, and improves conversation chrome and notification presentation. Simple tool approvals support unlock-required actions through the existing authenticated client; communication avatars remain subject to macOS signing capability.
+- Review a persistent notification inbox and take targeted actions on approvals, task failures, and provider issues. Authentication challenges expire with their notifications, and project task results can notify relevant collaborators.
+- Add bounded, yielding session-field memory estimates to explicitly requested diagnostic captures, without global heap scanning, tracing or cache mutation.
+- Collaborate through project members, project agents, shared knowledgebases, and read-only shared conversation history. Discover accessible project chats and browse paginated project tasks, schedules, conversations, and documents.
+- Monitor provider health and usage from the dashboard, configure SystemOne inference, and use GPT-6.1 Sol, Claude Sonnet 5.5, and Claude Haiku 5.5 with model-aware reasoning controls.
+- Browse release history and compare versions in the app's What's new view. Development-time changelog fragments now generate the same release material for the app and GitHub release notes.
+- Projects navigation returns to the last opened project and tab on this browser, with an explicit All projects link and a fallback when the project is no longer accessible.
+- Global Spotlight-style command palette with keyboard navigation, bounded metadata search, schedule and settings discovery, dashboard-aware opening, and document workspace windows.
+- Dashboard workspace windows can display artifacts and deliverables using the Library document reader.
+- Set up Cognis in three guided steps: configure system models with an OpenRouter preset or custom providers, connect an executor, and create an assistant. Optional Codex, OpenAI, and Anthropic accounts, provider and model pickers, reusable agent templates, and avatar generation are available without exposing advanced configuration by default. Setup completion is saved across devices.
+### Changed
+
+- Manage system-agent overrides, secondary agents, owner-scoped credentials, and primary executors through agent management tools. Switch conversation profiles quickly and inspect acknowledged guardrail policy in agent context.
+- Use transparent vector Cognis artwork across the web app, favicons, installation icons, splash screens, and notification assets.
+- Bring compact chats closer to the main chat experience, improve pinned-agent dock interactions and display controls, and show activity-ordered projects on the dashboard. Preserve upload progress, improve command navigation, and apply selected chat motion settings.
+- Dashboard provider columns now stack up to four health-only providers and fill space below short usage reports without reducing text size or hiding controls.
+- Local Compose now uses the published Mnemory and Intaris images from GHCR, matching the Cognis and executor image references.
+- Download portable HTML and Markdown deliverables with consistent hosted and offline rendering, preserved links, image previews, and simpler gallery controls.
+- Cache the PWA workspace for offline reading, queue attachment uploads, and recover more efficiently on slow or interrupted connections. Keep previews and file saving inside the installed app, with faster cached chat switching and smaller reconnect payloads.
+- Load the optional session details view on demand, with an explicit retry if its code cannot be loaded.
+- Prepare portable skill assets and shared Python environments from the current load manifest, ingest knowledgebase images, and move running shell commands to the background from chat.
+- Make Spotlight a balanced launcher for work, app pages, main-agent conversations and project dashboards. Keep idle results stable, use conversation avatars as primary icons, and pin desktop search above Notifications.
+- Keep Spotlight stable during background updates, allow slower bounded searches, show agent avatars and update times, distinguish file producers, prefer agent-produced files, show only the latest scheduled task execution, and add subtle multi-select result-type filtering.
+- Reduce repeated agent metadata reads and coalesce concurrent dashboard and sidebar requests without retaining authorization-sensitive results between requests.
+### Fixed
+
+- Retry executor bridge capacity rejection within the original tool admission, with bounded attempts and accurate capacity errors. Do not repeat duplicate admission requests or replay potentially started commands.
+- Image tools and artifact read tools can use current agent avatars when the acting user has use or manage access to the owning agent.
+- Agent settings now confirm hook and delegation changes with success notifications instead of repeated save notices. The detail header includes the agent avatar, and memory and guardrail settings are grouped with advanced evaluation controls disclosed separately.
+- Load custom-route capabilities for existing agent and profile selections on every editor tab. Distinguish loading and discovery failures from unsupported thinking efforts, preserve saved settings, and offer retry before saving.
+- Preserve upstream rate-limit and outage categories when every inference-route target is blocked. Report the earliest eligible target's retry time and retry known resets within the request deadline without resetting attempt or fallback limits.
+- Forward exact approval receipts on evaluated retries, reconcile restored escalation pauses before claiming work, contain evaluation conflicts, and report sanitized evaluation-size and response errors.
+- Artifact recovery recognizes URLs from the configured public controller origin instead of assuming a deployment-specific host. Set `COGNIS_PUBLIC_BASE_URL` when exposing the controller.
+- Direct chat now exposes configured core tool groups by default under the direct soft profile, while preserving other profile, hard-profile, and explicit-exclusion limits. When a provider rejects a named tool omitted from the request—during stream opening or generation—Cognis can promote an exact authorized match or provide bounded discovery guidance and retry with a changed request. Recovery limits persist across same-turn reentry and reset for a new turn.
+- Prevent background delegates from failing when the spawning chat turn completes and releases its execution fence.
+- Upgrade databases that were initialized by startup bootstrap without duplicate-table failures in project knowledgebase assignments, inference routes, and agent hooks. Migrations preserve existing tables and create any missing tables independently.
+- Prevent large rendered-history snapshots from failing workflow steps with Intaris HTTP 422 errors by recording size-bounded chunks and replaying only complete snapshots without truncating context.
+- Preserve projection decisions across cached retries, keep per-call executor schemas stable during temporary outages, and retain native Responses message envelopes across cold replay and profile changes to avoid unnecessary prompt-cache misses.
+- Keep background chat preloading from replacing the selected conversation, interrupting its loading, or changing its reading position. Clear stale compact-chat command results and isolate pending controls when switching conversations or session views.
+- Foreground chat opening now handles account-context invalidation during cached hydration with the existing session-verification state, while ignoring obsolete route failures and ordinary navigation cancellation.
+- Keep live sidebar updates ahead of device cache, preserve timeline refreshes received during loading, and show cached-history freshness. Compact and pinned work summaries avoid full history reads; reconnects refresh promptly without bypassing rate limits. Add bounded send/admission timing diagnostics.
+- Keep chat history reading positions stable when another view loads older messages, preserve live updates during canonical history recovery, and allow upward history loading to complete when animation frames are paused.
+- Prevent Safari scroll jumps and oversized chat rows, stabilize jump navigation and Markdown streaming, restore project document previews, and order grouped Library folders by document recency.
+- Assistant messages use the same 70-character reading measure as rich deliverables in every theme; in Paper, tables and code blocks can use the full chat width. Long unbreakable text in notices no longer widens the chat or adds a horizontal scrollbar.
+- Prevent older completed messages and tool activity from reappearing below recent chat history after reconnecting or reopening a PWA during a long-running turn.
+- Restore Classic Dark to its pre-theme colors: original translucent status tints, slate-950 sheets, finer muted/strong text and raised-surface shades, and original timeline label tints. Make Paper status and category colors distinguishable.
+- Avoid rebuilding the complete tool registry for individual classified-tool lookups and ledger updates, while retaining effective-definition validation and current handler routing.
+- Prevent multi-minute context preparation delays in long conversations by avoiding repeated scans of tool groups during prompt pruning.
+- Reuse exact native token counts for unchanged history blocks during long turns, reducing repeated context-projection CPU work without retaining message contents or changing prompt budgets.
+- Reduce temporary memory used by large executor bridge results while preserving canonical bytes, and make the optional startup allocation profiler honor the profiling flag and selected pod.
+- Refresh executor inventory and diagnostics, bind controller-owned readers correctly, return explicit errors for unsupported executor RPC methods, and avoid downloading tokenizer or model metadata assets at runtime.
+- Synchronize admitted user messages across open chat clients through canonical append notifications and cursor recovery. Preserve timeline state across equivalent scope updates and isolate conflicting API providers without resetting sibling views.
+- Clicking the background on main and project dashboards now minimizes all workspace windows without activating background controls, matching the tray's minimize-all action.
+  New chats reuse the previous eligible agent across dashboards and Chat. Sending a message resumes timeline follow, typing in compact composers preserves the viewport, and composer profile settings are hidden during active turns. Chat defaults its channel filter to Web while retaining explicit saved selections.
+- Restore existing dashboard conversation windows without requiring a free retained-window slot or redundant allocation metadata request. Distinguish visible, retained, and pinned-agent limits from owner, synchronization, and other open failures.
+- Dashboard windows update their position and size once per animation frame while dragging or resizing, and save the final geometry when the gesture ends instead of writing saved layouts on every pointer movement.
+- Deliverables inside Cognis now follow your account appearance, including task outputs and fullscreen views. Separate light, dark, and system controls apply only to external document readers.
+- Projected conversation history now replays consistently across turns and cold-cache recovery without storing duplicate prompt or tool-result content.
+- Controller and executor Docker builds now install runtime dependencies using frozen constraints exported from the workspace lockfile, preventing incompatible dependency drift.
+- Resume persisted workflow gates after controller recovery without rerunning completed steps or clearing their evidence. Preserve original deadlines, arbitrate timeout/operator decisions durably, clear pauses atomically on cancellation, and reject stale gate responses from refreshed task controls.
+- Prevent database deadlocks between trusted memory evidence or conversation forks and TODO persistence, and keep database pool occupancy metrics accurate after failed connection acquisition or invalidation.
+- Executor image builds prefer IPv4 and retry when downloading browser components, so transient Playwright CDN failures no longer block executor releases.
+- Release consumed executor WebSocket payloads and dispatch closures before waiting for the next frame, rather than retaining completed results on idle connections.
+- Executor container images install the shared common package normally instead of as an editable workspace link, fixing executors that crashed at startup with a missing `cognis.json_codec` module.
+- Preserve executor assignment notices in canonical session history across turns and cache loss, without duplicating unchanged notices or rewriting earlier assignments.
+- Fix repeated Intaris rejections of executor recovery notices by deriving valid, stable append keys from persisted notice identities. Pending notices retry without changing their content or already-valid append keys.
+- New conversation turns no longer inherit an expired executor recovery deadline from previous work. Executor recovery waits and successful recovery now appear as chat notices, and recovery timeouts explain how to continue.
+- Preserve original message times in newly forked history, show completed delegations correctly after reload, render delegation results as Markdown, and confirm message-level forks before creating a separate conversation.
+- Gemini image generation and editing now translate requested sizes into image configuration on both controller and executor instead of sending an invalid image_size field.
+- Gemini providers configured with a base URL now use the versioned inference endpoint correctly, including custom provider roots.
+- Gemini model discovery now includes Veo video-generation models and marks them as video models instead of chat models.
+- Show handoff progress and failures immediately, update the result live, and preserve it across history loading. Simplify recipient creation to a source-defaulted profile picker, prepare a normal unsent draft, and persist a link to the created conversation on the original handoff card.
+- Allow compatible Anthropic account fallback when earlier completed history contains Responses tool metadata. Keep active Responses continuations blocked and preserve explicit incompatibility errors instead of reporting false integrity failures.
+- Keep configured hook assignments distinct from rendered conversation evidence when creating child guardrail sessions. Hook prompts explicitly request execution of the configured task while retaining inherited restrictions.
+- Run each detached hook once within its original configured timeout, using normal session recovery instead of hook-level retries. Queue later eligible occurrences, retire legacy retrying runs as failed, and keep failed delivery independent of execution. Web chat now uses friendly hook names and one live hook card with direct session inspection.
+- Resume unfinished hook sessions safely after runtime metadata or profile changes. Persistent failures now retry automatically with capped backoff and visible failure details instead of permanently blocking later occurrences; previously blocked runs recover without manual resets.
+- Prevent historical idle-hook backfill, deduplicate and bound evidence reads, wait for the configured idle boundary, and prevent learning hooks from modifying system skills.
+- Idle hooks now evaluate work accumulated since that hook's last successful detached run in the conversation, so a question-only follow-up no longer hides earlier work. Failed runs retain the unprocessed work window.
+- Keep image attachments and composer text recoverable when local storage fails, and serialize reactive attachment metadata safely before queuing messages in full and compact chat.
+- Image tools now offer provider-qualified models from active, visible providers and resolve those references consistently with model routing, including publisher-namespaced model IDs.
+- Avoid restarting pending metadata reads for routine executor, progress and notification updates, keep sidebar refreshes serialized, and stop unrelated executor and schedule changes from rebuilding open chat timelines. Access-change and account fences remain immediate.
+- Preserve numeric output-token counts in inference logs, accept optional operation and request correlation metadata without forwarding it to providers, and add bounded route labels to inference metrics. Accounting now distinguishes unknown usage from reported zero and emits nullable price estimates with provenance rather than implying failed requests are free.
+- Delegated sessions inherit the parent's Intaris policy, including nested mode changes, instead of selecting the child agent's default. New agent and policy-editor defaults are Balanced; explicit Legacy selections remain available. Policy refreshes return the canonical acknowledged policy, and stale-approval messages no longer assume that a session change was the cause.
+- Load the new-chat dialog on demand instead of including it in every conversation's initial JavaScript bundle.
+- Library and chat share artifact previews for Markdown, CSV tables, Mermaid diagrams, highlighted code, PDF, HTML, and media. Markdown renders immediately on opening; editing preserves the original source with an optional draft preview.
+- Calm the light themes: neutral status and category containers without colored outlines, a single-tone tool timeline, borderless assistant messages with soft user bubbles, and brighter Classic and Porcelain content surfaces with darker navigation.
+- Rework the light themes: near-white content on a faintly tinted frame, hairline borders, and sentence-case section labels instead of letter-spaced uppercase.
+- Keep the loading screen visible while restoring a session on the login page, avoiding a brief sign-in form flash for signed-in users.
+- Restore LSP metrics for configured executors whose display names are not valid metric labels. Use a validated configured executor ID as the fallback, retain collision and cardinality guards, and use the same label in executor inventory.
+- Ad-hoc macOS builds no longer include a restricted communication-notification entitlement that prevents launch. Notifications retain agent names, text and actions using the standard app icon.
+- Preserve the pinned-agent rail's avatar glow at its scroll boundaries, including the first and last avatars, without removing activity or selection effects.
+- Close MCP transports in their owning task when initialization is cancelled or times out, preventing orphaned background tasks and sustained executor CPU usage.
+- Click outside a modal to dismiss it across the app. Unsaved editor and creation drafts ignore accidental backdrop clicks, including artifact edits and mobile sheets.
+- Preserve native tool-call argument formatting across executor and controller replay, expose bounded authorized tools before bundled hook inference, and log content-free projection trigger and budget diagnostics.
+- Restore isolated HTML artifact previews in the macOS app, including inline scripts, styles and supported embedded media. Clear previews on account changes and reject native actions initiated by artifact frames.
+- Schedules no longer wait for conversation history or creation-only options before appearing. Task, schedule, agent, and workflow pages show primary data independently of auxiliary configuration lists, and avoid redundant list requests.
+- Preserve retained results in partially pruned parallel tool batches across normal cycles and cold replay, protect interruption evidence, and retain pending projection decisions during below-threshold retries.
+- Pinned avatar conversations now stay open in the web app and PWA until dismissed or navigation changes, instead of closing immediately after selection.
+- Project instructions loaded mid-turn retain their canonical role across live requests and cold replays, preserving Anthropic prompt-prefix continuity.
+- Normalize Anthropic artifact images and high-resolution JPEG/MPO attachments before inference, preserve supported thinking transitions and tool replay, and keep retry ownership and provider-qualified model identities consistent.
+- Controller-only annotations are now removed from provider-bound messages across chat, Responses, streaming, and executor-routed inference, without modifying nested provider payloads.
+- Prevent internal question JSON from appearing as an assistant response after answering structured questions, including when replaying existing chat history.
+- Clear submitted chat messages from the composer reliably when draft autosave overlaps durable queue storage, while preserving newer edits and drafts from other windows.
+- Continue from saved work when native reasoning output times out instead of ending the turn after one attempt, and show one error card for model and turn failures belonging to the same turn.
+- Python distribution metadata now names the existing Business Source License, and controller source archives exclude private qualification reports.
+- Align runtime test fixtures and UI contract checks with current session, document-access, sharing, and collaboration behavior. Correct controller type annotations and fail cleanly when a manual hook has lost its foreground session or artifact storage is unavailable. Release qualification now records risk-based coverage and infrastructure gaps explicitly.
+- Preserve prompt-cache reuse by keeping controller tool discovery append-only through call_tool, replaying newly recorded native tool batches faithfully across turns, and avoiding larger omission placeholders for short tool outputs.
+- Reduce repeated artifact permission queries, executor discovery queries, and dashboard inventory transfers. Restore PostgreSQL inventory metrics, release metadata connections before external requests, and add snapshot-copy and database connection diagnostics.
+- Preserve provider failures when a Responses stream ends after an error event, and keep the original workflow failure instead of replacing it with a missing-deliverable error.
+- Interrupted detached hooks now resume their existing session after reconciling outstanding tools. Bounded retries retain the same-hook reservation, expose retry/blocked card states, and allow manual continuation without starting duplicate work.
+- Keep conversation-list and child-work refresh signals during WebSocket stream pressure, and prevent continuous child updates from repeatedly restarting sidebar requests. Coalesce follow-up reads without polling; reconnect saturated connections instead of leaving views silently stale.
+- Reduce controller memory pressure from S3 retention inventories, avoid decoding unselected executor tool schemas for explicit assignments, and reuse the optimized JSON decoder for database reads without changing stored JSON.
+- Stop recording and replaying full-transcript prompt snapshots that can exceed event limits and fail turns, while retaining threshold-triggered context projection and independent cache fixes.
+- Reconcile recovered-turn notices with canonical history instead of changing payloads under an existing idempotency key. Report event-store failures separately from model failures. Refresh session details after model switches, preserve actual serving-provider provenance, and prevent stale context or quota data from replacing newer runtime measurements.
+- Resolve thinking-effort and fast-mode options from custom route target models in agent and runtime-profile settings, offering only options supported by every fallback target.
+- Preserve request-scoped routing notices across turns and cold-cache replay, and keep the executor-switch tool schema stable during temporary executor outages without relaxing runtime target validation.
+- Preserve task intention across compaction, split oversized single turns, and bound consecutive compaction recovery without blocking progress. Defer automatic recaps until attached background work finishes.
+- Preserve Unicode text and formatting when copying selected text from standalone deliverables, shared previews, and offline HTML, avoiding native clipboard URL encoding of colon-prefixed prose on iPadOS.
+- Conversations without an active session now render correctly before a runtime model selection is available.
+- Settings loads only the selected section instead of waiting for unrelated diagnostics and registries. Opening or switching settings sections no longer triggers an unsaved-changes warning without edits; real unsaved edits remain protected.
+- Keep conversation drafts synchronized across full chat, dashboard, and pinned views so an untouched composer cannot block attachment sending. Remove dashboard chat refresh layout jumps and prevent empty search results from flashing during the search debounce.
+- Conversation sidebar rows no longer shift when opening a conversation reveals its bookmark button.
+- Recover stale conversations, unread indicators, and child-work activity when reopening the conversation list without polling. Keep current child TODOs and status authoritative over cached delegation previews.
+- Sidebar and Waiting updates now recover automatically after temporary failures, with bounded retries that pause while the app is hidden or offline. Resource-local failures no longer unnecessarily delay independent refreshes; server-directed cooldowns remain shared.
+- Restore single-click conversation forking without a browser confirmation dialog, with immediate progress feedback and duplicate-click protection.
+- Keep skill loading and tool discovery append-only: activation no longer changes direct tool schemas, dynamic-skill sessions use a stable discovery surface, and canonical replay preserves skill instructions, activation eligibility, attachment context, and artifact reminders.
+- Add a touch-accessible Spotlight magnifier beside Close in the mobile navigation menu, with safe focus handoff and tap-outside dismissal.
+- Show configured project avatars or colored project icons in Spotlight instead of a generic project symbol.
+- Finish stale approval waits immediately when Intaris invalidates their session or policy receipt, including after controller restart. Return a re-evaluation result instead of recording a human denial, and remove the settled approval card without bypassing freshness checks or executing the tool.
+- The loading screen and browser color now use the last selected theme on this device instead of Classic, and Library and attachment preview controls, the image viewer, and model cache settings follow the active theme.
+- Remove favorite stars from chat attachment rows and image thumbnails. Favorites remain available in previews and Library with smaller, borderless controls.
+- Restore Classic as the default theme and its subdued dark color treatments, improve neutral Porcelain surfaces and Paper typography, and align tool, approval, queued-message and mobile overlay styling with the selected theme family.
+
+  Explicitly accept a 401 KiB chat-critical JavaScript budget for this release's measured 400.8 KiB graph; CSS and largest-chunk limits remain unchanged.
+- Keep accepted tool history stable across turns and reduce old tool evidence only above the lightweight-compaction threshold, preserving provider cache reuse.
+- Settle open chat timelines when the account or server context is invalidated, release obsolete subscriptions, and offer verified same-account recovery instead of leaving a loading spinner. Bound typed JSON requests through coordination and response decoding, and cancel pending-request reads when their view closes or changes.
+- Share cached timeline data and in-flight loads across full chat, compact chat, dashboard, and tray views. Bound stalled response-body reads, keep critical history errors actionable, and advance empty history without depending on animation frames. Load the optional Work inspector on demand to reduce chat startup resources.
+- Resolve unambiguous MCP server-name references consistently across skill loading and tool discovery/dispatch. Report unresolved skill bindings explicitly and return exact tool matches before relevance-ranked results, including already-visible tools.
+- Avoid repeating successful audits of unchanged native tool contracts during registry construction, while preserving fresh validation for modified contracts, arguments and authorization.
+- Pinned and native tray chats load account-owned chat preferences on cold open and refresh changes made in other windows. Expanded activity groups use consistent compact spacing between tools and assistant messages.
+- Preserve controller reminders and mid-turn context notices in their original prompt positions across turns, allowing provider caches to reuse conversation history.
+- Wait for TypeScript project diagnostics on the first semantic query so cross-file definition lookup resolves imported symbols instead of stopping at a temporary single-file import alias.
+- Preserve existing video job tables when applying database migrations after startup bootstrap.
+- Fix Codex turn failures caused by unsupported regular expressions in video-tool cost schemas, while preserving exact decimal cost validation and spending limits.
+- Veo routing now accepts the video-generation metadata returned by model catalogs. Video spending limits are optional and off by default, with advanced account controls instead of a JSON and job-administration panel on Routing.
+- Prompts now require models to use only tools visible in the current request and discover other authorized capabilities before calling them. Deterministic provider rejections for unavailable tool names stop retrying the identical request, while transient failures retain recovery.
+- Fixed workflow steps failing with an async database error when an executor briefly disconnects between steps. New step sessions retain the executor pin generation, and recovery safely reloads pin identity after a rolled-back projection.
+- Preserve scheduler wakeups received during an evaluation pass, reduce direct-turn discovery queries, and prevent older settled failures from hiding pending failure notifications.
+### Security
+
+- Enforce explicit agent artifact entitlements, project membership, revision visibility, and document-sharing boundaries. Keep published rich-artifact references scoped to their authorized source and retain authenticated owner-only recovery for expired deliverable links.
+- Keep managed-session deliverables scoped to their authorized conversation when viewing or downloading them in the browser. Owner authentication alone no longer provides an unscoped fallback around managed-conversation access checks.
+- Reconstruct example fixtures with fictional data and remove operational screenshots from the current documentation.
+### Upgrade notes
+
+- Do not mix hook-enabled and older controller runtimes that cannot honor hook activation and handoff boundaries. Follow the Agent Hooks rollout guidance, preserve durable hook state, and reconcile active work before a downgrade.
+- Upgrade Intaris alongside Cognis before enabling the new plan-mode and workflow-step policy behavior. Plan mode does not itself impose a strict read-only ceiling; select the required outcome bounds explicitly. Older Intaris versions can still infer a read-only ceiling from plan mode. See the Chat modes guide.
+- Back up the Cognis database and apply migrations before starting the new controller fleet. This release adds project collaboration, document revisions/access, notification inbox, inference routes, and hook persistence. Upgrade executors as well so skill asset preparation and background shell controls use matching contracts.
+- Video policy `enabled` now enables optional spending limits rather than enabling video generation. Missing or disabled policies no longer block authorized video requests. Existing enabled policies retain their limits, and explicit request cost caps still require a model estimate. Provider charges and normal tool authorization continue to apply.
+### Release qualification
+
+- The full final-tree regression baseline is incomplete. Existing qualification and focused checks for the latest fixes are retained; expensive broad-suite reruns were explicitly waived.
+- GUI/browser acceptance, including headless Linux and native macOS scenarios, was explicitly skipped and is not a passing qualification. Earlier GUI failures have not been cleared by that waiver.
+- Initial Mac artifacts are ad-hoc signed and unnotarized. Dual-architecture packaging does not establish physical Intel runtime or communication-avatar acceptance.
+
+## [0.17.1] - 2026-09-28
 
 ### Fixed
 

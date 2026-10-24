@@ -10,22 +10,38 @@ tests or immediately fail in CI.
 
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
 from pydantic import ValidationError
 
-from cognis.api.chat_v2.schemas import RecapArtifact
+from cognis.api.chat_v2.schemas import (
+    BackgroundToolCallV2Response,
+    ErrorTimelineItem,
+    HandoffTimelineItem,
+    MessageTimelineItem,
+    RecapArtifact,
+    RetryProviderOptionsResponse,
+)
 from cognis.api.models import (
     AgentGrantResponse,
     AgentResponse,
+    BackgroundCommandDetailResponse,
     CreateScheduleRequest,
+    CursorPage,
     DeliverableResponse,
     EffectiveToolItemResponse,
     ExecutorTokenResponse,
+    HandoffLinkRequest,
+    HandoffLinkResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
+    NavigationSummaryResponse,
+    OnboardingStateResponse,
     PendingPauseResponse,
+    ProjectTaskSummaryResponse,
+    ProviderMonitorResponse,
     ScheduleResponse,
     SkillResponse,
     SkillVersionResponse,
@@ -41,10 +57,22 @@ from cognis.api.models import (
     ToolClassificationRequeueRequest,
     ToolResponse,
     UpdateScheduleRequest,
+    UserPreferencesResponse,
+    UserPreferencesUpdateRequest,
+    WaitingConversationPage,
+    WebSocketExecutorMonitorUpdate,
     WorkflowResponse,
 )
+from cognis.api.routes.profiling import ProfilingResponse, StartProfilingRequest
 from cognis.api.routes.push import PushSubscriptionStatusResponse
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
+from cognis.core.library import (
+    LibraryFilters,
+    LibraryGroup,
+    LibraryGroupsPage,
+    LibraryItem,
+    LibraryPage,
+)
 from cognis.models.search import (
     ConversationFlatSearchMatch,
     ConversationFlatSearchResponse,
@@ -54,6 +82,293 @@ from cognis.models.search import (
     SearchSessionMatch,
 )
 from cognis.models.task import TaskDelivery
+
+
+def test_handoff_progress_and_recipient_link_contracts() -> None:
+    legacy = HandoffTimelineItem(
+        id="handoff:session:8",
+        sort_key="0001",
+        source_refs=[],
+        text="Verified brief.",
+        source_session_id="session",
+        source_seq=7,
+    )
+    assert legacy.status == "complete"
+    assert legacy.recipient_conversation_id is None
+    assert legacy.model_copy(update={"status": "running"}).model_dump()["status"] == "running"
+    assert (
+        HandoffLinkRequest(
+            source_session_id="session",
+            source_event_seq=8,
+            recipient_conversation_id="recipient",
+        ).source_event_seq
+        == 8
+    )
+    assert HandoffLinkResponse(ok=True).model_dump() == {"ok": True}
+
+
+def test_profiling_contract_preserves_per_controller_state_and_report() -> None:
+    from uuid import uuid4
+
+    capture_id = str(uuid4())
+    request = StartProfilingRequest.model_validate(
+        {"capture_id": capture_id, "options": {"level": "full", "duration_seconds": 600}}
+    )
+    assert str(request.capture_id) == capture_id
+    assert request.targets is None
+    response = ProfilingResponse.model_validate(
+        {
+            "meta": {"capture_id": capture_id},
+            "desired": "stop",
+            "controllers": {"controller:incarnation": {"state": "stopping", "owned_tracing": True}},
+            "reports": {},
+        }
+    )
+    assert response.model_dump()["controllers"]["controller:incarnation"]["state"] == "stopping"
+    with pytest.raises(ValidationError):
+        StartProfilingRequest.model_validate(
+            {
+                "capture_id": capture_id,
+                "options": {"level": "full", "include_locals": True},
+            }
+        )
+
+
+@pytest.mark.parametrize("family", ["porcelain", "classic", "gruvbox", "paper"])
+@pytest.mark.parametrize("mode", ["light", "dark", "system"])
+def test_user_theme_family_contract(family: str, mode: str) -> None:
+    payload = UserPreferencesUpdateRequest.model_validate(
+        {"display": {"theme_family": family, "theme": mode}}
+    )
+    response = UserPreferencesResponse.model_validate(payload.model_dump(mode="json"))
+    assert response.display.theme_family == family
+    assert response.display.theme == mode
+
+
+def test_user_theme_family_defaults_and_strict_updates() -> None:
+    preferences = UserPreferencesResponse.model_validate({"display": {"theme": "dark"}})
+    assert preferences.display.theme_family == "classic"
+    assert preferences.display.theme == "dark"
+    for family in ["future-family", None, 1, {}]:
+        with pytest.raises(ValidationError):
+            UserPreferencesUpdateRequest.model_validate({"display": {"theme_family": family}})
+
+
+def test_chat_v2_error_turn_identity_contract() -> None:
+    item = ErrorTimelineItem(
+        id="error:turn-contract",
+        sort_key="0001",
+        source_refs=[],
+        title="Turn failed",
+        turn_id="turn-contract",
+    )
+    assert item.model_dump()["turn_id"] == "turn-contract"
+    assert ErrorTimelineItem.model_validate(item.model_dump()).turn_id == "turn-contract"
+    assert (
+        ErrorTimelineItem.model_validate(
+            {key: value for key, value in item.model_dump().items() if key != "turn_id"}
+        ).turn_id
+        is None
+    )
+
+
+def test_onboarding_state_response_contract() -> None:
+    assert OnboardingStateResponse().model_dump() == {"status": "pending"}
+    for status in ("completed", "dismissed"):
+        assert OnboardingStateResponse.model_validate({"status": status}).status == status
+
+
+def test_executor_monitor_update_contract() -> None:
+    frame = WebSocketExecutorMonitorUpdate(
+        executor_id="host-linux",
+        details_revision=None,
+        status="active",
+        runtime_state="active",
+        desired_config_version=2,
+        applied_config_version=2,
+        last_observed_at=None,
+        resource_snapshot=None,
+    )
+    assert frame.model_dump(mode="json") == {
+        "type": "executor_monitor_update",
+        "executor_id": "host-linux",
+        "details_revision": None,
+        "status": "active",
+        "runtime_state": "active",
+        "desired_config_version": 2,
+        "applied_config_version": 2,
+        "last_observed_at": None,
+        "resource_snapshot": None,
+    }
+
+
+def test_waiting_conversation_page_contract() -> None:
+    response = WaitingConversationPage.model_validate(
+        {
+            "conversations": {"items": [], "cursor": None, "has_more": False},
+            "active_conversation_ids": ["conversation-running"],
+        }
+    )
+    assert response.model_dump() == {
+        "conversations": {"items": [], "cursor": None, "has_more": False},
+        "active_conversation_ids": ["conversation-running"],
+        "activity_complete": True,
+    }
+    assert (
+        WaitingConversationPage.model_validate(
+            {**response.model_dump(), "activity_complete": False}
+        ).activity_complete
+        is False
+    )
+    with pytest.raises(ValidationError):
+        WaitingConversationPage.model_validate(
+            {
+                "conversations": {"items": [], "cursor": None, "has_more": False},
+                "active_conversation_ids": [False],
+            }
+        )
+
+
+def test_navigation_summary_contract() -> None:
+    model = NavigationSummaryResponse.model_validate(
+        {
+            "chat_groups": [
+                {
+                    "count": 3,
+                    "has_unread": True,
+                    "session_observed": False,
+                    "pending_notification_types": ["gate"],
+                }
+            ],
+            "dashboard": {"total": 2, "critical": 1, "warning": 1, "info": 0},
+            "schedules": 1,
+            "tasks": 4,
+        }
+    )
+    assert model.model_dump()["chat_groups"][0]["active_session_status"] is None
+    with pytest.raises(ValidationError):
+        NavigationSummaryResponse.model_validate(
+            {
+                **model.model_dump(),
+                "tasks": -1,
+            }
+        )
+
+
+def test_background_command_detail_contract() -> None:
+    response = BackgroundCommandDetailResponse.model_validate(
+        {
+            "shell_id": "shell-preview",
+            "executor_id": "exec-a",
+            "command": "npm run dev",
+            "status": "completed",
+            "exit_code": 0,
+            "output_tail": "Ready",
+            "user_email": "user@example.com",
+            "turn_id": "turn-private",
+        }
+    )
+    assert response.exit_code == 0
+    assert response.output_tail == "Ready"
+    assert response.session_id is None
+    assert "user_email" not in response.model_dump()
+    assert "turn_id" not in response.model_dump()
+
+
+def test_message_text_streaming_is_independent_of_partial_content() -> None:
+    message = MessageTimelineItem(
+        id="message:turn-a:phase:0",
+        message_id="turn-a",
+        sort_key="0",
+        role="assistant",
+        content="Commentary",
+        stable=False,
+        status="running",
+        partial=True,
+        text_streaming=False,
+    )
+    payload = message.model_dump()
+    assert payload["text_streaming"] is False
+    assert payload["partial"] is True
+    assert MessageTimelineItem.model_validate(payload).text_streaming is False
+    del payload["text_streaming"]
+    assert MessageTimelineItem.model_validate(payload).text_streaming is None
+
+
+def test_retry_provider_options_response_matches_ui_contract() -> None:
+    assert RetryProviderOptionsResponse().model_dump() == {
+        "turn_id": None,
+        "provider_id": None,
+        "model": None,
+        "options": [],
+    }
+    response = RetryProviderOptionsResponse(
+        turn_id="turn-1",
+        provider_id="anthropic",
+        model="claude-sonnet-4",
+        options=[{"provider_id": "backup", "display_name": "Backup", "model": "claude-sonnet-4"}],
+    )
+    assert response.model_dump()["options"][0] == {
+        "provider_id": "backup",
+        "display_name": "Backup",
+        "model": "claude-sonnet-4",
+    }
+
+
+def test_project_task_page_preserves_readable_card_metadata_without_runtime() -> None:
+    page = CursorPage[ProjectTaskSummaryResponse].model_validate(
+        {
+            "items": [
+                {
+                    "task_id": "task_project_card",
+                    "status": "completed",
+                    "created_by": "owner@test.cz",
+                    "is_readonly_for_caller": True,
+                    "visibility": "project",
+                    "priority": 3,
+                    "source_type": "schedule",
+                    "result_summary": "Ready for review",
+                }
+            ],
+            "cursor": None,
+            "has_more": False,
+        }
+    )
+    item = page.model_dump(mode="json")["items"][0]
+    assert item["result_summary"] == "Ready for review"
+    assert item["priority"] == 3
+    assert item["is_readonly_for_caller"] is True
+    assert "attention_actions" not in item
+    assert "progress_summary" not in item
+
+
+def test_provider_monitor_contract_includes_freshness_policy_and_usage() -> None:
+    response = ProviderMonitorResponse(
+        provider_id="claude",
+        display_name="Claude",
+        monitoring={},
+        usage={
+            "provider_id": "claude",
+            "source": "anthropic_subscription_usage",
+            "primary": {"used_percent": 85},
+        },
+        alert_severity="warning",
+    )
+    payload = response.model_dump(mode="json")
+    assert payload["monitoring"] == {
+        "enabled": True,
+        "interval_minutes": 15,
+        "warning_percent": 20,
+        "critical_percent": 0,
+    }
+    assert payload["usage"]["primary"]["used_percent"] == 85
+    assert {
+        "checked_at",
+        "health_checked_at",
+        "next_refresh_at",
+        "stale",
+        "error",
+    } <= payload.keys()
 
 
 def test_recap_artifact_size_contract_matches_numeric_ui_field() -> None:
@@ -712,3 +1027,127 @@ class TestLLMProviderSerializer:
 
         reasoning_model = next(m for m in response.models if m["model_id"] == "gpt-5.4")
         assert reasoning_model["reasoning_efforts"] == ["default", "low", "high"]
+
+
+def test_background_tool_call_response_contract_is_strict() -> None:
+    payload = BackgroundToolCallV2Response(
+        conversation_id="conv-1",
+        call_id="call-1",
+        tool_name="bash",
+        status="already_requested",
+        server_time="2026-10-01T00:00:00Z",
+    ).model_dump(mode="json")
+    assert set(payload) == {"conversation_id", "call_id", "tool_name", "status", "server_time"}
+    with pytest.raises(ValidationError):
+        BackgroundToolCallV2Response.model_validate({**payload, "status": "moved"})
+    with pytest.raises(ValidationError):
+        BackgroundToolCallV2Response.model_validate({**payload, "shell_id": "shell_1"})
+
+
+def test_upstream_request_error_body_contract() -> None:
+    import httpx
+    from openai import BadRequestError
+
+    from cognis.api.routes.inference import upstream_failure
+
+    exc = BadRequestError(
+        "private upstream text",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://provider.test")),
+        body={"error": {"code": "json_validate_failed", "message": "private upstream text"}},
+    )
+    response = upstream_failure(exc)
+    assert response.status_code == 422
+    assert json.loads(response.body) == {
+        "error": {"code": "upstream_json_validate_failed", "category": "request"}
+    }
+
+
+@pytest.mark.parametrize("can_edit", [True, False, None])
+def test_queued_edit_capability_survives_chat_projection(can_edit: bool | None) -> None:
+    from cognis.api.chat_v2.schemas import QueueState
+    from cognis.api.chat_v2.sync import queue_state_from_messages
+    from cognis.api.models import QueuedMessagesResponse
+
+    message: dict[str, object] = {"queue_id": "queue-1", "content": "queued", "position": 1}
+    if can_edit is not None:
+        message["can_edit"] = can_edit
+    projected = queue_state_from_messages([message])
+    restored = QueueState.model_validate_json(projected.model_dump_json())
+    assert restored.messages[0].can_edit is bool(can_edit)
+    rest_response = QueuedMessagesResponse(messages=[message], queued_count=1)
+    restored_rest = QueuedMessagesResponse.model_validate_json(rest_response.model_dump_json())
+    assert restored_rest.messages[0].can_edit is bool(can_edit)
+
+
+def test_library_contracts() -> None:
+    """List contracts retain origin, lineage and nullable detached provenance."""
+    row = LibraryItem.model_validate(
+        {
+            "id": "art_contract_upload",
+            "kind": "artifact",
+            "title": "brief.pdf",
+            "format": "application/pdf",
+            "created_at": "2026-10-17T06:00:00Z",
+            "updated_at": "2026-10-17T06:00:00Z",
+            "status": "attached",
+            "origin": "user",
+        }
+    )
+    page = LibraryPage(items=[row]).model_dump(mode="json")
+    assert page["items"][0]["origin"] == "user"
+    assert page["items"][0]["conversation_id"] is None
+    assert page["next_cursor"] is None
+    assert (
+        LibraryGroupsPage(groups=[LibraryGroup(id="", label="No project", count=1)]).groups[0].id
+        == ""
+    )
+    with pytest.raises(ValidationError):
+        LibraryFilters.model_validate({"origin": "upload"})
+
+
+@pytest.mark.parametrize(
+    "kind", ["agent", "project", "conversation", "task", "schedule", "deliverable", "artifact"]
+)
+def test_palette_navigation_projection_contract(kind: str) -> None:
+    """Every search producer shares the compact, nullable navigation contract."""
+    from cognis.core.palette import PalettePage
+
+    page = PalettePage.model_validate(
+        {
+            "items": [
+                {
+                    "kind": kind,
+                    "id": f"{kind}-palette-contract",
+                    "title": "Command palette",
+                    "project_id": None,
+                    "agent_id": None,
+                    "status": None,
+                    "format": None,
+                    "updated_at": "2026-10-23T12:00:00Z",
+                    "href": "/",
+                }
+            ],
+        }
+    ).model_dump(mode="json")
+    assert page["next_cursor"] is None
+    assert page["items"][0]["size_bytes"] == 0
+    assert set(page["items"][0]) == {
+        "kind",
+        "id",
+        "title",
+        "project_id",
+        "agent_id",
+        "agent_name",
+        "agent_avatar_url",
+        "project_avatar_url",
+        "project_icon",
+        "project_color",
+        "origin",
+        "producer_name",
+        "status",
+        "format",
+        "updated_at",
+        "href",
+        "size_bytes",
+    }
+    assert "content" not in page["items"][0]

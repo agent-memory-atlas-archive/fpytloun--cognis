@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -24,13 +25,21 @@ from typing import Any
 
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.events import Event, EventBus, EventType
-from cognis.core.question_sets import normalize_questions
+from cognis.core.question_sets import normalize_questions, validate_reply_for_questions
+from cognis.core.questions import (
+    AGENT_QUESTION,
+    QuestionOrigin,
+    QuestionRouting,
+    QuestionTaskResumer,
+)
 from cognis.core.task_execution import (
     assert_task_execution_fence,
     current_task_cancel_event,
@@ -38,14 +47,17 @@ from cognis.core.task_execution import (
 )
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent
+from cognis.providers.guardrails.resolution_errors import ResolutionRejected
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import DirectTurnRequestRow, NotificationRow, Schedule, Task
 from cognis.store.queries import (
     get_agent_direct_conversation,
+    get_conversation,
     get_latest_active_conversation_for_agent,
     get_managed_conversation_link_for_target,
     get_preferred_channel_account_for_agent,
     get_session_row,
+    get_step_run,
     get_task,
 )
 
@@ -54,6 +66,7 @@ logger = get_logger(__name__)
 _ACTIVE_TASK_STATUSES = {"queued", "ready", "running", "paused"}
 _RESOLUTION_POLL_SECONDS = 0.5
 _WAIT_RECONCILE_SECONDS = 5.0
+_PAUSE_RECONCILE_TIMEOUT_SECONDS = 5.0
 NOTIFICATION_WAIT_READS = Counter(
     "cognis_notification_wait_reads_total",
     "Authoritative notification wait reconciliation passes.",
@@ -203,11 +216,13 @@ class NotificationService:
         pause_waiter: PauseWaiter,
         event_bus: EventBus,
         providers: Any,
+        task_queue: QuestionTaskResumer | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._pause_waiter = pause_waiter
         self._event_bus = event_bus
         self._providers = providers
+        self._question_task_queue = task_queue
         self.cluster_signals: Any = None
         self._background_tasks: set[asyncio.Task[None]] = set()
 
@@ -335,6 +350,456 @@ class NotificationService:
     # ------------------------------------------------------------------
 
     _MANAGED_LINK_HOP_CAP = 10
+
+    async def create_question(
+        self,
+        *,
+        origin: QuestionOrigin,
+        user_email: str,
+        notification_id: str,
+        payload: dict[str, Any],
+        deliver: bool = True,
+    ) -> Notification:
+        """Pin the responsible agent separately from the user's delivery destination."""
+        if origin.task_id is None and origin.step_run_id:
+            async with self._session_factory() as db:
+                step_run = await get_step_run(db, origin.step_run_id)
+                if step_run is not None:
+                    task = await get_task(db, step_run.task_id)
+                    if task is not None and task.created_by == user_email:
+                        origin = origin.model_copy(update={"task_id": task.task_id})
+        user_conversation_id = (
+            await self.resolve_target_conversation(
+                origin.task_id,
+                origin.conversation_id,
+                session_id=origin.session_id,
+                user_email=user_email,
+            )
+        ) or origin.conversation_id
+        respondent: str | None = None
+        async with self._session_factory() as db:
+            session = await get_session_row(db, origin.session_id)
+            if (
+                session is not None
+                and session.user_email == user_email
+                and session.parent_session_id
+            ):
+                parent = await get_session_row(db, session.parent_session_id)
+                if parent is not None and parent.user_email == user_email:
+                    respondent = parent.conversation_id
+            if respondent is None:
+                link = await get_managed_conversation_link_for_target(db, origin.conversation_id)
+                if link is not None and link.conversation_state == "open":
+                    respondent = link.controller_conversation_id
+            if origin.task_id:
+                task = await get_task(db, origin.task_id)
+                if task is not None and task.created_by == user_email:
+                    origin = origin.model_copy(
+                        update={
+                            "task_title": task.title,
+                            "task_attempt_number": task.attempt_number,
+                            "source_type": task.source_type,
+                            "source_ref": task.source_ref,
+                            "source_session_id": task.source_session_id,
+                        }
+                    )
+                    if respondent is None or respondent == origin.conversation_id:
+                        respondent = (
+                            task.source_ref
+                            if task.source_type in {"chat", "agent"} and task.source_ref
+                            else user_conversation_id
+                        )
+            if respondent:
+                conversation = await get_conversation(db, respondent)
+                if conversation is None or conversation.user_email != user_email:
+                    respondent = None
+                elif respondent == origin.conversation_id and not (
+                    session is not None and session.parent_session_id
+                ):
+                    # Never ask the execution currently blocked on this request.
+                    respondent = None
+        enriched = {
+            **payload,
+            "question_origin": origin.model_dump(mode="json"),
+            "question_delivery_ready": deliver,
+        }
+        if respondent:
+            enriched["question_routing"] = QuestionRouting(
+                respondent_conversation_id=respondent,
+                user_conversation_id=user_conversation_id,
+            ).model_dump(mode="json")
+        notification = await self.create(
+            notification_type=AGENT_QUESTION if respondent else NotificationType.STEP_QUESTION,
+            user_email=user_email,
+            conversation_id=respondent or origin.conversation_id,
+            task_id=origin.task_id,
+            step_name=origin.step_name,
+            step_run_id=origin.step_run_id,
+            session_id=origin.session_id,
+            notification_id=notification_id,
+            payload=enriched,
+            suppress_event=bool(respondent),
+        )
+        if respondent and deliver:
+            await self.deliver_question(notification)
+        return notification
+
+    async def activate_question(self, question_id: str) -> None:
+        """Publish only after the requesting execution has persisted its pause."""
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, question_id)
+            if row is None or row.notification_type != AGENT_QUESTION or row.status != "pending":
+                return
+            if not (row.payload or {}).get("question_delivery_ready"):
+                result = await db.execute(
+                    update(NotificationRow)
+                    .where(
+                        NotificationRow.notification_id == question_id,
+                        NotificationRow.status == "pending",
+                        NotificationRow.notification_type == AGENT_QUESTION,
+                        NotificationRow.revision == _notification_revision(row),
+                    )
+                    .values(payload={**(row.payload or {}), "question_delivery_ready": True})
+                )
+                if not int(getattr(result, "rowcount", 0) or 0):
+                    return
+                await db.commit()
+                await db.refresh(row)
+            notification = _row_to_notification(row)
+        await self.deliver_question(notification)
+
+    async def deliver_question(self, notification: Notification) -> None:
+        """Deliver a correlated question through durable, serialized follow-up admission."""
+        from cognis.core.followups import (
+            FollowUpMode,
+            FollowUpOriginKind,
+            FollowUpRelevanceHint,
+            FollowUpRequiredAction,
+            FollowUpStatus,
+            QuestionFollowUp,
+            build_follow_up_id,
+        )
+
+        if (
+            notification.notification_type != AGENT_QUESTION
+            or notification.status != "pending"
+            or not notification.payload.get("question_delivery_ready")
+        ):
+            return
+        follow_up = QuestionFollowUp(
+            follow_up_id=build_follow_up_id(
+                kind="question",
+                conversation_id=notification.conversation_id,
+                parts={"question_id": notification.notification_id},
+            ),
+            mode=FollowUpMode.INTEGRATE,
+            origin_kind=FollowUpOriginKind.QUESTION,
+            relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+            required_action=FollowUpRequiredAction.ANSWER_QUESTION,
+            status=FollowUpStatus.PAUSED,
+            question_id=notification.notification_id,
+            revision=notification.revision,
+            origin=QuestionOrigin.model_validate(notification.payload["question_origin"]),
+            questions=normalize_questions(notification.payload["questions"]),
+            context=notification.payload.get("context"),
+        )
+        await self._event_bus.publish(
+            Event(
+                type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                data={
+                    "conversation_id": notification.conversation_id,
+                    "follow_up": follow_up.model_dump(mode="json"),
+                    "channel_deliverable": False,
+                },
+            )
+        )
+
+    async def recover_questions(self, *, limit: int = 100) -> None:
+        """Recover missed delivery; unanswered terminal mediation falls back to the user."""
+        from cognis.core.followups import build_follow_up_id
+        from cognis.store.models import FollowUpIntentRow
+
+        async with self._session_factory() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(NotificationRow)
+                        .where(
+                            NotificationRow.notification_type == AGENT_QUESTION,
+                            NotificationRow.status == "pending",
+                        )
+                        .order_by(NotificationRow.created_at)
+                        .limit(limit)
+                    )
+                ).scalars()
+            )
+        for row in rows:
+            async with self._session_factory() as db:
+                origin_live = await self._question_origin_is_live(db, row)
+            if not origin_live:
+                await self.mark_orphaned(row.notification_id, reason="origin_execution_terminal")
+                continue
+            if _is_expired_notification(row, now=datetime.now(UTC)):
+                await self.mark_orphaned(row.notification_id, reason="expired")
+                continue
+            if not (row.payload or {}).get("question_delivery_ready"):
+                # A crash after pause persistence but before activation is recoverable.
+                # Before that commit, only the originating execution may activate it.
+                async with self._session_factory() as db:
+                    task = await get_task(db, row.task_id) if row.task_id else None
+                    state = (task.workflow_state or {}) if task is not None else {}
+                if (
+                    state.get("pending_pause_type") == AGENT_QUESTION
+                    and (state.get("pending_pause_payload") or {}).get("pause_id")
+                    == row.notification_id
+                ):
+                    await self.activate_question(row.notification_id)
+                continue
+            follow_up_id = build_follow_up_id(
+                kind="question",
+                conversation_id=row.conversation_id,
+                parts={"question_id": row.notification_id},
+            )
+            async with self._session_factory() as db:
+                intent = (
+                    await db.execute(
+                        select(FollowUpIntentRow).where(
+                            FollowUpIntentRow.conversation_id == row.conversation_id,
+                            FollowUpIntentRow.follow_up_id == follow_up_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+            if intent is None:
+                await self.deliver_question(_row_to_notification(row))
+            elif intent.status in {"submitted", "failed"}:
+                await self.forward_question(
+                    row.notification_id,
+                    user_email=row.user_email,
+                    conversation_id=row.conversation_id,
+                    expected_revision=_notification_revision(row),
+                )
+
+        if self._question_task_queue is not None:
+            async with self._session_factory() as db:
+                answered = list(
+                    (
+                        await db.execute(
+                            select(NotificationRow)
+                            .join(Task, NotificationRow.task_id == Task.task_id)
+                            .where(
+                                NotificationRow.notification_type == AGENT_QUESTION,
+                                NotificationRow.status == "resolved",
+                                Task.status == "paused",
+                                Task.workflow_state["pending_pause_payload"]["pause_id"].as_string()
+                                == NotificationRow.notification_id,
+                            )
+                            .limit(limit)
+                        )
+                    ).scalars()
+                )
+            for question in answered:
+                await self._resume_answered_question(_row_to_notification(question))
+
+    async def _resume_answered_question(self, notification: Notification) -> None:
+        queue = self._question_task_queue
+        if queue is None or not notification.task_id or queue.has_active_run(notification.task_id):
+            return
+        reply = notification.resolution or {}
+        if reply.get("decision") != "continue" or reply.get("mode") != "structured":
+            return
+        async with self._session_factory() as db:
+            task = await db.get(Task, notification.task_id, with_for_update=True)
+            if task is None or task.status != "paused":
+                return
+            origin = QuestionOrigin.model_validate(notification.payload["question_origin"])
+            if origin.task_attempt_number != task.attempt_number:
+                return
+            state = dict(task.workflow_state or {})
+            payload = dict(state.get("pending_pause_payload") or {})
+            if payload.get("pause_id") != notification.notification_id:
+                return
+            payload.update(answers=reply["answers"], mode=reply["mode"])
+            state.update(
+                pending_pause_type="step_input",
+                pending_pause_payload=payload,
+                version=int(state.get("version") or 0) + 1,
+            )
+            task.workflow_state = state
+            await db.commit()
+        try:
+            await queue.resume_task(notification.task_id)
+        except ValueError:
+            # Capacity/ownership may still belong to another controller.
+            # The durable answered pause remains eligible for the next recovery scan.
+            logger.info(
+                "question: recovered task admission deferred",
+                extra={"extra_data": {"task_id": notification.task_id}},
+            )
+
+    async def answer_question(
+        self,
+        question_id: str,
+        *,
+        user_email: str,
+        conversation_id: str,
+        expected_revision: int,
+        answers: list[dict[str, Any]],
+    ) -> bool:
+        """Answer only an agent-mediated question assigned to this conversation."""
+        from cognis.core.question_sets import validate_reply_for_questions
+
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, question_id)
+            if (
+                row is None
+                or row.user_email != user_email
+                or row.conversation_id != conversation_id
+                or row.notification_type != AGENT_QUESTION
+            ):
+                raise ValueError("Question not found or not assigned to this conversation.")
+            reply = validate_reply_for_questions(
+                {"mode": "structured", "answers": answers},
+                normalize_questions((row.payload or {}).get("questions")),
+            )
+        reply["answered_by"] = {
+            "kind": "agent",
+            "conversation_id": conversation_id,
+        }
+
+        async def guard(db: AsyncSession) -> bool:
+            current = await db.get(NotificationRow, question_id)
+            return bool(
+                current is not None
+                and current.user_email == user_email
+                and current.conversation_id == conversation_id
+                and current.notification_type == AGENT_QUESTION
+                and bool((current.payload or {}).get("question_delivery_ready"))
+                and (
+                    current.status == "resolved" or await self._question_origin_is_live(db, current)
+                )
+            )
+
+        resolved = await self.resolve(
+            question_id,
+            "continue",
+            reply,
+            admission_guard=guard,
+            expected_revision=expected_revision,
+        )
+        if resolved:
+            notification = await self.get(question_id)
+            if notification is not None:
+                await self._resume_answered_question(notification)
+        return resolved
+
+    async def _question_origin_is_live(self, db: AsyncSession, row: NotificationRow) -> bool:
+        if row.session_id:
+            origin_session = await get_session_row(db, row.session_id)
+            if origin_session is None or origin_session.status in {
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted",
+            }:
+                return False
+        if row.task_id:
+            task = await get_task(db, row.task_id)
+            if task is None or task.status in {"completed", "failed", "cancelled"}:
+                return False
+            origin = (row.payload or {}).get("question_origin") or {}
+            if origin.get("task_attempt_number") != task.attempt_number:
+                return False
+        return True
+
+    async def forward_question(
+        self,
+        question_id: str,
+        *,
+        user_email: str,
+        conversation_id: str,
+        expected_revision: int,
+    ) -> bool:
+        """Expose the same paused request to the user without creating another waiter."""
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, question_id)
+            if (
+                row is None
+                or row.user_email != user_email
+                or row.notification_type != AGENT_QUESTION
+                or row.conversation_id != conversation_id
+                or row.status != "pending"
+                or not (row.payload or {}).get("question_delivery_ready")
+                or _notification_revision(row) != expected_revision
+                or _is_expired_notification(row, now=datetime.now(UTC))
+            ):
+                return False
+            routing = QuestionRouting.model_validate((row.payload or {}).get("question_routing"))
+            # Match task lifecycle lock order: task first, notification CAS second.
+            task = await db.get(Task, row.task_id, with_for_update=True) if row.task_id else None
+            if not await self._question_origin_is_live(db, row):
+                return False
+            target = await get_conversation(db, routing.user_conversation_id)
+            if target is None or target.user_email != user_email:
+                return False
+            payload = {**(row.payload or {}), "forwarded_by_conversation_id": conversation_id}
+            result = await db.execute(
+                update(NotificationRow)
+                .where(
+                    NotificationRow.notification_id == question_id,
+                    NotificationRow.notification_type == AGENT_QUESTION,
+                    NotificationRow.status == "pending",
+                    NotificationRow.revision == expected_revision,
+                )
+                .values(
+                    notification_type=NotificationType.STEP_QUESTION,
+                    conversation_id=routing.user_conversation_id,
+                    payload=payload,
+                    revision=expected_revision + 1,
+                )
+            )
+            if not int(getattr(result, "rowcount", 0) or 0):
+                await db.rollback()
+                return False
+            if row.task_id:
+                state = dict(task.workflow_state or {}) if task is not None else {}
+                pending_payload = state.get("pending_pause_payload") or {}
+                if task is not None and pending_payload.get("pause_id") == question_id:
+                    state["pending_pause_type"] = "step_input"
+                    state["version"] = int(state.get("version") or 0) + 1
+                    task.workflow_state = state
+            await db.commit()
+            await db.refresh(row)
+            notification = _row_to_notification(row)
+        self._pause_waiter.retarget(
+            question_id,
+            pause_type=NotificationType.STEP_QUESTION,
+            conversation_id=notification.conversation_id,
+        )
+        await self._event_bus.publish(
+            Event(
+                type=EventType.NOTIFICATION_CREATED,
+                data={
+                    "notification_id": question_id,
+                    "notification_type": NotificationType.STEP_QUESTION,
+                    "user_email": user_email,
+                    "conversation_id": notification.conversation_id,
+                    "task_id": notification.task_id,
+                    "step_name": notification.step_name,
+                    "session_id": notification.session_id,
+                    "payload": notification.payload,
+                },
+            )
+        )
+        await self._publish_notification_cluster_changes(
+            conversation_id=notification.conversation_id,
+            user_email=user_email,
+            notification_id=question_id,
+            task_id=notification.task_id,
+            session_id=notification.session_id,
+            revision=datetime.now(UTC),
+            payload=payload,
+        )
+        return True
 
     async def resolve_target_conversation(
         self,
@@ -1015,13 +1480,18 @@ class NotificationService:
         # Resolve target conversation (task source for task-originated;
         # managed-conversation chain for non-task notifications).
         resolved_conversation_id = (
-            await self.resolve_target_conversation(
-                task_id,
-                conversation_id,
-                session_id=session_id,
-                user_email=user_email,
+            conversation_id
+            if notification_type == AGENT_QUESTION
+            else (
+                await self.resolve_target_conversation(
+                    task_id,
+                    conversation_id,
+                    session_id=session_id,
+                    user_email=user_email,
+                )
             )
-        ) or conversation_id
+            or conversation_id
+        )
 
         # When the notification originated inside a managed sub-conversation
         # and was redirected to the parent, enrich the payload with managed-
@@ -1171,6 +1641,7 @@ class NotificationService:
                             "step_name": step_name,
                             "session_id": session_id,
                             "payload": enriched_payload,
+                            "expires_at": expires_at.isoformat() if expires_at else None,
                         },
                     )
                 ),
@@ -1211,6 +1682,9 @@ class NotificationService:
         admission_guard: Callable[[Any], Awaitable[bool]] | None = None,
         expected_revision: int | None = None,
         data_factory: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        selection_guard: ColumnElement[bool] | None = None,
+        pre_submit_guard: Callable[[], bool] | None = None,
+        human_answer: bool = False,
     ) -> bool:
         """Resolve a notification, update DB, resolve PauseWaiter.
 
@@ -1221,7 +1695,18 @@ class NotificationService:
         error after an approval raced with remote Intaris reconciliation,
         without accepting conflicting duplicate input.
         """
-        resolution_data = data or {}
+        resolution_data = dict(data or {})
+        # Only authenticated ingress can assert human authorship.
+        resolution_data.pop("human_answer", None)
+        if human_answer:
+            if user_email is None:
+                raise ValueError("Human question answers require an authenticated user")
+            resolution_data["human_answer"] = True
+        if user_email is not None:
+            async with self._session_factory() as db:
+                question = await db.get(NotificationRow, notification_id)
+                if question is not None and question.notification_type == AGENT_QUESTION:
+                    return False
         now = datetime.now(UTC)
         claim_token = f"resolve_{uuid.uuid4().hex}"
         claim_revision = 0
@@ -1241,7 +1726,74 @@ class NotificationService:
                 return False
             if user_email is not None and row.user_email != user_email:
                 return False
+            if row.notification_type == NotificationType.GATE and row.task_id:
+                # Enforce current gate identity and deadline in the decision CAS.
+                is_timeout = user_email is None and resolution_data.get("reason") == "timeout"
+                offered = {
+                    str(option.get("action"))
+                    for option in (row.payload or {}).get("options", [])
+                    if isinstance(option, dict)
+                }
+                timeout_action = (row.payload or {}).get("timeout_action")
+                if is_timeout:
+                    if decision not in {"fail", "continue", "cancel"}:
+                        return False
+                    if timeout_action is not None and decision != timeout_action:
+                        return False
+                elif decision not in offered:
+                    return False
+                active_gate = [
+                    Task.task_id == row.task_id,
+                    Task.status.in_(["running", "paused"]),
+                    Task.workflow_state["pending_pause_type"].as_string() == "gate",
+                    Task.workflow_state["pending_pause_payload"]["pause_id"].as_string()
+                    == row.notification_id,
+                ]
+                task_attempt = (row.payload or {}).get("task_attempt")
+                if isinstance(task_attempt, int):
+                    active_gate.append(Task.attempt_number == task_attempt)
+                gate_guard = select(Task.task_id).where(*active_gate).exists()
+                deadline_guard: ColumnElement[bool]
+                if row.status in {"resolving", "resolved"}:
+                    # The deadline governs admission, not completion of an
+                    # already-admitted winner after its controller disappears.
+                    if not _resolution_claim_matches(
+                        row.resolution or {},
+                        decision,
+                        resolution_data,
+                        require_exact_payload=True,
+                    ):
+                        return False
+                    deadline_guard = true()
+                else:
+                    deadline_guard = _unexpired_notification_predicate(row, db)
+                    if is_timeout:
+                        deadline_guard = ~deadline_guard
+                selection_guard = (
+                    gate_guard
+                    & deadline_guard
+                    & (selection_guard if selection_guard is not None else true())
+                )
+                if not await db.scalar(select(gate_guard)):
+                    return False
+            if (
+                row.notification_type
+                in {NotificationType.ESCALATION, NotificationType.AUTH_CHALLENGE}
+                and row.status == "pending"
+                and _is_expired_notification(row, now=now)
+                and not (
+                    row.notification_type == NotificationType.ESCALATION
+                    and user_email is None
+                    and decision == "deny"
+                    and resolution_data.get("reason") == "timeout"
+                )
+            ):
+                return False
             if row.status == "resolved":
+                if row.notification_type == NotificationType.STEP_QUESTION and not (
+                    _question_resolution_matches(row.resolution, decision, resolution_data)
+                ):
+                    return False
                 if _is_same_resolution(row, decision, resolution_data):
                     waiter_ok = self._pause_waiter.resolve(
                         notification_id,
@@ -1285,6 +1837,10 @@ class NotificationService:
                 return False
             if row.status == "resolving":
                 existing = row.resolution if isinstance(row.resolution, dict) else {}
+                if row.notification_type == NotificationType.STEP_QUESTION and not (
+                    _question_resolution_matches(existing, decision, resolution_data)
+                ):
+                    return False
                 if str(existing.get("decision") or "").lower() != decision.lower():
                     return False
                 claimed_at = row.resolved_at
@@ -1302,6 +1858,11 @@ class NotificationService:
                         return False
                     waits_for_existing_claim = True
                 else:
+                    if row.notification_type in {
+                        NotificationType.ESCALATION,
+                        NotificationType.AUTH_CHALLENGE,
+                    } and _is_expired_notification(row, now=datetime.now(UTC)):
+                        return False
                     result = await db.execute(
                         update(NotificationRow)
                         .where(
@@ -1309,6 +1870,11 @@ class NotificationService:
                             NotificationRow.status == "resolving",
                             NotificationRow.resolved_at == row.resolved_at,
                             NotificationRow.revision == row_revision,
+                            selection_guard if selection_guard is not None else true(),
+                            _unexpired_notification_predicate(row, db)
+                            if row.notification_type
+                            in {NotificationType.ESCALATION, NotificationType.AUTH_CHALLENGE}
+                            else true(),
                         )
                         .values(
                             resolution={
@@ -1337,6 +1903,17 @@ class NotificationService:
                         NotificationRow.notification_id == notification_id,
                         NotificationRow.status == "pending",
                         NotificationRow.revision == row_revision,
+                        selection_guard if selection_guard is not None else true(),
+                        _unexpired_notification_predicate(row, db)
+                        if row.notification_type
+                        in {NotificationType.ESCALATION, NotificationType.AUTH_CHALLENGE}
+                        and not (
+                            row.notification_type == NotificationType.ESCALATION
+                            and user_email is None
+                            and decision == "deny"
+                            and resolution_data.get("reason") == "timeout"
+                        )
+                        else true(),
                     )
                     .values(
                         status="resolving",
@@ -1349,6 +1926,7 @@ class NotificationService:
                         resolved_at=now,
                         revision=row_revision + 1,
                     )
+                    .execution_options(synchronize_session="fetch")
                 )
                 await db.commit()
                 owns_claim = _claim_update_succeeded(
@@ -1357,6 +1935,8 @@ class NotificationService:
                     claim_token=claim_token,
                 )
                 if not owns_claim:
+                    if selection_guard is not None:
+                        return False
                     return await self.resolve(
                         notification_id,
                         decision,
@@ -1365,6 +1945,9 @@ class NotificationService:
                         admission_guard=admission_guard,
                         expected_revision=expected_revision,
                         data_factory=data_factory,
+                        selection_guard=selection_guard,
+                        pre_submit_guard=pre_submit_guard,
+                        human_answer=human_answer,
                     )
                 claim_revision = row_revision + 1
             else:
@@ -1378,6 +1961,7 @@ class NotificationService:
             step_name = row.step_name
             session_id = row.session_id
             notification_payload = dict(row.payload) if isinstance(row.payload, dict) else {}
+            submission_expiry = _notification_expiry(row)
         if waits_for_existing_claim:
             return await self._wait_for_existing_resolution_claim(
                 notification_id,
@@ -1385,7 +1969,20 @@ class NotificationService:
                 resolution_data,
                 user_email=user_email,
                 admission_guard=admission_guard,
+                selection_guard=selection_guard,
+                pre_submit_guard=pre_submit_guard,
+                human_answer=human_answer,
             )
+        if (
+            notification_type == NotificationType.AUTH_CHALLENGE
+            and owns_claim
+            and submission_expiry is not None
+            and datetime.now(UTC) >= submission_expiry
+        ):
+            # The UPDATE may have waited for a lock past its deadline. Revalidate
+            # after acquiring the claim and before admitting any response work.
+            await self.mark_orphaned(notification_id, reason="expired", include_resolving=True)
+            return False
         if data_factory is not None and owns_claim:
             heartbeat_stop = asyncio.Event()
 
@@ -1457,7 +2054,57 @@ class NotificationService:
                 await db.commit()
                 if not int(getattr(result, "rowcount", 0) or 0):
                     return False
+        if (
+            owns_claim
+            and resolution_data.get("human_answer") is True
+            and decision == "continue"
+            and notification_type == NotificationType.STEP_QUESTION
+        ):
+            await self._record_question_answer(
+                notification_id=notification_id,
+                notification_payload=notification_payload,
+                resolution_data=resolution_data,
+                session_id=session_id,
+                user_email=row_user_email,
+            )
+        rejection: ResolutionRejected | None = None
+        if (
+            notification_type == NotificationType.AUTH_CHALLENGE
+            and owns_claim
+            and submission_expiry is not None
+            and datetime.now(UTC) >= submission_expiry
+        ):
+            await self.mark_orphaned(notification_id, reason="expired", include_resolving=True)
+            return False
         if notification_type == NotificationType.ESCALATION and owns_claim:
+            if (pre_submit_guard is not None and not pre_submit_guard()) or (
+                submission_expiry is not None
+                and datetime.now(UTC) >= submission_expiry
+                and not (
+                    user_email is None
+                    and decision == "deny"
+                    and resolution_data.get("reason") == "timeout"
+                )
+            ):
+                # The claim is ours and no submission has started. A new local
+                # registration may invalidate bare selection during the CAS.
+                async with self._session_factory() as db:
+                    await db.execute(
+                        update(NotificationRow)
+                        .where(
+                            NotificationRow.notification_id == notification_id,
+                            NotificationRow.status == "resolving",
+                            NotificationRow.revision == claim_revision,
+                        )
+                        .values(
+                            status="pending",
+                            resolution=None,
+                            resolved_at=None,
+                            revision=claim_revision + 1,
+                        )
+                    )
+                    await db.commit()
+                return False
             try:
                 with scoped_runtime_context(user_email=user_email or row_user_email):
                     await asyncio.wait_for(
@@ -1473,9 +2120,22 @@ class NotificationService:
                     extra={
                         "extra_data": {"notification_id": notification_id, "decision": decision}
                     },
-                    exc_info=True,
+                    # Exception payloads can contain upstream content.
                 )
-                if not isinstance(exc, TimeoutError):
+                if isinstance(exc, ResolutionRejected) and (
+                    exc.permanent or exc.requires_reevaluation
+                ):
+                    # This receipt cannot be approved. Close the owned wait:
+                    # stale context is cancellation, not a human refusal.
+                    rejection = exc
+                    decision = "cancel" if exc.requires_reevaluation else "deny"
+                    resolution_data = {
+                        "note": exc.message,
+                        "reason": exc.code,
+                        "resolution_rejected": True,
+                        **({"requires_reevaluation": True} if exc.requires_reevaluation else {}),
+                    }
+                elif not isinstance(exc, TimeoutError):
                     async with self._session_factory() as db:
                         await db.execute(
                             update(NotificationRow)
@@ -1492,7 +2152,11 @@ class NotificationService:
                             )
                         )
                         await db.commit()
-                return False
+                    if isinstance(exc, ResolutionRejected):
+                        raise
+                    return False
+                else:
+                    return False
 
         async with self._session_factory() as db:
             if admission_guard is not None and not await admission_guard(db):
@@ -1610,6 +2274,9 @@ class NotificationService:
                 }
             },
         )
+        if rejection is not None:
+            rejection.resolved_locally = True
+            raise rejection
         return True
 
     async def _wait_for_existing_resolution_claim(
@@ -1620,6 +2287,9 @@ class NotificationService:
         *,
         user_email: str | None,
         admission_guard: Callable[[Any], Awaitable[bool]] | None,
+        selection_guard: ColumnElement[bool] | None = None,
+        pre_submit_guard: Callable[[], bool] | None = None,
+        human_answer: bool = False,
     ) -> bool:
         """Wait until another resolver reaches an authoritative terminal state."""
 
@@ -1664,6 +2334,9 @@ class NotificationService:
                     resolution_data,
                     user_email=user_email,
                     admission_guard=admission_guard,
+                    selection_guard=selection_guard,
+                    pre_submit_guard=pre_submit_guard,
+                    human_answer=human_answer,
                 )
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -1677,28 +2350,132 @@ class NotificationService:
         conversation_id: str,
     ) -> Notification | None:
         """Return the oldest actionable escalation for one owned conversation."""
-        async with self._session_factory() as db:
-            row = (
-                (
-                    await db.execute(
-                        select(NotificationRow)
-                        .where(
-                            NotificationRow.user_email == user_email,
+        rows = await self.list_actionable_escalations(
+            user_email=user_email, conversation_id=conversation_id
+        )
+        return rows[0] if rows else None
+
+    async def _actionable_escalation_rows(
+        self, db: AsyncSession, *, user_email: str, conversation_id: str
+    ) -> list[NotificationRow]:
+        rows = (
+            (
+                await db.execute(
+                    select(NotificationRow)
+                    .where(
+                        NotificationRow.user_email == user_email,
+                        NotificationRow.notification_type == NotificationType.ESCALATION,
+                        NotificationRow.status.in_(("pending", "resolving")),
+                        or_(
                             NotificationRow.conversation_id == conversation_id,
-                            NotificationRow.notification_type == NotificationType.ESCALATION,
-                            NotificationRow.status.in_(("pending", "resolving")),
-                        )
-                        .order_by(
-                            NotificationRow.created_at.asc(),
-                            NotificationRow.notification_id.asc(),
-                        )
-                        .limit(1)
+                            NotificationRow.payload["managed_origin_conversation_id"].as_string()
+                            == conversation_id,
+                        ),
                     )
+                    .order_by(NotificationRow.created_at, NotificationRow.notification_id)
                 )
-                .scalars()
-                .first()
             )
-            return _row_to_notification(row) if row is not None else None
+            .scalars()
+            .all()
+        )
+        now = datetime.now(UTC)
+        return [
+            row
+            for row in rows
+            if _notification_visible_in_conversation(row, conversation_id)
+            and not _is_expired_notification(row, now=now)
+        ]
+
+    async def list_actionable_escalations(
+        self, *, user_email: str, conversation_id: str
+    ) -> list[Notification]:
+        """List owned, visible, unexpired approvals; never pick one implicitly."""
+        async with self._session_factory() as db:
+            rows = await self._actionable_escalation_rows(
+                db, user_email=user_email, conversation_id=conversation_id
+            )
+            return [_row_to_notification(row) for row in rows]
+
+    async def find_escalation(
+        self, *, notification_id: str, user_email: str, conversation_id: str
+    ) -> Notification | None:
+        """Find one owned visible approval, including an idempotent resolved retry."""
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, notification_id)
+            if (
+                row is None
+                or row.user_email != user_email
+                or row.notification_type != NotificationType.ESCALATION
+                or not _notification_visible_in_conversation(row, conversation_id)
+                or row.status not in {"pending", "resolving", "resolved"}
+                or (
+                    _is_expired_notification(row, now=datetime.now(UTC))
+                    and (row.status == "pending" or not _has_live_resolution_claim(row))
+                )
+            ):
+                return None
+            return _row_to_notification(row)
+
+    async def resolve_escalation(
+        self,
+        notification_id: str,
+        decision: str,
+        data: dict[str, Any],
+        *,
+        user_email: str,
+        conversation_id: str,
+        require_unique: bool = False,
+        pre_submit_guard: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Recheck selection at the resolution claim; keep resolution/CAS one-owned."""
+
+        async def guard(db: AsyncSession) -> bool:
+            row = await db.get(NotificationRow, notification_id)
+            if (
+                row is None
+                or row.user_email != user_email
+                or row.notification_type != NotificationType.ESCALATION
+                or not _notification_visible_in_conversation(row, conversation_id)
+            ):
+                return False
+            if row.status == "resolved":
+                return True  # resolve() still validates identical decision and note.
+            if require_unique and row.status == "pending":
+                rows = await self._actionable_escalation_rows(
+                    db, user_email=user_email, conversation_id=conversation_id
+                )
+                return len(rows) == 1 and rows[0].notification_id == notification_id
+            return True
+
+        selection_guard = None
+        if require_unique:
+            # Recheck ambiguity in the atomic claim, not just a prior read.
+            other = aliased(NotificationRow)
+            selection_guard = (
+                ~select(other.notification_id)
+                .where(
+                    other.notification_id != notification_id,
+                    other.user_email == user_email,
+                    other.notification_type == NotificationType.ESCALATION,
+                    other.status.in_(("pending", "resolving")),
+                    or_(
+                        other.conversation_id == conversation_id,
+                        other.payload["managed_origin_conversation_id"].as_string()
+                        == conversation_id,
+                    ),
+                    or_(other.expires_at.is_(None), other.expires_at > datetime.now(UTC)),
+                )
+                .exists()
+            )
+        return await self.resolve(
+            notification_id,
+            decision,
+            data,
+            user_email=user_email,
+            admission_guard=guard,
+            selection_guard=selection_guard,
+            pre_submit_guard=pre_submit_guard,
+        )
 
     async def find_tool_escalation(
         self,
@@ -1746,6 +2523,7 @@ class NotificationService:
                             NotificationRow.notification_type.in_(
                                 (
                                     NotificationType.STEP_QUESTION,
+                                    AGENT_QUESTION,
                                     NotificationType.AUTH_CHALLENGE,
                                 )
                             ),
@@ -1814,6 +2592,7 @@ class NotificationService:
         try:
             while True:
                 changed.clear()
+                recover_gate_claim: tuple[str, dict[str, Any]] | None = None
                 if local_wait.done() and resolved is None:
                     with contextlib.suppress(TimeoutError):
                         # Local completion is a wakeup, not authority for a decision.
@@ -1840,6 +2619,26 @@ class NotificationService:
                                 decision=decision,
                                 data=_resolution_waiter_data(row.resolution, {}),
                             )
+                        if (
+                            row.notification_type == NotificationType.GATE
+                            and row.status == "resolving"
+                            and isinstance(row.resolution, dict)
+                            and row.resolved_at is not None
+                        ):
+                            gate_claimed_at = row.resolved_at.replace(
+                                tzinfo=row.resolved_at.tzinfo or UTC
+                            )
+                            if (
+                                datetime.now(UTC) - gate_claimed_at
+                            ).total_seconds() >= _RESOLUTION_CLAIM_SECONDS:
+                                recover_gate_claim = (
+                                    str(row.resolution["decision"]),
+                                    {
+                                        key: value
+                                        for key, value in row.resolution.items()
+                                        if key not in {"decision", "state", "claim_token"}
+                                    },
+                                )
                         elif (
                             row.status == "resolving"
                             and deadline is not None
@@ -1862,6 +2661,12 @@ class NotificationService:
                                 )
                                 claim_grace_applied = True
 
+                if recover_gate_claim is not None:
+                    recovered = await self.resolve(
+                        notification_id, recover_gate_claim[0], recover_gate_claim[1]
+                    )
+                    if recovered:
+                        continue  # Re-read the finalized durable winner.
                 if resolved is None and deadline is not None and monotonic() >= deadline:
                     raise TimeoutError
 
@@ -1897,6 +2702,76 @@ class NotificationService:
             with contextlib.suppress(asyncio.CancelledError, TimeoutError):
                 await local_wait
 
+    async def _record_question_answer(
+        self,
+        *,
+        notification_id: str,
+        notification_payload: dict[str, Any],
+        resolution_data: dict[str, Any],
+        session_id: str | None,
+        user_email: str,
+    ) -> None:
+        """Publish accepted human input before making the resolution observable."""
+        if not session_id:
+            raise ValueError("Question answer has no originating session")
+        questions = notification_payload.get("questions") or []
+        reply = validate_reply_for_questions(resolution_data, questions)
+        by_id = {str(question["id"]): question for question in questions}
+        parts = []
+        for number, answer in enumerate(reply["answers"], 1):
+            question = by_id.get(answer["question_id"], {})
+            options = {str(option["id"]): option["label"] for option in question.get("options", [])}
+            values = [options[key] for key in answer["selected_option_ids"]]
+            if answer.get("custom_answer"):
+                values.append(answer["custom_answer"])
+            prefix = f"Answer {number}: " if len(reply["answers"]) > 1 else ""
+            parts.append(prefix + "; ".join(values))
+        content = "\n".join(parts)
+        async with self._session_factory() as db:
+            row = await get_session_row(db, session_id)
+        if row is None or row.user_email != user_email:
+            raise ValueError("Question session ownership could not be verified")
+        intaris_id = row.intaris_session_id or session_id
+        events = [
+            SessionEvent(
+                type="assistant_message",
+                data={
+                    "role": "assistant",
+                    "content": json.dumps(questions, ensure_ascii=False),
+                    "source": "question_context",
+                    "question_id": notification_id,
+                },
+            ),
+            SessionEvent(
+                type="user_message",
+                data={
+                    "role": "user",
+                    "content": content,
+                    "content_type": "text",
+                    "source": "question_answer",
+                    "intention_eligible": True,
+                    "question_id": notification_id,
+                },
+            ),
+        ]
+        with scoped_runtime_context(user_email=user_email):
+            result = await self._providers.guardrails.record_events(
+                session_id=intaris_id,
+                events=events,
+                source="cognis",
+                idempotency_key=f"{intaris_id}:question_answer:{notification_id}",
+                user_email=user_email,
+            )
+            if not result.ok:
+                raise RuntimeError("Intaris did not persist the human question answer")
+            # Reuse the normal event-to-intention path, including its evaluation barrier.
+            await self._providers.guardrails.report_reasoning(
+                session_id=intaris_id,
+                from_events=True,
+                wait_for_intention=True,
+                wait_timeout_ms=10000,
+            )
+
     async def _record_user_interaction(
         self,
         *,
@@ -1916,6 +2791,8 @@ class NotificationService:
         """
 
         if not session_id:
+            return
+        if notification_type == AGENT_QUESTION:
             return
         try:
             async with self._session_factory() as db:
@@ -2011,6 +2888,7 @@ class NotificationService:
             stmt = select(NotificationRow).where(
                 NotificationRow.user_email == user_email,
                 NotificationRow.status.in_(("pending", "resolving")),
+                NotificationRow.notification_type != AGENT_QUESTION,
             )
             if task_id:
                 stmt = stmt.where(NotificationRow.task_id == task_id)
@@ -2335,11 +3213,24 @@ class NotificationService:
         *,
         reason: str,
         resolving_before: datetime | None = None,
+        include_resolving: bool = False,
     ) -> bool:
         """Mark a stale notification as terminal without resuming a waiter."""
+        # Expiry is a configured workflow decision, not blanket cancellation.
+        # Legacy records without a policy are reconciled by the workflow engine.
+        if reason == "expired":
+            notification = await self.get(notification_id)
+            if notification is not None and notification.notification_type == NotificationType.GATE:
+                action = notification.payload.get("timeout_action")
+                if action not in {"fail", "continue", "cancel"}:
+                    return False
+                return await self.resolve(notification_id, action, {"reason": "timeout"})
         now = datetime.now(UTC)
         terminal_predicate = NotificationRow.status == "pending"
-        if resolving_before is not None:
+        if include_resolving:
+            # Only the owning cancelled/expired wait may fence a live claim.
+            terminal_predicate = NotificationRow.status.in_(("pending", "resolving"))
+        elif resolving_before is not None:
             stale_resolving = and_(
                 NotificationRow.status == "resolving",
                 or_(
@@ -2444,8 +3335,62 @@ class NotificationService:
         return resolved
 
     # ------------------------------------------------------------------
-    # Startup reconciliation
+    # Local pause reconciliation
     # ------------------------------------------------------------------
+
+    async def reconcile_escalation_pauses(self, *, conversation_id: str, user_email: str) -> bool:
+        """Discard only terminal, matching orphan pauses before a queue claim.
+
+        This reconciles local metadata, not decisions: live waiters retain their
+        durable resolution path, and no resolution or receipt is delivered here.
+        """
+        pauses = self._pause_waiter.list_pending(
+            conversation_id=conversation_id, pause_type=NotificationType.ESCALATION
+        )
+        if not pauses:
+            return True
+        try:
+            async with asyncio.timeout(_PAUSE_RECONCILE_TIMEOUT_SECONDS):
+                async with self._session_factory() as db:
+                    result = await db.execute(
+                        select(NotificationRow).where(
+                            NotificationRow.notification_id.in_(
+                                [pause.pause_id for pause in pauses]
+                            ),
+                            NotificationRow.user_email == user_email,
+                            NotificationRow.conversation_id == conversation_id,
+                            NotificationRow.notification_type == NotificationType.ESCALATION,
+                        )
+                    )
+                    rows = {row.notification_id: row for row in result.scalars().all()}
+        except Exception:
+            logger.warning(
+                "notification: pre-claim pause reconciliation failed",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
+            return False
+        # There is no await between validating the current pause and discarding it.
+        for pause in pauses:
+            row = rows.get(pause.pause_id)
+            if (
+                row is not None
+                and row.status == "resolved"
+                and isinstance(row.resolution, dict)
+                and row.resolution.get("decision") in ("approve", "deny", "cancel")
+                and row.session_id == pause.session_id
+                and row.task_id == pause.task_id
+                and row.step_name == pause.step_name
+                and row.step_run_id == pause.step_run_id
+                and self._pause_waiter.get(pause.pause_id) is pause
+            ):
+                self._pause_waiter.discard_unwatched(pause.pause_id)
+        return (
+            self._pause_waiter.find_pending(
+                conversation_id=conversation_id, pause_type=NotificationType.ESCALATION
+            )
+            is None
+        )
 
     async def reconcile_pending(self) -> int:
         """Re-register PauseWaiters for pending notifications after restart.
@@ -2747,6 +3692,15 @@ def _user_interaction_display(
             context=None,
         )
     if notification_type == NotificationType.ESCALATION:
+        from cognis.providers.guardrails.resolution_errors import stale_approval_result
+
+        if stale_approval_result(decision, resolution_data) is not None:
+            return {
+                "title": "Approval expired",
+                "summary": "Session or policy changed; re-evaluation is required. No user denial.",
+                "answers": [],
+                "status": "cancelled",
+            }
         return _decision_interaction_display(
             decision=decision,
             noun="action",
@@ -2881,17 +3835,28 @@ def _is_same_resolution(
     return _normalize_resolution_data(persisted_data) == _normalize_resolution_data(resolution_data)
 
 
+def _question_resolution_matches(resolution: Any, decision: str, data: dict[str, Any]) -> bool:
+    if not isinstance(resolution, dict) or resolution.get("decision") != decision:
+        return False
+    persisted = {
+        k: v for k, v in resolution.items() if k not in {"decision", "state", "claim_token"}
+    }
+    return _normalize_resolution_data(persisted) == _normalize_resolution_data(data)
+
+
 def _resolution_claim_matches(
     resolution: dict[str, Any],
     decision: str,
     resolution_data: dict[str, Any],
+    *,
+    require_exact_payload: bool = False,
 ) -> bool:
     """Return true when an in-flight claim represents the same request."""
 
     if str(resolution.get("decision") or "").lower() != decision.lower():
         return False
     submission_id = resolution_data.get("submission_id")
-    if submission_id is not None:
+    if submission_id is not None and not require_exact_payload:
         return bool(resolution.get("submission_id") == submission_id)
     persisted_data = {
         key: value
@@ -2928,23 +3893,9 @@ def _notification_payload_expires_at(
     *,
     created_at: datetime,
 ) -> datetime | None:
-    raw = payload.get("expires_at")
-    metadata = payload.get("metadata")
-    if raw is None and isinstance(metadata, dict):
-        raw = metadata.get("expires_at")
-    if isinstance(raw, str):
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-        except ValueError:
-            pass
-    if notification_type != NotificationType.ESCALATION:
-        return None
-    try:
-        timeout_seconds = max(0.0, float(payload.get("timeout_seconds", 300)))
-    except (TypeError, ValueError):
-        timeout_seconds = 300.0
-    return created_at + timedelta(seconds=timeout_seconds)
+    from cognis.store.notification_expiry import notification_payload_expiry
+
+    return notification_payload_expiry(notification_type, payload, created_at=created_at)
 
 
 def _resolution_waiter_data(
@@ -2959,37 +3910,36 @@ def _resolution_waiter_data(
     return data
 
 
+def _notification_expiry(row: NotificationRow) -> datetime | None:
+    """Resolve explicit or legacy payload-derived expiry at the canonical owner."""
+    from cognis.store.notification_expiry import notification_expiry
+
+    return notification_expiry(row)
+
+
 def _is_expired_notification(row: NotificationRow, *, now: datetime) -> bool:
-    """Return true when a pending notification has exceeded its expiry."""
-    if row.status not in {
-        "pending",
-        "resolving",
-    }:
+    """Return true when an actionable notification has exceeded its expiry."""
+    expiry = _notification_expiry(row)
+    return row.status in {"pending", "resolving"} and expiry is not None and now >= expiry
+
+
+def _unexpired_notification_predicate(
+    row: NotificationRow, db: AsyncSession
+) -> ColumnElement[bool]:
+    """Apply the same explicit/legacy deadline inside the atomic claim."""
+    from cognis.store.coordination import database_now_expression
+
+    expiry = func.coalesce(NotificationRow.expires_at, _notification_expiry(row))
+    return or_(expiry.is_(None), expiry > database_now_expression(db))
+
+
+def _has_live_resolution_claim(row: NotificationRow) -> bool:
+    claimed_at = row.resolved_at
+    if claimed_at is None:
         return False
-    expires_at = row.expires_at
-    if expires_at is not None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-        return now >= expires_at
-    if row.notification_type != NotificationType.ESCALATION:
-        return False
-    created_at = row.created_at
-    if created_at is None:
-        return False
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=UTC)
-    timeout_raw = (
-        (row.payload or {}).get("timeout_seconds") if isinstance(row.payload, dict) else None
-    )
-    try:
-        timeout_seconds = (
-            float(timeout_raw) if isinstance(timeout_raw, (int, float, str)) else 300.0
-        )
-    except ValueError:
-        timeout_seconds = 300.0
-    if timeout_seconds <= 0:
-        return True
-    return now >= created_at + timedelta(seconds=timeout_seconds)
+    if claimed_at.tzinfo is None:
+        claimed_at = claimed_at.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - claimed_at).total_seconds() < _RESOLUTION_CLAIM_SECONDS
 
 
 def _has_fresh_resolution_claim(row: NotificationRow, *, now: datetime) -> bool:

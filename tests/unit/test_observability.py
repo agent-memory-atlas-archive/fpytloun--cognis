@@ -357,9 +357,79 @@ async def test_executor_safe_names_are_unique_per_owner(
         snapshot = await collect_observability_snapshot(session)
 
     assert dict(snapshot.executor_slugs) == {
+        "executor-local": ("executor-local", "shared"),
         "executor-bob": ("macbook", "bob@cognis.local"),
         "executor-alice-macbook": ("macbook", "alice@cognis.local"),
     }
+
+
+@pytest.mark.asyncio
+async def test_lsp_configured_id_fallback_preserves_label_guards(
+    observability_db: async_sessionmaker[Any],
+) -> None:
+    specifications = [
+        ("builder", "Builder (Linux)", "alice@cognis.local"),
+        ("other-owner", "builder", "bob@cognis.local"),
+        ("collision", "Duplicate (display)", "alice@cognis.local"),
+        ("other-id", "collision", "alice@cognis.local"),
+        ("550e8400-e29b-41d4-a716-446655440000", "Unsafe / name", None),
+        ("unsafe/id", "Unsafe / name", None),
+        ("x" * 97, "Unsafe / name", None),
+    ]
+    async with observability_db() as session:
+        session.add_all(
+            [
+                ExecutorRow(
+                    executor_id=key,
+                    name=name,
+                    owner_email=owner,
+                    executor_type="websocket",
+                    runtime_state="ready",
+                )
+                for key, name, owner in specifications
+            ]
+        )
+        await session.commit()
+        snapshot = await collect_observability_snapshot(session)
+        capped = await collect_observability_snapshot(session, max_family_cardinality=1)
+    assert dict(snapshot.executor_slugs) == {
+        "executor-local": ("executor-local", "shared"),
+        "builder": ("builder", "alice@cognis.local"),
+        "other-owner": ("builder", "bob@cognis.local"),
+    }
+    assert not capped.executor_slugs
+    assert _family(capped, "cognis_executor_state") == []
+    assert ("executor_state", 1) in capped.cardinality_omitted
+    state = _family(snapshot, "cognis_executor_state")
+    assert any(
+        row["executor"] == "builder" and row["user"] == "alice@cognis.local" for row in state
+    )
+    assert any(row["executor"] == "executor-local" and row["user"] == "shared" for row in state)
+
+    class Provider:
+        async def get_lsp_statuses(self, **kwargs: Any) -> list[Any]:
+            return [
+                SimpleNamespace(executor_id=key, executor_type="websocket", state="ready")
+                for key in [
+                    "executor-local",
+                    *(item[0] for item in specifications),
+                    "unconfigured",
+                    "builder:run:abc",
+                    "builder",
+                ]
+            ]
+
+    service = ObservabilityService(
+        lambda: None, owner_id="controller-local", lsp_provider=Provider()
+    )
+    rows = await service._collect_lsp(snapshot)
+    assert {(row.executor, row.user) for row in rows} == set(snapshot.executor_slugs.values())
+    assert len(rows) == 3  # Duplicate provider report cannot create duplicate samples.
+    samples = [sample for family in _lsp_families(tuple(rows)) for sample in family.samples]
+    assert all(
+        "Unsafe" not in str(sample.labels) and "Builder (" not in str(sample.labels)
+        for sample in samples
+    )
 
 
 @pytest.mark.asyncio

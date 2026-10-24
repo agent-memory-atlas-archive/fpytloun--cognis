@@ -1,32 +1,55 @@
 <script lang="ts">
+  import { getContext } from 'svelte';
+  import { readable, type Readable } from 'svelte/store';
+  import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
   import { api } from '$lib/api/client';
-  import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
-  import { extractMarkdownHeadings } from '$lib/markdown';
+  // Loaded on demand (in parallel with the deliverable fetch) to keep the
+  // rich renderer out of the chat startup bundle.
+  const richDeliverableModule = import('$lib/components/rich/RichDeliverable.svelte');
+  import DeliverableRevisionBar from '$lib/components/DeliverableRevisionBar.svelte';
+  import {
+    isSupersededRevision,
+    loadDeliverableRevision,
+    observedLineageRevisions,
+    observeLineageRevision,
+  } from '$lib/deliverable-revisions';
+  import { deliverablePresentation } from '$lib/deliverable-presentation';
   import { privateDeliverableMediaUrl } from '$lib/rich-deliverable';
   import type { AssistantDeliverableTimelineItem as RenderAssistantDeliverableTimelineItem } from '$lib/timeline-render-model';
   import type { AssistantDeliverableTimelineItem } from '$lib/chat-v2/types';
-  import type { Deliverable } from '$lib/types/api';
+  import type { Deliverable, DeliverableRevisionSummary } from '$lib/types/api';
 
-  // Matches the threshold the old bespoke markdown card used before every
-  // format was unified onto RichDeliverable.
-  const MIN_HEADINGS_FOR_TOC = 3;
-
+  import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
   export let item: AssistantDeliverableTimelineItem | RenderAssistantDeliverableTimelineItem;
   export let loadDeliverable: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
+  export let loadRevision: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
+  export let showLibraryLink = true;
   export let displayOnly = false;
   export let collapsedByDefault = false;
+  export let allowSharing = true;
+  const sharingPermission = getContext<Readable<boolean>>(DELIVERABLE_SHARING_CONTEXT) ?? readable(true);
 
+  // `baseDeliverable` is the revision this card represents; `revisionView` is a
+  // revision the user opened from its history, rendered in place.
+  let baseDeliverable: Deliverable | null = null;
+  let revisionView: Deliverable | null = null;
+  let revisionError: string | null = null;
+  let revisionGeneration = 0;
   let deliverable: Deliverable | null = null;
+  $: deliverable = revisionView ?? baseDeliverable;
+  $: supersededCollapsed = !revisionView && isSupersededRevision(baseDeliverable);
   let loading = true;
   let error: string | null = null;
   let accessorConversationId = '';
   let loadGeneration = 0;
   $: deliverableId = 'deliverable_id' in item ? item.deliverable_id : item.deliverableId;
 
-  $: deliverableFormat = deliverable?.format ?? item.format ?? 'markdown';
   $: deliverableTitle = deliverable?.title ?? item.title ?? 'Deliverable';
   $: standaloneUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/view` : '';
   $: pdfUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/download.pdf` : '';
+  $: htmlUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/download.html` : '';
+  $: markdownUrl = deliverable && ['rich', 'markdown'].includes(deliverable.format)
+    ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/download.md` : '';
   // Every deliverable format renders through RichDeliverable now, giving
   // markdown/plain/html the same unified toolbar (TOC, full-view, share,
   // copy, PDF) and chrome that rich payloads already have -- previously
@@ -52,30 +75,7 @@
   // show. Detect real heading count directly and force `metadata.toc`
   // on/off explicitly (the same threshold the old card used) rather than
   // relying on the generic multi-block heuristic here.
-  $: markdownHeadingCount = deliverableFormat === 'markdown' && deliverable
-    ? extractMarkdownHeadings(deliverable.content).length
-    : 0;
-  $: richPayload = deliverable?.format === 'rich' && deliverable.rich_payload
-    ? deliverable.rich_payload
-    : deliverable
-      ? {
-          // `toc: true` alone would only enable the TOC at the default
-          // depth (2), which is exactly the depth of the wrapped
-          // markdown block's own single entry -- nested heading
-          // extraction requires `depth > level` (see buildTocItems),
-          // so an explicit depth is required for the block's internal
-          // `#`/`##`/`###` headings to actually appear as TOC items.
-          metadata: deliverableFormat === 'markdown'
-            ? { toc: { enabled: markdownHeadingCount >= MIN_HEADINGS_FOR_TOC, depth: 4 } }
-            : {},
-          blocks: [
-            {
-              type: deliverableFormat === 'plain' ? 'code' : deliverableFormat === 'html' ? 'raw_html' : 'markdown',
-              content: deliverable.content,
-            },
-          ],
-        }
-      : null;
+  $: richPayload = deliverable ? deliverablePresentation(deliverable) : null;
 
   function authenticatedMediaUrlFor(mediaKey: string): string {
     if (!deliverable) return '';
@@ -87,9 +87,9 @@
     return match?.[1] ? decodeURIComponent(match[1]) : '';
   }
 
-  async function createShareLink(): Promise<string> {
+  async function createShareLink(options?: import('$lib/components/rich/share-options').ShareLinkOptions): Promise<string> {
     if (!deliverable) throw new Error('Deliverable is not loaded');
-    const result = await api.deliverables.shareLink(deliverable.deliverable_id);
+    const result = await api.artifactDocuments.publicLink('deliverable', deliverable.deliverable_id, { ...options, mode: options?.mode ?? 'view' });
     return result.url;
   }
 
@@ -101,7 +101,9 @@
     const generation = ++loadGeneration;
     loading = true;
     error = null;
-    if (deliverable?.deliverable_id !== id) deliverable = null;
+    if (baseDeliverable?.deliverable_id !== id) baseDeliverable = null;
+    revisionView = null;
+    revisionError = null;
     accessorConversationId = currentConversationId();
     if (previewOnly && !loaderOverride) {
       loading = false;
@@ -111,7 +113,7 @@
       const result = await (loaderOverride
         ? loaderOverride(id)
         : api.deliverables.get(id, { accessorConversationId }));
-      if (generation === loadGeneration && deliverableId === id) deliverable = result;
+      if (generation === loadGeneration && deliverableId === id) baseDeliverable = result;
     } catch (err) {
       if (generation === loadGeneration && deliverableId === id) {
         error = err instanceof Error ? err.message : 'Failed to load deliverable';
@@ -122,42 +124,104 @@
   }
 
   $: void loadCurrent(deliverableId, loadDeliverable, displayOnly);
+
+  // Publish this card's revision, and refresh lineage facts when a newer
+  // revision of the same lineage is rendered after this card loaded.
+  $: itemLineageId = 'deliverable_id' in item ? item.lineage_id : item.lineageId;
+  $: itemRevision = item.revision;
+  $: observeLineageRevision(itemLineageId, itemRevision);
+  $: observeLineageRevision(baseDeliverable?.lineage_id, baseDeliverable?.revision);
+  $: lineageKey = itemLineageId ?? baseDeliverable?.lineage_id ?? null;
+  $: observedLatest = lineageKey ? $observedLineageRevisions[lineageKey] ?? 0 : 0;
+  let refreshedForRevision = 0;
+  $: if (
+    baseDeliverable
+    && observedLatest > (baseDeliverable.latest_revision ?? baseDeliverable.revision ?? 1)
+    && observedLatest > refreshedForRevision
+  ) {
+    refreshedForRevision = observedLatest;
+    void refreshBase(baseDeliverable.deliverable_id);
+  }
+
+  async function refreshBase(id: string): Promise<void> {
+    const generation = loadGeneration;
+    try {
+      const result = await (loadDeliverable
+        ? loadDeliverable(id)
+        : api.deliverables.get(id, { accessorConversationId }));
+      if (generation === loadGeneration && deliverableId === id) baseDeliverable = result;
+    } catch {
+      // Keep the loaded revision; lineage facts refresh on the next load.
+    }
+  }
+
+  async function openRevision(revision: DeliverableRevisionSummary): Promise<void> {
+    const generation = ++revisionGeneration;
+    revisionError = null;
+    if (revision.deliverable_id === baseDeliverable?.deliverable_id) {
+      revisionView = null;
+      return;
+    }
+    try {
+      const result = await (loadRevision
+        ? loadRevision(revision.deliverable_id)
+        : loadDeliverableRevision(revision, { accessorConversationId }));
+      if (generation === revisionGeneration) revisionView = result;
+    } catch (err) {
+      if (generation === revisionGeneration) {
+        revisionError = err instanceof Error ? err.message : 'Could not load revision';
+      }
+    }
+  }
 </script>
 
 <div class="assistant-deliverable-wrapper" data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
   {#if loading && !deliverable}
-    <div class="text-sm text-slate-400">Loading deliverable…</div>
+    <div class="text-sm text-muted">Loading deliverable…</div>
   {:else if displayOnly && !deliverable}
-    <div class="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3" data-testid="display-only-deliverable">
-      <p class="text-sm font-medium text-slate-200">{deliverableTitle}</p>
-      {#if item.format}<p class="mt-1 text-xs text-slate-500">{item.format} deliverable · preview only</p>{/if}
-      {#if item.content && !collapsedByDefault}<p class="mt-2 line-clamp-6 whitespace-pre-wrap text-sm text-slate-300">{item.content}</p>{/if}
+    <div class="rounded-xl border border-control-border bg-surface/60 p-3" data-testid="display-only-deliverable">
+      <p class="text-sm font-medium text-foreground">{deliverableTitle}</p>
+      {#if item.format}<p class="mt-1 text-xs text-quiet">{item.format} deliverable · preview only</p>{/if}
+      {#if item.content && !collapsedByDefault}<p class="mt-2 line-clamp-6 whitespace-pre-wrap text-sm text-secondary">{item.content}</p>{/if}
     </div>
   {:else if error && !deliverable}
     <div class="space-y-2">
-      <div class="text-sm font-medium text-rose-300">Could not load deliverable</div>
-      <div class="text-xs text-slate-500">{error}</div>
+      <div class="text-sm font-medium text-danger">Could not load deliverable</div>
+      <div class="text-xs text-quiet">{error}</div>
       {#if item.content}
-        <div class="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3 text-sm text-slate-200">
+        <div class="rounded-xl border border-control-border bg-surface/60 p-3 text-sm text-foreground">
           {item.content}
         </div>
       {/if}
     </div>
   {:else if deliverable && richPayload}
-    {#key deliverableId}
+    {#if showLibraryLink && !displayOnly}
+      <div class="mb-2 flex justify-end"><a class="inline-flex min-h-9 items-center text-xs text-accent hover:text-accent-hover hover:underline" href={`/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}>Open in Library ↗</a></div>
+    {/if}
+    <DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
+    {#if revisionError}<p class="mb-2 text-xs text-danger">{revisionError}</p>{/if}
+    <!-- Remount when the card becomes superseded so it applies the collapsed default. -->
+    {#key `${deliverable.deliverable_id}:${supersededCollapsed}`}
+    {#await richDeliverableModule then { default: RichDeliverable }}
     <RichDeliverable
       title={deliverableTitle}
       content={deliverable.content}
       payload={richPayload}
       instanceId={deliverable.deliverable_id}
+      internalUrl={`/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}
       mediaUrlFor={authenticatedMediaUrlFor}
       standaloneUrl={standaloneUrl}
       pdfUrl={pdfUrl}
-      shareLinkCallback={createShareLink}
+      htmlUrl={htmlUrl}
+      markdownUrl={markdownUrl}
+      shareLinkCallback={allowSharing && $sharingPermission ? createShareLink : undefined}
       surface="embedded"
       compact
-      {collapsedByDefault}
-    />
+      collapsedByDefault={collapsedByDefault || supersededCollapsed}
+    >
+      {#snippet extraActions()}<DocumentFavoriteButton kind="deliverable" id={deliverable.deliverable_id} />{/snippet}
+    </RichDeliverable>
+    {/await}
     {/key}
   {/if}
 </div>

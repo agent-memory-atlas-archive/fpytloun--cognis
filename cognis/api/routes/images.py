@@ -12,9 +12,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
+from cognis.core.project_access import can_read_conversation, resolve_project_role
 from cognis.logging import get_logger
-from cognis.store.models import Agent
-from cognis.store.queries import get_active_agent_grant
+from cognis.store.models import Agent, ProjectRow
+from cognis.store.project_queries import user_has_any_project_agent_access
+from cognis.store.queries import get_active_agent_grant, get_agent, get_conversation
 
 logger = get_logger(__name__)
 
@@ -41,10 +43,12 @@ class AvatarPromptRequest(BaseModel):
 
 
 @router.get("/{image_id}")
-async def serve_image(request: Request, image_id: str) -> Response:
+async def serve_image(
+    request: Request, image_id: str, conversation_id: str | None = None
+) -> Response:
     """Serve an image from the artifact store.
 
-    Validates ownership: the requesting user must own the image or be admin.
+    Validates ownership or an explicit shared avatar entitlement.
     Returns 404 for non-existent or non-owned images (anti-enumeration).
     """
     user = require_current_user(request)
@@ -60,16 +64,28 @@ async def serve_image(request: Request, image_id: str) -> Response:
             raise api_exception(404, "not_found", "Image not found")
         namespace = "images"
 
-    # Ownership check (admin bypasses)
+    # Admin status does not grant access to another user's content.
+    conversation_avatar = False
+    if conversation_id and namespace == "avatars":
+        async with request.app.state.session_factory() as session:
+            conversation = await get_conversation(session, conversation_id)
+            if conversation and await can_read_conversation(session, conversation, user.email):
+                agent = await get_agent(session, conversation.agent_id)
+                conversation_avatar = bool(
+                    agent
+                    and agent.avatar_image_id == image_id
+                    and agent.owner_email == meta.owner_email
+                )
     if (
         meta.owner_email
         and meta.owner_email != user.email
-        and getattr(user, "role", "") != "admin"
-        and (
-            namespace != "avatars"
-            or not await _can_view_shared_agent_avatar(
-                request, image_id=image_id, owner_email=meta.owner_email, grantee_email=user.email
-            )
+        and not conversation_avatar
+        and not await _can_view_shared_agent_avatar(
+            request,
+            image_id=image_id,
+            owner_email=meta.owner_email,
+            grantee_email=user.email,
+            include_agent_avatars=namespace == "avatars",
         )
     ):
         raise api_exception(404, "not_found", "Image not found")
@@ -83,7 +99,9 @@ async def serve_image(request: Request, image_id: str) -> Response:
         content=content,
         media_type=content_type,
         headers={
-            "Cache-Control": "private, max-age=31536000, immutable",
+            "Cache-Control": "private, no-store"
+            if conversation_id
+            else "private, max-age=31536000, immutable",
             "Content-Length": str(len(content)),
         },
     )
@@ -95,7 +113,10 @@ async def _can_view_shared_agent_avatar(
     image_id: str,
     owner_email: str,
     grantee_email: str,
+    include_agent_avatars: bool = True,
 ) -> bool:
+    """Shared agents' avatars and avatars of projects shared with the caller."""
+
     async with request.app.state.session_factory() as session:
         result = await session.execute(
             select(Agent.agent_id).where(
@@ -103,9 +124,25 @@ async def _can_view_shared_agent_avatar(
                 Agent.avatar_image_id == image_id,
             )
         )
-        for agent_id in result.scalars().all():
+        agent_ids = result.scalars().all() if include_agent_avatars else []
+        for agent_id in agent_ids:
             grant = await get_active_agent_grant(session, str(agent_id), grantee_email)
             if grant is not None:
+                return True
+            if await user_has_any_project_agent_access(
+                session, agent_id=str(agent_id), user_email=grantee_email
+            ):
+                return True
+        project_result = await session.execute(
+            select(ProjectRow.project_id).where(
+                ProjectRow.owner_email == owner_email,
+                ProjectRow.avatar_image_id == image_id,
+            )
+        )
+        for project_id in project_result.scalars().all():
+            project = await session.get(ProjectRow, project_id)
+            resolution = await resolve_project_role(session, project, grantee_email)
+            if resolution.role is not None:
                 return True
     return False
 

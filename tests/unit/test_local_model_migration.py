@@ -139,7 +139,11 @@ def test_local_model_migration_is_the_single_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["151_task_escalation_timeout"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert "144_work_v8_projection_repair" in {
+        revision.revision for revision in script.walk_revisions("base", heads[0])
+    }
     assert script.get_revision("144_work_v8_projection_repair").down_revision == (
         "143_schedule_terminal_task_correlation"
     )

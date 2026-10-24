@@ -373,8 +373,12 @@ class TestSchedulerBackoff:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["owner_configured", "agent_composed", None])
+@pytest.mark.parametrize("evaluation", [None, "legacy", "strict"])
 async def test_fire_schedule_defaults_empty_delivery_to_preferred_channel(
     monkeypatch: pytest.MonkeyPatch,
+    origin: str | None,
+    evaluation: str | None,
 ) -> None:
     captured_submit: dict[str, Any] = {}
     updates: list[dict[str, Any]] = []
@@ -397,8 +401,13 @@ async def test_fire_schedule_defaults_empty_delivery_to_preferred_channel(
     async def _get_schedule(_db: object, schedule_id: str) -> Any:
         assert schedule_id == "sched_1"
         return _schedule_row(
-            task_template={"title": "Scheduled task", "delivery": {}},
+            task_template={
+                "title": "Scheduled task",
+                "delivery": {},
+                "session_policy": {"intaris_evaluation": evaluation, "deny_policies": ["No push"]},
+            },
             consecutive_errors=2,
+            creation_origin=origin,
         )
 
     async def _get_task(_db: object, task_id: str) -> Any:
@@ -436,6 +445,9 @@ async def test_fire_schedule_defaults_empty_delivery_to_preferred_channel(
     assert isinstance(delivery, TaskDelivery)
     assert delivery.mode == "preferred_channel"
     assert captured_submit["source_type"] == "scheduler"
+    assert captured_submit["session_policy"]["intaris_evaluation"] == evaluation
+    assert captured_submit["session_policy"]["deny_policies"] == ["No push"]
+    assert captured_submit["creation_origin"] == origin
     assert captured_submit["scheduled_for"] is not None
     assert updates[0]["consecutive_errors"] == 2
 
@@ -1165,7 +1177,7 @@ class TestScheduleToolDefinitionOutput:
         assert updated_fields["interval_seconds"] == 120
         assert isinstance(updated_fields["next_fire_at"], datetime)
 
-    def test_update_does_not_mutate_project_or_skill_fields(self, monkeypatch: Any) -> None:
+    def test_update_does_not_mutate_unsupported_skill_field(self, monkeypatch: Any) -> None:
         row = _schedule_row()
 
         async def fake_get_schedule(_db: object, _schedule_id: str) -> Any:
@@ -1180,7 +1192,6 @@ class TestScheduleToolDefinitionOutput:
                 user_email="user@example.com",
                 arguments={
                     "schedule_id": "sched_1",
-                    "project_id": "proj_other",
                     "skill_id": "skill_other",
                 },
             )

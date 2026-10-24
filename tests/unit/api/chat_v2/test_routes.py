@@ -74,6 +74,79 @@ from tests.unit.api.chat_v2.test_cached_event_store import (
 )
 
 
+@pytest.mark.asyncio
+async def test_provider_options_enforce_author_access_before_catalog(monkeypatch) -> None:
+    catalog = AsyncMock()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(providers=SimpleNamespace(llm=catalog)))
+    )
+    loader = AsyncMock(side_effect=HTTPException(403, "Not the author"))
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", loader)
+    with pytest.raises(HTTPException) as error:
+        await chat_v2_routes.get_retry_provider_options(request, "conv-a")
+    assert error.value.status_code == 403
+    loader.assert_awaited_once_with(request, "conv-a", author_only=True)
+    catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_options_route_uses_current_wait_and_excludes_old_failures(
+    monkeypatch,
+) -> None:
+    from cognis.core import retry_provider_options as options_module
+    from cognis.store.direct_turns import DirectTurnStore
+
+    turn = {
+        "turn_id": "turn-a",
+        "status": "waiting",
+        "provider_id": "anthropic",
+        "model": "claude-sonnet-4",
+        "retry_reason": "server_error",
+    }
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                turn_scheduler=SimpleNamespace(
+                    durable_runtime_context=AsyncMock(return_value={"running": turn})
+                ),
+                session_factory=None,
+                providers=SimpleNamespace(llm=object()),
+            )
+        )
+    )
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", AsyncMock())
+    monkeypatch.setattr(
+        chat_v2_routes,
+        "require_current_user",
+        lambda request: SimpleNamespace(email="user@example.com"),
+    )
+    monkeypatch.setattr(chat_v2_routes, "forbid_mutation_for_viewer", lambda request: None)
+    service = AsyncMock(
+        return_value=[{"provider_id": "backup", "display_name": "Backup", "model": turn["model"]}]
+    )
+    monkeypatch.setattr(options_module, "retry_provider_options", service)
+    monkeypatch.setattr(
+        DirectTurnStore,
+        "get_conversation_runtime_authority_row",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                turn_id="turn-a",
+                status="recoverable",
+                outcome={"retry_target": {"scope": "provider_model", **turn}},
+            )
+        ),
+    )
+    result = await chat_v2_routes.get_retry_provider_options(request, "conv-a")
+    assert result.turn_id == "turn-a"
+    assert result.options[0].provider_id == "backup"
+    assert service.call_args.kwargs["active_turn"]["model"] == turn["model"]
+    result = await chat_v2_routes.get_retry_provider_options(
+        request, "conv-a", turn_id="old-turn", provider_id="anthropic", model=turn["model"]
+    )
+    assert result.options == []
+    assert service.await_count == 1
+
+
 def test_chat_v2_read_routes_are_registered() -> None:
     routes = {
         (next(iter(route.methods)), route.path)
@@ -82,6 +155,10 @@ def test_chat_v2_read_routes_are_registered() -> None:
     }
 
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/snapshot") in routes
+    assert (
+        "GET",
+        "/api/v1/chat/v2/conversations/{conversation_id}/retry-provider-options",
+    ) in routes
     assert (
         "GET",
         "/api/v1/chat/v2/conversations/{conversation_id}/snapshot/cache-only",

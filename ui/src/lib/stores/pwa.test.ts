@@ -341,7 +341,7 @@ describe('pwa stores', () => {
     expect(get(updateAvailable)).toBe(false);
   });
 
-  it('resets a stuck waiting worker and cognis caches when activation times out', async () => {
+  it('reloads without unregistering (which would drop Web Push) when activation times out', async () => {
     vi.useFakeTimers();
     installSynchronousMessageChannelMock();
     const waiting = workerWithVersion('v2');
@@ -387,11 +387,8 @@ describe('pwa stores', () => {
     await vi.advanceTimersByTimeAsync(5000);
     await updatePromise;
 
-    expect(registration.unregister).toHaveBeenCalledOnce();
-    expect(cacheKeys).toHaveBeenCalledOnce();
-    expect(cacheDelete).toHaveBeenCalledWith('cognis-precache-old');
-    expect(cacheDelete).toHaveBeenCalledWith('cognis-runtime-old');
-    expect(cacheDelete).not.toHaveBeenCalledWith('other-cache');
+    expect(registration.unregister).not.toHaveBeenCalled();
+    expect(cacheDelete).not.toHaveBeenCalled();
     expect(reload).toHaveBeenCalledOnce();
     expect(get(updateAvailable)).toBe(false);
   });

@@ -151,22 +151,22 @@
 </script>
 
 {#if loading && !action}
-  <p class="p-5 text-sm text-slate-400" role="status">Loading request…</p>
+  <p class="p-5 text-sm text-muted" role="status">Loading request…</p>
 {:else if action}
   <AttentionActionRenderer {action} {busy} {error} onSubmit={submit} {onDismiss} />
 {:else}
   <div class="p-5">
-    <p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{error ?? 'This request is unavailable.'}</p>
+    <p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{error ?? 'This request is unavailable.'}</p>
     <button
       type="button"
-      class="mt-3 rounded-xl border border-slate-600 px-3 py-2 text-sm"
+      class="mt-3 rounded-xl border border-control-border px-3 py-2 text-sm"
       onclick={() => void refresh()}
       onpointerdown={(event) => event.stopPropagation()}
     >Retry</button>
     {#if onDismiss}
       <button
         type="button"
-        class="ml-2 mt-3 min-h-11 rounded-xl border border-slate-600 px-3 py-2 text-sm"
+        class="ml-2 mt-3 min-h-11 rounded-xl border border-control-border px-3 py-2 text-sm"
         onclick={onDismiss}
       >Close</button>
     {/if}

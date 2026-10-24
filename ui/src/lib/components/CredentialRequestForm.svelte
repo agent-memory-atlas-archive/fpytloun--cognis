@@ -101,30 +101,30 @@
   }
 </script>
 
-<article class={`rounded-3xl border border-amber-400/30 bg-amber-400/10 text-amber-50 shadow-card ${compact ? 'px-4 py-3' : 'px-5 py-5'}`}>
+<article class={`rounded-3xl border border-warning-border bg-warning-subtle text-foreground shadow-card ${compact ? 'px-4 py-3' : 'px-5 py-5'}`}>
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div>
-      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-amber-200">Credential required</p>
-      <h3 class="mt-1 text-base font-semibold text-white">{label}</h3>
+      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-warning">Credential required</p>
+      <h3 class="mt-1 text-base font-semibold text-strong">{label}</h3>
     </div>
-    <span class="rounded-full border border-amber-300/40 px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.2em] text-amber-100">{kind}</span>
+    <span class="rounded-full border border-warning-border px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.2em] text-warning">{kind}</span>
   </div>
 
-  <p class="mt-3 text-sm leading-6 text-amber-50/90">{message}</p>
-  <p class="mt-2 text-xs leading-5 text-amber-100/70">Values are sent directly to Cognis encrypted credential storage and are not shown to the model.</p>
+  <p class="mt-3 text-sm leading-6 text-foreground">{message}</p>
+  <p class="mt-2 text-xs leading-5 text-secondary">Values are sent directly to Cognis encrypted credential storage and are not shown to the model.</p>
 
   <div class="mt-4 space-y-3">
-    <label class="flex items-center gap-2 text-xs text-amber-100/80">
-      <input bind:checked={useCustomInput} class="rounded border-amber-300/40 bg-slate-950 text-amber-300" type="checkbox" disabled={submitting} />
+    <label class="flex items-center gap-2 text-xs text-secondary">
+      <input bind:checked={useCustomInput} class="rounded border-control-border bg-surface accent-accent" type="checkbox" disabled={submitting} />
       <span>Provide custom input instead of structured fields</span>
     </label>
 
     {#if useCustomInput}
-      <textarea bind:value={customInput} class="min-h-[110px] w-full rounded-2xl border border-amber-300/30 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Paste the credential in the requested format"></textarea>
+      <textarea bind:value={customInput} class="min-h-[110px] w-full rounded-2xl border border-control-border bg-surface px-4 py-3 text-sm text-foreground placeholder:text-quiet focus:border-accent" placeholder="Paste the credential in the requested format"></textarea>
     {:else}
       <div class="grid gap-3 sm:grid-cols-2">
         {#each fields as field}
-          <label class="space-y-1.5 text-sm font-medium text-amber-50">
+          <label class="space-y-1.5 text-sm font-medium text-foreground">
             <span class="capitalize">{field.replaceAll('_', ' ')}</span>
             <Input
               autocomplete={autocomplete(field)}
@@ -140,7 +140,7 @@
   </div>
 
   {#if error}
-    <p class="mt-3 rounded-2xl border border-rose-400/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+    <p class="mt-3 rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
   {/if}
 
   <div class="mt-4 flex flex-wrap gap-2">

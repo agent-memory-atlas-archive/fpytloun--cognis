@@ -68,6 +68,7 @@ class TaskModel(BaseModel):
     agent_id: str
     agent_profile_id: str | None = None
     created_by_agent_id: str | None = None
+    creation_origin: str | None = None
     source_type: str = "api"  # "chat" | "api" | "scheduler" | "webhook"
     source_ref: str | None = None
     source_session_id: str | None = None

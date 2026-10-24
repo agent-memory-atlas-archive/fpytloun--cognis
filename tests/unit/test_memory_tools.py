@@ -759,6 +759,8 @@ class TestWorkflowToolDefinitions:
             "attach_artifact",
             "step_complete",
             "step_request_questions",
+            "answer_question",
+            "forward_question",
             "request_credential",
             "request_auth_challenge",
             "list_credentials",

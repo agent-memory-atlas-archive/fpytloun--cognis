@@ -5,6 +5,89 @@ import { createMarkdownStreamer, renderMarkdown } from './markdown';
 describe('createMarkdownStreamer', () => {
   const preCount = (html: string) => html.match(/<pre\b/g)?.length ?? 0;
 
+  it.each([
+    '- first\n\n- second\n\nTail',
+    '> first\n\n> second\n\nTail',
+    '[guide][ref]\n\n[ref]: https://example.com\n\nTail',
+    '1. first\n\n   continuation\n\n2. second\n\nTail',
+    '[ref]: https://example.com\n\nRead [guide][ref]',
+    '[guide]: https://example.com\n\nRead [guide][]',
+    '[guide]: https://example.com\n\nRead [guide]',
+    '[photo]: https://example.com/photo.png\n\n![Photo][photo]',
+  ])('preserves Markdown block structure while streaming %s', (content) => {
+    expect(createMarkdownStreamer().render(content)).toBe(renderMarkdown(content));
+  });
+
+  it.each(['![', '![Photo', '![Photo]', '![Photo](', '![Photo](https://example.com/photo'])(
+    'withholds an incomplete image without hiding earlier text: %s', (partial) => {
+      const s = createMarkdownStreamer();
+      expect(s.render(`## Photo\n\n${partial}`)).toBe(renderMarkdown('## Photo\n\n'));
+      const complete = '## Photo\n\n![Photo](https://example.com/photo.png)';
+      expect(s.render(complete)).toBe(renderMarkdown(complete));
+      expect(s.finalize(`## Photo\n\n${partial}`)).toBe(renderMarkdown(`## Photo\n\n${partial}`));
+    }
+  );
+
+  it('keeps incomplete link labels readable without exposing partial destinations', () => {
+    const s = createMarkdownStreamer();
+    expect(s.render('Read [the guide](https://example.com/gu')).toBe(renderMarkdown('Read the guide'));
+    expect(s.render('Read [the gui')).toBe(renderMarkdown('Read the gui'));
+  });
+
+  it.each(['`![`', '```\n![\n', '    ![', '\\![', '[literal]\n\nNext paragraph'])(
+    'does not hide code, escapes, or earlier bracketed text: %s', (content) => {
+      expect(createMarkdownStreamer().render(content)).toBe(renderMarkdown(content));
+    }
+  );
+
+  it.each([
+    ['**Yes—that is a', '**Yes—that is a**'],
+    ['**Yes—that is a*', '**Yes—that is a**'],
+    ['An _unfinished phrase', 'An _unfinished phrase_'],
+    ['Use `snake_case', 'Use `snake_case`'],
+    ['Use `data[', 'Use `data[`'],
+    ['Use `![literal', 'Use `![literal`'],
+    ['~~obsolete answer', '~~obsolete answer~~'],
+    ['**Bold and _nested', '**Bold and _nested_**'],
+    ['**𝑥 is a variable', '**𝑥 is a variable**'],
+    ['Ready **', 'Ready '],
+    ['**', ''],
+  ])('hides incomplete syntax and previews known formatting for %s', (partial, preview) => {
+    const streamer = createMarkdownStreamer();
+    expect(streamer.render(partial)).toBe(renderMarkdown(preview));
+    expect(streamer.finalize(partial)).toBe(renderMarkdown(partial));
+  });
+
+  it.each([
+    'a * b', 'snake_case', 'glob **/*.py', '\\**literal', '`**literal**`',
+    '```python\nvalue = "**literal"\n', 'Price: $5.00', '[**label**](https://example.com)',
+    '```md\n**do not bold** and `do not toggle`\n![literal]\n',
+    '~~~md\n**do not bold** and `do not toggle`\n![literal]\n',
+    '    **literal** and `literal`\n',
+    '> ~~~js\n> **literal and `tick`\n',
+    '- Code:\n\n  ```md\n  **literal and `tick`\n',
+  ])('preserves literal syntax and complete constructs: %s', (content) => {
+    expect(createMarkdownStreamer().render(content)).toBe(renderMarkdown(content));
+  });
+
+  it('continues rendering every prefix before completion without exposing bold delimiters', () => {
+    const streamer = createMarkdownStreamer();
+    for (const chunk of ['**Yes', '**Yes—that', '**Yes—that is a', '**Yes—that is a good case**.']) {
+      const html = streamer.render(chunk);
+      expect(html).not.toContain('**');
+      const preview = document.createElement('div');
+      preview.innerHTML = html;
+      expect(preview.textContent?.trim()).toBe(chunk.replaceAll('**', ''));
+    }
+    const complete = '**Yes—that is a good case**.';
+    expect(streamer.finalize(complete)).toBe(renderMarkdown(complete));
+  });
+
+  it('processes repeated code spans without quadratic duplicate protection', () => {
+    const source = ('`x` '.repeat(3000)) + '**Preview';
+    expect(createMarkdownStreamer().render(source)).toBe(renderMarkdown(source + '**'));
+  });
+
   it('renders empty string for empty input', () => {
     const s = createMarkdownStreamer();
     expect(s.render('')).toBe('');
@@ -43,7 +126,7 @@ describe('createMarkdownStreamer', () => {
     const intermediate = '```ts\nlet x = 1;\n';
     // Tail is an unclosed fence - should not be split.
     const html1 = s.render(intermediate);
-    expect(html1).toContain('hljs-keyword');
+    expect(html1).toContain('data-cognis-highlight="ts"');
     expect(html1).toContain('x =');
 
     const closed = intermediate + '```\n\nFollow-up.';

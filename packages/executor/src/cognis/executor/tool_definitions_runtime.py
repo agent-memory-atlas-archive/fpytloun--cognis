@@ -6,7 +6,7 @@ from typing import Any
 
 from cognis.executor.component_registry import load_component
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
-from cognis.models.tool import ToolSource
+from cognis.models.tool import ToolCapability, ToolSource
 from cognis.tools.executor.filesystem import (
     handle_apply_patch,
     handle_artifact_save,
@@ -14,7 +14,6 @@ from cognis.tools.executor.filesystem import (
     handle_list_directory,
     handle_multiedit,
     handle_read,
-    handle_skill_asset_materialize,
     handle_write,
 )
 from cognis.tools.executor.search import handle_glob, handle_grep
@@ -114,42 +113,6 @@ ARTIFACT_SAVE_TOOL = ToolDefinition(
     timeout_seconds=60,
 )
 
-SKILL_ASSET_MATERIALIZE_TOOL = ToolDefinition(
-    name="skill_asset_materialize",
-    description=(
-        "Materialize an attached skill asset onto the executor filesystem and return "
-        "its local_path. Prefer calling available skill tools directly for runnable "
-        "skill behavior; use this for asset-only scripts or asset inspection."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "skill_id": {"type": "string", "description": "Skill ID that owns the asset."},
-            "asset_id": {
-                "type": "string",
-                "description": "Asset ID from skill_load asset_manifest.",
-            },
-            "filename": {
-                "type": "string",
-                "description": "Optional asset filename to disambiguate when asset_id is not known.",
-            },
-            "target_path": {
-                "type": "string",
-                "description": (
-                    "Optional path under the managed skill asset cache to write. "
-                    "Defaults to a stable managed cache path."
-                ),
-            },
-        },
-        "required": ["skill_id"],
-    },
-    source=_EXECUTOR_SOURCE,
-    category="filesystem",
-    read_only=False,
-    non_bypassable=True,
-    timeout_seconds=60,
-)
-
 EDIT_TOOL = ToolDefinition(
     name="edit",
     description=(
@@ -193,6 +156,7 @@ EDIT_TOOL = ToolDefinition(
 
 APPLY_PATCH_TOOL = ToolDefinition(
     name="apply_patch",
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
     description=(
         "Apply a strict patch to one or more text files. Supports the apply_patch "
         "envelope grammar: *** Begin Patch, then one or more *** Add File, "
@@ -453,6 +417,7 @@ GREP_TOOL = ToolDefinition(
 
 BASH_TOOL = ToolDefinition(
     name="bash",
+    capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
     description=(
         "Execute a shell command and return its output. Use for shell-native operations: git, "
         "build/test/package-manager commands, process management, permissions, background "
@@ -539,6 +504,7 @@ BASH_OUTPUT_TOOL = ToolDefinition(
 
 BASH_KILL_TOOL = ToolDefinition(
     name="bash_kill",
+    capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
     description="Stop a background bash session created with bash(run_in_background=true). If the job is on a non-active executor, include target_executor when available.",
     parameters={
         "type": "object",
@@ -784,7 +750,6 @@ _CORE_EXECUTOR_TOOLS: list[ToolDefinition] = [
     READ_TOOL,
     WRITE_TOOL,
     ARTIFACT_SAVE_TOOL,
-    SKILL_ASSET_MATERIALIZE_TOOL,
     EDIT_TOOL,
     APPLY_PATCH_TOOL,
     MULTIEDIT_TOOL,
@@ -831,7 +796,6 @@ def executor_tool_handlers() -> dict[str, Any]:
         "read": handle_read,
         "write": handle_write,
         "artifact_save": handle_artifact_save,
-        "skill_asset_materialize": handle_skill_asset_materialize,
         "edit": handle_edit,
         "apply_patch": handle_apply_patch,
         "multiedit": handle_multiedit,

@@ -61,6 +61,46 @@ const schedule = {
 describe('Control Center sections', () => {
   beforeEach(() => goto.mockReset());
 
+  it('renders initial loading when the optional Waiting prop is omitted', () => {
+    render(ConversationsSection, {
+      conversations: null, agents: [], loading: true, onOpenConversation: vi.fn(),
+    });
+    expect(screen.getByText('Loading conversations…')).toBeInTheDocument();
+  });
+
+  it('keeps independent Waiting rows visible when history has failed', () => {
+    render(ConversationsSection, {
+      conversations: null, agents: [], error: 'History unavailable',
+      waitingConversations: [{
+        ...conversation, conversation_id: 'waiting-without-history',
+        title: 'Fresh Waiting', has_active_turn: false, has_unread: true,
+      }],
+      onOpenConversation: vi.fn(),
+    });
+    expect(screen.getByText('Fresh Waiting')).toBeInTheDocument();
+    expect(screen.getByTestId('dashboard-conversations-error')).toHaveTextContent('History unavailable');
+  });
+
+  it('uses the same topic-only classification for every dashboard embed', () => {
+    const rows = [
+      { ...conversation, conversation_id: 'signal-chat', context: { ...conversation.context, type: 'signal' } },
+      { ...conversation, conversation_id: 'direct-chat', context: { ...conversation.context, ref: 'web:agent_direct:riker' } },
+      { ...conversation, conversation_id: 'main-chat', context: { ...conversation.context, ref: 'web:user:user@test.cz:default' } },
+      { ...conversation, conversation_id: 'task-chat', context: { ...conversation.context, type: 'task' } },
+      ...Array.from({ length: 7 }, (_, index) => ({
+        ...conversation, conversation_id: `waiting-${index}`, pending_notification_types: ['escalation'],
+      })),
+    ];
+    render(ConversationsSection, {
+      conversations: rows, agents: [], onOpenConversation: vi.fn(),
+    });
+    for (const id of ['signal-chat', 'direct-chat', 'main-chat', 'task-chat']) {
+      expect(screen.queryByTestId(`dashboard-conversation-row-${id}`)).not.toBeInTheDocument();
+    }
+    expect(screen.getByTestId('dashboard-conversation-row-waiting-0')).toBeInTheDocument();
+    expect(screen.queryByTestId('dashboard-conversation-row-waiting-5')).not.toBeInTheDocument();
+  });
+
   it('keeps task data visible and retries when the schedules request fails', async () => {
     const onSchedulesRetry = vi.fn();
     render(TasksSection, {

@@ -105,10 +105,10 @@
   const revisionIntentLabel = $derived(isTerminal ? 'Revise result' : 'Request revision');
 
   const intentBadge: Record<string, { label: string; cls: string }> = {
-    record_only: { label: 'Note', cls: 'border-slate-700 bg-slate-900/80 text-slate-300' },
-    context_only: { label: 'Context', cls: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200' },
-    answer_pause: { label: 'Answer', cls: 'border-amber-500/40 bg-amber-500/10 text-amber-200' },
-    request_revision: { label: 'Revision', cls: 'border-violet-500/40 bg-violet-500/10 text-violet-200' }
+    record_only: { label: 'Note', cls: 'border-control-border bg-surface/80 text-secondary' },
+    context_only: { label: 'Context', cls: 'border-cyan-border bg-cyan-subtle text-cyan-tone' },
+    answer_pause: { label: 'Answer', cls: 'border-warning-border bg-warning-subtle text-warning' },
+    request_revision: { label: 'Revision', cls: 'border-violet-border bg-violet-subtle text-violet-tone' }
   };
 
   function intentLabel(value: string): string {
@@ -116,7 +116,7 @@
   }
 
   function intentClass(value: string): string {
-    return intentBadge[value]?.cls ?? 'border-slate-700 bg-slate-900/80 text-slate-300';
+    return intentBadge[value]?.cls ?? 'border-control-border bg-surface/80 text-secondary';
   }
 
   function appliedRevisionAttempt(comment: TaskComment): number | null {
@@ -313,9 +313,9 @@
 <Card class="p-4 sm:p-5">
   <div class="flex items-start justify-between gap-3">
     <div>
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">{notesOnly ? 'Notes' : 'Collaboration'}</p>
-      <h3 class="mt-1 text-base font-semibold text-white">{notesOnly ? 'Add task context' : 'Guide the next cycle, answer, or revise'}</h3>
-      <p class="mt-1 text-xs text-slate-400">{notesOnly ? 'Stored on the task for the team. This note does not resolve a decision.' : intentDescription}</p>
+      <p class="text-xs uppercase tracking-[0.25em] text-quiet">{notesOnly ? 'Notes' : 'Collaboration'}</p>
+      <h3 class="mt-1 text-base font-semibold text-strong">{notesOnly ? 'Add task context' : 'Guide the next cycle, answer, or revise'}</h3>
+      <p class="mt-1 text-xs text-muted">{notesOnly ? 'Stored on the task for the team. This note does not resolve a decision.' : intentDescription}</p>
     </div>
   </div>
 
@@ -337,19 +337,19 @@
       {/if}
 
       {#if intent === 'request_revision'}
-        <label class="block space-y-1 text-sm font-medium text-slate-200">
+        <label class="block space-y-1 text-sm font-medium text-foreground">
           <span>Target step</span>
           <select
             value={targetStep}
             onchange={(event) => { userPickedTargetStep = true; targetStep = (event.currentTarget as HTMLSelectElement).value; }}
-            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+            class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
           >
             <option value="">Select step…</option>
             {#each stepOptions as option}
               <option value={option.name}>{option.label}</option>
             {/each}
           </select>
-          <span class="block text-xs text-slate-500">Defaults to the step you have selected in the workflow above. The chosen step and every step after it will be reopened; prior outputs are kept as superseded history.</span>
+          <span class="block text-xs text-quiet">Defaults to the step you have selected in the workflow above. The chosen step and every step after it will be reopened; prior outputs are kept as superseded history.</span>
         </label>
       {/if}
 
@@ -358,7 +358,7 @@
         <textarea
           bind:value={body}
           aria-label="Comment body"
-          class="min-h-[100px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+          class="min-h-[100px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
           placeholder={intent === 'answer_pause'
             ? 'Answer for the current pause…'
             : intent === 'request_revision'
@@ -370,47 +370,47 @@
       </label>
 
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <p class="text-xs text-slate-400">{stateEffectLabel(intent)}</p>
+        <p class="text-xs text-muted">{stateEffectLabel(intent)}</p>
         <Button onclick={() => { if (notesOnly) intent = 'record_only'; void submit(); }} disabled={!submittable}>
           {posting ? 'Posting…' : notesOnly ? 'Add note' : intent === 'request_revision' ? (isTerminal ? 'Revise result' : 'Request revision') : intent === 'answer_pause' ? 'Submit answer' : intent === 'context_only' ? 'Guide next cycle' : 'Add note'}
         </Button>
       </div>
 
       {#if intent === 'request_revision' && isTerminal}
-        <p class="rounded-xl border border-slate-700/60 bg-slate-900/60 px-3 py-2 text-xs text-slate-400">Task is terminal. Submitting a revision reopens it from the selected step.</p>
+        <p class="rounded-xl border border-control-border/60 bg-surface/60 px-3 py-2 text-xs text-muted">Task is terminal. Submitting a revision reopens it from the selected step.</p>
       {/if}
     </div>
 
-    <div class="mt-6 space-y-3 border-t border-slate-800/80 pt-4">
+    <div class="mt-6 space-y-3 border-t border-separator/80 pt-4">
       {#if loading}
-        <p class="text-sm text-slate-400">Loading comments…</p>
+        <p class="text-sm text-muted">Loading comments…</p>
       {:else if comments.length === 0}
-        <p class="text-sm text-slate-400">No comments yet.</p>
+        <p class="text-sm text-muted">No comments yet.</p>
       {:else}
         {#each comments as comment (comment.comment_id)}
           {@const openedAttempt = appliedRevisionAttempt(comment)}
-          <article class="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+          <article class="rounded-2xl border border-separator bg-canvas/60 px-4 py-3">
             <header class="flex flex-wrap items-center gap-2 text-xs">
               <span class={`rounded-full border px-2 py-0.5 font-semibold uppercase tracking-wider ${intentClass(comment.intent)}`}>{intentLabel(comment.intent)}</span>
               {#if comment.applied}
-                <span class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-emerald-200">applied</span>
+                <span class="rounded-full border border-success-border bg-success-subtle px-2 py-0.5 text-success">applied</span>
               {:else if comment.intent === 'answer_pause' || comment.intent === 'request_revision'}
-                <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-200">pending</span>
+                <span class="rounded-full border border-warning-border bg-warning-subtle px-2 py-0.5 text-warning">pending</span>
               {/if}
               {#if comment.noop}
-                <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2 py-0.5 text-slate-400">noop</span>
+                <span class="rounded-full border border-control-border bg-surface/80 px-2 py-0.5 text-muted">noop</span>
               {/if}
               {#if comment.target_step}
-                <span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-200">→ {comment.target_step}</span>
+                <span class="rounded-full border border-violet-border bg-violet-subtle px-2 py-0.5 text-violet-tone">→ {comment.target_step}</span>
               {/if}
-              <span class="text-slate-500">created during attempt #{comment.attempt_number}</span>
+              <span class="text-quiet">created during attempt #{comment.attempt_number}</span>
               {#if comment.applied && openedAttempt !== null}
-                <span class="text-emerald-300">opened attempt #{openedAttempt}</span>
+                <span class="text-success">opened attempt #{openedAttempt}</span>
               {/if}
-              <span class="ml-auto text-slate-500" title={formatAbsoluteTime(comment.created_at)}>{formatRelativeTime(comment.created_at)}</span>
+              <span class="ml-auto text-quiet" title={formatAbsoluteTime(comment.created_at)}>{formatRelativeTime(comment.created_at)}</span>
             </header>
-            <p class="mt-1 text-xs text-slate-500">{comment.author_email}</p>
-            <div class="prose prose-sm prose-invert mt-2 max-w-none text-slate-200">{@html renderMarkdown(comment.body)}</div>
+            <p class="mt-1 text-xs text-quiet">{comment.author_email}</p>
+            <div class="prose prose-sm prose-invert mt-2 max-w-none text-foreground">{@html renderMarkdown(comment.body)}</div>
           </article>
         {/each}
       {/if}
@@ -425,7 +425,7 @@
     role="radio"
     aria-checked={active}
     tabindex={active ? 0 : -1}
-    class={`rounded-xl border px-3 py-2 text-sm transition ${active ? 'border-sky-500 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/80 text-slate-300 hover:border-slate-500'} ${enabled ? '' : 'cursor-not-allowed opacity-40'}`}
+    class={`rounded-xl border px-3 py-2 text-sm transition ${active ? 'border-accent bg-accent-subtle text-accent' : 'border-control-border bg-canvas/80 text-secondary hover:border-border-strong'} ${enabled ? '' : 'cursor-not-allowed opacity-40'}`}
     onclick={() => selectIntent(value)}
     disabled={!enabled}
   >

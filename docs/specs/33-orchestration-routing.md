@@ -71,8 +71,16 @@ and route recovery. Error text does not determine delivery certainty.
    controller allowlist, and inherited managed-depth budget are authoritative
    at runtime as well as during discovery.
 4. `delegate(wait=false)` is a narrow live/main or channel-chat primitive for
-   lightweight non-interactive background work. It is not a general
-   orchestration primitive.
+    lightweight non-interactive background work. It is not a general
+    orchestration primitive.
+    Its direct-turn ownership guard lasts for the child's execution. It permits
+    continuation after successful completion by the exact spawning owner, but
+    cancels on lease loss, takeover, failure, or cancellation. Child checkpoints
+    and tool dispatches check ownership without modifying the parent's recovery
+    journal. Checks release database sessions before external I/O; explicit
+    cancellation remains owned by the parent's tracked child task. This does
+    not add durable child replay or restart recovery. Workflow-task fences and
+    joined delegates retain their existing ownership.
 5. Managed conversation `wait=false` is available from main/channel and
    direct/topic chat surfaces. Main/channel chats default omitted
    managed-conversation `wait` to `false` to remain responsive; direct/topic
@@ -168,6 +176,53 @@ and route recovery. Error text does not determine delivery certainty.
      cross-agent task/workflow ownership. A managed descendant cannot create a
      task for another agent to reset its chain. Allowlists only restrict existing
      ownership, grant, lifecycle, and visibility checks; they never grant access.
+
+## Generic question mediation
+
+Clarification requests use one durable notification ID and the existing pause
+waiter. Direct-chat questions remain user-facing `step_question` notifications.
+Delegated and managed requests first become internal `agent_question` records
+assigned to the responsible conversation. Agent-only questions are excluded from
+user notification, attention, and pending-input surfaces.
+
+`answer_question` validates structured answers against the stored question set.
+`forward_question` promotes the same record to a user-facing question using a
+revision-fenced update; it preserves the original execution, questions, and
+deadline. Neither tool can resolve credentials, auth challenges, or approvals.
+Respondents answer from context, task instructions, or user preferences, and
+ask the user rather than guess when uncertain. The delivery destination of a
+scheduled/API task is not itself decision authority.
+
+Question follow-ups carry required controller-authored origin references:
+conversation, session, agent, tool call, and tool name; task, step, and source
+references accompany task questions. Task-created questions use the originating
+conversation, or the pinned task delivery destination when there is no creator
+conversation. Delegates inside a workflow use the task's responsible conversation
+when their shared task conversation cannot admit a controller turn.
+
+### State and delivery ownership
+
+- Notification rows own question lifetime, routing, expiry, and resolution.
+  Routing metadata uses existing JSON payloads; there is no schema migration.
+- The scheduler owns durable follow-up admission, deduplication, safe-boundary
+  absorption, and recovery. Persist the question before delivering its follow-up.
+  A durable delivery-readiness flag prevents recovery and response tools from
+  racing ahead of the origin's pause commit. Recovery activates an unready task
+  question only after its matching internal pause is committed.
+  Its recovery scan retries missed delivery and forwards unanswered questions to
+  the user after a failed or completed mediation turn.
+- Joined delegates run as tracked child tasks. A boundary event yields the join,
+  not the child; an observer delivers completion through the existing follow-up
+  path. Parent cancellation cancels the tracked child. Managed joins retain their
+  existing boundary-input protocol. No second parent turn runs concurrently.
+- Answer validation and routing revision fences reject stale or unauthorized
+  mutations, including stale task attempts. Answered task questions preserve
+  their structured reply and recover task admission if the local waiter was lost.
+  Forwarding locks the task before its notification CAS, matching task lifecycle
+  lock order. Database work ends before events and waits. Local waiters are only
+  synchronization fast paths; the durable notification remains authoritative.
+- Existing direct question IDs, user response APIs, interaction-mode limits,
+  and question replay contracts remain supported.
 
 ## Fine-tuning point
 

@@ -17,6 +17,8 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
     SNAPSHOT_CACHE_METRICS.redis_value(1024)
     SNAPSHOT_CACHE_METRICS.client_performance("cached_restore_ms", 25)
     SNAPSHOT_CACHE_METRICS.client_performance("activity_overview_request_success_ms", 10)
+    for stage in ("context", "immutable", "attachments"):
+        SNAPSHOT_CACHE_METRICS.request_stage(stage, 0.01)
 
     exposition = generate_latest().decode()
 
@@ -47,6 +49,11 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
         "cognis_chat_v2_client_performance_milliseconds_count"
         '{metric="activity_overview_request_success_ms"}' in exposition
     )
+    for stage in ("context", "immutable", "attachments"):
+        assert (
+            f'cognis_chat_snapshot_request_stage_latency_seconds_count{{stage="{stage}"}}'
+            in exposition
+        )
 
     SNAPSHOT_CACHE_METRICS.l1_resident(0, 0)
     SNAPSHOT_CACHE_METRICS.inflight_builds(0)
@@ -59,3 +66,5 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
 def test_snapshot_warm_metric_rejects_unbounded_outcomes() -> None:
     with pytest.raises(ValueError, match="invalid snapshot warm outcome"):
         SNAPSHOT_CACHE_METRICS.warm_event("conversation-1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid snapshot request stage"):
+        SNAPSHOT_CACHE_METRICS.request_stage("conversation-1", 0.01)

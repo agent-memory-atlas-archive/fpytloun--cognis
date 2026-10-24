@@ -15,13 +15,29 @@ from sqlalchemy import select, update
 from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.serializers import agent_to_response
+from cognis.core.agent_management_catalog import assignable_knowledgebases, available_workflows
 from cognis.core.agent_profiles import (
     agent_profile_options,
     resolve_agent_profile,
     validate_agent_profile_configuration,
 )
-from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
+from cognis.core.agent_registry import SYSTEM_AGENTS, AgentRegistry, validate_agent_id
+from cognis.core.credential_grants import (
+    CredentialGrantError,
+    credential_assignment_metadata,
+    update_credential_assignment,
+)
 from cognis.core.events import Event, EventType
+from cognis.core.executor_resolution import labels_match
+from cognis.core.system_agent_overrides import (
+    SYSTEM_AGENT_OVERRIDE_FIELDS,
+    SystemAgentOverrideError,
+    require_system_agent,
+    reset_system_agent_override,
+    set_system_agent_disabled,
+    system_override_payload,
+    update_system_agent_override,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import (
     AgentCapabilities,
@@ -32,6 +48,7 @@ from cognis.models.agent import (
 from cognis.models.skill import AgentSkillRef
 from cognis.models.tool import stable_tool_id
 from cognis.providers.backends import get_backend
+from cognis.providers.base import CredentialsProvider
 from cognis.providers.memory.policy import memory_backend_descriptors
 from cognis.store.models import (
     AuditLog,
@@ -47,15 +64,14 @@ from cognis.store.queries import (
     get_agent,
     get_agent_grant,
     get_agent_grant_for_user,
+    get_system_agent_override,
     get_user,
     list_agent_grants,
     list_agents,
     list_executors,
-    list_knowledgebases,
     list_llm_providers,
     list_secondary_bindings,
     list_skills,
-    list_workflows,
     revoke_agent_grant,
     set_agent_status,
     set_secondary_bindings,
@@ -65,6 +81,7 @@ from cognis.store.queries import (
 )
 from cognis.tools.builtin.image import _image_bytes
 from cognis.tools.builtin.knowledgebase import knowledgebase_tools
+from cognis.tools.builtin.projects import PROJECT_MANAGE_TOOL_IDS, PROJECT_READ_TOOL_IDS
 from cognis.tools.skills import is_agent_assignable_skill
 
 logger = get_logger(__name__)
@@ -132,6 +149,24 @@ TOOL_GROUP_DEFINITIONS: tuple[ToolGroupDefinition, ...] = (
         mutating=True,
         requires_executor=True,
     ),
+    ToolGroupDefinition(
+        group_id="projects_read",
+        name="Projects read",
+        description="List and inspect owned and shared projects.",
+        tool_ids=PROJECT_READ_TOOL_IDS,
+        risk_level="low",
+    ),
+    ToolGroupDefinition(
+        group_id="projects_manage",
+        name="Projects management",
+        description=(
+            "Create, edit, and archive projects; manage instructions, sources, workflows, "
+            "agent assignments, and the current conversation's project."
+        ),
+        tool_ids=PROJECT_MANAGE_TOOL_IDS,
+        risk_level="high",
+        mutating=True,
+    ),
 )
 
 
@@ -150,6 +185,8 @@ class AgentManagementDependencies:
     # Caller-effective, persistable tools. Mutations fail closed when absent.
     assignable_tools: list[Any] | None = None
     assignable_knowledgebase_ids: set[str] | None = None
+    caller_agent_id: str | None = None
+    credentials: CredentialsProvider | None = None
 
 
 def slugify_agent_id(text: str) -> str:
@@ -189,10 +226,57 @@ async def handle_agent_management_action(
         raise AgentManagementError("action is required")
 
     try:
+        if action.startswith(("hooks_", "hook_assignments_")) or action == "hook_runs_list":
+            from cognis.core.hooks import (
+                HookError,
+                hook_affects_agent,
+                manage_hooks,
+                notify_hook_change,
+            )
+
+            async with deps.session_factory() as db:
+                hook_id = str(arguments.get("hook_id") or "")
+                if (
+                    action in {"hooks_update", "hooks_delete"}
+                    and (await hook_affects_agent(db, hook_id, current_agent_id))
+                    and not self_mutation_approved
+                ):
+                    raise AgentManagementError("Self mutation requires explicit user approval.")
+                try:
+                    result = await manage_hooks(
+                        db,
+                        owner=actor_email,
+                        action=action,
+                        **{
+                            key: value
+                            for key, value in arguments.items()
+                            if key
+                            in {
+                                "hook_id",
+                                "definition",
+                                "agent_id",
+                                "assignment",
+                                "expected_revision",
+                            }
+                        },
+                    )
+                except HookError as exc:
+                    raise AgentManagementError(str(exc)) from exc
+                await db.commit()
+            await notify_hook_change(deps.event_bus, action, arguments)
+            return result
         if action == "list":
             return await _list_agents(deps, actor_email, current_agent_id)
         if action == "get":
+            if str(arguments.get("agent_id") or "").strip() in SYSTEM_AGENTS:
+                return await _system_agent_action(
+                    deps, actor_email, {**arguments, "action": "system_overrides_get"}
+                )
             return await _get_agent(deps, actor_email, current_agent_id, arguments)
+        if action in _SYSTEM_AGENT_ACTIONS:
+            return await _system_agent_action(deps, actor_email, arguments)
+        if action in {"credentials_get", "credentials_grant", "credentials_revoke"}:
+            return await _credentials_action(deps, actor_email, current_agent_id, arguments)
         if action == "settings_get":
             return await _settings_get(deps, actor_email, current_agent_id, arguments)
         if action == "settings_update":
@@ -270,6 +354,49 @@ async def handle_agent_management_action(
     raise AgentManagementError(f"Unknown action: {action}")
 
 
+async def _credentials_action(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    credential_id = _optional_string(arguments.get("credential_id"))
+    if not credential_id:
+        raise AgentManagementError("credential_id is required")
+    if deps.credentials is None:
+        raise AgentManagementError("Credential management is unavailable")
+    credential = await deps.credentials.get_credential(credential_id, actor_email)
+    action = arguments["action"]
+    try:
+        metadata = credential_assignment_metadata(credential, owner_email=actor_email)
+        if action == "credentials_get":
+            permissions = row.permissions or {}
+            return {
+                "agent_id": row.agent_id,
+                "credential": metadata,
+                "assigned": credential_id in (permissions.get("allowed_credentials") or []),
+                "updated_at": row.updated_at.isoformat(),
+            }
+        expected_updated_at = arguments.get("expected_updated_at")
+        if not isinstance(expected_updated_at, str):
+            raise CredentialGrantError("expected_updated_at must be an ISO-8601 timestamp")
+        async with deps.session_factory() as session:
+            result = await update_credential_assignment(
+                session,
+                agent_id=row.agent_id,
+                owner_email=actor_email,
+                credential=credential,
+                grant=action == "credentials_grant",
+                expected_updated_at=expected_updated_at,
+            )
+            await session.commit()
+    except CredentialGrantError as exc:
+        raise AgentManagementError(str(exc)) from exc
+    await _audit(deps, actor_email, row.agent_id, action, "success", arguments)
+    return result
+
+
 async def _list_agents(
     deps: AgentManagementDependencies, actor_email: str, current_agent_id: str
 ) -> dict[str, Any]:
@@ -289,7 +416,9 @@ async def _list_agents(
                 "description": row.description,
                 "agent_type": row.agent_type,
                 "status": row.status,
+                "is_system": False,
                 "manageable": not row.is_system,
+                "management_mode": "full",
                 "default_agent_profile_id": resolve_agent_profile(
                     agent_definitions[row.agent_id]
                 ).profile_id,
@@ -298,6 +427,7 @@ async def _list_agents(
             for row in rows
             if not getattr(row, "is_system", False)
         ],
+        "system_agents": await _system_agent_list_entries(deps, actor_email),
     }
 
 
@@ -1104,6 +1234,15 @@ async def _create_agent(
         validate_agent_id(agent_id)
     except ValueError as exc:
         raise AgentManagementError(str(exc)) from exc
+    agent_type = str(arguments.get("agent_type") or "primary")
+    if agent_type not in {"primary", "secondary"}:
+        raise AgentManagementError("agent_type must be primary or secondary")
+    # Secondary agents cannot hold management tools; keep their defaults valid.
+    default_tools = [
+        tool
+        for tool in deps.assignable_tools
+        if agent_type == "primary" or tool.name not in _MANAGEMENT_TOOL_NAMES
+    ]
 
     avatar_image_id = arguments.get("avatar_image_id")
     if arguments.get("generate_avatar"):
@@ -1123,15 +1262,15 @@ async def _create_agent(
     async with deps.session_factory() as session:
         if await get_agent(session, agent_id) is not None:
             raise AgentManagementError("Agent already exists")
-        available_knowledgebases = await list_knowledgebases(
+        available_knowledgebases = await assignable_knowledgebases(
             session,
-            owner_email=actor_email,
+            actor_email=actor_email,
+            caller_agent_id=deps.caller_agent_id,
+            allowed_ids=deps.assignable_knowledgebase_ids,
         )
         available_knowledgebase_ids = {
             row.knowledgebase_id for row in available_knowledgebases if row.status == "active"
         }
-        if deps.assignable_knowledgebase_ids is not None:
-            available_knowledgebase_ids &= deps.assignable_knowledgebase_ids
         invalid_knowledgebases = sorted(set(assigned_knowledgebases) - available_knowledgebase_ids)
         if invalid_knowledgebases:
             raise AgentManagementError(
@@ -1150,18 +1289,16 @@ async def _create_agent(
             tools={
                 "tool_groups": [],
                 "builtin_tools": sorted(
-                    stable_tool_id(tool)
-                    for tool in deps.assignable_tools
-                    if tool.source.type == "builtin"
+                    stable_tool_id(tool) for tool in default_tools if tool.source.type == "builtin"
                 ),
-                "allow_tools": sorted(assignable_ids),
+                "allow_tools": sorted(stable_tool_id(tool) for tool in default_tools),
                 "deny_tools": denied_static_ids,
             },
             permissions=permissions or None,
             llm_config=None,
             execution=None,
             avatar_image_id=_optional_string(avatar_image_id),
-            agent_type=str(arguments.get("agent_type") or "primary"),
+            agent_type=agent_type,
             status=str(arguments.get("status") or "draft"),
         )
         await session.commit()
@@ -1282,17 +1419,27 @@ async def _bindings_set(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    if getattr(row, "agent_type", "primary") != "primary":
+        raise AgentManagementError("Secondary bindings can only be set on primary agents")
     raw_ids = arguments.get("secondary_agent_ids")
     if not isinstance(raw_ids, list):
         raise AgentManagementError("secondary_agent_ids must be a list")
-    ids = [str(item) for item in raw_ids if isinstance(item, str) and item.strip()]
+    ids = list(
+        dict.fromkeys(item.strip() for item in raw_ids if isinstance(item, str) and item.strip())
+    )
     async with deps.session_factory() as session:
         for secondary_id in ids:
+            if secondary_id in SYSTEM_AGENTS:
+                raise AgentManagementError(
+                    f"{secondary_id} is a system agent and is available without a binding"
+                )
             secondary = await get_agent(session, secondary_id)
             if secondary is None or secondary.owner_email != actor_email:
                 raise AgentManagementError(
                     f"Secondary agent not found or not owned: {secondary_id}"
                 )
+            if getattr(secondary, "agent_type", "primary") != "secondary":
+                raise AgentManagementError(f"Agent is not a secondary agent: {secondary_id}")
         await set_secondary_bindings(session, row.agent_id, ids)
         await session.commit()
     await _audit(deps, actor_email, row.agent_id, "bindings_set", "success", arguments)
@@ -1336,6 +1483,10 @@ async def _share_create(
     current_agent_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
+    from typing import Literal
+
+    from cognis.core.inbox import publish_notification, stage_share_notification
+
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     grantee_email = str(arguments.get("grantee_email") or "").strip()
     if not grantee_email:
@@ -1348,7 +1499,19 @@ async def _share_create(
     async with deps.session_factory() as session:
         if await get_user(session, grantee_email) is None:
             raise AgentManagementError("Grantee user not found")
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(
+            session, resource_type="agent", resource_id=row.agent_id
+        )
         existing = await get_agent_grant_for_user(session, row.agent_id, grantee_email)
+        change: Literal["shared", "updated"] | None = (
+            "shared"
+            if existing is None or existing.revoked_at is not None
+            else "updated"
+            if existing.executor_scope != executor_scope
+            else None
+        )
         if existing is not None:
             grant = await update_agent_grant(
                 session,
@@ -1372,7 +1535,21 @@ async def _share_create(
                 granted_by=actor_email,
                 note=_optional_string(arguments.get("note")),
             )
+        notice = (
+            stage_share_notification(
+                session,
+                recipient=grantee_email,
+                actor=actor_email,
+                resource_type="agent",
+                resource_id=row.agent_id,
+                resource_name=row.name,
+                change=change,
+            )
+            if change
+            else None
+        )
         await session.commit()
+    await publish_notification(deps.event_bus, notice)
     await _audit(deps, actor_email, row.agent_id, "share_create", "success", arguments)
     return {"status": "shared", "share": _grant_payload(grant)}
 
@@ -1383,6 +1560,8 @@ async def _share_update(
     current_agent_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
+    from cognis.core.inbox import publish_notification, stage_share_notification
+
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     grant_id = str(arguments.get("grant_id") or "").strip()
     if not grant_id:
@@ -1391,9 +1570,15 @@ async def _share_update(
     if executor_scope not in {"owner_executor", "grantee_executor"}:
         raise AgentManagementError("executor_scope must be owner_executor or grantee_executor")
     async with deps.session_factory() as session:
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(
+            session, resource_type="agent", resource_id=row.agent_id
+        )
         grant = await get_agent_grant(session, grant_id)
         if grant is None or grant.agent_id != row.agent_id or grant.revoked_at is not None:
             raise AgentManagementError("Grant not found")
+        changed = grant.executor_scope != executor_scope
         updated = await update_agent_grant(
             session,
             grant_id,
@@ -1404,7 +1589,21 @@ async def _share_update(
             else grant.grantee_overrides,
         )
         assert updated is not None
+        notice = (
+            stage_share_notification(
+                session,
+                recipient=grant.grantee_user_email,
+                actor=actor_email,
+                resource_type="agent",
+                resource_id=row.agent_id,
+                resource_name=row.name,
+                change="updated",
+            )
+            if changed
+            else None
+        )
         await session.commit()
+    await publish_notification(deps.event_bus, notice)
     await _audit(deps, actor_email, row.agent_id, "share_update", "success", arguments)
     return {"status": "updated", "share": _grant_payload(updated)}
 
@@ -1415,12 +1614,19 @@ async def _share_revoke(
     current_agent_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
+    from cognis.core.inbox import publish_notification, stage_share_notification
+
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     grant_id = str(arguments.get("grant_id") or "").strip()
     if not grant_id:
         raise AgentManagementError("grant_id is required")
     running_task_ids: list[str] = []
     async with deps.session_factory() as session:
+        from cognis.store.queries import lock_resource_share_transition
+
+        await lock_resource_share_transition(
+            session, resource_type="agent", resource_id=row.agent_id
+        )
         grant = await get_agent_grant(session, grant_id)
         if grant is None or grant.agent_id != row.agent_id or grant.revoked_at is not None:
             raise AgentManagementError("Grant not found")
@@ -1454,7 +1660,17 @@ async def _share_revoke(
                 task.updated_at = datetime.now(UTC)
                 if not task.result_summary:
                     task.result_summary = "Access to the shared agent was revoked."
+        notice = stage_share_notification(
+            session,
+            recipient=grantee_email,
+            actor=actor_email,
+            resource_type="agent",
+            resource_id=row.agent_id,
+            resource_name=row.name,
+            change="revoked",
+        )
         await session.commit()
+    await publish_notification(deps.event_bus, notice)
 
     if deps.task_queue is not None:
         for task_id in running_task_ids:
@@ -1462,6 +1678,347 @@ async def _share_revoke(
                 await deps.task_queue.pause_task(task_id)
     await _audit(deps, actor_email, row.agent_id, "share_revoke", "success", arguments)
     return {"status": "revoked", "ok": True, "grant_id": grant_id}
+
+
+_SYSTEM_AGENT_ACTIONS = frozenset(
+    {
+        "system_overrides_get",
+        "system_overrides_update",
+        "system_overrides_reset",
+        "system_disable",
+        "system_enable",
+    }
+)
+_MANAGEMENT_TOOL_NAMES = frozenset({"manage_agents", "manage_mcp"})
+_SYSTEM_TOOL_OVERRIDE_KEYS = frozenset(
+    {
+        "builtin_tools",
+        "allow_tools",
+        "deny_tools",
+        "tool_groups",
+        "disabled_tools",
+        "disabled_categories",
+        "disabled_mcp_servers",
+    }
+)
+
+
+def _required_system_agent(arguments: dict[str, Any]) -> AgentDefinition:
+    agent_id = str(arguments.get("agent_id") or "").strip()
+    if not agent_id:
+        raise AgentManagementError("agent_id is required")
+    try:
+        return require_system_agent(agent_id)
+    except SystemAgentOverrideError as exc:
+        raise AgentManagementError(
+            f"System agent not found: {agent_id}. Use list to discover system agents."
+        ) from exc
+
+
+def _system_management_mode(base: AgentDefinition) -> str:
+    return "overrides" if base.allow_user_override else "read_only"
+
+
+async def _system_agent_payload(
+    deps: AgentManagementDependencies, actor_email: str, base: AgentDefinition
+) -> dict[str, Any]:
+    async with deps.session_factory() as session:
+        override = await get_system_agent_override(
+            session, owner_email=actor_email, agent_id=base.agent_id
+        )
+    effective = await AgentRegistry(deps.session_factory).get(
+        base.agent_id, owner_email=actor_email, include_disabled=True
+    )
+    assert effective is not None
+    override_payload = system_override_payload(override)
+    return {
+        "agent_id": base.agent_id,
+        "is_system": True,
+        "management_mode": _system_management_mode(base),
+        "allow_user_override": base.allow_user_override,
+        "allow_user_disable": base.allow_user_disable,
+        "editable_fields": list(base.editable_fields),
+        "override_fields": sorted(SYSTEM_AGENT_OVERRIDE_FIELDS),
+        "disabled": bool(effective.disabled),
+        "has_overrides": override is not None,
+        "override": override_payload,
+        "override_updated_at": override_payload["updated_at"] if override_payload else "",
+        "shipped": {
+            "llm_config": (
+                base.llm_config.model_dump(mode="json", exclude_none=True)
+                if base.llm_config
+                else None
+            ),
+            "skills": base.skills,
+            "tools": base.tools,
+            "permissions": base.permissions.model_dump(mode="json") if base.permissions else None,
+            "agent_profiles": {
+                profile_id: profile.model_dump(mode="json", exclude_none=True)
+                for profile_id, profile in base.agent_profiles.items()
+            },
+            "default_agent_profile_id": base.default_agent_profile_id,
+        },
+        "effective": agent_to_response(effective).model_dump(mode="json"),
+        "default_agent_profile_id": resolve_agent_profile(effective).profile_id,
+        "agent_profiles": agent_profile_options(effective),
+    }
+
+
+async def _system_agent_action(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    action = str(arguments["action"])
+    base = _required_system_agent(arguments)
+    if action == "system_overrides_get":
+        return {
+            "status": "ok",
+            "system_agent": await _system_agent_payload(deps, actor_email, base),
+        }
+    if not base.allow_user_override:
+        raise AgentManagementError(f"{base.agent_id} is an internal system agent and is read-only")
+    expected = arguments.get("expected_updated_at")
+    if expected is not None and not isinstance(expected, str):
+        raise AgentManagementError("expected_updated_at must be a string")
+    overrides: dict[str, Any] = {}
+    if action == "system_overrides_update":
+        raw_overrides = arguments.get("overrides")
+        if not isinstance(raw_overrides, dict) or not raw_overrides:
+            raise AgentManagementError("overrides must be a non-empty object")
+        # Caller-scoped validation runs before the DB session; it may call providers.
+        overrides = await _validated_system_overrides(deps, actor_email, base, raw_overrides)
+    try:
+        async with deps.session_factory() as session:
+            if action == "system_overrides_update":
+                await update_system_agent_override(
+                    session,
+                    base=base,
+                    owner_email=actor_email,
+                    updates=overrides,
+                    expected_updated_at=expected,
+                )
+                status = "updated"
+            elif action == "system_overrides_reset":
+                deleted = await reset_system_agent_override(
+                    session, base=base, owner_email=actor_email, expected_updated_at=expected
+                )
+                status = "reset" if deleted else "unchanged"
+            else:
+                disabled = action == "system_disable"
+                await set_system_agent_disabled(
+                    session,
+                    base=base,
+                    owner_email=actor_email,
+                    disabled=disabled,
+                    expected_updated_at=expected,
+                )
+                status = "disabled" if disabled else "enabled"
+            await session.commit()
+    except SystemAgentOverrideError as exc:
+        raise AgentManagementError(str(exc)) from exc
+    await _audit(deps, actor_email, base.agent_id, action, "success", arguments)
+    return {
+        "status": status,
+        "system_agent": await _system_agent_payload(deps, actor_email, base),
+    }
+
+
+async def _validated_system_overrides(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    base: AgentDefinition,
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply caller-scoped validation that the shared override owner cannot know.
+
+    The core override module validates shapes and persistence invariants. Tool
+    callers may additionally only reference providers, tools, skills,
+    knowledgebases, and credentials that exist and are available to them.
+    """
+
+    validated = dict(overrides)
+    catalog: dict[str, set[str]] | None = None
+
+    async def _provider_catalog() -> dict[str, set[str]]:
+        nonlocal catalog
+        if catalog is None:
+            async with deps.session_factory() as session:
+                rows = await list_llm_providers(session)
+            catalog = {row.provider_id: _configured_provider_models(row) for row in rows}
+        return catalog
+
+    async def _check_provider_model(provider_id: Any, model: Any, field: str) -> None:
+        providers = await _provider_catalog()
+        if provider_id is not None and provider_id not in providers:
+            raise AgentManagementError(f"Invalid {field}.provider_id: {provider_id}")
+        effective_provider = provider_id
+        if effective_provider is None and base.llm_config is not None:
+            effective_provider = base.llm_config.provider_id
+        allowed = providers.get(effective_provider, set()) if effective_provider else set()
+        if model is not None and allowed and model not in allowed:
+            raise AgentManagementError(
+                f"Invalid {field}.model for provider {effective_provider}: {model}"
+            )
+
+    llm_config = overrides.get("llm_config")
+    if isinstance(llm_config, dict):
+        await _check_provider_model(
+            llm_config.get("provider_id"), llm_config.get("model"), "llm_config"
+        )
+    profiles = overrides.get("agent_profiles")
+    if isinstance(profiles, dict):
+        for profile_id, profile in profiles.items():
+            if isinstance(profile, dict):
+                await _check_provider_model(
+                    profile.get("provider_id"),
+                    profile.get("model"),
+                    f"agent_profiles.{profile_id}",
+                )
+
+    tools = overrides.get("tools")
+    if isinstance(tools, dict):
+        _validate_system_tool_override(deps, base, tools)
+
+    skills = overrides.get("skills")
+    if isinstance(skills, dict):
+        validated["skills"] = await _validated_system_skill_override(deps, actor_email, skills)
+
+    permissions = overrides.get("permissions")
+    if isinstance(permissions, dict):
+        await _validate_system_permission_override(deps, actor_email, base, permissions)
+    return validated
+
+
+def _validate_system_tool_override(
+    deps: AgentManagementDependencies, base: AgentDefinition, tools: dict[str, Any]
+) -> None:
+    # Only restrictive or inventory-checked keys are accepted. Omitting
+    # builtin_tools would enable every default-on builtin, and inline/Intaris
+    # MCP servers, opt-ins, or delegation tools would bypass caller inventory.
+    unsupported = sorted(set(tools) - _SYSTEM_TOOL_OVERRIDE_KEYS)
+    if unsupported:
+        raise AgentManagementError(
+            f"Unsupported system agent tools override keys: {', '.join(unsupported)}"
+        )
+    if not isinstance(tools.get("builtin_tools"), list):
+        raise AgentManagementError(
+            "tools.builtin_tools must be an explicit list; start from the effective tools"
+        )
+    for field in _SYSTEM_TOOL_OVERRIDE_KEYS:
+        if tools.get(field) is not None:
+            _validated_string_list(tools[field], f"tools.{field}")
+    shipped = base.tools if isinstance(base.tools, dict) else {}
+    shipped_ids = {
+        item for key in ("builtin_tools", "allow_tools") for item in _string_list(shipped.get(key))
+    }
+    available = _available_tool_map(deps.assignable_tools)
+    for group_id in _string_list(tools.get("tool_groups")):
+        group = _tool_group_map().get(group_id)
+        if group is None:
+            raise AgentManagementError(f"Invalid tools.tool_groups: {group_id}")
+        unavailable = sorted(tool_id for tool_id in group.tool_ids if tool_id not in available)
+        if unavailable:
+            raise AgentManagementError(
+                f"Tool group {group_id} exceeds caller-effective assignable inventory: "
+                + ", ".join(unavailable)
+            )
+    for field in ("builtin_tools", "allow_tools"):
+        for tool_id in _string_list(tools.get(field)):
+            if tool_id.removeprefix("builtin:") in _MANAGEMENT_TOOL_NAMES:
+                raise AgentManagementError(f"System agents cannot be granted {tool_id}")
+            if tool_id in shipped_ids:
+                continue
+            if deps.assignable_tools is None:
+                raise AgentManagementError(
+                    "Caller-effective assignable tool inventory is required to grant tools "
+                    "beyond the shipped system agent tools"
+                )
+            if tool_id not in available:
+                raise AgentManagementError(
+                    f"Invalid tools.{field}: {tool_id} is not in the caller-effective "
+                    "assignable inventory"
+                )
+
+
+async def _validated_system_skill_override(
+    deps: AgentManagementDependencies, actor_email: str, skills: dict[str, Any]
+) -> dict[str, Any]:
+    # Other keys are runtime-injected state, and legacy inline items carry
+    # tool_names grants that bypass caller inventory checks.
+    unsupported = sorted(set(skills) - {"items"})
+    if unsupported:
+        raise AgentManagementError(
+            f"Unsupported system agent skills override keys: {', '.join(unsupported)}"
+        )
+    raw_items = skills.get("items", [])
+    if not isinstance(raw_items, list):
+        raise AgentManagementError("skills.items must be a list")
+    available = {
+        item["skill_id"]: item for item in await _available_skill_options(deps, actor_email)
+    }
+    return {"items": _validated_skill_assignments(raw_items, available)}
+
+
+async def _validate_system_permission_override(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    base: AgentDefinition,
+    permissions: dict[str, Any],
+) -> None:
+    knowledgebases = permissions.get("allowed_knowledgebases")
+    if knowledgebases is not None:
+        selected = _validated_string_list(knowledgebases, "permissions.allowed_knowledgebases")
+        valid = {item["id"] for item in await _available_knowledgebase_options(deps, actor_email)}
+        invalid = sorted(set(selected) - valid)
+        if invalid:
+            raise AgentManagementError(
+                f"Invalid permissions.allowed_knowledgebases: {', '.join(invalid)}"
+            )
+    credentials = permissions.get("allowed_credentials")
+    if credentials is not None:
+        shipped = set(base.permissions.allowed_credentials) if base.permissions else set()
+        for credential_id in _validated_string_list(credentials, "permissions.allowed_credentials"):
+            if credential_id in shipped:
+                continue
+            if deps.credentials is None:
+                raise AgentManagementError("Credential management is unavailable")
+            credential = await deps.credentials.get_credential(credential_id, actor_email)
+            try:
+                credential_assignment_metadata(credential, owner_email=actor_email)
+            except CredentialGrantError as exc:
+                raise AgentManagementError(f"{exc}: {credential_id}") from exc
+
+
+async def _system_agent_list_entries(
+    deps: AgentManagementDependencies, actor_email: str
+) -> list[dict[str, Any]]:
+    registry = AgentRegistry(deps.session_factory)
+    entries: list[dict[str, Any]] = []
+    for base in SYSTEM_AGENTS.values():
+        if base.hidden:
+            continue
+        effective = await registry.get(
+            base.agent_id, owner_email=actor_email, include_disabled=True
+        )
+        assert effective is not None
+        entries.append(
+            {
+                "agent_id": base.agent_id,
+                "name": effective.name,
+                "description": effective.description,
+                "agent_type": effective.agent_type,
+                "status": effective.status,
+                "is_system": True,
+                "manageable": base.allow_user_override,
+                "management_mode": _system_management_mode(base),
+                "has_overrides": bool(effective.has_overrides),
+                "disabled": bool(effective.disabled),
+                "default_agent_profile_id": resolve_agent_profile(effective).profile_id,
+                "agent_profiles": agent_profile_options(effective),
+            }
+        )
+    return entries
 
 
 async def _require_owned_target(
@@ -1474,7 +2031,10 @@ async def _require_owned_target(
     if not agent_id:
         raise AgentManagementError("agent_id is required")
     if agent_id in SYSTEM_AGENTS:
-        raise AgentManagementError("System agents are read-only")
+        raise AgentManagementError(
+            f"{agent_id} is a shipped system agent. Manage it with system_overrides_get, "
+            "system_overrides_update, system_overrides_reset, system_disable, or system_enable."
+        )
     async with deps.session_factory() as session:
         row = await get_agent(session, agent_id)
     if row is None:
@@ -1621,26 +2181,44 @@ async def _settings_updates(
 
     async with deps.session_factory() as session:
         workflow_ids = {
-            workflow.workflow_id
-            for workflow in await list_workflows(session, owner_email=actor_email)
+            workflow.workflow_id for workflow in await available_workflows(session, actor_email)
         }
         skill_ids = {
             skill.skill_id for skill in await list_skills(session, owner_email=actor_email)
         }
-        executor_ids = {
-            executor.executor_id
-            for executor in await list_executors(
-                session,
-                owner_email=actor_email,
-                include_shared=True,
-                defer_observed_tools=True,
-            )
-        }
+        executors = await list_executors(
+            session,
+            owner_email=actor_email,
+            include_shared=True,
+            defer_observed_tools=True,
+        )
+        executor_ids = {executor.executor_id for executor in executors}
         providers = await list_llm_providers(session)
         provider_ids = {provider.provider_id for provider in providers}
         provider_models = {
             provider.provider_id: _configured_provider_models(provider) for provider in providers
         }
+
+    if settings.get("executor_id") is not None and settings.get("executor_selector") is not None:
+        raise AgentManagementError("Set either executor_id or executor_selector, not both")
+    selector = settings.get("executor_selector")
+    if selector is not None:
+        if (
+            not isinstance(selector, dict)
+            or not selector
+            or any(
+                not isinstance(key, str)
+                or not key.strip()
+                or not isinstance(value, str)
+                or not value.strip()
+                for key, value in selector.items()
+            )
+        ):
+            raise AgentManagementError(
+                "executor_selector must be a non-empty object of non-empty string labels"
+            )
+        if not any(labels_match(executor.labels, selector) for executor in executors):
+            raise AgentManagementError("executor_selector does not match an available executor")
 
     tools = dict(row.tools) if isinstance(row.tools, dict) else {}
     skills = dict(row.skills) if isinstance(row.skills, dict) else {}
@@ -1746,6 +2324,8 @@ def _settings_field_names() -> set[str]:
         "available_workflow_ids",
         "default_workflow_id",
         "workflow_selection_mode",
+        "executor_id",
+        "executor_selector",
         "provider_id",
         "model",
         "temperature",
@@ -1775,7 +2355,7 @@ def _apply_execution_setting(
     elif field == "step_agent_overrides":
         execution[field] = _object(value, field)
     elif field == "executor_id":
-        execution[field] = _nullable_enum(value, field, valid=executor_ids)
+        execution[field] = None if value is None else _enum(value, field, valid=executor_ids)
         if execution[field]:
             execution.pop("executor_selector", None)
     elif field == "executor_selector":
@@ -2122,10 +2702,12 @@ async def _available_knowledgebase_options(
     deps: AgentManagementDependencies, actor_email: str
 ) -> list[dict[str, Any]]:
     async with deps.session_factory() as session:
-        rows = await list_knowledgebases(session, owner_email=actor_email)
-    rows = [row for row in rows if row.status == "active"]
-    if deps.assignable_knowledgebase_ids is not None:
-        rows = [row for row in rows if row.knowledgebase_id in deps.assignable_knowledgebase_ids]
+        rows = await assignable_knowledgebases(
+            session,
+            actor_email=actor_email,
+            caller_agent_id=deps.caller_agent_id,
+            allowed_ids=deps.assignable_knowledgebase_ids,
+        )
     return [{"id": row.knowledgebase_id, "name": row.name, "status": row.status} for row in rows]
 
 
@@ -2304,6 +2886,7 @@ async def _audit(
         "replacement_profile_id": arguments.get("replacement_profile_id"),
         "migrated_references": arguments.get("migrated_references"),
         "grant_id": arguments.get("grant_id"),
+        "credential_id": arguments.get("credential_id"),
         "grantee_email": arguments.get("grantee_email"),
     }
     async with deps.session_factory() as session:

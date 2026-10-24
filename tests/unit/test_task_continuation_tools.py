@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from sqlalchemy import select
 
 from cognis.models.tool import ExecutorHandle
+from cognis.store.deliverable_storage import DeliverablePayloadIntegrityError
 from cognis.store.models import Agent, AuditLog
 from cognis.store.queries import (
     create_conversation,
@@ -14,6 +17,29 @@ from cognis.store.queries import (
 )
 from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
 from cognis.tools.registry import ToolExecutionContext
+
+
+@pytest.mark.asyncio
+async def test_reader_distinguishes_missing_store_and_integrity(task_continuation_db) -> None:
+    context = _context("owner@example.com", scope_task_id="task-owner")
+    handlers = build_task_continuation_tool_handlers(task_continuation_db)
+    assert await handlers["read_task_deliverable"]({"deliverable_id": "dlv_owner"}, context) == {
+        "ok": False,
+        "error": "artifact_store_unavailable",
+    }
+    store = task_continuation_db.artifact_store
+    handlers = build_task_continuation_tool_handlers(task_continuation_db, artifact_store=store)
+    original_load = store.async_load
+    store.async_load = AsyncMock(side_effect=DeliverablePayloadIntegrityError("corrupt bytes"))
+    try:
+        assert await handlers["read_task_deliverable"](
+            {"deliverable_id": "dlv_owner"}, context
+        ) == {"ok": False, "error": "deliverable_integrity_error"}
+        store.async_load = AsyncMock(side_effect=ValueError("unexpected failure"))
+        with pytest.raises(ValueError, match="unexpected failure"):
+            await handlers["read_task_deliverable"]({"deliverable_id": "dlv_owner"}, context)
+    finally:
+        store.async_load = original_load
 
 
 def _context(

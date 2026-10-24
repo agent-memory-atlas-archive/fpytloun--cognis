@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import importlib.util
 import io
+import mimetypes
 import multiprocessing
 import os
 import pickle
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+from cognis.core.attachment_compat import normalize_mime_type
 
 
 @dataclass(slots=True)
@@ -33,6 +36,7 @@ class ExtractedDocument:
 
 
 _TEXT_MIME_PREFIXES = ("text/",)
+IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 _TEXT_MIME_TYPES = {
     "application/json",
     "application/xml",
@@ -45,6 +49,7 @@ SUPPORTED_MIME_TYPES = tuple(
     sorted(
         {
             *_TEXT_MIME_TYPES,
+            *IMAGE_MIME_TYPES,
             "application/pdf",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "text/plain",
@@ -67,6 +72,11 @@ SUPPORTED_EXTENSIONS = (
     ".xml",
     ".yaml",
     ".yml",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
 )
 
 
@@ -82,11 +92,20 @@ def available_supported_types() -> tuple[list[str], list[str]]:
     return mime_types, extensions
 
 
+def image_mime_type(*, filename: str, mime_type: str) -> str | None:
+    """Resolve supported image MIME metadata consistently for admission and indexing."""
+    normalized = normalize_mime_type(mime_type)
+    if normalized in {None, "application/octet-stream"}:
+        normalized = mimetypes.guess_type(filename)[0]
+    return normalized if normalized in IMAGE_MIME_TYPES else None
+
+
 def supports_artifact_type(*, filename: str, mime_type: str) -> bool:
     mime_types, extensions = available_supported_types()
     lower_name = filename.lower()
     return (
-        lower_name.endswith(tuple(extensions))
+        image_mime_type(filename=filename, mime_type=mime_type) is not None
+        or lower_name.endswith(tuple(extensions))
         or mime_type.startswith(_TEXT_MIME_PREFIXES)
         or mime_type in mime_types
     )

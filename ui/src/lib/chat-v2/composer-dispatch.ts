@@ -1,6 +1,7 @@
 import { chatV2Api } from '$lib/chat-v2/api';
 import type { ChatMode, CommandV2Response, SendMessageV2Response } from '$lib/chat-v2/types';
 import type { ChatV2Outbox } from '$lib/chat-v2/outbox';
+import { sendOutboxEntry } from '$lib/chat-v2/outbox-send';
 import {
   isSystemSlashCommand,
   normalizeSlashCommandInput,
@@ -87,31 +88,16 @@ export async function dispatchChatComposerMessage(
   const content = normalized.content;
   const chatMode = normalized.chatMode;
   const timestamp = now();
-  let stored = false;
   if (dependencies.outbox) {
-    try {
-      const existing = await dependencies.outbox.get(clientTxnId);
-      if (!existing) {
-        await dependencies.outbox.put({
-          client_txn_id: clientTxnId,
-          client_message_id: clientMessageId,
-          conversation_id: input.conversationId,
-          content,
-          attachments,
-          chat_mode: chatMode,
-          status: 'pending',
-          created_at: timestamp,
-          updated_at: timestamp
-        });
-      }
-      stored = true;
-      await dependencies.outbox.update(clientTxnId, { status: 'sending', updated_at: now() });
-    } catch {
-      stored = false;
-    }
+    const existing = await dependencies.outbox.get(clientTxnId);
+    if (!existing) await dependencies.outbox.put({
+      client_txn_id: clientTxnId, client_message_id: clientMessageId,
+      conversation_id: input.conversationId, content, attachments, chat_mode: chatMode,
+      status: 'pending', created_at: timestamp, updated_at: timestamp,
+    });
+    return sendOutboxEntry(dependencies.outbox, (await dependencies.outbox.get(clientTxnId))!,
+      dependencies.sendMessage);
   }
-
-  try {
     const sendMessage = dependencies.sendMessage ?? ((...args) => chatV2Api.sendMessage(...args));
     const response = await sendMessage(
       input.conversationId,
@@ -123,19 +109,5 @@ export async function dispatchChatComposerMessage(
         chat_mode: chatMode
       }
     );
-    if (stored) {
-      await dependencies.outbox?.update(clientTxnId, { status: 'acked', updated_at: now() }).catch(() => undefined);
-      await dependencies.outbox?.delete(clientTxnId).catch(() => undefined);
-    }
     return { kind: 'message', response, clientTxnId, clientMessageId };
-  } catch (error) {
-    if (stored) {
-      await dependencies.outbox?.update(clientTxnId, {
-        status: 'failed',
-        updated_at: now(),
-        last_error: error instanceof Error ? error.message : String(error)
-      }).catch(() => undefined);
-    }
-    throw error;
-  }
 }

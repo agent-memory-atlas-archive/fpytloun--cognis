@@ -28,8 +28,11 @@ vi.mock('$lib/ws/client', () => ({
     subscribe: vi.fn(() => () => undefined),
     acquireChatV2: vi.fn(),
     updateChatV2Cursor: vi.fn(),
-    releaseChatV2: vi.fn()
-  }
+    releaseChatV2: vi.fn(),
+    consumeCatchUp: vi.fn(() => null),
+    reconnectNow: vi.fn()
+  },
+  wsState: { subscribe: (run: (value: unknown) => void) => { run({ status: 'connected', attempts: 0, lastError: null }); return () => undefined; } }
 }));
 
 vi.mock('$lib/api/client', () => ({
@@ -220,14 +223,29 @@ describe('TaskControlChat', () => {
     expect(composer).toHaveValue('Keep this draft');
   });
 
-  it('recovers a snapshot when post-admission sync loses the connection', async () => {
+  it('keeps a failed post-admission cursor sync unreconciled until explicit snapshot recovery', async () => {
     api.sync.mockRejectedValueOnce(new Error('WebSocket disconnected'));
     render(TaskControlChat, { chat: chat('task-a') });
+    await waitFor(() => expect(document.querySelector('[data-cursor="cursor:conv-task-a:1"]'))
+      .toHaveAttribute('data-freshness', 'current'));
     const composer = screen.getByTestId('task-control-composer');
     await fireEvent.input(composer, { target: { value: 'Reconnect safely' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
 
+    await waitFor(() => expect(api.sync).toHaveBeenCalledOnce());
+    expect(api.sync).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'conversation:conv-task-a' }),
+      'cursor:conv-task-a:1', expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent('WebSocket disconnected');
+    expect(document.querySelector('[data-cursor="cursor:conv-task-a:1"]'))
+      .toHaveAttribute('data-freshness', 'reconciling');
+    expect(api.snapshot).toHaveBeenCalledOnce();
+    await fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     await waitFor(() => expect(api.snapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(document.querySelector('[data-cursor="cursor:conv-task-a:1"]'))
+      .toHaveAttribute('data-freshness', 'current'));
+    expect(screen.queryByRole('alert')).toBeNull();
     await waitFor(() => expect(composer).toHaveValue(''));
   });
 

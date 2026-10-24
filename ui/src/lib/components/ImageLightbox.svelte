@@ -5,7 +5,8 @@
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import ChevronLeft from 'lucide-svelte/icons/chevron-left';
   import ChevronRight from 'lucide-svelte/icons/chevron-right';
-  import Download from 'lucide-svelte/icons/download';
+  import AttachmentSaveButton from './AttachmentSaveButton.svelte';
+  import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
   import X from 'lucide-svelte/icons/x';
 
   /**
@@ -13,8 +14,7 @@
    *
    * - Click the backdrop or the close button to dismiss.
    * - Press Escape to dismiss.
-   * - The download button triggers a real save (uses an ``<a download>``
-   *   so the user gets the actual filename, not a hashed artifact id).
+    * - The shared file-save control keeps downloads inside the app.
    * - Locks the body scroll while open so touchmove on the backdrop on
    *   iOS Safari doesn't rubber-band the page behind the lightbox.
    *   Without the lock the user can drag the page underneath, and the
@@ -28,6 +28,7 @@
     src: string;
     alt?: string;
     filename?: string | null;
+    artifact_id?: string;
   };
 
   let { src, alt = 'Image', filename = null, images = null, index = 0, onIndexChange = undefined, onClose } = $props<{
@@ -63,6 +64,7 @@
   const items = $derived.by(() => (images && images.length > 0 ? images : [{ src, alt, filename }]));
   const active = $derived(items[Math.min(currentIndex, items.length - 1)] ?? { src, alt, filename });
   const canNavigate = $derived(items.length > 1);
+  const favoriteId = $derived('artifact_id' in active ? active.artifact_id : null);
 
   $effect(() => {
     if (index >= 0 && index < items.length && index !== currentIndex) {
@@ -247,7 +249,7 @@
   aria-modal="true"
   aria-label={active.filename ?? active.alt ?? 'Image'}
   tabindex="-1"
-  class="app-viewport-overlay app-safe-fullscreen z-[95] overflow-hidden overscroll-contain touch-none bg-slate-950/95"
+  class="app-viewport-overlay app-safe-fullscreen z-[95] overflow-hidden overscroll-contain touch-none bg-scrim/95"
 >
   <!--
     Safe top toolbar. It is part of the fullscreen shell layout instead of
@@ -255,30 +257,27 @@
     and the Cognis mobile shell cannot push the close control out of view.
   -->
   <div
-    class="app-safe-fullscreen__toolbar flex items-center justify-between gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/90 px-3 py-2.5 shadow-lg backdrop-blur sm:px-4 sm:py-3"
+    class="app-safe-fullscreen__toolbar flex items-center justify-between gap-2 rounded-2xl border border-separator bg-elevated/90 px-3 py-2.5 shadow-lg backdrop-blur sm:px-4 sm:py-3"
     onclick={(event) => event.stopPropagation()}
   >
-    <p class="min-w-0 flex-1 truncate text-sm text-slate-200">
-      {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-slate-500">{currentIndex + 1}/{items.length}</span>{/if}
+    <p class="min-w-0 flex-1 truncate text-sm text-foreground">
+      {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-quiet">{currentIndex + 1}/{items.length}</span>{/if}
     </p>
     <div class="flex shrink-0 items-center gap-2">
-      <a
-        aria-label="Download"
-        title="Download"
-        href={active.src}
-        download={active.filename ?? ''}
-        target="_blank"
-        rel="noopener noreferrer"
-        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-800/90 text-slate-100 transition hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
-      >
-        <Download class="h-5 w-5" />
-      </a>
+      {#if favoriteId && !favoriteId.startsWith('local:')}<DocumentFavoriteButton kind="artifact" id={favoriteId} />{/if}
+      {#key active.src}
+      <AttachmentSaveButton
+        filename={active.filename ?? 'image'}
+        resolveUrl={() => Promise.resolve(active.src)}
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-raised text-foreground transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+      />
+      {/key}
       <button
         aria-label="Close image viewer"
         title="Close"
         type="button"
         onclick={onClose}
-        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-100 text-slate-950 shadow-lg transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-accent text-on-accent shadow-lg transition hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       >
         <X class="h-5 w-5" />
       </button>
@@ -291,7 +290,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
-    class="app-safe-fullscreen__content flex items-center justify-center overflow-hidden rounded-[1.75rem] bg-slate-950/30"
+    class="app-safe-fullscreen__content flex items-center justify-center overflow-hidden rounded-[1.75rem] bg-scrim/30"
     onclick={handleStageClick}
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}
@@ -313,7 +312,7 @@
     <button
       type="button"
       aria-label="Previous image"
-      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/80 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:inline-flex"
+      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-elevated/90 text-foreground shadow-lg backdrop-blur transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:inline-flex"
       style="left: var(--app-overlay-inner-left);"
       onclick={(event) => { event.stopPropagation(); navigate(-1); }}
     >
@@ -322,7 +321,7 @@
     <button
       type="button"
       aria-label="Next image"
-      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/80 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:inline-flex"
+      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-elevated/90 text-foreground shadow-lg backdrop-blur transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:inline-flex"
       style="right: var(--app-overlay-inner-right);"
       onclick={(event) => { event.stopPropagation(); navigate(1); }}
     >
@@ -333,7 +332,7 @@
   <div class="app-safe-fullscreen__toolbar flex justify-center sm:hidden" onclick={(event) => event.stopPropagation()}>
     <button
       type="button"
-      class="inline-flex min-h-11 items-center justify-center rounded-full border border-slate-700 bg-slate-900/95 px-6 text-sm font-medium text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+      class="inline-flex min-h-11 items-center justify-center rounded-full border border-control-border bg-elevated/95 px-6 text-sm font-medium text-foreground shadow-lg backdrop-blur transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       onclick={onClose}
     >
       Close image

@@ -1,5 +1,7 @@
 <script lang="ts">
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
+  import ActivityLabel from './ActivityLabel.svelte';
+  import { chatDisclosure } from '$lib/chat-v2/motion';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
@@ -64,32 +66,36 @@
   <button
     type="button"
     onclick={() => (expanded = !expanded)}
-    class={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-slate-500/5 focus:outline-none ${row.summary.accentClass}`}
+    class={`chat-state-handoff flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm hover:bg-surface-hover focus-visible:outline-accent ${row.summary.accentClass}`}
+    data-motion-state={row.summary.status}
     aria-expanded={expanded}
   >
     <ActivityGroupIcon
       icon={row.summary.icon}
-      class="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-70 {row.summary.status === 'running' ? 'animate-pulse' : ''}"
+      class="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-70"
     />
     <span class="min-w-0 flex-1 truncate font-medium">
-      {row.summary.label}
+      <ActivityLabel label={row.summary.label} active={row.summary.status === 'running'} />
     </span>
-    <span class="shrink-0 text-xs tabular-nums text-slate-500">
+    <span class="shrink-0 text-xs tabular-nums text-quiet">
       {row.summary.detailLabel}
     </span>
     {#if durationLabel}
-      <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
+      <span class="shrink-0 text-xs tabular-nums text-quiet">{durationLabel}</span>
     {/if}
     {#if statusLabel}
-      <span class="shrink-0 text-xs text-slate-500">{statusLabel}</span>
+      <span class="shrink-0 text-xs text-danger">{statusLabel}</span>
     {/if}
     <ChevronDown
-      class="h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform duration-150 ease-out {expanded ? 'rotate-180' : ''}"
+      class="chat-disclosure-chevron h-3.5 w-3.5 shrink-0 text-quiet {expanded ? 'rotate-180' : ''}"
     />
   </button>
 
   {#if expanded}
-    <div class="mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-slate-700/60 bg-slate-950/20 px-2 py-2">
+    <div transition:chatDisclosure
+      onoutrostart={(event) => { event.currentTarget.inert = true; }}
+      onintrostart={(event) => { event.currentTarget.inert = false; }}
+      class="mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-control-border bg-inset/20 px-2 py-2">
       {#each row.items as item (item.id)}
         {@const searchMatched = searchMatchedIds.has(item.id)}
         <ChatV2TimelineItemRenderer

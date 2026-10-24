@@ -20,6 +20,7 @@ class LLMStreamTerminal(TypedDict):
     done: NotRequired[bool]
     response_incomplete_details: NotRequired[ResponseIncompleteDetails]
     error: NotRequired[str | None]
+    response_error: NotRequired[dict[str, Any] | None]
     backend_metadata: NotRequired[dict[str, Any] | None]
 
 

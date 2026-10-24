@@ -32,7 +32,16 @@ def test_bundled_anthropic_model_catalog_includes_current_aliases() -> None:
     assert "claude-opus-5" in ids
     assert "claude-opus-5-5" in ids
     assert "claude-sonnet-5" in ids
+    assert "claude-haiku-5-5" in ids
     assert "claude-haiku-4-5" in ids
+    haiku_5_5 = next(entry for entry in entries if entry["model_id"] == "claude-haiku-5-5")
+    assert haiku_5_5["display_name"] == "Claude Haiku 5.5"
+    assert haiku_5_5["context_window"] == 1_000_000
+    assert haiku_5_5["max_output_tokens"] == 128_000
+    assert haiku_5_5["input_cost_per_mtok"] == 0.1
+    assert haiku_5_5["output_cost_per_mtok"] == 0.5
+    assert haiku_5_5["supports_vision"] is True
+    assert haiku_5_5["supports_pdf_input"] is True
     opus_5_5 = next(entry for entry in entries if entry["model_id"] == "claude-opus-5-5")
     assert opus_5_5["context_window"] == 1_000_000
     assert opus_5_5["max_input_tokens"] == 872_000

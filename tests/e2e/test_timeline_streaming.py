@@ -22,7 +22,9 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event as ThreadEvent
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -32,6 +34,7 @@ from tests.e2e.conftest import (
     GOLDEN_DIR,
     E2EStack,
     _assert_reset_recovery_snapshot,
+    _subscribe_chat_v2,
     capture_scoped_scope_events,
     capture_ws_events,
     clear_active_scenario,
@@ -75,6 +78,109 @@ SCENARIOS = [
 ]
 
 pytestmark = pytest.mark.e2e
+
+
+def test_independent_recipient_reads_user_after_append_before_sender_ack(
+    e2e_stack: E2EStack,
+) -> None:
+    """Real admission/append/WS path; sender response consumption is held.
+
+    This tests the backend conversation scope, not browser rendering or the
+    deterministic pre-append empty-read race.
+    """
+    import websockets.sync.client as wsc
+
+    stack = e2e_stack
+    inject_scenario(stack.mock_llm_url, "single-phase-stream")
+    created = stack.post(
+        "/api/v1/conversations",
+        json={"agent_id": E2E_AGENT_ID, "title": "Independent recipient append"},
+    )
+    assert created.status_code == 200, created.text
+    conversation_id = created.json()["conversation_id"]
+    client_message_id = uuid4().hex
+    text = f"Synthetic independent input {client_message_id}"
+    release_ack = ThreadEvent()
+    response_consumed = ThreadEvent()
+
+    def send_with_held_ack():
+        # A separate HTTP client models the sender. The recipient never sees
+        # this response or seeds its projection from sender-local data.
+        import httpx
+
+        response = httpx.put(
+            f"{stack.cognis_url}/api/v1/chat/v2/conversations/"
+            f"{conversation_id}/messages/{client_message_id}",
+            headers=stack.admin_headers(),
+            json={"client_message_id": client_message_id, "content": text, "attachments": []},
+            timeout=90,
+        )
+        assert release_ack.wait(90), "Recipient did not release held sender acknowledgement"
+        response_consumed.set()
+        return response
+
+    with (
+        wsc.connect(stack.ws_url, close_timeout=5, open_timeout=10) as sender,
+        wsc.connect(stack.ws_url, close_timeout=5, open_timeout=10) as recipient,
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        for ws in (sender, recipient):
+            ws.send(json.dumps({"type": "auth", "token": stack.admin_token}))
+            assert json.loads(ws.recv(timeout=15))["type"] == "authenticated"
+        initial = _subscribe_chat_v2(recipient, stack, conversation_id)
+        _subscribe_chat_v2(sender, stack, conversation_id)
+        cursor = initial["cursor"]
+        items = {item["id"]: item for item in initial["timeline"]["items"]}
+        assert not any(
+            item.get("client_message_id") == client_message_id for item in items.values()
+        )
+        # Confirm recipient subscription before sending, without shared state.
+        while True:
+            event = json.loads(recipient.recv(timeout=15))
+            assert event["type"] != "error", event
+            if event["type"] == "chat_v2_frame":
+                break
+        future = pool.submit(send_with_held_ack)
+        try:
+            deadline = time.monotonic() + 90
+            found = []
+            post_append_seen = False
+            while not (found and post_append_seen):
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, "No post-append recipient recovery"
+                event = json.loads(recipient.recv(timeout=remaining))
+                assert event["type"] != "error", event
+                if event["type"] != "scope_invalidated":
+                    continue
+                post_append_seen |= event.get("reason") == "event_store_session_invalidated"
+                # Reads are driven exclusively by server invalidation, never a
+                # timer, sender ACK, or repeated forced snapshot.
+                response = stack.get(
+                    f"/api/v1/chat/v2/conversations/{conversation_id}/sync",
+                    params={"cursor": cursor},
+                )
+                assert response.status_code == 200, response.text
+                delta = response.json()
+                assert not delta["reset_required"], delta
+                for op in delta["ops"]:
+                    if op["op"] == "upsert_item":
+                        items[op["item"]["id"]] = op["item"]
+                cursor = delta["cursor_after"]
+                found = [
+                    item
+                    for item in items.values()
+                    if item.get("client_message_id") == client_message_id
+                ]
+            assert not response_consumed.is_set()
+            assert len(found) == 1
+            assert found[0]["role"] == "user"
+            assert found[0]["content"] == text
+            assert found[0]["attachments"] == []
+            assert found[0]["source_refs"], "User must be canonically sourced, not optimistic"
+        finally:
+            release_ack.set()
+        acknowledgement = future.result(timeout=90)
+        assert acknowledgement.status_code == 202, acknowledgement.text
 
 
 @pytest.fixture(autouse=True)

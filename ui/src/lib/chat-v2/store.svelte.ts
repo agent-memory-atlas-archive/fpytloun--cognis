@@ -37,11 +37,26 @@ export interface ChatV2RefreshWatermark {
   cursor: string | null;
   runtimeRevision: number | null;
   mutationRevision: number;
+  canonicalRevision: number;
 }
+
+export type PrepareTimelineMembership = (
+  before: readonly TimelineItem[],
+  after: readonly TimelineItem[],
+) => (() => void) | void;
 
 export class ChatV2Store {
   private _state: ChatV2ClientState = $state.raw(emptyChatV2State());
   private mutationRevision = 0;
+  private canonicalRevision = 0;
+  private membershipViews = new Set<PrepareTimelineMembership>();
+
+  /** Views prepare against the old DOM and commit their own window after one
+   * shared projection. Unsubscribing also fences a prepared commit. */
+  observeMembership(prepare: PrepareTimelineMembership): () => void {
+    this.membershipViews.add(prepare);
+    return () => { this.membershipViews.delete(prepare); };
+  }
 
   readonly visibleItems: TimelineItem[] = $derived(visibleTimelineItems(this._state));
   readonly visibleQueue = $derived(visibleQueueMessages(this._state));
@@ -55,7 +70,8 @@ export class ChatV2Store {
     return {
       cursor: this._state.cursor,
       runtimeRevision: this._state.runtime?.runtime_revision ?? null,
-      mutationRevision: this.mutationRevision
+      mutationRevision: this.mutationRevision,
+      canonicalRevision: this.canonicalRevision,
     };
   }
 
@@ -80,14 +96,22 @@ export class ChatV2Store {
         snapshot,
         this._state,
         { adoptUnscopedLocalAdmissions: true },
-      ));
+      ), true, true);
       return true;
     }
     return this.replaceFromSnapshotIfUnchanged(snapshot, watermark);
   }
 
   replaceFromSnapshot(snapshot: ChatSnapshot): void {
-    this.replaceState(applySnapshot(snapshot, this._state));
+    this.replaceState(applySnapshot(snapshot, this._state), true, true);
+  }
+
+  /** Runtime/local admissions do not establish a newer canonical base.
+   * applySnapshot preserves those overlays using their own acceptance rules. */
+  replaceFromSnapshotForRecovery(snapshot: ChatSnapshot, watermark: ChatV2RefreshWatermark): boolean {
+    if (this.canonicalRevision !== watermark.canonicalRevision) return false;
+    this.replaceFromSnapshot(snapshot);
+    return true;
   }
 
   addOptimisticUser(input: {
@@ -120,13 +144,15 @@ export class ChatV2Store {
 
   applySync(response: ChatSyncResponse): ChatV2SyncResult {
     const result = applySyncResponse(this._state, response);
-    this.replaceState(result.state);
+    this.replaceState(result.state, this.hasCanonicalChange(result.state)
+      || result.outcome === 'reset_required' || result.outcome === 'cursor_mismatch');
     return result;
   }
 
   applyRealtime(frame: ChatRealtimeFrame): ChatV2SyncResult {
     const result = applyRealtimeFrame(this._state, frame);
-    this.replaceState(result.state);
+    this.replaceState(result.state, this.hasCanonicalChange(result.state)
+      || result.outcome === 'reset_required' || result.outcome === 'cursor_mismatch');
     return result;
   }
 
@@ -137,11 +163,13 @@ export class ChatV2Store {
   }
 
   applySend(response: SendMessageV2Response): void {
-    this.replaceState(applySendResponse(this._state, response));
+    const state = applySendResponse(this._state, response);
+    this.replaceState(state, this.hasCanonicalChange(state));
   }
 
   applyCancel(response: CancelTurnV2Response): void {
-    this.replaceState(applyCancelResponse(this._state, response));
+    const state = applyCancelResponse(this._state, response);
+    this.replaceState(state, this.hasCanonicalChange(state));
   }
 
   applyQueueMutation(response: QueueMutationResponse): void {
@@ -169,7 +197,7 @@ export class ChatV2Store {
   }
 
   reset(): void {
-    this.replaceState(emptyChatV2State());
+    this.replaceState(emptyChatV2State(), true, true);
   }
 
   /**
@@ -195,7 +223,8 @@ export class ChatV2Store {
     return {
       ...state,
       localItems,
-      runtime: { ...runtime, has_active_turn: false, active_turn: null, volatile_items: [], cycle_states: [] },
+      // Cache-only neutralization is not an authoritative terminal transition.
+      runtime: { ...runtime, authority: null, has_active_turn: false, active_turn: null, volatile_items: [], cycle_states: [] },
       cycleStates: state.cycleStates.filter((cycleState) => cycleState.turn_id !== activeTurnId)
     };
   }
@@ -206,11 +235,18 @@ export class ChatV2Store {
     // the cache. $state.snapshot is proxy-safe whether the input is plain data
     // or a reactive proxy from a caller.
     const restored = $state.snapshot(state) as ChatV2ClientState;
+    const runtime = restored.runtime;
+    // Repair persisted entries written before cache neutralization cleared authority.
+    // Real terminal authority must survive restore to reject delayed active frames.
+    const cachedActiveAuthority = runtime?.has_active_turn === false
+      && runtime.authority?.protocol === 'runtime_authority_v1'
+      && runtime.authority.lifecycle === 'active';
     this.replaceState({
       ...restored,
+      runtime: cachedActiveAuthority ? { ...runtime, authority: null } : runtime,
       cycleStates: restored.cycleStates ?? [],
       admissionPlacements: restored.admissionPlacements ?? {}
-    });
+    }, true, true);
   }
 
   /**
@@ -228,9 +264,31 @@ export class ChatV2Store {
     });
   }
 
-  private replaceState(state: ChatV2ClientState): void {
+  private hasCanonicalChange(state: ChatV2ClientState): boolean {
+    return state.cursor !== this._state.cursor
+      || state.timelineItems !== this._state.timelineItems
+      || state.state !== this._state.state
+      || state.projectionVersion !== this._state.projectionVersion;
+  }
+
+  private replaceState(state: ChatV2ClientState, canonical = false, replacesLineage = false): void {
     if (state === this._state) return;
+    const commits: Array<{ view: PrepareTimelineMembership; commit: () => void }> = [];
+    if (this.membershipViews.size) {
+      const before = visibleTimelineItems(this._state);
+      const after = visibleTimelineItems(state);
+      if (replacesLineage || before.length !== after.length || before.some((item, i) => item.id !== after[i]?.id)) {
+        for (const view of this.membershipViews) {
+          const commit = view(before, after);
+          if (commit) commits.push({ view, commit });
+        }
+      }
+    }
     this._state = state;
     this.mutationRevision += 1;
+    if (canonical) this.canonicalRevision += 1;
+    for (const { view, commit } of commits) {
+      if (this.membershipViews.has(view)) commit();
+    }
   }
 }

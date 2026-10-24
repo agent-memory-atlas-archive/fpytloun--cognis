@@ -119,7 +119,7 @@ def test_codex_models_expose_apply_patch_without_exact_edit_tools() -> None:
     assert visible_tools == [patch]
 
 
-def test_search_description_lists_only_authorized_hidden_deferred_families() -> None:
+def test_search_description_is_independent_of_hidden_inventory() -> None:
     memory_delete = _tool("memory_delete", category="memory")
     memory_list = _tool("memory_list", category="memory")
     artifact_search = _tool("artifact_search", category="artifact")
@@ -149,16 +149,13 @@ def test_search_description_lists_only_authorized_hidden_deferred_families() -> 
         if tool.get("function", {}).get("name") == "search_tools"
     )
     description = search_schema["description"]
-    assert description.endswith(
-        "Use search_tools to find other authorized operations in these deferred "
-        "capabilities: artifacts, memory, Todoist."
-    )
+    assert description == SEARCH_TOOLS_TOOL.description
     assert "web research" not in description
     assert "skills" not in description
     assert forbidden_skill_list.name not in {tool.name for tool in inventory}
 
 
-def test_deferred_hint_preserves_families_under_integration_limit() -> None:
+def test_large_hidden_inventory_does_not_edit_the_search_schema() -> None:
     inventory = [
         _tool("skill_list", category="skill"),
         _tool("web_map", source_type="executor", category="web"),
@@ -180,16 +177,7 @@ def test_deferred_hint_preserves_families_under_integration_limit() -> None:
         for tool in result.tools
         if tool.get("function", {}).get("name") == "search_tools"
     )
-    names = (
-        search_schema["description"]
-        .split("capabilities: ", maxsplit=1)[1]
-        .removesuffix(".")
-        .split(", ")
-    )
-    assert names == sorted(names, key=str.casefold)
-    assert len(names) == 20
-    assert {"skills", "web research"} <= set(names)
-    assert "Skills" not in names
+    assert search_schema == _search_schema()["function"]
 
 
 def test_promoted_only_family_is_not_advertised_as_deferred() -> None:
@@ -372,7 +360,7 @@ def test_prepare_tool_exposure_controller_search_never_uses_anthropic_deferred_l
     assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
 
 
-def test_prepare_tool_exposure_exposes_controller_dispatch_kernel_only_with_hidden_tools() -> None:
+def test_controller_dispatch_kernel_is_stable_before_and_after_hidden_tools_appear() -> None:
     read = _tool("read", source_type="executor", category="filesystem")
     hidden = _mcp("gmail", "search_messages")
     controller_schemas = [
@@ -401,9 +389,7 @@ def test_prepare_tool_exposure_exposes_controller_dispatch_kernel_only_with_hidd
     assert {
         tool["function"]["name"] for tool in with_hidden.tools if tool["type"] == "function"
     } >= {"search_tools", "describe_tool", "call_tool"}
-    assert {
-        tool["function"]["name"] for tool in without_hidden.tools if tool["type"] == "function"
-    } == {"read"}
+    assert without_hidden.tools == with_hidden.tools
 
 
 def test_prepare_tool_exposure_native_anthropic_omits_controller_dispatch_kernel() -> None:
@@ -524,7 +510,7 @@ def test_direct_schema_size_guard_warns_without_blocking_exposure(
     validate_direct_schema_sizes([compact, waived])
 
 
-def test_search_description_lists_authorized_task_management_only_in_fallback() -> None:
+def test_search_description_stays_canonical_in_controller_fallback() -> None:
     task_tool = _tool("create_task")
     result = prepare_tool_exposure(
         inventory_tools=[_tool("read"), task_tool],
@@ -539,7 +525,7 @@ def test_search_description_lists_authorized_task_management_only_in_fallback() 
         for tool in result.tools
         if tool.get("function", {}).get("name") == "search_tools"
     )
-    assert "task management" in search["description"]
+    assert search["description"] == SEARCH_TOOLS_TOOL.description
 
     native = prepare_tool_exposure(
         inventory_tools=[_tool("read"), task_tool],

@@ -66,6 +66,207 @@ async def _bootstrap_db(tmp_path: object) -> tuple[object, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin", "creator", "expected"),
+    [
+        ("owner_configured", None, "owner_configured"),
+        ("owner_configured", "agent-1", "agent_composed"),
+        (None, None, None),
+    ],
+)
+async def test_task_creation_origin_round_trip(tmp_path, origin, creator, expected):
+    engine, factory = await _bootstrap_db(tmp_path)
+    queue = TaskQueue(
+        session_factory=factory,
+        workflow_engine=AsyncMock(),
+        workflow_registry=WorkflowRegistry(factory),
+        event_bus=EventBus(),
+    )
+    try:
+        task = await queue.create_draft(
+            created_by="user@test.com",
+            agent_id="agent-1",
+            title="Origin",
+            creation_origin=origin,
+            created_by_agent_id=creator,
+        )
+        assert task.creation_origin == expected
+        async with factory() as db:
+            row = await get_task(db, task.task_id)
+            assert row.creation_origin == expected
+            assert _row_to_task_model(row).creation_origin == expected
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["deleted", "agent_edit", "owner_edit", "matched"])
+async def test_agent_workflow_edit_revokes_schedule_and_detached_task_origin(tmp_path, scenario):
+    from cognis.core.workflow_management import create_user_workflow, update_user_workflow
+    from cognis.core.workflow_step_scope import WorkflowStepScope, refresh_scope_origin
+    from cognis.models.workflow import Workflow, WorkflowState, pin_effective_workflow
+    from cognis.store.queries import create_schedule, delete_schedule, get_schedule
+
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        workflow = await create_user_workflow(
+            session_factory=factory,
+            owner_email="user@test.com",
+            payload={
+                "name": "Inspect",
+                "steps": [
+                    {
+                        "name": "inspect",
+                        "type": "tool_call",
+                        "tool_call": {"tool": "bash", "args": {"command": "true"}},
+                    }
+                ],
+            },
+        )
+        async with factory() as db:
+            await create_schedule(
+                db,
+                schedule_id="sched_origin",
+                task_template={"title": "Inspect"},
+                name="Owner schedule",
+                agent_id="agent-1",
+                schedule_type="interval",
+                interval_seconds=60,
+                created_by="user@test.com",
+                workflow_id=workflow.workflow_id,
+                creation_origin="owner_configured",
+            )
+            await db.commit()
+        state = pin_effective_workflow(
+            WorkflowState(), Workflow.model_validate(workflow.definition)
+        )
+        if scenario != "matched":
+            await update_user_workflow(
+                session_factory=factory,
+                owner_email="user@test.com",
+                workflow_id=workflow.workflow_id,
+                agent_composed=scenario != "owner_edit",
+                payload={
+                    "steps": [
+                        {
+                            "name": "inspect",
+                            "type": "tool_call",
+                            "tool_call": {"tool": "bash", "args": {"command": "pwd"}},
+                        }
+                    ]
+                },
+            )
+        async with factory() as db:
+            schedule = await get_schedule(db, "sched_origin")
+            if scenario in {"deleted", "agent_edit"}:
+                assert schedule.creation_origin == "agent_composed"
+            row = await create_task(
+                db,
+                task_id="task_stale_origin",
+                title="Scheduled",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                workflow_id=workflow.workflow_id,
+                source_type="scheduler",
+                source_ref="sched_origin",
+                creation_origin="owner_configured",
+            )
+            task = _row_to_task_model(row)
+            if scenario == "deleted":
+                # The one-shot scheduler removes the source after creating its
+                # task from the stale, detached owner-configured snapshot.
+                await delete_schedule(db, "sched_origin")
+            await db.commit()
+        if scenario == "deleted":
+            current = await WorkflowRegistry(factory).get(workflow.workflow_id)
+            state = pin_effective_workflow(WorkflowState(), current)
+        task.workflow_state = state
+        scope_task, reason = await refresh_scope_origin(task, factory)
+        expected = "owner_configured" if scenario == "matched" else "agent_composed"
+        assert scope_task.creation_origin == expected
+        assert reason == (
+            "schedule_missing"
+            if scenario == "deleted"
+            else None
+            if scenario == "matched"
+            else "schedule_digest_mismatch"
+        )
+        pinned = Workflow.model_validate(state.effective_workflow_definition)
+        scope = WorkflowStepScope.build(
+            task=scope_task,
+            workflow=pinned,
+            state=state,
+            step=pinned.steps[0],
+            session_id="sess_scope",
+            step_run_id="run_scope",
+            logical_call_id="call_scope",
+            rendered_args=pinned.steps[0].tool_call.args,
+        )
+        declaration = scope.declaration(
+            session_id="sess_scope",
+            call_id="call_scope",
+            tool="bash",
+            args=pinned.steps[0].tool_call.args,
+            executor_id="maitrea_riker",
+        )
+        assert declaration.authorized_by == expected
+        assert "scope_origin_reason" not in declaration.model_dump()
+        if scenario == "deleted":
+            from cognis.core.tool_router import ToolRouter
+            from cognis.models.agent import AgentDefinition
+            from cognis.models.session import SessionModel
+            from cognis.models.tool import (
+                EvaluationResult,
+                NativeToolDefinition,
+                ToolCall,
+                ToolSource,
+            )
+            from cognis.tools.registry import RegisteredTool, ToolRegistry
+
+            guardrails = AsyncMock()
+            guardrails.evaluate.return_value = EvaluationResult(
+                decision="escalate",
+                call_id="eval_scope",
+                reasoning="Agent-composed workflow scope does not grant permission",
+            )
+            registry = ToolRegistry()
+            registry.register(
+                RegisteredTool(
+                    definition=NativeToolDefinition(
+                        name="bash",
+                        description="Execute",
+                        parameters={"type": "object"},
+                        source=ToolSource(type="builtin"),
+                    )
+                )
+            )
+            executor = AsyncMock()
+            result = await ToolRouter(guardrails).execute(
+                ToolCall(
+                    call_id="call_scope", name="bash", arguments=pinned.steps[0].tool_call.args
+                ),
+                agent=AgentDefinition(agent_id="agent-1", name="Test", owner_email="user@test.com"),
+                session=SessionModel(
+                    session_id="sess_scope",
+                    conversation_id="conv_scope",
+                    agent_id="agent-1",
+                    user_email="user@test.com",
+                ),
+                registry=registry,
+                executor=executor,
+                workflow_step_scope=scope,
+                workflow_executor_id="maitrea_riker",
+            )
+            assert (
+                guardrails.declare_workflow_step.call_args.args[0].authorized_by == "agent_composed"
+            )
+            assert result.metadata["evaluation"]["decision"] == "escalate"
+            executor.tool_execute.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_queue_remote_wakeup_and_idle_attempt_reduction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

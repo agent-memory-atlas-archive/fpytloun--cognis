@@ -12,24 +12,24 @@
   <Card class="p-5">
     <div class="flex items-start justify-between gap-3">
       <div>
-        <h3 class="text-lg font-semibold text-white">{guide.title}</h3>
-        <p class="mt-1 text-sm text-slate-400">{guide.service}</p>
+        <h3 class="text-lg font-semibold text-strong">{guide.title}</h3>
+        <p class="mt-1 text-sm text-muted">{guide.service}</p>
       </div>
       {#if docsUrl}
-        <a class="inline-flex items-center gap-2 text-sm text-sky-300 hover:text-sky-200" href={docsUrl} target="_blank" rel="noopener noreferrer">
+        <a class="inline-flex items-center gap-2 text-sm text-accent hover:text-accent-hover" href={docsUrl} target="_blank" rel="noopener noreferrer">
           <Link2 class="h-4 w-4" /> Docs
         </a>
       {/if}
     </div>
 
-    <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-      <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Manual setup</p>
-      <ol class="mt-3 space-y-2 text-sm text-slate-300">
+    <div class="mt-4 rounded-2xl border border-separator bg-canvas/60 p-4">
+      <p class="text-xs uppercase tracking-[0.24em] text-quiet">Manual setup</p>
+      <ol class="mt-3 space-y-2 text-sm text-secondary">
         {#each guide.steps as step, index}
-          <li class="flex gap-3"><span class="text-sky-300">{index + 1}.</span><span>{step}</span></li>
+          <li class="flex gap-3"><span class="text-accent">{index + 1}.</span><span>{step}</span></li>
         {/each}
       </ol>
-      <p class="mt-3 text-xs text-slate-500">
+      <p class="mt-3 text-xs text-quiet">
         {#if guide.publicUrlNeeded}
           This adapter needs a public webhook URL. Save the account first, then copy the generated webhook URL from Cognis.
         {:else}

@@ -4,9 +4,12 @@
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';
+  import WorkflowPlanPreview from '$lib/components/workflows/WorkflowPlanPreview.svelte';
   import { api, asApiError } from '$lib/api/client';
   import { formatAbsoluteTime } from '$lib/time';
+  import { auth } from '$lib/stores/auth';
   import type { Agent, Schedule, Workflow } from '$lib/types/api';
 
   let {
@@ -33,7 +36,11 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let refreshing = $state(false);
+  let mutating = $state(false);
   let refreshError = $state<string | null>(null);
+  // Hidden while the global connection banner applies; reload on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(error || refreshError), retry: () => load() });
+  const visibleRefreshError = $derived(net.hideErrors ? null : refreshError);
   let activeTab = $state<'description' | 'steps'>('description');
   let workflow = $state<Workflow | null>(null);
   let workflowLoading = $state(false);
@@ -59,6 +66,17 @@
       ? schedule.task_template.description
       : schedule?.description
   );
+
+  async function toggleEnabled(): Promise<void> {
+    if (!schedule || mutating || $auth.user?.role === 'viewer') return;
+    mutating = true;
+    try {
+      if (schedule.enabled) await api.schedules.disable(scheduleId);
+      else await api.schedules.enable(scheduleId);
+      await load();
+    } catch (caught) { refreshError = asApiError(caught).message; }
+    finally { mutating = false; }
+  }
 
   function activityStatus(detail: Schedule): string | null {
     if (detail.consecutive_errors > 0 || detail.last_run_status === 'failed') return 'failed';
@@ -170,15 +188,15 @@
   testId="dashboard-schedule-modal"
   {embedded}
 >
-  {#if !loading && (refreshing || refreshError)}
-    <div class={`shrink-0 border-b px-4 py-1.5 text-xs ${refreshError ? 'border-amber-500/20 bg-amber-500/5 text-amber-200' : 'border-slate-800 text-slate-500'}`}>
-      {refreshError ? `Could not refresh: ${refreshError}` : 'Refreshing…'}
+  {#if !loading && (refreshing || visibleRefreshError)}
+    <div class={`shrink-0 border-b px-4 py-1.5 text-xs ${visibleRefreshError ? 'border-warning-border bg-warning-subtle text-warning' : 'border-separator text-quiet'}`}>
+      {visibleRefreshError ? `Could not refresh: ${visibleRefreshError}` : 'Refreshing…'}
     </div>
   {/if}
-  {#if loading}
-    <p class="p-6 text-center text-sm text-slate-400">Loading…</p>
+  {#if loading || (error && net.hideErrors)}
+    <p class="p-6 text-center text-sm text-muted">Loading…</p>
   {:else if error}
-    <div class="m-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" role="alert">
+    <div class="m-4 rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" role="alert">
       <p>{error}</p>
       <Button class="mt-3" size="sm" variant="secondary" onclick={() => void load()}>Try again</Button>
     </div>
@@ -194,48 +212,53 @@
     <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6" data-testid={`dashboard-schedule-modal-panel-${activeTab}`}>
     {#if activeTab === 'description'}
       <div class="space-y-5">
+        {#if $auth.user && $auth.user.role !== 'viewer'}
+          <Button size="sm" variant="secondary" disabled={mutating} onclick={() => void toggleEnabled()}>
+            {schedule.enabled ? 'Pause schedule' : 'Enable schedule'}
+          </Button>
+        {/if}
         <div class="flex items-center gap-3">
           <AgentAvatar name={agent?.display_name ?? agent?.name ?? schedule.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-10 w-10" />
           <div class="min-w-0">
-            <p class="truncate font-medium text-white">{agent?.display_name ?? agent?.name ?? schedule.agent_id}</p>
-            <p class="text-xs text-slate-400">{schedule.human_schedule ?? schedule.schedule_type}</p>
+            <p class="truncate font-medium text-strong">{agent?.display_name ?? agent?.name ?? schedule.agent_id}</p>
+            <p class="text-xs text-muted">{schedule.human_schedule ?? schedule.schedule_type}</p>
           </div>
         </div>
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
-          <h3 class="font-medium text-white">{templateTitle}</h3>
-          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-300">{templateDescription ?? 'No task description was provided.'}</p>
+        <section class="rounded-2xl border border-separator bg-surface/60 p-4">
+          <h3 class="font-medium text-strong">{templateTitle}</h3>
+          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-secondary">{templateDescription ?? 'No task description was provided.'}</p>
         </section>
-        <dl class="grid gap-4 rounded-2xl border border-slate-800 p-4 text-xs sm:grid-cols-2">
-          <div><dt class="text-slate-500">Next run</dt><dd class="mt-1 text-slate-200">{schedule.next_fire_at ? formatAbsoluteTime(schedule.next_fire_at) : 'Not scheduled'}</dd></div>
-          <div><dt class="text-slate-500">Workflow</dt><dd class="mt-1 break-all text-slate-200">{schedule.workflow_id ?? 'Ad hoc'}</dd></div>
-          <div><dt class="text-slate-500">Project</dt><dd class="mt-1 break-all text-slate-200">{schedule.project_id ?? 'None'}</dd></div>
-          <div><dt class="text-slate-500">Skill</dt><dd class="mt-1 break-all text-slate-200">{schedule.skill_id ?? 'None'}</dd></div>
+        <dl class="grid gap-4 rounded-2xl border border-separator p-4 text-xs sm:grid-cols-2">
+          <div><dt class="text-quiet">Next run</dt><dd class="mt-1 text-foreground">{schedule.next_fire_at ? formatAbsoluteTime(schedule.next_fire_at) : 'Not scheduled'}</dd></div>
+          <div><dt class="text-quiet">Workflow</dt><dd class="mt-1 break-all text-foreground">{schedule.workflow_id ?? 'Ad hoc'}</dd></div>
+          <div><dt class="text-quiet">Project</dt><dd class="mt-1 break-all text-foreground">{schedule.project_id ?? 'None'}</dd></div>
+          <div><dt class="text-quiet">Skill</dt><dd class="mt-1 break-all text-foreground">{schedule.skill_id ?? 'None'}</dd></div>
         </dl>
       </div>
     {:else if !schedule.workflow_id}
-      <div class="rounded-2xl border border-dashed border-slate-700 p-8 text-center" data-testid="dashboard-schedule-ad-hoc">
-        <p class="font-medium text-slate-200">Ad-hoc task</p>
-        <p class="mt-1 text-sm text-slate-400">This schedule creates a task without a workflow.</p>
+      <div class="rounded-2xl border border-dashed border-control-border p-8 text-center" data-testid="dashboard-schedule-ad-hoc">
+        <p class="font-medium text-foreground">Ad-hoc task</p>
+        <p class="mt-1 text-sm text-muted">This schedule creates a task without a workflow.</p>
       </div>
     {:else if workflowLoading}
-      <p class="text-sm text-slate-400">Loading planned steps…</p>
+      <p class="text-sm text-muted">Loading planned steps…</p>
     {:else if workflowError}
-      <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100" role="alert">
+      <div class="rounded-xl border border-warning-border bg-warning-subtle p-3 text-sm text-warning" role="alert">
         <p>{workflowError}</p>
         <Button class="mt-3" size="sm" variant="secondary" onclick={() => void loadWorkflow()}>Try again</Button>
       </div>
     {:else if workflow}
-      <ol class="space-y-2" data-testid="dashboard-schedule-planned-steps">
-        {#each workflow.steps as step, index (step.name)}
-          <li class="flex gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
-            <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-800 text-xs text-slate-300">{index + 1}</span>
-            <div class="min-w-0">
-              <p class="font-medium text-white">{step.name}</p>
-              <p class="mt-1 text-sm text-slate-400">{step.description ?? step.objective ?? step.type}</p>
-            </div>
-          </li>
-        {/each}
-      </ol>
+      <WorkflowPlanPreview
+        {workflow}
+        taskDescription={templateDescription ?? ''}
+        context={{
+          interactionMode: schedule.interaction_mode_override ?? 'none',
+          allowSilentCompletion: schedule.allow_silent_completion,
+          deliveryMode: typeof schedule.task_template.delivery === 'object' && schedule.task_template.delivery !== null
+            && 'mode' in schedule.task_template.delivery && typeof schedule.task_template.delivery.mode === 'string'
+              ? schedule.task_template.delivery.mode : 'preferred_channel',
+        }}
+      />
     {/if}
     </div>
   {/if}

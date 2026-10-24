@@ -17,6 +17,7 @@
   export let onClose: (() => void) | undefined = undefined;
   export let layout: 'auto' | 'sidebar' | 'drawer' = 'auto';
   export let theme: 'light' | 'dark' | undefined = undefined;
+  export let family: string | null = null;
   export let documentRoot: (() => HTMLElement | undefined) | undefined = undefined;
 
   $: nodes = nestTocItems(items);
@@ -232,7 +233,7 @@
        z-index. Without the portal, the drawer visibly mis-layers behind
        the app's own chrome (verified via rendered screenshots). -->
    {#if visible && open}
-    <div class="rich-toc-drawer-root" data-viewer-theme={theme} data-testid="rich-deliverable-toc" use:portal>
+    <div class="rich-toc-drawer-root" class:theme-palette={Boolean(family)} data-theme-family={family} data-resolved-theme={family ? theme : undefined} data-viewer-theme={theme} data-testid="rich-deliverable-toc" use:portal>
       <button
         class="rich-toc-backdrop"
         type="button"

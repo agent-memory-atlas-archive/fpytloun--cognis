@@ -90,14 +90,14 @@
 
 {#if $updateAvailable}
   <div
-    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-amber-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-warning-border bg-surface/95 px-4 py-3 text-sm text-foreground shadow-card backdrop-blur"
     role="region"
     aria-label="Cognis update available"
   >
-    <RefreshCw class={`mt-0.5 h-4 w-4 shrink-0 text-amber-300 ${updateApplying ? 'animate-spin' : ''}`} />
+    <RefreshCw class={`mt-0.5 h-4 w-4 shrink-0 text-warning ${updateApplying ? 'animate-spin' : ''}`} />
     <div class="min-w-0 flex-1">
       <p class="font-medium">Update available</p>
-      <p class="text-xs text-slate-400">Reload Cognis to use the latest app version and avoid stale PWA state.</p>
+      <p class="text-xs text-muted">Reload Cognis to use the latest app version and avoid stale PWA state.</p>
     </div>
     <div class="flex shrink-0 gap-2">
       <Button size="sm" variant="secondary" disabled={updateApplying} onclick={dismissUpdateBanner}>Later</Button>
@@ -108,14 +108,14 @@
   </div>
 {:else if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div
-    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-accent/40 bg-surface/95 px-4 py-3 text-sm text-foreground shadow-card backdrop-blur"
     role="region"
     aria-label="Install Cognis as app"
   >
-    <Download class="mt-0.5 h-4 w-4 shrink-0 text-sky-300" />
+    <Download class="mt-0.5 h-4 w-4 shrink-0 text-accent" />
     <div class="min-w-0 flex-1">
       <p class="font-medium">Install Cognis</p>
-      <p class="text-xs text-slate-400">Get a dedicated window, offline shell, and app-icon launch.</p>
+      <p class="text-xs text-muted">Get a dedicated window, offline shell, and app-icon launch.</p>
     </div>
     <div class="flex shrink-0 gap-2">
       <Button size="sm" variant="secondary" onclick={dismissInstall}>Not now</Button>
@@ -126,14 +126,14 @@
 
 {#if shouldShowInstallUi && showIosHint && $displayMode === 'browser'}
   <div
-    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-accent/40 bg-surface/95 px-4 py-3 text-sm text-foreground shadow-card backdrop-blur"
     role="region"
     aria-label="Add Cognis to Home Screen"
   >
-    <Share class="mt-0.5 h-4 w-4 shrink-0 text-sky-300" />
+    <Share class="mt-0.5 h-4 w-4 shrink-0 text-accent" />
     <div class="min-w-0 flex-1">
       <p class="font-medium">Add to Home Screen</p>
-      <p class="text-xs text-slate-400">Tap the Share icon in Safari, then "Add to Home Screen" for a native-app feel.</p>
+      <p class="text-xs text-muted">Tap the Share icon in Safari, then "Add to Home Screen" for a native-app feel.</p>
     </div>
     <Button aria-label="Dismiss" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="ghost" onclick={dismissIos}>
       <X class="h-4 w-4" />

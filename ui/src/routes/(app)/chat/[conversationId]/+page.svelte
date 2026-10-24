@@ -1,6 +1,16 @@
 <script lang="ts">
+  import GitFork from 'lucide-svelte/icons/git-fork';
+  import PinConversationButton from '$lib/components/chat/PinConversationButton.svelte';
+  import { isWorkspaceReplica, openNativeConversationWindow } from '$lib/native/host';
   import { goto } from '$app/navigation';
+  import { isResolvedApprovalRejection } from '$lib/approval-resolution';
   import { page } from '$app/state';
+  import WaitingRefreshStatus from '$lib/components/WaitingRefreshStatus.svelte';
+  import { WaitingActivity } from '$lib/complete-waiting';
+  import {
+    RefreshCooldown, SidebarRefreshController, overlaySidebarRows, updateSidebarRow, type RefreshAttempt,
+  } from '$lib/sidebar-refresh';
+  import { SidebarRefreshLifecycle } from '$lib/sidebar-refresh-lifecycle';
   import { onDestroy, onMount, setContext, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { fade } from 'svelte/transition';
@@ -27,9 +37,20 @@ import X from 'lucide-svelte/icons/x';
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import AttentionActionDialog from '$lib/components/attention/AttentionActionDialog.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
+  import AgentQuickProfileSwitcher from '$lib/components/chat/AgentQuickProfileSwitcher.svelte';
+  import RateLimitProviderSwitch from '$lib/components/chat/RateLimitProviderSwitch.svelte';
+  import {
+    agentQuickProfileSelection,
+    QUICK_PROFILE_RUNTIME_MAX_FAILURES,
+    recordRuntimeForSession,
+    shouldLoadRuntimeForSession,
+    type RuntimeBySession
+  } from '$lib/agent-quick-switch';
   import ChatSearchBar from '$lib/components/ChatSearchBar.svelte';
+  import { findTarget } from '$lib/find';
   import SidebarConversationRow from '$lib/components/chat/SidebarConversationRow.svelte';
   import ConversationInfoDrawer from '$lib/components/ConversationInfoDrawer.svelte';
+  import TimelineDiagnosticExport from '$lib/components/chat/TimelineDiagnosticExport.svelte';
   import ActivityTree from '$lib/components/ActivityTree.svelte';
   import InspectorOverview from '$lib/components/InspectorOverview.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
@@ -37,18 +58,20 @@ import X from 'lucide-svelte/icons/x';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import NewChatModal from '$lib/components/NewChatModal.svelte';
+  import { preferredNewChatAgentId } from '$lib/chat/new-chat-agent';
+  import { parseStoredMultiFilter } from '$lib/chat-page';
   import ProviderUnavailableNotices from '$lib/components/ProviderUnavailableNotices.svelte';
   import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
   import ChatV2Composer from '$lib/components/chat-v2/ChatV2Composer.svelte';
+  import ConversationProjectControl from '$lib/components/projects/ConversationProjectControl.svelte';
   import SharedInspectorTabs from '$lib/components/inspector/SharedInspectorTabs.svelte';
   import ChildChatView from '$lib/components/chat-v2/ChildChatView.svelte';
   import ManagedConversationControls from '$lib/components/ManagedConversationControls.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
   import SessionDetailsContent from '$lib/components/session/SessionDetailsContent.svelte';
   import { conversationYoloEnabled, sessionYoloEnabled } from '$lib/yolo-mode';
-  import WorkView from '$lib/components/work/WorkView.svelte';
+  import LazyWorkView from '$lib/components/work/LazyWorkView.svelte';
   import type { WorkInitialFocus } from '$lib/work/workFocus';
   import TimelineOngoingWorkDrawer from '$lib/components/timeline/TimelineOngoingWorkDrawer.svelte';
   import TimelineViewport from '$lib/components/timeline/TimelineViewport.svelte';
@@ -64,7 +87,9 @@ import X from 'lucide-svelte/icons/x';
     dashboardConversationWaitingReason,
   } from '$lib/dashboard/dashboard';
   import { partitionSidebarConversationLanes } from '$lib/conversation-sidebar';
+  import { mergeWaitingConversations, reconcileWaitingSnapshot } from '$lib/complete-waiting';
   import { ObservedConversationReadTracker } from '$lib/dashboard/conversation-read';
+  import { hostAllowsObservation } from '$lib/native/host';
   import {
     activityOverviewIsVisible,
     getActivityOverview,
@@ -79,12 +104,16 @@ import X from 'lucide-svelte/icons/x';
     mergeRuntimeSelection,
     newestRuntimeSelection,
     setSessionInfo,
+    mergeSessionInfo,
+    mergeSessionContextUsage,
+    sessionInfoFromDetail,
     type SessionInfoData,
   } from '$lib/sessionInfoCache';
   import {
     acceptsSessionDiagnostics,
     diagnosticsForSession,
     mergeContextUsage,
+    runtimeModelPresentation,
   } from '$lib/sessionDiagnostics';
   import {
     FocusedSessionDiagnosticsController,
@@ -169,8 +198,7 @@ import X from 'lucide-svelte/icons/x';
     expandWindowUp,
     expandWindowUpPreservingLiveTail,
     expandWindowDown,
-    windowAfterPrepend,
-    windowAfterViewportFillBackfill,
+     reconcileTimelineMembership,
     clampWindow,
     freezeTailWindow,
     TIMELINE_WINDOW_TARGET_ROWS as TIMELINE_WINDOW_TARGET_ROWS_HELPER,
@@ -193,8 +221,6 @@ import X from 'lucide-svelte/icons/x';
     shouldClearRecoverableRetry,
     settleWithTimeout,
     shouldReconcileAfterReconnect,
-    shouldRecoverChatV2ForInvalidation,
-    shouldSnapshotAfterChatV2Sync,
     ChatV2CanonicalRecoveryCoalescer,
     beginCanonicalTimelineAuthority,
     acceptCanonicalTimelineBase,
@@ -209,8 +235,6 @@ import X from 'lucide-svelte/icons/x';
     shouldRefreshForStaleRuntime,
     deriveChatV2ViewProjection,
     resolveOlderMessagesCursorAfterSnapshot,
-    refreshCachedTimeline,
-    snapshotNeedsHistoryRecovery,
     isRuntimeSnapshotOlderThanView,
     shouldAdoptConversationSessionId,
     shouldSuppressPreSessionSocketError,
@@ -273,7 +297,8 @@ import X from 'lucide-svelte/icons/x';
     notifyIfHidden,
     permissionState,
     reconcileWebPushSubscription,
-    setWebPushPromptDismissed
+    setWebPushPromptDismissed,
+    wantsWebPush
   } from '$lib/notifications';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { providerNoticeOwnsSocketError } from '$lib/provider-notices';
@@ -306,8 +331,34 @@ import X from 'lucide-svelte/icons/x';
     } from '$lib/chat-v2/oversized-message';
   import { forkAssistantMessageContext, type ForkAssistantMessage } from '$lib/chat-message-actions';
    import { conversationTimelineScope, sessionTimelineScope, type ActivityOverviewResponse, type TimelineScope, type WorkCategory, type WorkstreamRef } from '$lib/chat-v2/types';
-  import { MemoryChatV2Outbox, createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
+  import { createMemoryChatV2Outbox, createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
+   import { DocumentDrafts } from '$lib/offline/document-drafts';
+   import { documentCoordination } from '$lib/document-coordination';
+    import { ComposerSubmission } from '$lib/chat-v2/composer-submission';
+    import { conversationComposer } from '$lib/chat-v2/conversation-composer';
+    import { sameSubmissionInput } from '$lib/chat-v2/submission-input';
+    import { hydrateComposer, emptyComposerInput, selectLegacyInput, canSelectRecovery, type RecoveryScope, type LegacyComposerInput } from '$lib/chat-v2/composer-hydration';
+    import LegacyComposerRecovery from '$lib/components/chat-v2/LegacyComposerRecovery.svelte';
+    import { drainConversationOutbox, projectAdmissionFailure, sendOutboxEntry } from '$lib/chat-v2/outbox-send';
+   const pageDataOwner = typeof window === 'undefined' ? null : documentCoordination().storageName('offline-cache');
+  const liveComposer = typeof window === 'undefined' ? null : conversationComposer();
+  const composerDrafts = liveComposer?.drafts ?? new DocumentDrafts();
+  import {
+    OutboxRetryScheduler,
+    isRetryableSendError,
+    mergeFailedSendIntoDraft,
+  } from '$lib/chat-v2/outbox-retry';
+  import {
+    attachmentUploads,
+    isLocalAttachment,
+    toServerAttachment,
+  } from '$lib/chat-v2/attachment-uploads';
+  import { allDraftAttachmentLists } from '$lib/chat-v2/unsent-recovery';
+  import { isOfflineError, offlineCache } from '$lib/offline/cache';
+  import { recordPerf } from '$lib/perf-log';
   import { ChatV2Store } from '$lib/chat-v2/store.svelte';
+  import { acquireTimeline, recoverTimeline, TimelineOwnershipError, peekTimeline, type TimelineController } from '$lib/chat-v2/timeline-controller.svelte';
+  import { ConversationPreloadScheduler } from '$lib/chat-v2/preload-scheduler';
   import {
     isPinnedTransientNotice,
     isRenderableTimelineItem,
@@ -315,7 +366,6 @@ import X from 'lucide-svelte/icons/x';
     selectLatestTodoState,
     selectPendingInputToolCall,
   } from '$lib/chat-v2/selectors';
-  import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
   import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem as ChatV2TimelineItem } from '$lib/chat-v2/types';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
   import {
@@ -364,8 +414,9 @@ import X from 'lucide-svelte/icons/x';
     isTerminalSessionStatus,
     updateRuntimeActiveSessions,
   } from '$lib/session-status';
-     import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, AttentionActionDetail, AttentionActionSummary, BackgroundWorkItem, BackgroundWorkProjection, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, ConversationTodoItem, Escalation, GenerationPerformanceSnapshot, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection } from '$lib/types/api';
+     import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, AttentionActionDetail, AttentionActionSummary, BackgroundWorkItem, BackgroundWorkProjection, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, ConversationTodoItem, Escalation, GenerationPerformanceSnapshot, MessageEvent, Notification, Project, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, ResourceVisibility, Session, SidebarProjection } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
+  import { connectivity, isConnectivityError, onConnectivityRestored } from '$lib/connectivity';
   import { isNonFatalWebSocketBackpressureError } from '$lib/ws/errors';
   import {
     activityOverviewReadPresentation,
@@ -389,6 +440,8 @@ import X from 'lucide-svelte/icons/x';
   let historyError = $state('');
   let sessionsError = $state('');
   let conversations = $state<Conversation[]>([]);
+  let waitingConversations = $state<Conversation[]>([]);
+  let waitingLoadError = $state<string | null>(null);
   let availableChannelTypes = $state<string[]>([]);
   let conversationCursor: string | null = null;
   let conversationsHasMore = $state(false);
@@ -413,6 +466,9 @@ import X from 'lucide-svelte/icons/x';
   let isStandalonePwa = $derived($displayMode === 'standalone');
   let canOpenAuxiliaryWindow = $derived(canAttemptPwaAuxiliaryWindow());
   let chatSearchOpen = $state(false);
+  let chatSearchInput = $state<HTMLInputElement | null>(null);
+  let findOnlySearchConversationId = $state<string | null>(null);
+  let conversationSidebar = $state<HTMLElement | null>(null);
   let chatSearchQuery = $state('');
   let chatSearchLoading = $state(false);
   let chatSearchResults = $state<ChatSearchResult[]>([]);
@@ -438,6 +494,33 @@ import X from 'lucide-svelte/icons/x';
   let conversationTodoSnapshots = $state<Record<string, ChatTodo[]>>({});
   let conversationSubloadsLoading = $state(false);
   let cachedConversationRefreshing = $state(false);
+  // The refresh banner is noise when the cached view is recent (preloaded or
+  // just seen) or the refresh is quick; show it only for stale views whose
+  // refresh is actually slow.
+  // A view with content is already readable, so its quiet refresh only
+  // earns a banner when genuinely slow; an empty cached view shows it soon.
+  const CACHED_REFRESH_BANNER_DELAY_MS = 2_500;
+  const EMPTY_CACHED_VIEW_BANNER_DELAY_MS = 300;
+  const CACHED_VIEW_FRESH_MS = 30_000;
+  let cachedViewFetchedAt = 0;
+  let cachedViewHasContent = $state(false);
+  let cachedRefreshBannerVisible = $state(false);
+  let cachedRefreshBannerTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const refreshing = cachedConversationRefreshing;
+    const hasContent = cachedViewHasContent;
+    if (cachedRefreshBannerTimer !== null) clearTimeout(cachedRefreshBannerTimer);
+    cachedRefreshBannerTimer = null;
+    if (!refreshing) {
+      cachedRefreshBannerVisible = false;
+      return;
+    }
+    if (hasContent && Date.now() - cachedViewFetchedAt < CACHED_VIEW_FRESH_MS) return;
+    cachedRefreshBannerTimer = setTimeout(() => {
+      cachedRefreshBannerTimer = null;
+      if (cachedConversationRefreshing) cachedRefreshBannerVisible = true;
+    }, hasContent ? CACHED_REFRESH_BANNER_DELAY_MS : EMPTY_CACHED_VIEW_BANNER_DELAY_MS);
+  });
   let canonicalTimelineAuthority = $state<CanonicalTimelineAuthority>({
     conversationId: null,
     routeGeneration: 0,
@@ -447,7 +530,23 @@ import X from 'lucide-svelte/icons/x';
   let canonicalTimelineApplyRevision = 0;
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
-  let composerAttachments = $state<AttachmentRef[]>([]);
+   let composerAttachments = $state<AttachmentRef[]>([]);
+    let composerRevision = 0;
+    let composerInputRevision = $state<string>(crypto.randomUUID());
+    let composerLegacyRecovery = $state(false);
+    let composerLegacyCandidates = $state<LegacyComposerInput[]>([]);
+    let composerRecoveryScope = $state.raw<RecoveryScope | null>(null);
+    let composerHydratedGeneration = -1;
+    let composerInputMode = $state<'default' | 'plan' | 'build' | null>(null);
+    function editComposerInput(): void { composerRevision++; composerInputRevision = crypto.randomUUID(); }
+    function compositeComposerInput() {
+      return { input_revision: composerInputRevision, text: composer,
+        attachments: $state.snapshot(composerAttachments) as AttachmentRef[], chat_mode: composerInputMode };
+    }
+   let composerAlive = true;
+   let preparingComposer = false;
+   let latestComposerSubmissionId: string | null = null;
+   onDestroy(() => { composerAlive = false; });
   let managedInstructionOpen = $state(false);
   let managedInstruction = $state('');
   let managedActionBusy = $state<string | null>(null);
@@ -466,7 +565,9 @@ import X from 'lucide-svelte/icons/x';
   function readDraft(key: string): string {
     if (typeof localStorage === 'undefined') return '';
     try {
-      return localStorage.getItem(key) ?? '';
+      if (liveComposer) return liveComposer.hydrate(key.slice(DRAFT_PREFIX.length)).input.text;
+      const saved = composerDrafts.readComposite(key);
+      return saved ? (saved.consumed ? '' : saved.text) : composerDrafts.read(key) ?? '';
     } catch {
       return '';
     }
@@ -475,16 +576,23 @@ import X from 'lucide-svelte/icons/x';
   function writeDraft(key: string, value: string): void {
     if (typeof localStorage === 'undefined') return;
     try {
-      if (value) localStorage.setItem(key, value);
-      else localStorage.removeItem(key);
+      if (!composerLegacyRecovery) liveComposer?.update(key.slice(DRAFT_PREFIX.length),
+        key === currentDraftKey ? { ...compositeComposerInput(), text: value }
+          : { ...(liveComposer?.hydrate(key.slice(DRAFT_PREFIX.length)).input ?? emptyComposerInput()),
+            input_revision: crypto.randomUUID(), text: value });
     } catch {
       // non-fatal
     }
   }
 
-  function clearDraft(key: string | null): void {
-    if (!key) return;
-    writeDraft(key, '');
+  // Mobile browsers can freeze or kill a backgrounded PWA without further
+  // events, so persist the in-flight debounced draft as soon as the page is
+  // hidden instead of waiting for the debounce timer.
+  function flushPendingDraft(): void {
+    if (draftSaveTimer === null || typeof window === 'undefined') return;
+    window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+    if (currentDraftKey) writeDraft(currentDraftKey, composer);
   }
   let showDropZone = $state(false);
   let dragCounter = 0;
@@ -492,6 +600,11 @@ import X from 'lucide-svelte/icons/x';
   const CONTEXT_DONUT_RADIUS = 15.5;
   const CONTEXT_DONUT_CIRCUMFERENCE = 2 * Math.PI * CONTEXT_DONUT_RADIUS;
   let selectedAgentIds = $state<string[]>([]);
+  // Project filter for the sidebar ('' = all projects) and the caller's projects.
+  let selectedProjectId = $state('');
+  let includeSharedChats = $state(true);
+  let projects = $state<Project[]>([]);
+  let projectChangeBusy = $state(false);
   let selectedConversationStatus = $state<ConversationStatusFilter>(parseConversationStatusFilter(page.url.searchParams.get('status')));
   let starringConversationId = $state<string | null>(null);
   let archivingConversation = $state(false);
@@ -515,6 +628,7 @@ import X from 'lucide-svelte/icons/x';
   let childView = $state<ChildView | null>(null);
   let parentSurfaceWasHidden = false;
   let parentSurfaceScrollTop = 0;
+  let parentSurfaceAnchor: ReturnType<typeof captureTimelineAnchor> = null;
   let parentSurfaceTransitionGeneration = 0;
   let selectedChildWorkstream = $state<WorkstreamRef | null>(null);
   let runtimeActiveChildSessionIds = $state<Set<string>>(new Set());
@@ -656,7 +770,152 @@ import X from 'lucide-svelte/icons/x';
   let queueEditingId = $state<string | null>(null);
   let queueEditContent = $state('');
   let queueEditError = $state('');
-  const chatV2Store = new ChatV2Store();
+  let chatV2Store = $state.raw(new ChatV2Store());
+  let timelineController: TimelineController | null = null;
+  let releaseTimeline: (() => void) | null = null;
+  let stopTimelineOwnership: (() => void) | null = null;
+  let stopTimelineMembership: (() => void) | null = null;
+  let timelineMembershipRevision = 0;
+  let timelineIdentityRequired = $state(false);
+  let timelineIdentityError = $state('');
+  let recoveringTimelineOwner = $state(false);
+  let timelineOwnerRecovery: AbortController | null = null;
+  let timelineLoadAbort = new AbortController();
+  let pageAlive = true;
+  onDestroy(() => {
+    pageAlive = false;
+    timelineViewportStates.invalidate();
+    timelineLoadAbort.abort();
+    timelineOwnerRecovery?.abort();
+    stopTimelineOwnership?.();
+    stopTimelineMembership?.();
+    releaseTimeline?.();
+  });
+
+  function bindTimeline(conversationId: string): TimelineController {
+    if (timelineIdentityRequired) throw new TimelineOwnershipError();
+    if (timelineController?.scope.key === conversationTimelineScope(conversationId).key && timelineController.current) {
+      chatV2Store = timelineController.store;
+      return timelineController;
+    }
+    timelineLoadAbort.abort();
+    timelineLoadAbort = new AbortController();
+    releaseTimeline?.();
+    stopTimelineOwnership?.();
+    stopTimelineMembership?.();
+    const acquired = acquireTimeline(conversationTimelineScope(conversationId));
+    adoptTimeline(acquired);
+    return acquired.controller;
+  }
+
+  function adoptTimeline(acquired: ReturnType<typeof acquireTimeline>): void {
+    stopTimelineMembership?.();
+    timelineViewportStates.invalidateWindow();
+    timelineController = acquired.controller;
+    releaseTimeline = acquired.release;
+    chatV2Store = timelineController.store;
+    const current = acquired.controller;
+    const attachedStore = current.store;
+    let attached = true;
+    const stop = attachedStore.observeMembership((before, after) => {
+      if (!attached || !pageAlive || !current.current || current !== timelineController
+        || currentConversation?.conversation_id !== current.scope.conversation_id
+        || !timelineViewportStates.hasRetainedWindow(current.scope.key, conversationLoadRequestId)) return;
+      const revision = ++timelineMembershipRevision;
+      const loadId = conversationLoadRequestId;
+      const viewport = timelineEl;
+      const transition = parentSurfaceTransitionGeneration;
+      const anchor = userScrolledUp && !childView && timelineInitialPositionSettled ? captureTimelineAnchor() : null;
+      const renderable = (items: readonly ChatV2TimelineItem[]) => items
+        .filter(isRenderableTimelineItem).filter(item => !isPinnedTransientNotice(item));
+      const beforeItems = renderable(before);
+      const afterItems = renderable(after);
+      const window = userScrolledUp
+        ? reconcileTimelineMembership(timelineWindow, beforeItems, afterItems, loadingOlderMessages)
+        : loadingOlderMessages ? { start: 0, end: null } : timelineWindow;
+      return () => {
+        timelineWindow = window;
+        lastRenderableVisibleCount = afterItems.length;
+        void tick().then(() => {
+          if (!attached || !pageAlive || !current.current || current !== timelineController
+            || loadId !== conversationLoadRequestId || revision !== timelineMembershipRevision
+            || !timelineViewportStates.hasRetainedWindow(current.scope.key, loadId)
+            || !timelineInitialPositionSettled
+            || transition !== parentSurfaceTransitionGeneration || childView || viewport !== timelineEl) return;
+          restoreTimelineAnchor(anchor);
+        });
+      };
+    });
+    stopTimelineMembership = () => { attached = false; stop(); };
+    stopTimelineOwnership = timelineController.onInvalidated(caught => {
+      if (!pageAlive || timelineController !== acquired.controller) return;
+      requireTimelineIdentity(caught);
+    });
+  }
+
+  function requireTimelineIdentity(caught: TimelineOwnershipError): void {
+      if (timelineIdentityRequired) return;
+      timelineIdentityRequired = true;
+      timelineIdentityError = caught.message;
+      ++conversationLoadRequestId;
+      timelineLoadAbort.abort(caught);
+      olderMessagesAbortController?.abort(caught);
+      timelineOwnerRecovery?.abort(caught);
+      chatV2Lifecycle.release();
+      if (activeConversationId) wsClient.unsubscribeConversation(activeConversationId);
+      unsubscribeWs?.();
+      unsubscribeWs = null;
+      conversationPreloader.dispose();
+      clearControllerRecovery();
+      chatV2OutboxRetry.cancelAll();
+      for (const timer of chatV2CanonicalRecoveryTimers.values()) clearTimeout(timer);
+      chatV2CanonicalRecoveryTimers.clear();
+      chatV2CanonicalRecoveryCoalescer.clear();
+      conversationViewCache.clear();
+      clearConversationViewState();
+      currentConversation = null;
+      initializing = false;
+      initialConversationResolved = true;
+      conversationSubloadsLoading = false;
+      cachedConversationRefreshing = false;
+      resetConversationSwitch();
+      releaseTimeline?.();
+  }
+
+  async function recoverTimelineOwner(): Promise<void> {
+    const current = timelineController;
+    if (recoveringTimelineOwner) return;
+    const conversationId = conversationIdFromRoute();
+    if (!conversationId) return;
+    const generation = conversationLoadRequestId;
+    const controller = new AbortController();
+    timelineOwnerRecovery = controller;
+    recoveringTimelineOwner = true;
+    try {
+      const acquired = await recoverTimeline(conversationTimelineScope(conversationId), chatV2Api, controller.signal, current?.owner ?? pageDataOwner);
+      if (!pageAlive || controller.signal.aborted || generation !== conversationLoadRequestId
+        || conversationId !== conversationIdFromRoute()) {
+        acquired.release();
+        return;
+      }
+      stopTimelineOwnership?.();
+      releaseTimeline?.();
+      timelineLoadAbort = new AbortController();
+      adoptTimeline(acquired);
+      timelineIdentityRequired = false;
+      timelineIdentityError = '';
+      activeConversationId = '';
+      conversationPreloader = new ConversationPreloadScheduler(preloadConversationView);
+      unsubscribeWs = wsClient.subscribe(handleSocketEvent);
+      await openConversation(conversationId);
+    } catch (caught) {
+      if (!pageAlive || controller.signal.aborted || generation !== conversationLoadRequestId) return;
+      timelineIdentityError = caught instanceof Error ? caught.message : new TimelineOwnershipError().message;
+    } finally {
+      if (timelineOwnerRecovery === controller) timelineOwnerRecovery = null;
+      if (pageAlive) recoveringTimelineOwner = false;
+    }
+  }
   const chatV2Lifecycle = new ChatV2ConversationLifecycle(wsClient);
   const focusedSessionIdentityLoader = new FocusedSessionIdentityLoader(
     (sessionId, signal) => api.sessions.detail(sessionId, { signal }),
@@ -688,10 +947,16 @@ import X from 'lucide-svelte/icons/x';
     focusedDiagnosticsController.select(scope, focusedWorkstream, visible);
   });
   const chatV2Outbox = typeof indexedDB === 'undefined'
-    ? new MemoryChatV2Outbox()
+    ? createMemoryChatV2Outbox()
     : createIndexedDbChatV2Outbox();
   let chatV2OutboxReady = false;
   let chatV2OutboxDraining = false;
+  let chatV2PendingDrain: (() => Promise<void>) | null = null;
+  const chatV2OutboxRetry = new OutboxRetryScheduler();
+  onDestroy(() => {
+    chatV2PendingDrain = null;
+    chatV2OutboxRetry.cancelAll();
+  });
 
   const TIMELINE_WINDOW_TARGET_ROWS = TIMELINE_WINDOW_TARGET_ROWS_HELPER;
   const TIMELINE_WINDOW_PAGE_ROWS = TIMELINE_WINDOW_PAGE_ROWS_HELPER;
@@ -713,12 +978,41 @@ import X from 'lucide-svelte/icons/x';
   let lastSidebarSyncAt = 0;
   let lastSidebarSyncTimestamp: string | null = null;
   const sidebarRevisionAdmission = new SidebarRevisionAdmission();
-  const sidebarReconciliation = new SerialInvalidationCoalescer(
-    () => resyncSidebarData('sidebar-invalidation', {
-      force: true,
-      recoveryAttempt: true,
-    }),
+  // Realtime sidebar upserts patch rows immediately; this REST reconciliation
+  // is the safety net. A running turn bumps the sidebar revision about once a
+  // second and every revision change makes the server return a full
+  // projection (~50 KB), so space reconciliations out instead of fetching one
+  // per frame: that churn was saturating mobile links and delaying switches.
+  const SIDEBAR_RECONCILIATION_MIN_INTERVAL_MS = 4_000;
+  const sidebarCooldown = new RefreshCooldown();
+  const sidebarReconciliation = new SidebarRefreshController(
+    async (attempt) => {
+      if (attempt.scope !== sidebarProjectionCacheKey()) {
+        scheduleSidebarReconciliation('changed-sidebar-scope');
+        return;
+      }
+      sidebarRevisionAdmission.selectScope(attempt.scope);
+      if (attempt.full) await performSidebarLoad({ signal: attempt.signal });
+      else await performSidebarResync('sidebar-invalidation', {
+        force: true, recoveryAttempt: true, signal: attempt.signal,
+      });
+    }, sidebarCooldown, SIDEBAR_RECONCILIATION_MIN_INTERVAL_MS,
   );
+  const waitingReconciliation = new SidebarRefreshController(
+    performWaitingRefresh, sidebarCooldown, SIDEBAR_RECONCILIATION_MIN_INTERVAL_MS,
+  );
+  const sidebarRefreshLifecycle = new SidebarRefreshLifecycle(
+    [sidebarReconciliation, waitingReconciliation], sidebarProjectionCacheKey,
+  );
+  onMount(() => sidebarRefreshLifecycle.start());
+  $effect(() => {
+    const scope = sidebarProjectionCacheKey();
+    untrack(() => sidebarRefreshLifecycle.sync(scope));
+  });
+  const waitingActivity = new WaitingActivity();
+  let waitingSnapshotScope = $state<string | null>(null);
+  let sidebarSnapshotScope: string | null = null;
+  const waitingSnapshotCache = new Map<string, Conversation[]>();
   let sidebarProjectionRefreshEpoch = 0;
   let pendingNotificationEpoch = 0;
   const pendingNotificationEpochByConversation = new Map<string, number>();
@@ -732,7 +1026,7 @@ import X from 'lucide-svelte/icons/x';
   const CONVERSATION_SUBLOAD_TIMEOUT_MS = 35_000;
   let olderMessagesCursor = $state<string | null>(null);
   let hasOlderMessages = $state(false);
-  const CONVERSATION_VIEW_CACHE_LIMIT = 8;
+  const CONVERSATION_VIEW_CACHE_LIMIT = 20;
   const SIDEBAR_PROJECTION_CACHE_LIMIT = 8;
   const sidebarProjectionCache = new Map<string, SidebarProjection>();
   const escalationTimeoutSeconds = 300;
@@ -781,6 +1075,35 @@ import X from 'lucide-svelte/icons/x';
   let controllerRecoveryTimer: number | null = null;
   let controllerRecoveryAttempts = $state(0);
   let controllerRecoveryConversationId: string | null = null;
+  // Notice precedence (see $lib/connectivity): while the connection is
+  // degraded the global ConnectionBanner is the only connectivity notice, so
+  // this page's history/session/escalation/refresh banners stay hidden. When
+  // the connection is restored, failed loads are retried first and their
+  // banners stay hidden until that retry settles; only errors that persist
+  // with a healthy connection are shown. Critical event-store failures are
+  // always shown.
+  let connectivityRetryPending = $state(false);
+  const connectivityOwnsNotices = $derived($connectivity.degraded || connectivityRetryPending);
+
+  async function retryLoadsAfterConnectivityRestored(): Promise<void> {
+    if (!currentConversation) {
+      const routeConversationId = conversationIdFromRoute();
+      if (routeConversationId && (initialLoadTimedOut || error)) void openConversation(routeConversationId);
+      return;
+    }
+    const retrySubloads = Boolean(historyError || sessionsError);
+    const retryEscalations = Boolean(escalationError);
+    if (!retrySubloads && !retryEscalations) return;
+    connectivityRetryPending = true;
+    try {
+      if (retrySubloads) await retryConversationSubloads();
+      if (retryEscalations) await refreshEscalations();
+    } finally {
+      connectivityRetryPending = false;
+    }
+  }
+
+  $effect(() => onConnectivityRestored(() => { void retryLoadsAfterConnectivityRestored(); }));
   let escalationCountdownTimer: number | null = null;
   let notificationRefreshTimer: number | null = null;
   let pushPromptDismissed = $state(hasDismissedWebPushPrompt());
@@ -812,14 +1135,81 @@ import X from 'lucide-svelte/icons/x';
   let showNewChatModal = $state(false);
   let newChatAgentId = $state('');
   let newChatAgentProfileId = $state('');
+  let newChatProjectId = $state('');
   let newChatCreating = $state(false);
   let newChatError = $state('');
+  let newChatHandoff = $state<import('$lib/chat-v2/types').HandoffTimelineItem | null>(null);
+  let newChatHandoffSource = $state('');
+  let newChatCreated = $state<Conversation | null>(null);
   let editingTitle = $state(false);
   let editTitleValue = $state('');
   let titleSuggestionLoading = $state(false);
   let ignoreNextTitleBlur = $state(false);
   let sessionIdCopied = $state(false);
-  let showAgentProfile = $state(false);
+  let showAgentProfile = $state<'header' | 'sidebar' | null>(null);
+  let quickProfileBusy = $state(false);
+  let composerAdmissionBusy = $state(false);
+  // The canonical snapshot omits runtime override sources, and the info-drawer
+  // loader (loadSessionInfo) is invalidated by route lifecycle effects. Keep the
+  // quick switcher's runtime selection per session so it survives navigation
+  // (A -> B -> A) and fetch it independently of the drawer.
+  type RuntimeSelection = import('$lib/types/api').RuntimeSelection;
+  let quickProfileRuntimeBySession = $state<RuntimeBySession>({});
+  const quickProfileRuntimeInFlight = new Set<string>();
+  const quickProfileRuntimeFailures = new Map<string, number>();
+
+  function recordQuickProfileRuntime(sid: string, selection: RuntimeSelection): void {
+    const next = recordRuntimeForSession(quickProfileRuntimeBySession, sid, selection);
+    if (next !== quickProfileRuntimeBySession) quickProfileRuntimeBySession = next;
+  }
+
+  // Every runtime update for the active session (command responses, drawer
+  // loads, this loader) flows through latestRuntimeSelection; mirror it.
+  $effect(() => {
+    const latest = latestRuntimeSelection;
+    if (latest) untrack(() => recordQuickProfileRuntime(latest.sessionId, latest.selection));
+  });
+
+  async function loadQuickProfileRuntime(sid: string): Promise<void> {
+    quickProfileRuntimeInFlight.add(sid);
+    try {
+      const detail = await api.sessions.intarisDetail(sid);
+      // Session-keyed storage is valid even if the user navigated away.
+      if (detail.runtime_selection) recordQuickProfileRuntime(sid, detail.runtime_selection);
+      else quickProfileRuntimeFailures.set(sid, QUICK_PROFILE_RUNTIME_MAX_FAILURES);
+    } catch {
+      // Indicator is best-effort; retry a bounded number of times.
+      quickProfileRuntimeFailures.set(sid, (quickProfileRuntimeFailures.get(sid) ?? 0) + 1);
+    } finally {
+      quickProfileRuntimeInFlight.delete(sid);
+    }
+  }
+
+  $effect(() => {
+    const conversation = currentConversation;
+    const sid = conversation?.active_session_id;
+    if (!conversation || !sid || childView) return;
+    const agent = conversationAgent(conversation);
+    if (!agent || agentQuickProfileSelection(agent).options.length === 0) return;
+    if (!shouldLoadRuntimeForSession(
+      quickProfileRuntimeBySession, sid, quickProfileRuntimeInFlight, quickProfileRuntimeFailures
+    )) return;
+    void untrack(() => loadQuickProfileRuntime(sid));
+  });
+
+  async function selectQuickProfile(profileId: string): Promise<void> {
+    if (!currentConversation || quickProfileBusy || composerAdmissionBusy || voiceTranscribing || turnInProgress || awaitingAssistantStart) return;
+    const conversationId = currentConversation.conversation_id;
+    quickProfileBusy = true;
+    try {
+      const response = await executeCommandWithRetry(conversationId, `/profile ${profileId}`);
+      if (currentConversation?.conversation_id === conversationId) await applyCommandResponse(response);
+    } catch (error) {
+      addToast(asApiError(error).message, 'error', 4000, 'Unable to switch profile');
+    } finally {
+      quickProfileBusy = false;
+    }
+  }
   let childWorkstream = $derived.by(() => {
     if (!childView || !selectedChildWorkstream) return null;
     const overviewNode = childViewWorkstream(renderedActivityOverview?.workstreams ?? [], childView);
@@ -834,23 +1224,30 @@ import X from 'lucide-svelte/icons/x';
     timelineInitialPositionSettled = false;
     if (hidden) {
       parentSurfaceWasHidden = true;
-      parentSurfaceScrollTop = timelineEl?.scrollTop ?? parentSurfaceScrollTop;
       return;
     }
     if (!parentSurfaceWasHidden) return;
     parentSurfaceWasHidden = false;
     const restorePausedPosition = userScrolledUp;
+    const loadId = conversationLoadRequestId;
+    const controller = timelineController;
     untrack(() => {
       void tick().then(() => {
         requestAnimationFrame(() => {
-          if (transitionGeneration !== parentSurfaceTransitionGeneration || childView) return;
+          if (!pageAlive || loadId !== conversationLoadRequestId || !controller?.current
+            || !timelineViewportStates.hasRetainedWindow(controller.scope.key, loadId)
+            || controller !== timelineController || transitionGeneration !== parentSurfaceTransitionGeneration || childView) return;
           if (restorePausedPosition) {
             writeProgrammaticScrollTop(parentSurfaceScrollTop);
+            restoreTimelineAnchor(parentSurfaceAnchor);
           } else {
             scrollToBottom();
           }
           requestAnimationFrame(() => {
-            if (transitionGeneration === parentSurfaceTransitionGeneration && !childView) {
+            if (pageAlive && loadId === conversationLoadRequestId && controller.current
+              && controller === timelineController
+              && timelineViewportStates.hasRetainedWindow(controller.scope.key, loadId)
+              && transitionGeneration === parentSurfaceTransitionGeneration && !childView) {
               timelineInitialPositionSettled = true;
             }
           });
@@ -886,6 +1283,7 @@ import X from 'lucide-svelte/icons/x';
     },
     isObserved: (conversationId) => (
       typeof document !== 'undefined'
+      && hostAllowsObservation()
       && !document.hidden
       && conversationIdFromRoute() === conversationId
     ),
@@ -909,7 +1307,7 @@ import X from 'lucide-svelte/icons/x';
   let lastTimelineTouchY: number | null = null;
   let lastTimelineScrollTop = $state(0);
   let footerChromeEl = $state<HTMLDivElement | null>(null);
-  let selectedChannels = $state<string[]>([]);
+  let selectedChannels = $state<string[]>(['web']);
   let chatSidebarCollapsed = $state(false);
   const CHAT_SIDEBAR_DEFAULT_WIDTH = 272;
   const CHAT_SIDEBAR_LEGACY_DEFAULT_WIDTH = 304;
@@ -951,27 +1349,11 @@ import X from 'lucide-svelte/icons/x';
     snapshot: ChatSnapshot,
     options: {
       resetLineage?: boolean;
-      refreshWatermark?: ReturnType<ChatV2Store['refreshWatermark']>;
-      bootstrapPending?: boolean;
       routeGeneration?: number;
     } = {}
   ): boolean {
-    const refreshWatermark = options.refreshWatermark ?? (
-      options.bootstrapPending
-        ? chatV2Store.refreshWatermark()
-        : undefined
-    );
-    if (refreshWatermark) {
-      if (!chatV2Store.replaceFromSnapshotForCanonicalBootstrap(
-        snapshot,
-        refreshWatermark,
-        options.bootstrapPending === true,
-      )) {
-        return false;
-      }
-    } else {
-      chatV2Store.replaceFromSnapshot(snapshot);
-    }
+    // Timeline state was admitted once by TimelineController. Only route
+    // metadata, inspector state and viewport ownership are updated here.
     canonicalTimelineAuthority = acceptCanonicalTimelineBase(
       canonicalTimelineAuthority,
       snapshot.conversation.conversation_id,
@@ -1055,6 +1437,7 @@ import X from 'lucide-svelte/icons/x';
 
 
   async function applyChatV2Frame(frame: ChatRealtimeFrame): Promise<void> {
+    if (!timelineController?.current) return;
     const previousStatus = chatV2Store.snapshot.syncStatus;
     const previouslyActive = chatV2Store.snapshot.runtime?.has_active_turn === true;
     const result = chatV2Store.applyRealtime(frame);
@@ -1107,6 +1490,7 @@ import X from 'lucide-svelte/icons/x';
     requestId?: number
   ): Promise<void> {
     const routeGeneration = requestId ?? conversationLoadRequestId;
+    const ownerLease = documentCoordination().capture();
     if (
       !chatV2RecoveryMatchesRoute(conversationId)
       || isStaleConversationLoad(routeGeneration)
@@ -1117,6 +1501,23 @@ import X from 'lucide-svelte/icons/x';
     );
     if (!isStaleConversationLoad(routeGeneration) && !historyError) {
       await settleInitialCanonicalHistory(conversationId, routeGeneration);
+      if (
+        !isStaleConversationLoad(routeGeneration)
+        && chatV2RecoveryMatchesRoute(conversationId)
+        && chatV2OwnsActiveConversation(conversationId)
+        && canonicalTimelineAuthority.conversationId === conversationId
+        && canonicalTimelineAuthority.routeGeneration === routeGeneration
+        && canonicalTimelineAuthority.status === 'ready'
+      ) {
+        try { ownerLease.assertCurrent(); } catch { return; }
+        // Canonical completion does not wait for admission; the drain retains
+        // this component's generation, outbox and account lease.
+        void drainChatV2Outbox(conversationId).catch((error) => {
+          if (!composerAlive || isStaleConversationLoad(routeGeneration)) return;
+          try { ownerLease.assertCurrent(); } catch { return; }
+          reportError(error);
+        });
+      }
     }
   }
 
@@ -1144,10 +1545,9 @@ import X from 'lucide-svelte/icons/x';
           hasMoreBefore: hasOlderMessages,
           beforeCursor: olderMessagesCursor,
         }),
-        loadPage: (before) => chatV2Api.timeline(conversationId, { before }),
+        loadPage: (before) => bindTimeline(conversationId).older(before, timelineLoadAbort.signal),
         applyPage: (response) => {
-          const admitted = chatV2Store.applyBackfill(response);
-          if (!admitted) return false;
+          if (!response) return false;
           applyChatV2StateToTimeline();
           olderMessagesCursor = response.before_cursor ?? null;
           hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
@@ -1187,46 +1587,9 @@ import X from 'lucide-svelte/icons/x';
     );
     if (!matchesLoad()) return;
     try {
-      const cursor = chatV2Store.snapshot.conversationId === conversationId
-        ? chatV2Store.snapshot.cursor
-        : null;
-      if (!cursor) {
-        // No basis for incremental sync at all (nothing loaded yet, or the
-        // store does not own this conversation). Any pagination cursor
-        // currently held cannot be trusted to align with a lineage we have
-        // no sync cursor for, so this is a lineage reset for cursor purposes.
-        const applied = await recoverChatV2Snapshot(
-          conversationId,
-          { resetLineage: true },
-          routeGeneration,
-        );
-        if (!applied && historyError) {
-          setCanonicalTimelineAuthority(conversationId, routeGeneration, 'error');
-        }
-        return;
-      }
-      const response = await chatV2Api.sync(conversationId, cursor);
+      const snapshot = await bindTimeline(conversationId).load({ signal: timelineLoadAbort.signal });
       if (!matchesLoad()) return;
-      const result = chatV2Store.applySync(response);
-      if (shouldSnapshotAfterChatV2Sync({
-        resetRequired: response.reset_required,
-        outcome: result.outcome,
-      })) {
-        // The server reported a reset/cursor mismatch the sync engine cannot
-        // recover from: the event lineage changed underneath us, so any
-        // previously held older-messages cursor (including one restored from
-        // a cached view) must be replaced from the fresh snapshot rather than
-        // preserved.
-        const applied = await recoverChatV2Snapshot(
-          conversationId,
-          { resetLineage: true },
-          routeGeneration,
-        );
-        if (!applied && historyError) {
-          setCanonicalTimelineAuthority(conversationId, routeGeneration, 'error');
-        }
-        return;
-      }
+      if (snapshot) applyChatV2Snapshot(snapshot, { resetLineage: true, routeGeneration });
       applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
       applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
       applyChatV2StateToTimeline();
@@ -1260,10 +1623,8 @@ import X from 'lucide-svelte/icons/x';
           markControllerUnavailable(error);
           return;
         }
-        const applied = await recoverChatV2Snapshot(conversationId, {}, routeGeneration);
-        if (!applied && historyError) {
-          setCanonicalTimelineAuthority(conversationId, routeGeneration, 'error');
-        }
+        historyError = apiError.message;
+        setCanonicalTimelineAuthority(conversationId, routeGeneration, 'error');
       }
   }
 
@@ -1279,27 +1640,17 @@ import X from 'lucide-svelte/icons/x';
     );
     if (!matchesLoad()) return false;
     try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const bootstrapPending = !canonicalTimelineBaseIsAccepted(
-          canonicalTimelineAuthority,
-          conversationId,
-          routeGeneration,
-        );
-        const refreshWatermark = options.replaceUnconditionally || bootstrapPending
-          ? undefined
-          : chatV2Store.refreshWatermark();
-        const snapshot = await chatV2Api.snapshot(conversationId);
+        const snapshot = await bindTimeline(conversationId).load({
+          signal: timelineLoadAbort.signal,
+          forceSnapshot: true,
+        });
         if (!matchesLoad()) return false;
-        if (snapshotNeedsHistoryRecovery(snapshot)) {
-          if (attempt === 0) continue;
-          historyError = 'Conversation history is temporarily unavailable';
-          setCanonicalTimelineAuthority(conversationId, routeGeneration, 'error');
-          return false;
+        if (!snapshot) {
+          applyChatV2StateToTimeline();
+          return true;
         }
         if (applyChatV2Snapshot(snapshot, {
           ...options,
-          refreshWatermark,
-          bootstrapPending,
           routeGeneration,
         })) {
           historyError = '';
@@ -1307,7 +1658,6 @@ import X from 'lucide-svelte/icons/x';
           canonicalTimelineApplyRevision += 1;
           return true;
         }
-      }
       scheduleChatV2CanonicalRecovery(conversationId);
       return false;
     } catch (error) {
@@ -1324,7 +1674,6 @@ import X from 'lucide-svelte/icons/x';
       }
       if (chatV2Store.snapshot.conversationId === conversationId) {
         if (chatV2Store.visibleItems.length === 0) {
-          chatV2Store.reset();
           applyChatV2StateToTimeline();
           wsClient.clearChatV2Cursor(conversationId);
           olderMessagesCursor = null;
@@ -1337,7 +1686,9 @@ import X from 'lucide-svelte/icons/x';
         }
       }
       reportError(error);
-      addToast(failureMessage, 'error');
+      // Connectivity failures belong to the global banner; the load is
+      // retried when the connection is restored.
+      if (!isConnectivityError(error)) addToast(failureMessage, 'error');
       return false;
     }
   }
@@ -1398,52 +1749,98 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function drainChatV2Outbox(conversationId: string): Promise<void> {
-    if (chatV2OutboxDraining) return;
-    chatV2OutboxDraining = true;
-    let sentAny = false;
-    try {
-      const pendingEntries = (await chatV2Outbox.list())
-        .filter((entry) => entry.conversation_id === conversationId && entry.status !== 'acked')
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
-      for (const entry of pendingEntries) {
-        try {
-          await chatV2Outbox.update(entry.client_txn_id, {
-            status: 'sending',
-            updated_at: new Date().toISOString(),
-            last_error: undefined
-          });
-          const response = await chatV2Api.sendMessage(entry.conversation_id, entry.client_txn_id, {
-            content: entry.content,
-            attachments: entry.attachments,
-            client_message_id: entry.client_message_id,
-            chat_mode: entry.chat_mode
-          });
-          if (chatV2OwnsActiveConversation(entry.conversation_id)) {
-            chatV2Store.applySend(response);
-          }
-          await chatV2Outbox.update(entry.client_txn_id, {
-            status: 'acked',
-            updated_at: new Date().toISOString(),
-            last_error: undefined
-          });
-          await chatV2Outbox.delete(entry.client_txn_id);
-          sentAny = true;
-        } catch (caughtError) {
-          await chatV2Outbox.update(entry.client_txn_id, {
-            status: 'failed',
-            updated_at: new Date().toISOString(),
-            last_error: asApiError(caughtError).message
-          }).catch(() => undefined);
-        }
+    const routeGeneration = conversationLoadRequestId;
+    const ownerLease = documentCoordination().capture();
+    const outbox = chatV2Outbox;
+    const isCurrent = () => {
+      if (!composerAlive || isStaleConversationLoad(routeGeneration)
+        || !chatV2OwnsActiveConversation(conversationId)) return false;
+      try { ownerLease.assertCurrent(); return true; } catch { return false; }
+    };
+    if (!isCurrent()) return;
+    const run = async () => {
+      if (!isCurrent()) return;
+      chatV2OutboxDraining = true;
+      chatV2OutboxRetry.cancel(conversationId);
+      let sentAny = false;
+      let retryRemaining = false;
+      try {
+        const result = await drainConversationOutbox({
+          outbox, conversationId, isCurrent,
+          onAdmitted: (_entry, dispatched) => {
+            if (dispatched.kind === 'message' && isCurrent()) {
+              chatV2Store.applySend(dispatched.response);
+            }
+          },
+        });
+        sentAny = result.sentAny;
+        retryRemaining = result.retryRemaining;
+      } catch (caughtError) {
+        reportError(caughtError);
+      } finally {
+        chatV2OutboxDraining = false;
+        const pending = chatV2PendingDrain;
+        chatV2PendingDrain = null;
+        if (pending) await pending();
       }
-    } catch (caughtError) {
-      reportError(caughtError);
-    } finally {
-      chatV2OutboxDraining = false;
+      if (!isCurrent()) return;
+      if (retryRemaining) {
+        scheduleChatV2OutboxRetry(conversationId);
+      } else {
+        chatV2OutboxRetry.reset(conversationId);
+      }
+      if (sentAny) {
+        await recoverChatV2Snapshot(conversationId);
+      }
+    };
+    if (chatV2OutboxDraining) {
+      // Coalesce to the latest eligible caller, retaining its own lease and
+      // generation rather than recreating a request from the finishing drain.
+      chatV2PendingDrain = run;
+      return;
     }
-    if (sentAny) {
-      await recoverChatV2Snapshot(conversationId);
+    await run();
+  }
+
+  /**
+   * Show messages still waiting in the durable outbox (sent offline or
+   * before a reload) as pending/failed bubbles in their conversation.
+   */
+  async function showPendingOutboxMessages(conversationId: string): Promise<void> {
+    let entries: OutboxEntry[];
+    try {
+      entries = (await chatV2Outbox.list(conversationId))
+        .filter((entry) => entry.status !== 'acked')
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch {
+      return;
     }
+    if (entries.length === 0 || !chatV2OwnsActiveConversation(conversationId)) return;
+    const visibleClientIds = new Set(
+      chatV2Store.visibleItems
+        .map((item) => (item.kind === 'message' ? item.client_message_id : null))
+        .filter((id): id is string => Boolean(id)),
+    );
+    let changed = false;
+    for (const entry of entries) {
+      if (visibleClientIds.has(entry.client_message_id)) continue;
+      chatV2Store.addOptimisticUser({
+        content: entry.content,
+        attachments: entry.attachments,
+        clientMessageId: entry.client_message_id,
+        chatMode: entry.chat_mode ?? undefined,
+      });
+      if (entry.retryable === false) chatV2Store.markOptimisticUserFailed(entry.client_message_id);
+      changed = true;
+    }
+    if (changed) applyChatV2StateToTimeline();
+  }
+
+  function scheduleChatV2OutboxRetry(conversationId: string): void {
+    chatV2OutboxRetry.schedule(conversationId, () => {
+      if (currentConversation?.conversation_id !== conversationId) return;
+      void drainChatV2Outbox(conversationId);
+    });
   }
 
   // Synchronize page-level state (queue, turn flags) from the Chat v2 store.
@@ -1502,6 +1899,19 @@ import X from 'lucide-svelte/icons/x';
     applyChatV2StateToTimeline();
   }
 
+  const projectedConversationId = $derived(currentConversation?.conversation_id ?? null);
+  $effect(() => {
+    const state = chatV2Store.snapshot;
+    if (!state.cursor || state.conversationId !== projectedConversationId) return;
+    // Another surface may advance the shared owner without this route making
+    // a request. Keep route-local flags and pagination aligned with that owner.
+    untrack(() => {
+      olderMessagesCursor = state.beforeCursor;
+      hasOlderMessages = state.hasMoreBefore;
+      applyChatV2StateToTimeline();
+    });
+  });
+
   let localCommandResultOrdinal = 0;
 
   function appendChatV2LocalSystemMessage(text: string, idHint: string, noticeId?: string | null): void {
@@ -1541,7 +1951,7 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
     }
-    if (response.result_type === 'recap') {
+    if (response.result_type === 'recap' || response.result_type === 'handoff') {
       scheduleChatV2CanonicalRecovery(response.conversation_id, { immediate: true });
       return;
     }
@@ -1616,6 +2026,12 @@ import X from 'lucide-svelte/icons/x';
         setSessionInfo(currentConversation.conversation_id, currentConversation.active_session_id, sessionInfo);
       }
     }
+    if (data.command === '/profile' && typeof data.resolved_agent_profile_id === 'string') {
+      // The durable projection owns coalescing and turn boundaries; do not
+      // append a second speculative card while its canonical update arrives.
+      scheduleChatV2CanonicalRecovery(response.conversation_id, { immediate: true });
+      return;
+    }
     appendChatV2LocalSystemMessage(
       response.text,
       `rest:${response.result_type}:${response.client_txn_id}`,
@@ -1660,7 +2076,6 @@ import X from 'lucide-svelte/icons/x';
   interface ConversationViewCacheEntry {
     conversation: Conversation;
     sessions: Session[];
-    chatV2State: ChatV2ClientState;
     queuedCount: number;
     queuedMessages: QueuedMessage[];
     contextUsage: ContextUsage | null;
@@ -1833,21 +2248,21 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function contextUsageColor(usage: ContextUsage | null): string {
-    if (!usage) return 'text-slate-400';
+    if (!usage) return 'text-muted';
     const contextWindowPercentage = contextWindowUsagePercentage(usage);
-    if (contextWindowPercentage > 95) return 'text-rose-300';
-    if (contextWindowPercentage > 85) return 'text-orange-300';
-    if (contextWindowPercentage > 65) return 'text-amber-300';
-    return 'text-emerald-300';
+    if (contextWindowPercentage > 95) return 'text-danger';
+    if (contextWindowPercentage > 85) return 'text-danger/80';
+    if (contextWindowPercentage > 65) return 'text-warning';
+    return 'text-success';
   }
 
   function contextUsageStroke(usage: ContextUsage | null): string {
-    if (!usage) return '#64748b';
+    if (!usage) return 'rgb(var(--color-muted))';
     const contextWindowPercentage = contextWindowUsagePercentage(usage);
-    if (contextWindowPercentage > 95) return '#fb7185';
-    if (contextWindowPercentage > 85) return '#fb923c';
-    if (contextWindowPercentage > 65) return '#fcd34d';
-    return '#34d399';
+    if (contextWindowPercentage > 95) return 'rgb(var(--color-danger))';
+    if (contextWindowPercentage > 85) return 'rgb(var(--color-danger) / 0.8)';
+    if (contextWindowPercentage > 65) return 'rgb(var(--color-warning))';
+    return 'rgb(var(--color-success))';
   }
 
   function contextDonutDashOffset(value: number | null | undefined): number {
@@ -1913,7 +2328,10 @@ import X from 'lucide-svelte/icons/x';
       ? mergeContextUsage(contextUsage, usage)
       : usage;
     if (sessionInfo?.intaris_session_id === ownerSessionId) {
-      sessionInfo = { ...sessionInfo, context_usage: contextUsage };
+      sessionInfo = mergeSessionContextUsage(sessionInfo, contextUsage);
+      if (currentConversation) {
+        setSessionInfo(currentConversation.conversation_id, ownerSessionId!, sessionInfo);
+      }
     }
   }
 
@@ -1933,7 +2351,7 @@ import X from 'lucide-svelte/icons/x';
       ? mergeLatestPerformance(lastGenerationPerformance, performance)
       : performance;
     if (sessionInfo?.intaris_session_id === ownerSessionId) {
-      sessionInfo = { ...sessionInfo, last_generation: performance };
+      sessionInfo = { ...sessionInfo, last_generation: lastGenerationPerformance };
     }
   }
 
@@ -1944,7 +2362,9 @@ import X from 'lucide-svelte/icons/x';
     contextUsage = previousOwnerSessionId === diagnostics.ownerSessionId
       ? mergeContextUsage(contextUsage, diagnostics.contextUsage)
       : diagnostics.contextUsage;
-    lastGenerationPerformance = diagnostics.lastGeneration;
+    lastGenerationPerformance = previousOwnerSessionId === diagnostics.ownerSessionId
+      ? mergeLatestPerformance(lastGenerationPerformance, diagnostics.lastGeneration)
+      : diagnostics.lastGeneration;
   }
 
   function sessionNarrativeText(info: SessionInfoData | null): string | null {
@@ -1992,33 +2412,33 @@ import X from 'lucide-svelte/icons/x';
 
   function contextMetricBarColor(label: string, percent: number): string {
     if (label === 'Steady target') {
-      if (percent > 130) return 'bg-rose-400';
-      if (percent > 110) return 'bg-orange-400';
-      if (percent > 85) return 'bg-amber-300';
-      return 'bg-emerald-400';
+      if (percent > 130) return 'bg-danger';
+      if (percent > 110) return 'bg-danger/80';
+      if (percent > 85) return 'bg-warning';
+      return 'bg-success';
     }
     if (label === 'Within-turn burst') {
-      if (percent > 100) return 'bg-rose-400';
-      if (percent > 95) return 'bg-orange-400';
-      if (percent > 80) return 'bg-amber-300';
-      return 'bg-emerald-400';
+      if (percent > 100) return 'bg-danger';
+      if (percent > 95) return 'bg-danger/80';
+      if (percent > 80) return 'bg-warning';
+      return 'bg-success';
     }
     if (label === 'Hard target') {
-      if (percent > 100) return 'bg-rose-400';
-      if (percent > 95) return 'bg-orange-400';
-      if (percent > 85) return 'bg-amber-300';
-      return 'bg-emerald-400';
+      if (percent > 100) return 'bg-danger';
+      if (percent > 95) return 'bg-danger/80';
+      if (percent > 85) return 'bg-warning';
+      return 'bg-success';
     }
     if (label === 'Effective prompt budget' || label === 'Loop pressure') {
-      if (percent > 98) return 'bg-rose-400';
-      if (percent > 90) return 'bg-orange-400';
-      if (percent > 75) return 'bg-amber-300';
-      return 'bg-emerald-400';
+      if (percent > 98) return 'bg-danger';
+      if (percent > 90) return 'bg-danger/80';
+      if (percent > 75) return 'bg-warning';
+      return 'bg-success';
     }
-    if (percent > 95) return 'bg-rose-400';
-    if (percent > 85) return 'bg-orange-400';
-    if (percent > 65) return 'bg-amber-300';
-    return 'bg-emerald-400';
+    if (percent > 95) return 'bg-danger';
+    if (percent > 85) return 'bg-danger/80';
+    if (percent > 65) return 'bg-warning';
+    return 'bg-success';
   }
 
   function contextBudgetBars(usage: ContextUsage): Array<{
@@ -2418,6 +2838,7 @@ import X from 'lucide-svelte/icons/x';
   onDestroy(cancelScheduledTreeRefresh);
   onDestroy(() => treeReconciliation.dispose());
   onDestroy(() => sidebarReconciliation.dispose());
+  onDestroy(() => waitingReconciliation.dispose());
 
   function openInspectorWork(category: WorkCategory = 'files', sessionId?: string, focus?: WorkInitialFocus): void {
     cancelActivityOverviewDemand();
@@ -2679,6 +3100,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function startQueuedMessageEdit(message: QueuedMessage): void {
+    if (!message.can_edit || message.status === 'committing') return;
     queueEditingId = message.queue_id;
     queueEditContent = message.content;
     queueEditError = '';
@@ -2704,6 +3126,10 @@ import X from 'lucide-svelte/icons/x';
 
     const conversationId = conversation.conversation_id;
     const queuedMessage = queuedMessages.find((message) => message.queue_id === queueId);
+    if (!queuedMessage?.can_edit || queuedMessage.status === 'committing') {
+      cancelQueuedMessageEdit();
+      return;
+    }
     queueBusyId = queueId;
     queueEditError = '';
 
@@ -2790,6 +3216,7 @@ import X from 'lucide-svelte/icons/x';
   let focusHandler: (() => void) | null = null;
   let pageShowHandler: ((event: PageTransitionEvent) => void) | null = null;
   let onlineHandler: (() => void) | null = null;
+  let pageHideHandler: (() => void) | null = null;
   let foregroundSyncTimer: number | null = null;
   let historySectionDayTimer: number | null = null;
   let conversationLoadRequestId = 0;
@@ -2879,7 +3306,9 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function reconcileChatNotifications(): Promise<void> {
-    if (!pushSubscriptionKnownEnabled) return;
+    // Reconcile whenever the user opted in on this device, even if the last
+    // check found the subscription gone: it is silently recreated.
+    if (!wantsWebPush()) return;
     pushSubscriptionKnownEnabled = await reconcileWebPushSubscription();
     const status = await api.push.status().catch(() => null);
     pushDeliveryError = status?.last_error ?? '';
@@ -2887,6 +3316,7 @@ import X from 'lucide-svelte/icons/x';
 
   function isReadOnly(conversation: Conversation | null): boolean {
     if (!conversation) return true;
+    if (conversation.is_readonly_for_caller) return true;
     if (conversation.status !== 'active') return true;
     if (isManagedConversation(conversation)) return true;
     if (!isWebConversation(conversation)) return true;
@@ -3868,12 +4298,24 @@ import X from 'lucide-svelte/icons/x';
       pendingNotificationSource?: 'server' | 'refetch';
     } = {}
   ): void {
+    updateWaitingCaches(conversationId, item => mergeConversationRowPatch(item, patch));
     if (Object.prototype.hasOwnProperty.call(patch, 'pending_notification_types') && options.pendingNotificationSource === 'server') {
       observePendingNotificationServerPush(conversationId);
     }
     const index = conversations.findIndex((conversation) => conversation.conversation_id === conversationId);
     const now = new Date().toISOString();
+    waitingConversations = waitingConversations.map((item) => item.conversation_id === conversationId
+      ? mergeConversationRowPatch(item, {
+          ...patch,
+          ...(options.touchUpdatedAt ? { updated_at: patch.updated_at ?? now } : {}),
+          ...(options.touchLastMessageAt ? { last_message_at: patch.last_message_at ?? now } : {}),
+        })
+      : item);
     if (index < 0) {
+      if (waitingConversations.some((item) => item.conversation_id === conversationId)) {
+        rememberSidebarProjection();
+        return;
+      }
       const direct = agentDirectChats.find((item) => item.conversation.conversation_id === conversationId);
       if (direct) {
         const effectivePatch: Partial<Conversation> = {
@@ -3911,11 +4353,17 @@ import X from 'lucide-svelte/icons/x';
 
   function removeConversationFromSidebar(
     conversationId: string,
-    { markCurrentDeleted = false }: { markCurrentDeleted?: boolean } = {}
+    { markCurrentDeleted = false, canonicalRemoval = false }: {
+      markCurrentDeleted?: boolean; canonicalRemoval?: boolean;
+    } = {}
   ): void {
+    // Filter eviction is local; only a canonical tombstone removes all scopes.
+    if (canonicalRemoval) updateWaitingCaches(conversationId, () => null);
     const previousConversationCount = conversations.length;
+    const previousWaitingCount = waitingConversations.length;
     const previousDirectCount = agentDirectChats.length;
     conversations = removeSidebarConversationRow(conversations, conversationId);
+    waitingConversations = removeSidebarConversationRow(waitingConversations, conversationId);
     agentDirectChats = agentDirectChats.filter(
       (item) => item.conversation.conversation_id !== conversationId
     );
@@ -3926,7 +4374,8 @@ import X from 'lucide-svelte/icons/x';
       turnInProgress = false;
       activeTurnChatMode = 'default';
     }
-    if (previousConversationCount !== conversations.length || previousDirectCount !== agentDirectChats.length) {
+    if (previousConversationCount !== conversations.length || previousDirectCount !== agentDirectChats.length
+      || previousWaitingCount !== waitingConversations.length) {
       rememberSidebarProjection();
     }
   }
@@ -3939,6 +4388,11 @@ import X from 'lucide-svelte/icons/x';
     const admission = sidebarRevisionAdmission.admitPush(conversationId, revision);
     if (admission.reconcile) scheduleSidebarReconciliation('sidebar-upsert-gap');
     if (!admission.apply) return;
+    sidebarNetworkProjectionApplied = true;
+    updateWaitingCaches(conversationId, item => mergeAuthoritativeSidebarConversation(item, conversation));
+    waitingConversations = waitingConversations.map((item) => item.conversation_id === conversationId
+      ? mergeAuthoritativeSidebarConversation(item, conversation)
+      : item);
     observePendingNotificationServerPush(conversationId);
     applyConversationStateSnapshot(conversation.conversation_state, { patchConversationRows: false });
     if (currentConversation?.conversation_id === conversationId) {
@@ -4044,6 +4498,7 @@ import X from 'lucide-svelte/icons/x';
   function saveCurrentConversationView(): void {
     try {
       if (!currentConversation) return;
+      timelineController?.persist();
       if (conversationViewSaveTimer !== null && typeof window !== 'undefined') {
         window.clearTimeout(conversationViewSaveTimer);
         conversationViewSaveTimer = null;
@@ -4070,7 +4525,6 @@ import X from 'lucide-svelte/icons/x';
         // compaction item, so discarding this overlay made the compaction card
         // and the optimistic user message disappear until canonical history
         // eventually caught up.
-        chatV2State: chatV2Store.serializeState(),
         queuedCount,
         queuedMessages: queuedMessages.map((message) => ({ ...message })),
         contextUsage,
@@ -4090,9 +4544,161 @@ import X from 'lucide-svelte/icons/x';
         activeTurnChatMode,
         fetchedAt: Date.now(),
       });
+      persistConversationView(currentConversation.conversation_id);
     } catch (error) {
       console.warn('Failed to save conversation view cache', error);
     }
+  }
+
+  // Device (IndexedDB) copy of the in-memory view cache, used for instant
+  // cold starts and offline reading. Live runtime overlays are settled so a
+  // relaunch never shows a stale "streaming" turn; reconnect/sync refreshes.
+  const PERSISTED_VIEW_HYDRATE_BUDGET_MS = 600;
+
+  /**
+   * Copy of a non-current (e.g. preloaded) view's state with live runtime
+   * overlays settled, so a relaunch never restores a finished turn as live.
+   */
+  function persistConversationView(conversationId: string): void {
+    const entry = conversationViewCache.get(conversationId);
+    if (!entry || isReadOnly(entry.conversation)) return;
+    try {
+      const persisted: ConversationViewCacheEntry = JSON.parse(JSON.stringify({
+        ...entry,
+        turnInProgress: false,
+        awaitingAssistantStart: false,
+        userScrolledUp: false,
+        viewportAnchor: null,
+      }));
+       void offlineCache.put('conversation-view', conversationId, persisted, pageDataOwner);
+    } catch (error) {
+      console.warn('Failed to persist conversation view', error);
+    }
+  }
+
+  async function hydratePersistedConversationView(conversationId: string): Promise<boolean> {
+    // Hydration is also used by background preloads. Only an accepted foreground
+    // restore may bind the controller and replace the visible store/scroll owner.
+    const acquired = acquireTimeline(conversationTimelineScope(conversationId));
+    const controller = acquired.controller;
+    try {
+      await controller.hydrate();
+      const persisted = await Promise.race([
+        offlineCache.get<ConversationViewCacheEntry>('conversation-view', conversationId, pageDataOwner),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), PERSISTED_VIEW_HYDRATE_BUDGET_MS)),
+      ]);
+      if (!controller.current) throw controller.ownerSignal.reason ?? new TimelineOwnershipError();
+      if (
+        !pageAlive
+        || !persisted
+        || conversationViewCache.has(conversationId)
+        || persisted.conversation?.conversation_id !== conversationId
+      ) return false;
+      const { chatV2State: _legacy, ...metadata } = persisted as ConversationViewCacheEntry & { chatV2State?: unknown };
+      touchConversationViewCache(conversationId, metadata);
+      return true;
+    } finally {
+      acquired.release();
+    }
+  }
+
+  // ---- Background preloading -------------------------------------------
+  // Conversations with activity are brought up to date in the background
+  // (cursor sync on the cached view, snapshot when uncached or reset) so
+  // opening them paints current content without a loading/refresh state.
+  const PRELOAD_IDLE_WARM_COUNT = 5;
+
+  function sidebarConversation(conversationId: string): Conversation | null {
+    return waitingConversations.find((item) => item.conversation_id === conversationId)
+      ?? conversations.find((item) => item.conversation_id === conversationId)
+      ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
+      ?? null;
+  }
+
+  async function preloadConversationView(conversationId: string, signal: AbortSignal): Promise<void> {
+    if (conversationId === currentConversation?.conversation_id) return;
+    const listed = sidebarConversation(conversationId);
+    if (!listed || isReadOnly(listed)) return;
+    if (!conversationViewCache.has(conversationId)) {
+      await hydratePersistedConversationView(conversationId);
+    }
+    const existing = conversationViewCache.get(conversationId) ?? null;
+    const acquired = acquireTimeline(conversationTimelineScope(conversationId));
+    const store = acquired.controller.store;
+    try { await acquired.controller.load({ signal }); } finally { acquired.release(); }
+    const olderCursor = store.snapshot.beforeCursor;
+    const hasOlder = store.snapshot.hasMoreBefore;
+    // The user may have opened it meanwhile; its own load path owns it now.
+    if (signal.aborted || conversationId === currentConversation?.conversation_id) return;
+    const latest = conversationViewCache.get(conversationId);
+    if (latest && latest !== existing) return;
+    const state = store.snapshot;
+    const projection = deriveChatV2ViewProjection(state);
+    touchConversationViewCache(conversationId, {
+      conversation: { ...(sidebarConversation(conversationId) ?? listed) },
+      sessions: existing?.sessions ?? [],
+      queuedCount: existing?.queuedCount ?? 0,
+      queuedMessages: existing?.queuedMessages ?? [],
+      contextUsage: existing?.contextUsage ?? null,
+      sessionInfo: existing?.sessionInfo ?? null,
+      visibleStartIndex: existing?.userScrolledUp ? existing.visibleStartIndex : 0,
+      scrollTop: existing?.userScrolledUp ? existing.scrollTop : 0,
+      userScrolledUp: existing?.userScrolledUp ?? false,
+      viewportAnchor: existing?.userScrolledUp ? existing.viewportAnchor : null,
+      turnInProgress: projection.turnInProgress,
+      awaitingAssistantStart: false,
+      activeSessionLastSeq: existing?.activeSessionLastSeq ?? 0,
+      olderMessagesCursor: olderCursor,
+      hasOlderMessages: hasOlder,
+      activeTurnChatMode: existing?.activeTurnChatMode ?? 'default',
+      fetchedAt: Date.now(),
+    });
+    persistConversationView(conversationId);
+  }
+
+  let conversationPreloader = new ConversationPreloadScheduler(preloadConversationView);
+  onDestroy(() => conversationPreloader.dispose());
+  let idlePreloadWarmed = false;
+  $effect(() => {
+    if (idlePreloadWarmed || !initialConversationResolved || conversations.length === 0) return;
+    idlePreloadWarmed = true;
+    scheduleIdlePreloadWarmup();
+  });
+
+  /** Back in the foreground: bring chats with running turns up to date. */
+  function preloadActiveConversations(): void {
+    const currentId = currentConversation?.conversation_id;
+    for (const item of conversations) {
+      if (item.conversation_id !== currentId && item.has_active_turn) {
+        requestActivityPreload(item.conversation_id, true);
+      }
+    }
+  }
+
+  function requestActivityPreload(conversationId: string, activeTurn: boolean): void {
+    conversationPreloader.request(conversationId, { priority: 'activity', activeTurn });
+  }
+
+  /** After the page settles, warm the most recent conversations when idle. */
+  function scheduleIdlePreloadWarmup(): void {
+    if (typeof window === 'undefined') return;
+    const run = () => {
+      const currentId = currentConversation?.conversation_id;
+      const candidates = conversations
+        .filter((item) => item.conversation_id !== currentId && !isReadOnly(item))
+        .filter((item) => {
+          const cached = conversationViewCache.get(item.conversation_id);
+          return !cached || Date.now() - cached.fetchedAt > 120_000;
+        })
+        .slice(0, PRELOAD_IDLE_WARM_COUNT);
+      for (const item of candidates) {
+        conversationPreloader.request(item.conversation_id, { priority: 'idle' });
+      }
+    };
+    const idle = (window as Window & { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number })
+      .requestIdleCallback;
+    if (idle) idle(run, { timeout: 5_000 });
+    else window.setTimeout(run, 3_000);
   }
 
   function scheduleCurrentConversationViewSave(): void {
@@ -4111,12 +4717,13 @@ import X from 'lucide-svelte/icons/x';
 
   function restoreConversationView(conversationId: string): ConversationViewCacheEntry | null {
     const entry = conversationViewCache.get(conversationId);
-    if (!entry) return null;
+    const canonical = peekTimeline(conversationTimelineScope(conversationId));
+    if (!entry || !canonical?.cursor) return null;
     touchConversationViewCache(conversationId, entry);
     activeConversationId = conversationId;
     currentConversation = { ...entry.conversation };
     sessions = entry.sessions.map((session) => ({ ...session }));
-    chatV2Store.restoreState(entry.chatV2State);
+    bindTimeline(conversationId);
     // Derive queue/turn-flag/active-turn-id projections through the same
     // projection path used for live snapshots and sync frames
     // (applyChatV2StateToTimeline -> deriveChatV2ViewProjection), instead of
@@ -4130,8 +4737,9 @@ import X from 'lucide-svelte/icons/x';
     contextUsage = entry.contextUsage;
     sessionInfo = entry.sessionInfo ? { ...entry.sessionInfo } : null;
     activeSessionLastSeq = entry.activeSessionLastSeq;
-    olderMessagesCursor = entry.olderMessagesCursor ?? null;
-    hasOlderMessages = entry.hasOlderMessages ?? false;
+    olderMessagesCursor = chatV2Store.snapshot.beforeCursor;
+    hasOlderMessages = chatV2Store.snapshot.hasMoreBefore;
+    chatV2Lifecycle.acceptSnapshot(conversationTimelineScope(conversationId), chatV2Store.snapshot.cursor!);
     activeTurnChatMode = entry.activeTurnChatMode ?? 'default';
     // The cache entry only carries durable per-conversation view state. Any
     // transient open/send/modal state from whatever conversation was
@@ -4176,6 +4784,7 @@ import X from 'lucide-svelte/icons/x';
           TIMELINE_WINDOW_TARGET_ROWS,
         );
     userScrolledUp = viewportState.mode === 'paused';
+    establishTimelineWindow();
     tailPinned = !userScrolledUp;
     timelineInitialPositionSettled = false;
     initialLoadTimedOut = false;
@@ -4184,11 +4793,13 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function clearConversationViewState(): void {
+    timelineViewportStates.invalidateWindow();
     sessions = [];
     sessionIds.clear();
     // Reset the canonical Chat v2 store immediately so the outgoing
     // conversation's content cannot flash into the incoming conversation.
-    chatV2Store.reset();
+    // Do not reset a timeline retained by another surface.
+    chatV2Store = new ChatV2Store();
     timelineWindow = { start: 0, end: null };
     lastRenderableVisibleCount = 0;
     activeSessionLastSeq = 0;
@@ -4235,6 +4846,7 @@ import X from 'lucide-svelte/icons/x';
     // callback for the old conversation must never write into the new scope.
     parentSurfaceTransitionGeneration += 1;
     parentSurfaceWasHidden = false;
+    parentSurfaceAnchor = null;
     timelineViewportTransition = timelineViewportStates.begin(scopeKey, generation);
     timelineInitialPositionSettled = false;
     programmaticScrollTarget = null;
@@ -4305,14 +4917,15 @@ import X from 'lucide-svelte/icons/x';
   function sidebarConversationById(conversationId: string): Conversation | null {
     if (currentConversation?.conversation_id === conversationId) return currentConversation;
     return (
-      conversations.find((conversation) => conversation.conversation_id === conversationId)
+      waitingConversations.find((conversation) => conversation.conversation_id === conversationId)
+      ?? conversations.find((conversation) => conversation.conversation_id === conversationId)
       ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
       ?? null
     );
   }
 
   function markConversationReadLocally(conversationId: string | null | undefined, readAt?: string | null): void {
-    if (!conversationId) return;
+    if (!conversationId || !hostAllowsObservation()) return;
     const conversation = sidebarConversationById(conversationId);
     const readFloor = conversationReadAcknowledgementAt(conversation, readAt);
     patchConversationInList(conversationId, {
@@ -4322,14 +4935,22 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
+    if (reset) {
+      await loadSidebarProjection();
+      return;
+    }
+    const initialKey = sidebarProjectionCacheKey();
     conversationListLoadCount += 1;
     conversationListLoading = true;
     try {
       const response = await api.conversations.list(reset ? null : conversationCursor, {
         contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
         agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
+        projectId: selectedProjectId || null,
+        includeShared: includeSharedChats,
         status: selectedConversationStatus,
       });
+      if (initialKey !== sidebarProjectionCacheKey()) return;
       mergeConversationList(response.items, { reset });
       conversationCursor = response.cursor;
       conversationsHasMore = response.has_more;
@@ -4355,6 +4976,8 @@ import X from 'lucide-svelte/icons/x';
         {
           contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
           agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
+          projectId: selectedProjectId || null,
+          includeShared: includeSharedChats,
           status: selectedConversationStatus,
           query: normalizedQuery,
         },
@@ -4399,8 +5022,11 @@ import X from 'lucide-svelte/icons/x';
 
   function sidebarProjectionCacheKey(): string {
     return JSON.stringify({
-      channels: selectedChannels,
-      agents: selectedAgentIds,
+      owner: auth.getSnapshot().user?.email,
+      channels: [...selectedChannels].sort(),
+      agents: [...selectedAgentIds].sort(),
+      project: selectedProjectId,
+      includeShared: includeSharedChats,
       status: selectedConversationStatus,
     });
   }
@@ -4410,16 +5036,21 @@ import X from 'lucide-svelte/icons/x';
       selectedChannels,
       selectedAgentIds,
       selectedConversationStatus,
+      selectedProjectId,
     };
   }
 
   function rememberSidebarProjection(key = sidebarProjectionCacheKey()): void {
+    // Independent Waiting completion must not cache old-scope sidebar rows
+    // under a newly selected scope before that sidebar has loaded.
+    if (sidebarSnapshotScope !== key) return;
     rememberSidebarProjectionSnapshot(
       sidebarProjectionCache,
       key,
       {
         agents,
         agent_direct_chats: agentDirectChats,
+        waiting_conversations: waitingSnapshotScope === key ? waitingConversations : undefined,
         conversations: {
           items: conversations,
           cursor: conversationCursor,
@@ -4432,6 +5063,34 @@ import X from 'lucide-svelte/icons/x';
       },
       SIDEBAR_PROJECTION_CACHE_LIMIT,
     );
+    const snapshot = sidebarProjectionCache.get(key);
+    if (snapshot) {
+      try {
+        // Device copy for cold start/offline. Drop the revision so a stale
+        // copy can never advance revision admission past the server.
+        void offlineCache.put('sidebar', key, JSON.parse(JSON.stringify({
+          ...snapshot,
+          sidebar_revision: null,
+        })), pageDataOwner);
+      } catch {
+        // Non-serializable or quota issue: device cache is best effort.
+      }
+    }
+  }
+
+  function updateWaitingCaches(
+    conversationId: string, update: (row: Conversation) => Conversation | null,
+  ): void {
+    for (const [key, rows] of waitingSnapshotCache) {
+      waitingSnapshotCache.set(key, updateSidebarRow(rows, conversationId, update));
+    }
+    for (const projection of sidebarProjectionCache.values()) {
+      if (projection.waiting_conversations) {
+        projection.waiting_conversations = updateSidebarRow(
+          projection.waiting_conversations, conversationId, update,
+        );
+      }
+    }
   }
 
   function applySidebarProjection(
@@ -4443,17 +5102,31 @@ import X from 'lucide-svelte/icons/x';
       if (!admission.apply) return false;
     }
     const reset = options.reset ?? true;
+    sidebarSnapshotScope = sidebarProjectionCacheKey();
+    const protectedIds = sidebarRevisionAdmission.newerConversationIds(projection.sidebar_revision);
+    const protectedDirectChats = agentDirectChats.filter(
+      item => protectedIds.has(item.conversation.conversation_id)
+        && conversationMatchesSidebarProjectionFilter(item.conversation, currentSidebarProjectionFilter()),
+    );
+    const incomingDirectChats = projection.agent_direct_chats.filter(
+      item => !protectedIds.has(item.conversation.conversation_id),
+    );
+    sidebarNetworkProjectionApplied = true;
     if (reset || projection.agents.length > 0) agents = projection.agents;
     if (reset) {
-      agentDirectChats = projection.agent_direct_chats;
+      agentDirectChats = sortAgentDirectChats([...incomingDirectChats, ...protectedDirectChats]);
     } else if (projection.agent_direct_chats.length > 0) {
-      mergeAgentDirectChats(projection.agent_direct_chats);
+      mergeAgentDirectChats(incomingDirectChats);
     }
     if (reset || projection.context_types.length > 0) applyAvailableChannelTypes(projection.context_types);
     backgroundWork = mergeSidebarBackgroundWork(backgroundWork, projection);
-    mergeConversationList(projection.conversations.items, { reset });
+    mergeConversationList(overlaySidebarRows(
+      projection.conversations.items, reset ? conversations.filter(
+        item => conversationMatchesSidebarProjectionFilter(item, currentSidebarProjectionFilter()),
+      ) : [], protectedIds,
+    ), { reset });
     for (const removedId of projection.removed_conversation_ids ?? []) {
-      removeConversationFromSidebar(removedId);
+      if (!protectedIds.has(removedId)) removeConversationFromSidebar(removedId);
     }
     if (reset) {
       conversationCursor = projection.conversations.cursor;
@@ -4476,6 +5149,49 @@ import X from 'lucide-svelte/icons/x';
     return true;
   }
 
+  // True once any live (memory/network) projection has been applied. A
+  // device-cached sidebar is only a cold-start placeholder before that.
+  let sidebarNetworkProjectionApplied = false;
+  const SIDEBAR_DEVICE_HYDRATE_BUDGET_MS = 800;
+  let sidebarDeviceHydration: Promise<boolean> | null = null;
+
+  /**
+   * Paint the device-cached sidebar on cold start. Independent of network
+   * refresh epochs (reconnect/invalidation resyncs must not cancel it) and
+   * applied only while nothing live has been shown. The copy carries no
+   * revision or sync timestamp, so the next server load is a full reset and
+   * revision admission is never advanced by stale data.
+   */
+  function hydrateSidebarFromDevice(): Promise<boolean> {
+    if (sidebarDeviceHydration) return sidebarDeviceHydration;
+    const key = sidebarProjectionCacheKey();
+    const startedAt = performance.now();
+    sidebarDeviceHydration = (async () => {
+      const email = auth.getSnapshot().user?.email;
+      if (email && !offlineCache.currentOwner) await offlineCache.setOwner(pageDataOwner);
+      const persisted = await offlineCache.get<SidebarProjection>('sidebar', key, pageDataOwner);
+      if (!persisted || sidebarNetworkProjectionApplied || key !== sidebarProjectionCacheKey()) {
+        return false;
+      }
+      const reset = true;
+      agents = persisted.agents ?? [];
+      agentDirectChats = persisted.agent_direct_chats ?? [];
+      applyAvailableChannelTypes(persisted.context_types ?? []);
+      mergeConversationList(persisted.conversations?.items ?? [], { reset });
+      if (!waitingSnapshotCache.has(key)) {
+        waitingConversations = persisted.waiting_conversations ?? [];
+      }
+      conversationCursor = persisted.conversations?.cursor ?? null;
+      conversationsHasMore = persisted.conversations?.has_more ?? false;
+      sidebarProjectionLoaded = true;
+      sidebarProjectionFailed = false;
+      conversationListLoading = false;
+      recordPerf({ kind: 'sidebar', path: 'device', ms: performance.now() - startedAt });
+      return true;
+    })().catch(() => false);
+    return sidebarDeviceHydration;
+  }
+
   function applyCachedSidebarProjection(key = sidebarProjectionCacheKey()): boolean {
     const cached = sidebarProjectionCache.get(key);
     if (!cached) return false;
@@ -4491,20 +5207,95 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadSidebarProjection(
-    options: { recoveryAttempt?: boolean } = {},
+    options: { recoveryAttempt?: boolean; manual?: boolean } = {},
+  ): Promise<void> {
+    if (isWorkspaceReplica()) return;
+    sidebarRefreshLifecycle.sync();
+    const scope = sidebarProjectionCacheKey();
+    await Promise.all([
+      sidebarReconciliation.request(scope, { full: true, urgent: true, manual: options.manual }),
+      waitingReconciliation.request(scope, { urgent: true, manual: options.manual }),
+    ]);
+  }
+
+  async function performWaitingRefresh(attempt: RefreshAttempt): Promise<void> {
+    const key = attempt.scope;
+    const recoverChangedScope = () => {
+      void waitingReconciliation.request(sidebarProjectionCacheKey(), { urgent: true });
+    };
+    if (key !== sidebarProjectionCacheKey()) {
+      recoverChangedScope();
+      return;
+    }
+    if (waitingSnapshotScope !== key) {
+      waitingSnapshotScope = key;
+      waitingConversations = (waitingSnapshotCache.get(key)
+        ?? sidebarProjectionCache.get(key)?.waiting_conversations ?? []).filter(
+        item => conversationMatchesSidebarProjectionFilter(item, currentSidebarProjectionFilter()),
+      );
+      waitingLoadError = null;
+    }
+    const sequence = sidebarRevisionAdmission.pushSequence;
+    try {
+      const items = selectedConversationStatus === 'active'
+        ? await api.conversations.waiting({
+          contextTypes: selectedChannels.length > 0 ? [...selectedChannels] : null,
+          agentIds: selectedAgentIds.length > 0 ? [...selectedAgentIds] : null,
+          projectId: selectedProjectId || null,
+        }, { signal: attempt.signal, activity: waitingActivity, scope: key }) : [];
+      if (attempt.signal.aborted) return;
+      if (key !== sidebarProjectionCacheKey()) {
+        recoverChangedScope();
+        return;
+      }
+      waitingConversations = reconcileWaitingSnapshot(
+        mergeWaitingConversations(conversations, waitingConversations),
+        overlaySidebarRows(items, waitingConversations, sidebarRevisionAdmission.pushedSince(sequence)),
+      );
+      waitingLoadError = null;
+      waitingSnapshotCache.delete(key);
+      waitingSnapshotCache.set(key, waitingConversations);
+      if (waitingSnapshotCache.size > SIDEBAR_PROJECTION_CACHE_LIMIT) {
+        waitingSnapshotCache.delete(waitingSnapshotCache.keys().next().value!);
+      }
+      rememberSidebarProjection();
+    } catch (error) {
+      if (attempt.signal.aborted) return;
+      if (key !== sidebarProjectionCacheKey()) {
+        recoverChangedScope();
+        return;
+      }
+      waitingLoadError = asApiError(error).message;
+      throw error;
+    }
+  }
+
+  async function performSidebarLoad(
+    options: { recoveryAttempt?: boolean; signal: AbortSignal },
   ): Promise<void> {
     const requestEpoch = ++sidebarProjectionRefreshEpoch;
     conversationListLoadCount += 1;
     const initialKey = sidebarProjectionCacheKey();
     const hadCachedProjection = applyCachedSidebarProjection(initialKey);
     conversationListLoading = conversationListLoadCount > 1 || !hadCachedProjection;
+    const loadStartedAt = performance.now();
+    if (hadCachedProjection) {
+      recordPerf({ kind: 'sidebar', path: 'memory', ms: 0 });
+    } else if (!sidebarNetworkProjectionApplied) {
+      // Cold start: show the device-cached sidebar while the network loads.
+      void hydrateSidebarFromDevice();
+    }
     const load = () => api.conversations.sidebar(null, {
       contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
       agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
+      projectId: selectedProjectId || null,
+      includeShared: includeSharedChats,
       status: selectedConversationStatus,
-    });
+    }, { signal: options.signal, invalidationOwner: 'refresh' });
     try {
-      let response = await load();
+      const response = await load();
+      if (options.signal.aborted) return;
+      recordPerf({ kind: 'sidebar', path: 'network', ms: performance.now() - loadStartedAt });
       if (!shouldApplySidebarProjectionRefresh({
         requestEpoch,
         currentEpoch: sidebarProjectionRefreshEpoch,
@@ -4516,38 +5307,21 @@ import X from 'lucide-svelte/icons/x';
         scheduleSidebarReconciliation('changed-sidebar-filter');
         return;
       }
-      let admission = sidebarRevisionAdmission.admitProjection(response.sidebar_revision);
+      const admission = sidebarRevisionAdmission.admitProjection(response.sidebar_revision);
       if (!admission.apply) {
         ensureSidebarRecoveryIfBehind('rejected-sidebar-load', options);
         return;
       }
       agents = response.agents;
       if (restoreSelectedAgent()) {
-        const restoredKey = sidebarProjectionCacheKey();
-        response = await load();
-        if (!shouldApplySidebarProjectionRefresh({
-          requestEpoch,
-          currentEpoch: sidebarProjectionRefreshEpoch,
-        })) {
-          ensureSidebarRecoveryIfBehind('superseded-restored-sidebar-load', options);
-          return;
-        }
-        if (restoredKey !== sidebarProjectionCacheKey()) {
-          scheduleSidebarReconciliation('changed-restored-sidebar-filter');
-          return;
-        }
-        admission = sidebarRevisionAdmission.admitProjection(response.sidebar_revision);
-        if (!admission.apply) {
-          ensureSidebarRecoveryIfBehind('rejected-restored-sidebar-load', options);
-          return;
-        }
-        agents = response.agents;
-        restoreSelectedAgent();
+        scheduleSidebarReconciliation('changed-restored-sidebar-filter');
+        return;
       }
       if (applySidebarProjection(response, { revisionAdmitted: true })) {
         rememberSidebarProjection();
       }
     } catch (caughtError) {
+      if (options.signal.aborted || initialKey !== sidebarProjectionCacheKey()) return;
       if (!shouldApplySidebarProjectionRefresh({
         requestEpoch,
         currentEpoch: sidebarProjectionRefreshEpoch,
@@ -4559,17 +5333,6 @@ import X from 'lucide-svelte/icons/x';
       conversationListLoadCount = Math.max(0, conversationListLoadCount - 1);
       conversationListLoading = conversationListLoadCount > 0;
     }
-  }
-
-  async function loadAgentDirectChats(): Promise<void> {
-    if (selectedChannels.length > 0 && !selectedChannels.includes('web')) {
-      agentDirectChats = [];
-      return;
-    }
-    agentDirectChats = await api.conversations.agentDirect({
-      agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
-      status: 'active'
-    });
   }
 
   function restoreSelectedAgent(): boolean {
@@ -4607,7 +5370,7 @@ import X from 'lucide-svelte/icons/x';
   async function clearSelectedAgentFilterForDirectChat(): Promise<void> {
     if (!clearSelectedAgentFilter()) return;
     resetConversationSearchResults();
-    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+    await loadConversationPage(true);
   }
 
   function conversationIdFromRoute(): string {
@@ -4723,7 +5486,8 @@ import X from 'lucide-svelte/icons/x';
    }
 
   function isStaleConversationLoad(requestId: number): boolean {
-    return !isCurrentConversationLoad(requestId, conversationLoadRequestId);
+    return !pageAlive || timelineController?.current === false
+      || !isCurrentConversationLoad(requestId, conversationLoadRequestId);
   }
 
   let conversationSwitchRequestId = 0;
@@ -5037,6 +5801,7 @@ import X from 'lucide-svelte/icons/x';
     }
     if (key === lastSeededSearchKey) return;
     lastSeededSearchKey = key;
+    findOnlySearchConversationId = null;
     chatSearchOpen = true;
     chatSearchQuery = seed;
     seededChatSearchSession = session;
@@ -5207,6 +5972,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function openChatSearch(seed = ''): void {
+    findOnlySearchConversationId = null;
     chatSearchOpen = true;
     seededChatSearchSession = null;
     seededChatSearchRef = null;
@@ -5217,6 +5983,7 @@ import X from 'lucide-svelte/icons/x';
 
   function openCurrentConversationInSeparateWindow(): void {
     if (!currentConversation || typeof window === 'undefined') return;
+    if (openNativeConversationWindow(currentConversation.conversation_id)) return;
     const width = Math.min(980, Math.max(720, Math.round(window.screen.availWidth * 0.62)));
     const height = Math.min(1100, Math.max(760, Math.round(window.screen.availHeight * 0.86)));
     const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
@@ -5403,6 +6170,13 @@ import X from 'lucide-svelte/icons/x';
     reason: string,
     options: { force?: boolean; recoveryAttempt?: boolean } = {},
   ): Promise<void> {
+    scheduleSidebarReconciliation(reason, options);
+  }
+
+  async function performSidebarResync(
+    reason: string,
+    options: { force?: boolean; recoveryAttempt?: boolean; signal: AbortSignal },
+  ): Promise<void> {
     if (
       !options.force &&
       shouldDebounceSidebarResync({
@@ -5415,6 +6189,8 @@ import X from 'lucide-svelte/icons/x';
     const filters = {
       contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
       agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
+      projectId: selectedProjectId || null,
+      includeShared: includeSharedChats,
       status: selectedConversationStatus,
     };
     const filterKey = sidebarProjectionCacheKey();
@@ -5425,8 +6201,11 @@ import X from 'lucide-svelte/icons/x';
         ? await api.conversations.sidebar(null, filters, {
             changedSince: lastSidebarSyncTimestamp,
             sidebarRevision: sidebarRevisionAdmission.authoritativeRestCursor,
+            signal: options.signal,
+            invalidationOwner: 'refresh',
           })
-        : await api.conversations.sidebar(null, filters);
+        : await api.conversations.sidebar(null, filters, { signal: options.signal, invalidationOwner: 'refresh' });
+      if (options.signal.aborted) return;
       if (!shouldApplySidebarProjectionRefresh({
         requestEpoch,
         currentEpoch: sidebarProjectionRefreshEpoch,
@@ -5439,7 +6218,7 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       if (response.full_resync_required) {
-        await loadSidebarProjection({ recoveryAttempt: options.recoveryAttempt });
+        void sidebarReconciliation.request(filterKey, { full: true });
         return;
       }
       const applied = applySidebarProjection(response, {
@@ -5448,6 +6227,7 @@ import X from 'lucide-svelte/icons/x';
       if (!applied) ensureSidebarRecoveryIfBehind('rejected-sidebar-resync', options);
       if (applied) rememberSidebarProjection();
     } catch (error) {
+      if (options.signal.aborted || filterKey !== sidebarProjectionCacheKey()) return;
       if (!shouldApplySidebarProjectionRefresh({
         requestEpoch,
         currentEpoch: sidebarProjectionRefreshEpoch,
@@ -5456,11 +6236,8 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       console.debug('Sidebar resync failed', { reason, error });
-      try {
-        await loadSidebarProjection({ recoveryAttempt: options.recoveryAttempt });
-      } catch {
-        ensureSidebarRecoveryIfBehind('failed-sidebar-resync', options);
-      }
+      sidebarProjectionFailed = true;
+      throw error;
     }
   }
 
@@ -5473,9 +6250,15 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  function scheduleSidebarReconciliation(reason: string): void {
-    void reason;
-    sidebarReconciliation.invalidate();
+  function scheduleSidebarReconciliation(reason: string, options: { force?: boolean } = {}): void {
+    sidebarRefreshLifecycle.sync();
+    // User-driven filter changes must not wait for the realtime spacing.
+    const changed = reason.startsWith('changed-');
+    const scope = sidebarProjectionCacheKey();
+    void sidebarReconciliation.request(scope, {
+      full: changed || options.force, urgent: changed || options.force,
+    });
+    void waitingReconciliation.request(scope, { urgent: changed || options.force });
   }
 
   async function forceRefreshConversationHistory(): Promise<void> {
@@ -5483,17 +6266,10 @@ import X from 'lucide-svelte/icons/x';
     conversationListRefreshing = true;
     resetConversationSearchResults();
     try {
-      await refreshSidebarData();
+      await loadSidebarProjection({ manual: true });
     } finally {
       conversationListRefreshing = false;
     }
-  }
-
-  async function refreshAvailableChannelTypes(): Promise<void> {
-    const contextTypes = await api.conversations.contextTypes({
-      status: selectedConversationStatus
-    });
-    applyAvailableChannelTypes(contextTypes);
   }
 
   function resetSessionFilter(): void {
@@ -5835,6 +6611,15 @@ import X from 'lucide-svelte/icons/x';
       start: Math.max(0, renderableVisibleItems.length - TIMELINE_WINDOW_TARGET_ROWS),
       end: null,
     };
+    establishTimelineWindow();
+  }
+
+  function establishTimelineWindow(): void {
+    if (pageAlive && timelineController?.current
+      && chatV2Store.snapshot.cursor !== null
+      && timelineController.scope.conversation_id === currentConversation?.conversation_id) {
+      timelineViewportStates.establishWindow(timelineController.scope.key, conversationLoadRequestId);
+    }
   }
 
   function timelineWindowEndIndex(total = renderableVisibleItems.length): number {
@@ -5852,11 +6637,10 @@ import X from 'lucide-svelte/icons/x';
   function shrinkTailWindowIfPinned(): void {
     const total = renderableVisibleItems.length;
     if (userScrolledUp) {
-      // Freeze the tail so items arriving while the user reads older history do
-      // not remount the tail. freezeTailWindow anchors to the prior count, so
-      // appends are hidden; prepends are absorbed by windowAfterPrepend before
-      // this runs (never an index freeze under a prepend).
+      // Membership transitions already map the reading range by identity.
+      // Retain the count fallback for initial view/cache positioning.
       timelineWindow = freezeTailWindow(timelineWindow, total, lastRenderableVisibleCount);
+      establishTimelineWindow();
       return;
     }
     timelineWindow = reconcileLiveTailWindow(
@@ -5864,6 +6648,7 @@ import X from 'lucide-svelte/icons/x';
       total,
       TIMELINE_WINDOW_TARGET_ROWS,
     );
+    establishTimelineWindow();
   }
 
   function timelineDistanceFromBottom(): number {
@@ -6179,34 +6964,17 @@ import X from 'lucide-svelte/icons/x';
     return `${labels.slice(0, 2).join(' + ')} +${labels.length - 2}`;
   }
 
-  function parseStoredMultiFilter(stored: string | null): string[] {
-    if (!stored || stored === 'all') return [];
-    try {
-      const parsed = JSON.parse(stored);
-      if (Array.isArray(parsed)) {
-        return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
-      }
-    } catch {
-      // Backwards-compatible single-value storage from the old select.
-    }
-    return [stored];
-  }
-
   async function persistSelectedChannels(): Promise<void> {
     if (typeof window === 'undefined') return;
-    if (selectedChannels.length === 0) {
-      window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedChannel);
-    } else {
-      window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, JSON.stringify(selectedChannels));
-    }
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, JSON.stringify(selectedChannels));
     resetConversationSearchResults();
-    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+    await loadConversationPage(true);
   }
 
   function restoreSelectedChannel(): void {
     if (typeof window === 'undefined') return;
     const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedChannel);
-    selectedChannels = parseStoredMultiFilter(stored);
+    selectedChannels = stored === null ? ['web'] : parseStoredMultiFilter(stored);
   }
 
   async function toggleSelectedChannel(channel: string): Promise<void> {
@@ -6271,6 +7039,7 @@ import X from 'lucide-svelte/icons/x';
   function toggleChatSidebar(): void {
     if (isWindowMode) return;
     chatSidebarCollapsed = !chatSidebarCollapsed;
+    if (!chatSidebarCollapsed) refreshOpenedConversationList();
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(CHAT_STORAGE_KEYS.sidebarCollapsed, chatSidebarCollapsed ? '1' : '0');
     }
@@ -6281,6 +7050,12 @@ import X from 'lucide-svelte/icons/x';
     mobileDrawerPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     conversationFiltersOpen = false;
     mobileListOpen = true;
+    refreshOpenedConversationList();
+  }
+
+  function refreshOpenedConversationList(): void {
+    sidebarRefreshLifecycle.sync();
+    void sidebarReconciliation.request(sidebarProjectionCacheKey(), { maxAgeMs: 30_000 });
   }
 
   // Edge-swipe handlers for the chat detail viewport. The gestures
@@ -6377,7 +7152,6 @@ import X from 'lucide-svelte/icons/x';
         ? mergeRuntimeSelection(cached, latestRuntimeSelection.selection)
         : cached;
       applyCachedSessionDiagnostics(sid, cached);
-      return;
     }
     const requestId = nextSessionInfoRequestId();
     sessionInfoLoading = true;
@@ -6386,20 +7160,10 @@ import X from 'lucide-svelte/icons/x';
       if (isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         return;
       }
-      let nextSessionInfo: SessionInfoData = {
-        intaris_session_id: detail.intaris_session_id,
-        intention: detail.intention,
-        summary: detail.summary,
-        status: detail.status,
-        maximum_outcome: detail.maximum_outcome ?? null,
-        total_calls: detail.total_calls,
-        approved_count: detail.approved_count,
-        denied_count: detail.denied_count,
-        escalated_count: detail.escalated_count,
-        context_usage: detail.context_usage ?? null,
-        last_generation: detail.last_generation ?? null,
-        runtime_selection: detail.runtime_selection ?? null
-      };
+      let nextSessionInfo = mergeSessionInfo(
+        sessionInfo?.intaris_session_id === sid ? sessionInfo : null,
+        sessionInfoFromDetail(detail),
+      );
       if (detail.runtime_selection) {
         latestRuntimeSelection = {
           sessionId: sid,
@@ -6416,8 +7180,8 @@ import X from 'lucide-svelte/icons/x';
       }
       setSessionInfo(conversationId, sid, nextSessionInfo);
       sessionInfo = nextSessionInfo;
-      applyContextUsageSnapshot(detail.context_usage, sid);
-      applyLastGenerationSnapshot(detail.last_generation, sid);
+      applyContextUsageSnapshot(nextSessionInfo.context_usage, sid);
+      applyLastGenerationSnapshot(nextSessionInfo.last_generation, sid);
     } catch {
       // Retain the last rendered session details when a refresh fails.
     } finally {
@@ -6442,6 +7206,10 @@ import X from 'lucide-svelte/icons/x';
       }
       applyContextUsageSnapshot(detail.context_usage);
       applyLastGenerationSnapshot(detail.last_generation);
+      if (sessionInfo?.intaris_session_id === sid) {
+        sessionInfo = mergeSessionInfo(sessionInfo, sessionInfoFromDetail(detail));
+        setSessionInfo(conversationId, sid, sessionInfo);
+      }
     } catch {
       // Context diagnostics are opportunistic; the Info panel can still load details on demand.
     }
@@ -6474,7 +7242,6 @@ import X from 'lucide-svelte/icons/x';
     // to the bottom.
     const preTailPinned = tailPinned;
     const initialLoadPolicy = conversationInitialLoadPolicy(currentConversation);
-    const chatV2RefreshWatermark = reloadHistory ? chatV2Store.refreshWatermark() : null;
     const [conversationResult, sessionResult, chatV2SnapshotResult] = await Promise.all([
       settleWithTimeout(
         reloadSessions ? api.conversations.detail(conversationId, { includeState: false }) : Promise.resolve(null),
@@ -6489,7 +7256,9 @@ import X from 'lucide-svelte/icons/x';
         'Conversation sessions',
       ),
       settleWithTimeout(
-        reloadHistory ? chatV2Api.snapshot(conversationId) : Promise.resolve(null),
+        reloadHistory
+          ? bindTimeline(conversationId).load({ signal: timelineLoadAbort.signal }).then(snapshot => ({ snapshot }))
+          : Promise.resolve(null),
         CONVERSATION_SUBLOAD_TIMEOUT_MS,
         'Chat snapshot',
       ),
@@ -6519,10 +7288,11 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
+    const timelineLoaded = chatV2SnapshotResult.status === 'fulfilled' && chatV2SnapshotResult.value !== null;
     const chatV2Snapshot = chatV2SnapshotResult.status === 'fulfilled'
-      ? chatV2SnapshotResult.value
+      ? chatV2SnapshotResult.value?.snapshot
       : null;
-    if (reloadHistory && !chatV2Snapshot) {
+    if (reloadHistory && !timelineLoaded) {
       const failure = chatV2SnapshotResult.status === 'rejected'
         ? chatV2SnapshotResult.reason
         : new Error('Chat v2 snapshot unavailable');
@@ -6532,7 +7302,6 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       if (!chatV2OwnsActiveConversation(conversationId) || chatV2Store.visibleItems.length === 0) {
-        chatV2Store.reset();
         applyChatV2StateToTimeline();
         olderMessagesCursor = null;
         hasOlderMessages = false;
@@ -6544,34 +7313,34 @@ import X from 'lucide-svelte/icons/x';
         wsClient.clearChatV2Cursor(conversationId);
       }
       reportError(failure);
-      addToast(failureMessage, 'error');
+      if (!isConnectivityError(failure)) addToast(failureMessage, 'error');
       return;
     }
     let chatV2SnapshotApplied = false;
-    if (reloadHistory && chatV2Snapshot && chatV2RefreshWatermark) {
+    if (reloadHistory && chatV2Snapshot) {
       // Capture the scroll position immediately before the snapshot mutates
       // the timeline — the user's position NOW, not where they were when the
       // network fetch started.
       if (wantsPreserveScroll && userScrolledUp && timelineEl) {
         preservedScrollTop = timelineEl.scrollTop;
       }
-      const bootstrapPending = !canonicalTimelineBaseIsAccepted(
-        canonicalTimelineAuthority,
-        conversationId,
-        requestId,
-      );
       chatV2SnapshotApplied = applyChatV2Snapshot(chatV2Snapshot, {
-        refreshWatermark: chatV2RefreshWatermark,
-        bootstrapPending,
         routeGeneration: requestId,
       });
       if (chatV2SnapshotApplied) {
-        void drainChatV2Outbox(conversationId);
+        void showPendingOutboxMessages(conversationId).then(() => drainChatV2Outbox(conversationId));
         nextActiveSessionId = chatV2Snapshot.conversation.active_session_id ?? nextActiveSessionId;
         setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
       } else {
         scheduleChatV2CanonicalRecovery(conversationId);
       }
+    } else if (reloadHistory && timelineLoaded) {
+      chatV2SnapshotApplied = true;
+      applyChatV2StateToTimeline();
+      olderMessagesCursor = chatV2Store.snapshot.beforeCursor;
+      hasOlderMessages = chatV2Store.snapshot.hasMoreBefore;
+      canonicalTimelineAuthority = acceptCanonicalTimelineBase(canonicalTimelineAuthority, conversationId, requestId);
+      chatV2Lifecycle.acceptSnapshot(conversationTimelineScope(conversationId), chatV2Store.snapshot.cursor!);
     }
 
     if (reloadSessions && sessionResult.status === 'fulfilled') {
@@ -6603,6 +7372,7 @@ import X from 'lucide-svelte/icons/x';
           start: Math.min(preservedVisibleStartIndex, Math.max(0, renderableVisibleItems.length - TIMELINE_WINDOW_TARGET_ROWS)),
           end: null,
         };
+        establishTimelineWindow();
       } else {
         syncVisibleWindow();
         userScrolledUp = false;
@@ -6775,6 +7545,23 @@ import X from 'lucide-svelte/icons/x';
     ));
   }
 
+  // Project readers get no live socket fan-out for another member's chat, so
+  // refresh the durable snapshot while a shared read-only conversation is open.
+  const SHARED_READER_REFRESH_MS = 8_000;
+  $effect(() => {
+    const conversationId = currentConversation?.is_readonly_for_caller
+      ? currentConversation.conversation_id
+      : null;
+    // Hidden tabs do not poll; the visibility handler refreshes on return.
+    if (!conversationId || !browserVisible || typeof window === 'undefined') return;
+    const timer = window.setInterval(() => {
+      if (currentConversation?.conversation_id === conversationId) {
+        void refreshConversationView('shared-reader-poll');
+      }
+    }, SHARED_READER_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  });
+
   async function refreshConversationView(reason: string): Promise<void> {
     if (switchingConversation) {
       expireStaleConversationSwitch();
@@ -6844,6 +7631,35 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function openConversation(conversationId: string): Promise<void> {
+    const opening = openConversationView(conversationId);
+    const requestId = conversationLoadRequestId;
+    try {
+      await opening;
+    } catch (caught) {
+      if (!pageAlive || requestId !== conversationLoadRequestId
+        || conversationId !== conversationIdFromRoute()) return;
+      if (caught instanceof TimelineOwnershipError) {
+        requireTimelineIdentity(caught);
+      } else if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+        error = asApiError(caught).message;
+        initializing = false;
+        initialConversationResolved = true;
+        conversationSubloadsLoading = false;
+        cachedConversationRefreshing = false;
+        stopInitialLoadTimeout();
+        resetConversationSwitch();
+      }
+    }
+  }
+
+  async function openConversationView(conversationId: string): Promise<void> {
+    if (timelineIdentityRequired) {
+      // Navigation still supersedes explicit verification while the identity
+      // panel owns rendering; do not revive an obsolete route after it settles.
+      ++conversationLoadRequestId;
+      timelineOwnerRecovery?.abort();
+      return;
+    }
     if (!conversationId) {
       initializing = false;
       resetConversationSwitch();
@@ -6938,10 +7754,11 @@ import X from 'lucide-svelte/icons/x';
     }
     const isInitialLoad = !initialConversationResolved && !currentConversation;
     const switchRequestId = beginConversationSwitch(conversationId, !isInitialLoad);
+    conversationPreloader.setExcluded(conversationId);
     saveCurrentConversationView();
     beginTimelineViewportTransition(conversationId, requestId);
 
-    showAgentProfile = false;
+    showAgentProfile = null;
     error = '';
     historyError = '';
     sessionsError = '';
@@ -6966,10 +7783,22 @@ import X from 'lucide-svelte/icons/x';
     // not part of the cache entry is reset inside restoreConversationView()
     // itself, so cached restore cannot leak conversation A's ephemeral state
     // into conversation B.
+    if (!conversationViewCache.has(conversationId)) {
+      // Cold start / PWA relaunch: paint the device-cached view first.
+      try {
+        await hydratePersistedConversationView(conversationId);
+      } catch (caught) {
+        if (timelineIdentityRequired || isStaleConversationLoad(requestId)) return;
+        throw caught;
+      }
+      if (isStaleConversationLoad(requestId)) return;
+    }
     const cachedView = restoreConversationView(conversationId);
     if (cachedView) {
       // Keep an empty cached view in its loading state until canonical history
       // has confirmed whether this is genuinely a new conversation.
+      cachedViewFetchedAt = cachedView.fetchedAt ?? 0;
+      cachedViewHasContent = chatV2Store.visibleItems.length > 0;
       cachedConversationRefreshing = true;
       if (isAgentDirectConversation(cachedView.conversation)) {
         await clearSelectedAgentFilterForDirectChat();
@@ -6992,6 +7821,7 @@ import X from 'lucide-svelte/icons/x';
         finishConversationSwitch(conversationId, switchRequestId);
       }
       clientPerformance.cachedRestore();
+      void showPendingOutboxMessages(conversationId);
       wsClient.subscribeConversation(
         conversationId,
         cachedView.activeSessionLastSeq,
@@ -7002,76 +7832,57 @@ import X from 'lucide-svelte/icons/x';
        api.conversations.markRead(conversationId).catch(() => {});
        conversationSubloadsLoading = true;
        setCanonicalTimelineAuthority(conversationId, requestId, 'loading');
+       // A restored, non-empty canonical timeline with a sync cursor only
+       // needs a cursor delta; empty views still hydrate from a snapshot.
+       const trustedBase = Boolean(
+         chatV2Store.snapshot.conversationId === conversationId
+         && chatV2Store.snapshot.cursor
+         && chatV2Store.visibleItems.length > 0
+       );
+       const switchStartedAt = performance.now();
+       let refreshPath = 'error';
        const canonicalTimelineRefresh = startCachedTimelineRefresh(
-        () => chatV2CanonicalRecoveryCoalescer.run(conversationId, async () => {
-          const appliedBefore = canonicalTimelineApplyRevision;
-           await refreshCachedTimeline({
-            captureWatermark: () => chatV2Store.refreshWatermark(),
-            probe: () => chatV2Api.snapshotCacheOnly(conversationId),
-            applyIfUnchanged: (snapshot, refreshWatermark) => {
-              if (isStaleConversationLoad(requestId)) return false;
-             const applied = applyChatV2Snapshot(snapshot, {
-               resetLineage: true,
-               refreshWatermark,
-               routeGeneration: requestId,
-             });
-              if (applied) {
-                canonicalTimelineApplyRevision += 1;
-                if (chatV2Store.snapshot.cursor) {
-                  wsClient.updateChatV2Cursor(conversationId, chatV2Store.snapshot.cursor);
-                }
-              }
-              return applied;
-            },
-            // A cache-only miss means the restored timeline is not a usable
-            // base for cursor deltas. Its full snapshot must establish the
-            // base even if a live frame arrives while it is in flight.
-            snapshot: async () => {
-              const applied = await recoverChatV2Snapshot(
-                conversationId,
-                { resetLineage: true, replaceUnconditionally: true },
-               requestId,
-             );
-             if (!applied && !isStaleConversationLoad(requestId)) {
-               throw new Error(historyError || 'Conversation history could not be loaded.');
+         async () => {
+            const appliedBefore = canonicalTimelineApplyRevision;
+             await recoverChatV2Canonical(conversationId, requestId);
+             refreshPath = 'shared-timeline';
+             if (!isStaleConversationLoad(requestId) && historyError) {
+               throw new Error(historyError);
              }
-              // Reconcile from the authoritative snapshot cursor so live
-              // frames or local mutations that arrived during its fetch are
-              // not hidden behind the forced bootstrap replacement.
-               if (applied) {
-                 await performChatV2CanonicalRecovery(conversationId, requestId);
-               }
-            },
-             sync: () => performChatV2CanonicalRecovery(conversationId, requestId),
+             clientPerformance.timelineFresh(
+               !isStaleConversationLoad(requestId)
+                 && canonicalTimelineApplyRevision > appliedBefore
+             );
+          },
+         () => {
+           recordPerf({
+             kind: 'switch',
+             path: refreshPath,
+             ms: performance.now() - switchStartedAt,
+             detail: cachedRefreshBannerVisible ? 'banner' : undefined,
            });
-            if (!isStaleConversationLoad(requestId) && historyError) {
-              throw new Error(historyError);
-            }
-            clientPerformance.timelineFresh(
-              !isStaleConversationLoad(requestId)
-                && canonicalTimelineApplyRevision > appliedBefore
-            );
-         }),
-        () => {
-          cachedConversationRefreshing = false;
-        },
-        () => !isStaleConversationLoad(requestId),
-       );
-        void canonicalTimelineRefresh.then(
-          async () => {
-            if (!isStaleConversationLoad(requestId) && !historyError) {
-              await settleInitialCanonicalHistory(conversationId, requestId);
-            }
+           cachedConversationRefreshing = false;
          },
-         () => {},
-       );
+         () => !isStaleConversationLoad(requestId),
+        );
        void canonicalTimelineRefresh.catch((caughtError) => {
-         if (!isStaleConversationLoad(requestId)) {
-            setCanonicalTimelineAuthority(conversationId, requestId, 'error');
-           historyError = asApiError(caughtError).message;
+         if (isStaleConversationLoad(requestId)) return;
+         if (isOfflineError(caughtError)) {
+           // Offline: keep showing the saved view; reconnect resyncs it.
+           setCanonicalTimelineAuthority(conversationId, requestId, 'error');
+           historyError = '';
+           return;
          }
-         if (!isStaleConversationLoad(requestId)) reportError(caughtError);
+         setCanonicalTimelineAuthority(conversationId, requestId, 'error');
+         historyError = asApiError(caughtError).message;
+         reportError(caughtError);
        });
+      if (trustedBase) {
+        // The cached conversation metadata is already shown; let the timeline
+        // delta use the link first instead of racing it on slow networks.
+        await canonicalTimelineRefresh.catch(() => undefined);
+        if (isStaleConversationLoad(requestId)) return;
+      }
       try {
         const [conversation] = await Promise.all([
           api.conversations.detail(conversationId, { includeState: false }),
@@ -7104,6 +7915,11 @@ import X from 'lucide-svelte/icons/x';
         });
       } catch (caughtError) {
         if (!isStaleConversationLoad(requestId)) {
+          if (isOfflineError(caughtError)) {
+            // Cached view stays usable; reconnect refreshes metadata.
+            cachedConversationRefreshing = false;
+            return;
+          }
           if (markControllerUnavailable(caughtError, conversationId)) {
             error = '';
             return;
@@ -7130,7 +7946,6 @@ import X from 'lucide-svelte/icons/x';
       if (selectedConversationStatus !== desiredStatusFilter) {
         selectedConversationStatus = desiredStatusFilter;
         await replaceConversationStatusUrl(desiredStatusFilter);
-        await refreshAvailableChannelTypes();
         await loadConversationPage(true);
         if (isStaleConversationLoad(requestId)) {
           return;
@@ -7189,7 +8004,7 @@ import X from 'lucide-svelte/icons/x';
       api.conversations.markRead(conversationId).catch(() => {});
       currentConversation = {
         ...(currentConversation ?? conversation),
-        has_unread: false,
+        has_unread: hostAllowsObservation() ? false : currentConversation?.has_unread,
       };
       markConversationReadLocally(conversationId);
       patchConversationInList(conversationId, {
@@ -7197,6 +8012,15 @@ import X from 'lucide-svelte/icons/x';
       });
     } catch (caughtError) {
       if (isStaleConversationLoad(requestId)) {
+        return;
+      }
+      if (isOfflineError(caughtError)) {
+        // Keep the last-opened pointer: this conversation is fine, the
+        // device just never cached it.
+        error = 'This conversation is not available offline yet. It will load when you are back online.';
+        initializing = false;
+        initialConversationResolved = true;
+        resetConversationSwitch();
         return;
       }
       if (markControllerUnavailable(caughtError, conversationId)) {
@@ -7207,7 +8031,7 @@ import X from 'lucide-svelte/icons/x';
       clearLastOpenedConversation(conversationId);
       currentConversation = null;
       sessions = [];
-      chatV2Store.reset();
+      chatV2Store = new ChatV2Store();
       olderMessagesCursor = null;
       hasOlderMessages = false;
       escalations = [];
@@ -7269,28 +8093,19 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function preferredNewConversationAgentId(): string {
-    const primaryAgents = agents.filter((agent) => agent.status === 'active' && agent.agent_type === 'primary');
-    if (selectedAgentIds.length === 1 && primaryAgents.some((agent) => agent.agent_id === selectedAgentIds[0])) {
-      return selectedAgentIds[0];
-    }
-    const currentAgentId = currentConversation?.agent_id ?? '';
-    if (currentAgentId && primaryAgents.some((agent) => agent.agent_id === currentAgentId)) {
-      return currentAgentId;
-    }
-    if (typeof window !== 'undefined') {
-      const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
-      const storedAgents = parseStoredMultiFilter(stored);
-      if (storedAgents.length === 1 && primaryAgents.some((agent) => agent.agent_id === storedAgents[0])) {
-        return storedAgents[0];
-      }
-    }
-    return primaryAgents[0]?.agent_id ?? '';
+    return preferredNewChatAgentId(agents, [
+      selectedAgentIds.length === 1 ? selectedAgentIds[0] : null,
+      currentConversation?.agent_id,
+    ]);
   }
 
   function openNewConversationModal(): void {
+    newChatHandoff = null;
+    newChatCreated = null;
     newChatError = '';
     newChatAgentId = preferredNewConversationAgentId();
     newChatAgentProfileId = '';
+    newChatProjectId = selectedProjectId;
     // On mobile the conversation list is a sliding overlay. Hide it before
     // showing the modal or the modal is obscured by the list drawer.
     mobileListOpen = false;
@@ -7298,9 +8113,12 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function openNewConversationForSelectedAgent(): Promise<void> {
+    newChatHandoff = null;
+    newChatCreated = null;
     newChatError = '';
     newChatAgentId = preferredNewConversationAgentId();
     newChatAgentProfileId = '';
+    newChatProjectId = selectedProjectId;
     mobileListOpen = false;
     await tick();
     await createNewConversation();
@@ -7309,6 +8127,8 @@ import X from 'lucide-svelte/icons/x';
   function closeNewConversationModal(): void {
     if (newChatCreating) return;
     showNewChatModal = false;
+    newChatHandoff = null;
+    newChatCreated = null;
     newChatError = '';
   }
 
@@ -7324,9 +8144,10 @@ import X from 'lucide-svelte/icons/x';
     newChatError = '';
 
     try {
-      const conversation = await api.conversations.create({
+      const conversation = newChatCreated ?? await api.conversations.create({
         agent_id: agentId,
         agent_profile_id: newChatAgentProfileId || null,
+        project_id: newChatProjectId || null,
         context: {
           type: 'web',
           ref: null,
@@ -7334,7 +8155,24 @@ import X from 'lucide-svelte/icons/x';
           memory_labels: {}
         }
       });
+      newChatCreated = conversation;
       mergeConversationList([conversation]);
+      if (newChatHandoff) {
+        const saved = await composerDrafts.writeComposite(DRAFT_PREFIX + conversation.conversation_id, {
+          input_revision: crypto.randomUUID(), text: newChatHandoff.text,
+          attachments: [], chat_mode: null,
+        });
+        if (!saved) throw new Error('Could not save the handoff draft. Please retry.');
+        const source = newChatHandoff.source_refs
+          .filter(ref => ref.store === 'intaris').sort((a, b) => b.seq - a.seq)[0];
+        if (!source) throw new Error('Handoff source is unavailable.');
+        await api.conversations.linkHandoff(newChatHandoffSource, {
+          source_session_id: source.session_id, source_event_seq: source.seq,
+          recipient_conversation_id: conversation.conversation_id,
+        });
+        scheduleChatV2CanonicalRecovery(newChatHandoffSource, { immediate: true });
+        newChatHandoff = null;
+      }
       showNewChatModal = false;
       addToast('Conversation created.', 'success');
       await goto(conversationUrl(conversation.conversation_id));
@@ -7429,8 +8267,7 @@ import X from 'lucide-svelte/icons/x';
     selectedConversationStatus = status;
     await replaceConversationStatusUrl(status);
     resetConversationSearchResults();
-    await refreshAvailableChannelTypes();
-    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+    await loadConversationPage(true);
   }
 
   async function saveTitle(): Promise<void> {
@@ -7675,16 +8512,38 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function handleSend(): Promise<void> {
+    if (quickProfileBusy || composerAdmissionBusy) return;
+    composerAdmissionBusy = true;
+    try {
+      await prepareAndSendMessage();
+    } finally {
+      composerAdmissionBusy = false;
+    }
+  }
+
+  async function prepareAndSendMessage(): Promise<void> {
     let content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
     const sendConversationId = currentConversation.conversation_id;
     if (voiceTranscribing) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
+    const composerView = () => ({
+      input_revision: composerInputRevision, chat_mode: composerInputMode,
+      conversationId: conversationIdFromRoute(), generation: composerAlive ? conversationLoadRequestId : -1,
+      draftKey: currentDraftKey, revision: composerRevision, text: composer,
+      attachments: $state.snapshot(composerAttachments) as AttachmentRef[],
+    });
+    const submittedView = composerView();
+    if (submittedView.conversationId !== sendConversationId
+      || submittedView.draftKey !== DRAFT_PREFIX + sendConversationId) return;
+    const submissionLease = documentCoordination().capture();
+    const submittedChatMode = submittedView.chat_mode;
+    const composerAttachmentsSnapshot = submittedView.attachments.filter((item) => !item.voice_recording);
 
     // STT-first: transcribe any voice recordings, replace the composer body
     // with (or append to) the transcript, and drop the audio from the
     // outgoing turn payload. Matches the channel inbound behavior.
-    const voiceRecordings = composerAttachments.filter((a) => a.voice_recording);
+    const voiceRecordings = submittedView.attachments.filter((a) => a.voice_recording);
     if (voiceRecordings.length > 0) {
       voiceTranscribing = true;
       haptic.light();
@@ -7698,11 +8557,7 @@ import X from 'lucide-svelte/icons/x';
         if (transcript) {
           content = content ? `${content}\n\n${transcript}` : transcript;
         }
-        composerAttachments = composerAttachments.filter((a) => !a.voice_recording);
-        for (const recording of voiceRecordings) {
-          if (recording.blob_url) URL.revokeObjectURL(recording.blob_url);
-        }
-        if (!content && composerAttachments.length === 0) {
+        if (!content && composerAttachmentsSnapshot.length === 0) {
           addToast("Couldn't transcribe the recording. Try again or type a message.", 'error');
           haptic.error();
           return;
@@ -7716,11 +8571,15 @@ import X from 'lucide-svelte/icons/x';
         voiceTranscribing = false;
       }
     }
+    await submissionLease.validate();
+    // Pending-question/slash resolution belongs to the view that initiated STT.
+    if (composerView().generation !== submittedView.generation
+      || composerView().conversationId !== submittedView.conversationId) return;
 
     const normalizedComposerInput = normalizeChatComposerInput({ content });
     const isSlashCommand = normalizedComposerInput.kind === 'command';
     const optimisticContent = normalizedComposerInput.content;
-    const optimisticTurnMode = normalizedComposerInput.chatMode ?? persistentChatMode;
+    const optimisticTurnMode = normalizedComposerInput.chatMode ?? submittedChatMode ?? undefined;
 
     // Detect a pending input tool call sitting in the timeline
     // waiting for a reply. This is the source-of-truth signal that the
@@ -7756,15 +8615,70 @@ import X from 'lucide-svelte/icons/x';
     // not append a separate user bubble — the tool call block will show the
     // user's answer inline as the resolution. Adding a bubble too would
     // duplicate the content and leave the tool call block stuck as pending.
-    const clientMessageId = (!isSlashCommand && !isStepInputReply)
+    let clientMessageId = (!isSlashCommand && !isStepInputReply)
       ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
       : null;
     const willQueueBehindActiveTurn = !isSlashCommand && !isStepInputReply && turnInProgress;
     const awaitCanonicalUserMessage =
       !isSlashCommand && !isStepInputReply && shouldAwaitCanonicalUserMessage(optimisticContent);
-    const composerAttachmentsSnapshot = $state.snapshot(composerAttachments) as typeof composerAttachments;
+    let preparedEntry: OutboxEntry | null = null;
+    let submission: ComposerSubmission | null = null;
+    if (clientMessageId) {
+      if (composerLegacyRecovery) { addToast('Confirm sending the recovered draft as a new message.', 'error'); return; }
+      if (preparingComposer) return;
+      preparingComposer = true;
+      const createdAt = new Date().toISOString();
+      preparedEntry = {
+        client_txn_id: clientMessageId, client_message_id: clientMessageId,
+        conversation_id: sendConversationId, content: normalizedComposerInput.content,
+        attachments: composerAttachmentsSnapshot, chat_mode: optimisticTurnMode,
+        status: 'pending', created_at: createdAt, updated_at: createdAt,
+      };
+      try {
+        // Preserve input before IndexedDB; recovery cannot require the failed
+        // database to become readable. No admission or UI clearing on failure.
+        submission = new ComposerSubmission(submittedView, preparedEntry, submissionLease);
+        preparedEntry = await submission.prepare(composerDrafts, chatV2Outbox, () => {
+          if (submission?.matchesInput(composerView())) flushPendingDraft();
+        });
+        clientMessageId = preparedEntry.client_message_id;
+      } catch (persistenceError) {
+        preparingComposer = false;
+        if (!submission || submission.isCurrentView(composerView())) addToast(asApiError(persistenceError).message, 'error');
+        return;
+      }
+    }
+    const canProjectSubmission = () => {
+      if (submission) return submission.isCurrentView(composerView());
+      try { submissionLease.assertCurrent(); } catch { return false; }
+      return composerAlive && composerView().generation === submittedView.generation
+        && composerView().conversationId === submittedView.conversationId;
+    };
+    let consumedNormal = false;
+    if (submission) {
+      try {
+        consumedNormal = await submission.consume(composerDrafts, composerView, () => {
+          liveComposer?.consumed(sendConversationId, submittedView.input_revision);
+          if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+          draftSaveTimer = null;
+           composer = '';
+           composerAttachments = [];
+           composerInputMode = null;
+          composerRevision++;
+          for (const recording of voiceRecordings) {
+            if (recording.blob_url) URL.revokeObjectURL(recording.blob_url);
+          }
+          if (composerElement) composerElement.value = '';
+        });
+      } catch (cleanupError) {
+        // Persistence already owns the submitted transaction. Failed draft
+        // cleanup must not prevent its admission or restore a second copy.
+        reportError(cleanupError);
+      } finally { preparingComposer = false; }
+    }
 
     if (
+      canProjectSubmission() &&
       clientMessageId &&
       shouldRenderOptimisticUserMessage({
         isSlashCommand,
@@ -7773,7 +8687,7 @@ import X from 'lucide-svelte/icons/x';
       })
     ) {
       saveOptimisticUserMessageDraft({
-        conversationId: directQuestionDraftConversationId() ?? routeConversationId,
+        conversationId: sendConversationId,
         clientMessageId,
         content: optimisticContent,
         attachments: composerAttachmentsSnapshot,
@@ -7789,7 +8703,8 @@ import X from 'lucide-svelte/icons/x';
       applyChatV2StateToTimeline();
     }
 
-    if (!isSlashCommand) {
+    if (!isSlashCommand && canProjectSubmission()) {
+      latestComposerSubmissionId = clientMessageId;
       lastSubmittedMessage = optimisticContent;
       lastRecoverableMessage = '';
       lastRecoverableTurnId = null;
@@ -7797,29 +8712,50 @@ import X from 'lucide-svelte/icons/x';
       if (!willQueueBehindActiveTurn) {
         awaitingAssistantStart = true;
         turnInProgress = true;
-        activeTurnChatMode = optimisticTurnMode;
+        const visualTurnMode = normalizeChatModeTone(optimisticTurnMode ?? persistentChatMode);
+        activeTurnChatMode = visualTurnMode;
         patchConversationInList(
           sendConversationId,
-          optimisticConversationTurnPatch(optimisticTurnMode),
+          optimisticConversationTurnPatch(visualTurnMode),
           { touchLastMessageAt: true }
         );
       }
     }
-    error = '';
-    composer = '';
-    // Drop any persisted draft synchronously so a quick tab-away right
-    // after send does not repopulate the pill from storage.
-    clearDraft(currentDraftKey);
+    if (canProjectSubmission()) error = '';
+    let consumedDirect = false;
+    let clearedDirectRevision: string | null = null;
+    if (!submission && canProjectSubmission() && composerInputRevision === submittedView.input_revision) {
+      try {
+        const pinned = await composerDrafts.persistComposite(submittedView.draftKey!, submittedView);
+        consumedDirect = pinned !== null && await composerDrafts.consumeComposite(pinned,
+          () => canProjectSubmission() && composerInputRevision === submittedView.input_revision);
+      } catch (persistenceError) {
+        if (canProjectSubmission()) addToast(asApiError(persistenceError).message, 'error');
+        return;
+      }
+      if (consumedDirect && canProjectSubmission() && composerInputRevision === submittedView.input_revision) {
+        liveComposer?.consumed(sendConversationId, submittedView.input_revision);
+        if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+        draftSaveTimer = null;
+        composer = '';
+        composerAttachments = [];
+        composerRevision++;
+        clearedDirectRevision = composerInputRevision;
+      } else consumedDirect = false;
+    }
     // Clear the native value synchronously and let Svelte flush the
     // reactive binding before measuring scrollHeight. Without the tick,
     // `syncComposerHeight` runs while the textarea still holds the
     // multi-line content, so it "resizes" back to the same height and
     // the composer stays expanded until the user types again.
-    if (composerElement) composerElement.value = '';
+    if (consumedDirect && composerElement) composerElement.value = '';
+    const clearedElement = composerElement;
     await tick();
-    syncComposerHeight();
+    if ((consumedDirect && canProjectSubmission() && composerInputRevision === clearedDirectRevision)
+      || (submission && consumedNormal && submission.canResize(composerView())
+      && composerElement === clearedElement)) syncComposerHeight();
+    if (!submission && !canProjectSubmission()) return;
     const attachments = composerAttachmentsSnapshot;
-    composerAttachments = [];
 
     if (isStepInputReply) {
       beginDirectQuestionSubmission(directQuestionNotificationId);
@@ -7855,17 +8791,18 @@ import X from 'lucide-svelte/icons/x';
             response_payload: reply as unknown as Record<string, unknown>
           });
         }
-        settleDirectQuestionLocally(directQuestionNotificationId);
-        haptic.success();
+        if (canProjectSubmission()) {
+          settleDirectQuestionLocally(directQuestionNotificationId);
+          haptic.success();
+        }
         return;
       } catch (caughtError) {
         if (shouldRestoreDirectQuestionOnSubmitFailure(directQuestionNotificationId, authoritativelySettledDirectQuestionIds)) {
           unmarkDirectQuestionSettledLocally(directQuestionNotificationId);
           directQuestionAck = null;
-          composer = content;
-          if (composerElement) composerElement.value = content;
-          await tick();
-          syncComposerHeight();
+          if (consumedDirect && canProjectSubmission() && composerInputRevision === clearedDirectRevision) {
+            restoreComposerAfterFailedSend(sendConversationId, content);
+          }
         }
         clearDirectQuestionSubmission(directQuestionNotificationId);
         addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to submit response');
@@ -7873,64 +8810,44 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
-    syncVisibleWindow();
-    userScrolledUp = false;
-    tailPinned = true;
-    scrollToBottom(true);
-    haptic.success();
+    if (canProjectSubmission()) {
+      syncVisibleWindow();
+      userScrolledUp = false;
+      tailPinned = true;
+      scrollToBottom(true);
+      haptic.success();
+    }
     if (isSlashCommand) {
       try {
          const dispatched = await dispatchChatComposerMessage({
            conversationId: sendConversationId,
            content
         });
-        if (dispatched.kind === 'command') await applyCommandResponse(dispatched.response);
+        if (dispatched.kind === 'command' && canProjectSubmission()) await applyCommandResponse(dispatched.response);
       } catch (caughtError) {
+        // Commands are not queued in the outbox; give the text back so a
+        // command lost to a flaky connection can be resent.
+        if (isRetryableSendError(caughtError) && consumedDirect && canProjectSubmission()
+          && composerInputRevision === clearedDirectRevision) {
+          restoreComposerAfterFailedSend(sendConversationId, content);
+        }
         addToast(asApiError(caughtError).message, 'error', 4000, 'Command failed');
       }
       return;
     }
-    const clientTxnId = clientMessageId ?? crypto.randomUUID();
+    const clientTxnId = preparedEntry!.client_txn_id;
     const effectiveClientMessageId = clientMessageId ?? clientTxnId;
-    const createdAt = new Date().toISOString();
-    let outboxStored = false;
+    const outboxStored = true;
     const effectiveContent = normalizedComposerInput.content;
-    const effectiveChatMode = normalizedComposerInput.chatMode;
-    const outboxEntry: OutboxEntry = {
-      client_txn_id: clientTxnId,
-      client_message_id: effectiveClientMessageId,
-      conversation_id: sendConversationId,
-      content: effectiveContent,
-      attachments,
-      chat_mode: effectiveChatMode,
-      status: 'pending',
-      created_at: createdAt,
-      updated_at: createdAt
-    };
+    const effectiveChatMode = preparedEntry?.chat_mode ?? undefined;
+    const outboxEntry = preparedEntry!;
     try {
-      await chatV2Outbox.put(outboxEntry);
-      outboxStored = true;
-      await chatV2Outbox.update(clientTxnId, { status: 'sending', updated_at: new Date().toISOString() });
-    } catch (outboxError) {
-      console.warn('Chat v2 outbox persistence failed; sending online without durable retry', outboxError);
-    }
-    try {
-       const dispatched = await dispatchChatComposerMessage({
-         conversationId: sendConversationId,
-         content,
-         attachments,
-        clientMessageId: effectiveClientMessageId,
-        clientTxnId,
-        chatMode: effectiveChatMode
-      });
+       const dispatched = await sendOutboxEntry(chatV2Outbox, outboxEntry);
       if (dispatched.kind !== 'message') throw new Error('Expected message admission');
       const response = dispatched.response;
-      if (chatV2OwnsActiveConversation(sendConversationId)) {
+      if (canProjectSubmission() && chatV2OwnsActiveConversation(sendConversationId)) {
         chatV2Store.applySend(response);
         applyChatV2StateToTimeline();
-      }
-      if (outboxStored) {
-        await chatV2Outbox.update(clientTxnId, { status: 'acked', updated_at: new Date().toISOString() }).catch(() => undefined);
       }
       // Cursor-correct incremental sync instead of a full snapshot fetch: a
       // snapshot resolved while live WS frames are streaming replaces the
@@ -7938,16 +8855,30 @@ import X from 'lucide-svelte/icons/x';
       // subsequent frame mismatch -> gapped -> another recovery (visible
       // re-sort/flicker at the start of each turn). /sync advances from the
       // current cursor and falls back to a snapshot only when actually needed.
-      await recoverChatV2Canonical(sendConversationId);
+      // The message is already admitted: a recovery failure here must never
+      // be treated as a send failure (reconnect/foreground resync catches up).
+      if (canProjectSubmission()) await recoverChatV2Canonical(sendConversationId).catch((recoveryError: unknown) => {
+        reportError(recoveryError);
+      });
     } catch (caughtError) {
-      if (outboxStored) {
-        await chatV2Outbox.update(clientTxnId, {
-          status: 'failed',
-          updated_at: new Date().toISOString(),
-          last_error: asApiError(caughtError).message
-        }).catch(() => undefined);
+      await projectAdmissionFailure(chatV2Outbox, outboxEntry, async (queued, assertCurrent) => {
+      const retryable = isRetryableSendError(caughtError);
+      const durablyQueued = queued !== null || outboxStored;
+      if (queued && retryable && queued.retryable !== false) {
+        scheduleChatV2OutboxRetry(sendConversationId);
+      } else if (!durablyQueued) {
+        // Persistence failed before admission. Only this case may restore
+        // input; queued/unknown outcomes retain their original transaction.
+        restoreComposerAfterFailedSend(sendConversationId, content);
+        if (sendConversationId === conversationIdFromRoute() && attachments.length > 0) {
+          const present = new Set(composerAttachments.map((item) => item.artifact_id));
+          composerAttachments = [
+            ...attachments.filter((item) => !present.has(item.artifact_id)),
+            ...composerAttachments,
+          ];
+        }
       }
-      if (!shouldApplyChatSendFailureSideEffects(sendConversationId, conversationIdFromRoute())) return;
+      if (!canProjectSubmission() || !shouldApplyChatSendFailureSideEffects(sendConversationId, conversationIdFromRoute())) return;
       if (awaitCanonicalUserMessage) {
         chatV2Store.addOptimisticUser({
           content: optimisticContent,
@@ -7955,27 +8886,81 @@ import X from 'lucide-svelte/icons/x';
           clientMessageId: effectiveClientMessageId,
         });
       }
-      awaitingAssistantStart = false;
-      turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
-      currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
+      if (latestComposerSubmissionId === clientMessageId) {
+        awaitingAssistantStart = false;
+        turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
+        currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
+      }
       applyChatV2StateToTimeline();
-      await recoverChatV2Snapshot(sendConversationId).catch(() => undefined);
+      // Do not yield between reconciliation and failure UI projection.
+      assertCurrent();
       // Keep the durable optimistic row visible, but make admission failure
       // explicit instead of leaving it indefinitely in the sending state.
       chatV2Store.markOptimisticUserFailed(effectiveClientMessageId);
-      addToast(asApiError(caughtError).message, 'error');
+      if (durablyQueued && retryable) {
+        addToast('Message saved. It will be sent automatically when the connection recovers.', 'info', 4000);
+      } else {
+        addToast(asApiError(caughtError).message, 'error');
+      }
+      }, (admitted) => {
+        if (admitted.kind === 'message' && canProjectSubmission() && chatV2OwnsActiveConversation(sendConversationId)) {
+          chatV2Store.applySend(admitted.response);
+          applyChatV2StateToTimeline();
+        }
+      });
     }
   }
 
+  // Give unsent text back to its conversation's composer/draft. Text typed
+  // since the send is kept; the failed message is placed before it.
+  function restoreComposerAfterFailedSend(conversationId: string, content: string): void {
+    const draftKey = DRAFT_PREFIX + conversationId;
+    if (draftKey !== currentDraftKey) {
+      writeDraft(draftKey, mergeFailedSendIntoDraft(content, readDraft(draftKey)));
+      return;
+    }
+    const merged = mergeFailedSendIntoDraft(content, composer);
+    editComposerInput();
+    composer = merged;
+    if (composerElement) composerElement.value = merged;
+    writeDraft(draftKey, merged);
+    void tick().then(syncComposerHeight);
+  }
+
+  // Show picked files immediately and upload them in the background. Sending
+  // does not wait for uploads; the outbox resolves them before admission.
   async function uploadFiles(files: File[]): Promise<void> {
     if (files.length === 0) return;
-    try {
-      const uploaded = await Promise.all(files.map((file) => api.artifacts.upload(file)));
-      composerAttachments = [...composerAttachments, ...uploaded];
-      addToast(files.length === 1 ? 'Attachment uploaded.' : `${files.length} attachments uploaded.`, 'success');
-    } catch (caughtError) {
-      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to upload attachment');
-    }
+    const staged = files.map((file) => attachmentUploads.stage(file));
+    composerAttachments = [...composerAttachments, ...staged];
+    editComposerInput();
+  }
+
+  function applyAttachmentUploadPatch(localId: string, patch: Partial<AttachmentRef>): void {
+    if (!composerAttachments.some((item) => item.local_id === localId)) return;
+    composerAttachments = composerAttachments.map((item) => (
+      item.local_id === localId ? { ...item, ...patch } : item
+    ));
+  }
+  onDestroy(attachmentUploads.onChange(applyAttachmentUploadPatch));
+
+  function cancelComposerAttachment(attachment: AttachmentRef): void {
+    if (attachment.local_id) attachmentUploads.cancel(attachment.local_id);
+  }
+
+  function retryComposerAttachment(attachment: AttachmentRef): void {
+    if (attachment.local_id) attachmentUploads.retry(attachment.local_id);
+  }
+
+  /**
+   * Finish background uploads for an outbox entry and persist the server
+   * references so a later retry does not upload the files again.
+   */
+  async function resolveOutboxAttachments(entry: OutboxEntry): Promise<AttachmentRef[]> {
+    if (!entry.attachments.some(isLocalAttachment)) return entry.attachments.map(toServerAttachment);
+    const resolved = await attachmentUploads.resolveAll(entry.attachments);
+    await chatV2Outbox.update(entry.client_txn_id, { attachments: resolved }).catch(() => undefined);
+    return resolved;
   }
 
   function uniqueNewPastedFiles(files: File[]): File[] {
@@ -8000,7 +8985,10 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function removeAttachment(artifactId: string): void {
+    const removed = composerAttachments.find((item) => item.artifact_id === artifactId);
     composerAttachments = composerAttachments.filter((item) => item.artifact_id !== artifactId);
+    editComposerInput();
+    if (removed) cancelComposerAttachment(removed);
   }
 
   function handleDragEnter(event: DragEvent): void {
@@ -8100,9 +9088,18 @@ import X from 'lucide-svelte/icons/x';
       if (escalations.length === 0) stopEscalationCountdown();
       return true;
     } catch (caughtError) {
+      const error = asApiError(caughtError);
+      if (isResolvedApprovalRejection(error.details)) {
+        escalations = escalations.filter((item) => item.call_id !== callId);
+        locallySettledEscalationCallIds = new Set(locallySettledEscalationCallIds).add(callId);
+        escalationSettledAck = error.details?.decision === 'deny'
+          ? { callId, toolName: current.tool_name, decision: 'deny' }
+          : null;
+        if (escalations.length === 0) stopEscalationCountdown();
+      }
       escalationResolutionPending = null;
       escalationBusyCallId = null;
-      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to resolve approval');
+      addToast(error.message, 'error', 4000, 'Unable to resolve approval');
       return false;
     }
   }
@@ -8111,11 +9108,13 @@ import X from 'lucide-svelte/icons/x';
     if (!currentConversation || !text.trim()) return;
     const clientTxnId = crypto.randomUUID();
     try {
-      await chatV2Api.sendMessage(currentConversation.conversation_id, clientTxnId, {
+      await dispatchChatComposerMessage({
+        conversationId: currentConversation.conversation_id,
+        clientTxnId,
+        clientMessageId: clientTxnId,
         content: text.trim(),
         attachments: [],
-        client_message_id: clientTxnId
-      });
+      }, { outbox: chatV2Outbox });
     } catch (caughtError) {
       addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to send message');
     }
@@ -8162,18 +9161,15 @@ import X from 'lucide-svelte/icons/x';
     olderMessagesAbortController = controller;
     loadingOlderMessages = true;
     try {
-      const beforeCount = renderableVisibleItems.length;
+      const beforeIds = new Set(renderableVisibleItems.map(item => item.id));
       const beforeCursor = olderMessagesCursor;
-      const response = await chatV2Api.timeline(conversationId, {
-        before: olderMessagesCursor,
-        signal: controller.signal,
-      });
+      const response = await bindTimeline(conversationId).older(olderMessagesCursor, controller.signal);
       if (
         controller.signal.aborted
         || currentConversation?.conversation_id !== conversationId
         || conversationLoadRequestId !== loadRequestId
       ) return false;
-      if (!chatV2Store.applyBackfill(response)) {
+      if (!response) {
         void recoverChatV2Canonical(
           conversationId,
           loadRequestId,
@@ -8184,19 +9180,12 @@ import X from 'lucide-svelte/icons/x';
       olderMessagesCursor = response.before_cursor ?? null;
       hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
 
-      const prependedCount = Math.max(0, renderableVisibleItems.length - beforeCount);
-      timelineWindow = windowAfterViewportFillBackfill(
-        timelineWindow,
-        prependedCount,
-        renderableVisibleItems.length,
-        true,
-      );
       saveCurrentConversationView();
       await tick();
       await nextAnimationFrame();
       scheduleScrollToBottom(false, 1);
 
-      return prependedCount > 0 || beforeCursor !== olderMessagesCursor;
+      return response.items.some(item => !beforeIds.has(item.id)) || beforeCursor !== olderMessagesCursor;
     } catch (caughtError) {
       if (caughtError instanceof DOMException && caughtError.name === 'AbortError') return false;
       if (
@@ -8208,7 +9197,8 @@ import X from 'lucide-svelte/icons/x';
       if (isRecoverableBackfillCursorError(caughtError)) {
         olderMessagesCursor = null;
         hasOlderMessages = false;
-      } else {
+      } else if (!isConnectivityError(caughtError)) {
+        // Offline/timeouts: the global banner covers it; scrolling retries.
         addToast(`Unable to load older messages: ${message}`, 'error');
       }
       return false;
@@ -8286,10 +9276,8 @@ import X from 'lucide-svelte/icons/x';
         const anchor = captureTimelineAnchor();
         timelineWindow = expandWindowUp(timelineWindow, renderableVisibleItems.length);
         await tick();
-        requestAnimationFrame(() => {
-          restoreTimelineAnchor(anchor);
-          loadingOlderMessages = false;
-        });
+        restoreTimelineAnchor(anchor);
+        loadingOlderMessages = false;
       } else if (olderMessagesCursor && currentConversation) {
         const conversationId = currentConversation.conversation_id;
         const loadRequestId = conversationLoadRequestId;
@@ -8299,18 +9287,13 @@ import X from 'lucide-svelte/icons/x';
         requestLoadId = loadRequestId;
         olderMessagesAbortController?.abort();
         olderMessagesAbortController = controller;
-        const beforeCount = renderableVisibleItems.length;
-        const response = await chatV2Api.timeline(conversationId, {
-          before: olderMessagesCursor,
-          signal: controller.signal,
-        });
+        const response = await bindTimeline(conversationId).older(olderMessagesCursor, controller.signal);
         if (
           controller.signal.aborted
           || currentConversation?.conversation_id !== conversationId
           || conversationLoadRequestId !== loadRequestId
         ) return;
-        const anchor = captureTimelineAnchor();
-        if (!chatV2Store.applyBackfill(response)) {
+        if (!response) {
           loadingOlderMessages = false;
           void recoverChatV2Canonical(
             conversationId,
@@ -8321,17 +9304,9 @@ import X from 'lucide-svelte/icons/x';
         applyChatV2StateToTimeline();
         olderMessagesCursor = response.before_cursor ?? null;
         hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
-        // Keep the rows the user was reading mounted (do NOT reset to the oldest
-        // page): shift the window down by however many rows were prepended so
-        // the same newer rows stay rendered and the anchor restore is exact.
-        const prependedCount = Math.max(0, renderableVisibleItems.length - beforeCount);
-        timelineWindow = windowAfterPrepend(timelineWindow, prependedCount, renderableVisibleItems.length);
         saveCurrentConversationView();
         await tick();
-        requestAnimationFrame(() => {
-          restoreTimelineAnchor(anchor);
-          loadingOlderMessages = false;
-        });
+        loadingOlderMessages = false;
       } else {
         loadingOlderMessages = false;
       }
@@ -8355,7 +9330,8 @@ import X from 'lucide-svelte/icons/x';
       if (isRecoverableBackfillCursorError(caughtError)) {
         olderMessagesCursor = null;
         hasOlderMessages = false;
-      } else {
+      } else if (!isConnectivityError(caughtError)) {
+        // Offline/timeouts: the global banner covers it; scrolling retries.
         addToast(`Unable to load older messages: ${message}`, 'error');
       }
       loadingOlderMessages = false;
@@ -8421,12 +9397,13 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent | ChatRealtimeFrame): void {
+    if (!pageAlive || timelineController?.current === false) return;
     const currentId = conversationIdFromRoute();
     if (eventNeedsTreeRefresh(event as { type: string } & Record<string, unknown>)) {
       scheduleTreeRefresh();
     }
     if (event.type === 'work_invalidated') {
-      sidebarRevisionAdmission.observeInvalidation(event.revision);
+      if (!sidebarRevisionAdmission.observeInvalidation(event.revision)) return;
       scheduleSidebarReconciliation('work-invalidation');
     } else if (
       currentId
@@ -8454,16 +9431,13 @@ import X from 'lucide-svelte/icons/x';
       if (event.reason === 'notification_state_changed') {
         void refreshPendingNotifications();
       }
-      if (shouldRecoverChatV2ForInvalidation({
-        activeConversationId: currentId,
-        invalidatedConversationId: event.conversation_id,
-      })) {
+      if (timelineController?.admitInvalidation(event)) {
         scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
       }
       return;
     }
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
-    if (event.type === 'recap_available') {
+    if (event.type === 'recap_available' || event.type === 'handoff_available') {
       scheduleChatV2CanonicalRecovery(event.conversation_id, { immediate: true });
       return;
     }
@@ -8478,8 +9452,12 @@ import X from 'lucide-svelte/icons/x';
       };
       if (upsert.conversation) {
         applySidebarConversationUpsert(upsert.conversation, upsert.revision);
+        const row = upsert.conversation;
+        if (row.conversation_id !== currentId && (row.has_active_turn || row.has_unread)) {
+          requestActivityPreload(row.conversation_id, row.has_active_turn === true);
+        }
       } else {
-        void refreshSidebarData();
+        scheduleSidebarReconciliation('missing-sidebar-upsert');
       }
       return;
     }
@@ -8491,8 +9469,10 @@ import X from 'lucide-svelte/icons/x';
       );
       if (admission.reconcile) scheduleSidebarReconciliation('sidebar-removal-gap');
       if (!admission.apply) return;
+      sidebarNetworkProjectionApplied = true;
       removeConversationFromSidebar(removal.conversation_id, {
         markCurrentDeleted: removal.conversation_id === currentId,
+        canonicalRemoval: true,
       });
       return;
     }
@@ -8540,6 +9520,9 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       if (event.type === 'conversation_updated' && event.conversation_id) {
+        if (event.has_active_turn === true || typeof event.last_message_at === 'string') {
+          requestActivityPreload(event.conversation_id, event.has_active_turn === true);
+        }
         const { patch } = orderedConversationRuntimePatch(event.conversation_id, event);
         if (Object.keys(patch).length > 0) {
           patchConversationInList(event.conversation_id, patch, {
@@ -8550,6 +9533,8 @@ import X from 'lucide-svelte/icons/x';
         }
       }
       if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed') {
+        // Turn finished elsewhere: land its final state in the background.
+        requestActivityPreload(otherConvId, false);
         const idx = conversations.findIndex((c) => c.conversation_id === otherConvId);
         const agentDirectConversation = agentDirectChats.find(
           (item) => item.conversation.conversation_id === otherConvId
@@ -8601,9 +9586,11 @@ import X from 'lucide-svelte/icons/x';
         patchConversationInList(
           currentConversation.conversation_id,
           {
-            has_unread: false,
             last_message_at: event.completed_at ?? undefined,
-            last_read_at: event.completed_at ?? new Date().toISOString(),
+            ...(hostAllowsObservation() ? {
+              has_unread: false,
+              last_read_at: event.completed_at ?? new Date().toISOString(),
+            } : {}),
           },
           { touchLastMessageAt: true }
         );
@@ -8619,7 +9606,9 @@ import X from 'lucide-svelte/icons/x';
         || event.type === 'workflow_cancelled'
         || event.type === 'session_compacted'
       ) {
-        patchConversationInList(currentConversation.conversation_id, { has_unread: false });
+        if (hostAllowsObservation()) {
+          patchConversationInList(currentConversation.conversation_id, { has_unread: false });
+        }
       }
     }
 
@@ -8676,6 +9665,10 @@ import X from 'lucide-svelte/icons/x';
           active_executor_id: event.executor_id,
           active_executor_source: 'user'
         });
+      }
+      if (event.command === '/profile' && event.resolved_agent_profile_id && event.conversation_id) {
+        scheduleChatV2CanonicalRecovery(event.conversation_id, { immediate: true });
+        return;
       }
       appendChatV2LocalSystemMessage(
         event.text,
@@ -8902,7 +9895,7 @@ import X from 'lucide-svelte/icons/x';
         notifyIfHidden(agentLabel, `New message in "${convTitle}"`, currentConversation.conversation_id, currentConversation.conversation_id);
       }
       // Mark as read since the user is viewing this conversation
-      if (currentConversation && !document.hidden) {
+      if (currentConversation && !document.hidden && hostAllowsObservation()) {
         markConversationObservedByServiceWorker(
           currentConversation.conversation_id,
           event.type === 'message_complete' ? event.completed_at : null,
@@ -9100,6 +10093,7 @@ import X from 'lucide-svelte/icons/x';
       if (chatV2OwnsCurrent) {
         scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
       }
+      if (currentId) void drainChatV2Outbox(currentId);
       const previousTurnInProgress = turnInProgress;
       if (!chatV2OwnsCurrent) {
         awaitingAssistantStart = false;
@@ -9219,11 +10213,123 @@ import X from 'lucide-svelte/icons/x';
     // No longer polling for escalations — they arrive via push events
   }
 
+  async function loadProjects(): Promise<void> {
+    try {
+      projects = await api.projects.list();
+    } catch {
+      projects = [];
+    }
+    if (selectedProjectId && !projects.some((project) => project.project_id === selectedProjectId)) {
+      selectedProjectId = '';
+      persistSelectedProject();
+    }
+  }
+
+  function persistSelectedProject(): void {
+    if (typeof window === 'undefined') return;
+    if (selectedProjectId) {
+      window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedProject, selectedProjectId);
+    } else {
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedProject);
+    }
+  }
+
+  async function handleProjectFilterChange(): Promise<void> {
+    persistSelectedProject();
+    resetConversationSearchResults();
+    await loadSidebarProjection();
+  }
+
+  function toggleSidebarProject(projectId: string): void {
+    selectedProjectId = selectedProjectId === projectId ? '' : projectId;
+    void handleProjectFilterChange();
+  }
+
+  function patchCurrentConversation(updated: Conversation): void {
+    if (currentConversation?.conversation_id === updated.conversation_id) {
+      currentConversation = { ...currentConversation, ...updated };
+    }
+    patchConversationInList(updated.conversation_id, updated);
+  }
+
+  async function changeConversationProject(projectId: string | null): Promise<void> {
+    if (!currentConversation) return;
+    const target = projects.find((project) => project.project_id === projectId) ?? null;
+    const targetShared = target
+      && (target.is_shared_with_me || (target.grants ?? []).some((grant) => !grant.revoked_at));
+    // A chat without a project becomes shared when it is added to one.
+    if (
+      targetShared
+      && (!currentConversation.project_id || currentConversation.visibility !== 'private')
+      && typeof window !== 'undefined'
+      && !window.confirm(`"${target?.name}" is shared. Project members will be able to read this chat. Continue?`)
+    ) {
+      return;
+    }
+    projectChangeBusy = true;
+    try {
+      const updated = await api.conversations.update(currentConversation.conversation_id, { project_id: projectId });
+      patchCurrentConversation(updated);
+      addToast(target ? `Moved to ${target.name}.` : 'Removed from project.', 'success');
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to change project');
+    } finally {
+      projectChangeBusy = false;
+    }
+  }
+
+  async function changeConversationVisibility(visibility: ResourceVisibility): Promise<void> {
+    if (!currentConversation) return;
+    projectChangeBusy = true;
+    try {
+      const updated = await api.conversations.update(currentConversation.conversation_id, { visibility });
+      patchCurrentConversation(updated);
+      addToast(visibility === 'private' ? 'Chat is now private.' : 'Chat is shared with the project.', 'success');
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to change visibility');
+    } finally {
+      projectChangeBusy = false;
+    }
+  }
+
+  function sharedConversationAuthor(conversation: Conversation | null): string | null {
+    return conversation?.is_readonly_for_caller ? conversation.user_email : null;
+  }
+
+  function canContinueSharedConversation(conversation: Conversation | null): boolean {
+    return Boolean(conversation?.is_readonly_for_caller && conversation.can_continue);
+  }
+
+  async function continueSharedConversation(): Promise<void> {
+    const source = currentConversation;
+    if (!source || !canContinueSharedConversation(source)) return;
+    newChatCreating = true;
+    try {
+      const conversation = await api.conversations.create({
+        agent_id: source.agent_id,
+        project_id: source.project_id,
+        title: `Continue: ${conversationTitle(source)}`,
+        context: {
+          type: 'web',
+          ref: null,
+          platform_data: { continued_from_conversation_id: source.conversation_id },
+          memory_labels: {}
+        }
+      });
+      mergeConversationList([conversation]);
+      composer = `Continuing from the shared conversation "${conversationTitle(source)}" by ${source.user_email} (/chat/${source.conversation_id}). `;
+      await goto(conversationUrl(conversation.conversation_id));
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to continue');
+    } finally {
+      newChatCreating = false;
+    }
+  }
+
   async function handleAgentFilterChange(): Promise<void> {
     persistSelectedAgent();
     resetConversationSearchResults();
-    await refreshAvailableChannelTypes();
-    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+    await loadConversationPage(true);
   }
 
   function handleViewSession(sessionId: string, selectedNode?: WorkstreamRef): void {
@@ -9266,6 +10372,10 @@ import X from 'lucide-svelte/icons/x';
       middleSessionId: childView?.sessionId ?? null,
       workSessionId: focusedSessionId,
     }, canonicalSessionId);
+    if (!childView) {
+      parentSurfaceScrollTop = timelineEl?.scrollTop ?? 0;
+      parentSurfaceAnchor = captureTimelineAnchor();
+    }
     childView = nextChildView;
     selectedChildWorkstream = node;
     childManagedConversation = null;
@@ -9476,7 +10586,7 @@ import X from 'lucide-svelte/icons/x';
 
   $effect(() => {
     if (mobileListOpen) {
-      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
+      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false, root: () => conversationSidebar });
       mobileListOverlayCleanup = handle.unregister;
       return () => {
         handle.unregister();
@@ -9531,7 +10641,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    if (!chatSearchOpen || seededChatSearchRan || !chatSearchQuery.trim() || !currentConversation) {
+    if (findOnlySearchConversationId === currentConversation?.conversation_id || !chatSearchOpen || seededChatSearchRan || !chatSearchQuery.trim() || !currentConversation) {
       return;
     }
     if (conversationSubloadsLoading) return;
@@ -9541,7 +10651,7 @@ import X from 'lucide-svelte/icons/x';
 
   $effect(() => {
     const conversationId = currentConversation?.conversation_id ?? '';
-    if (!chatSearchOpen || !chatSearchQuery.trim() || !conversationId) return;
+    if (findOnlySearchConversationId === conversationId || !chatSearchOpen || !chatSearchQuery.trim() || !conversationId) return;
     if (conversationSubloadsLoading) return;
     if (lastChatSearchConversationId && conversationId !== lastChatSearchConversationId) {
       chatSearchResults = [];
@@ -9556,7 +10666,9 @@ import X from 'lucide-svelte/icons/x';
         (conversation) => !isAgentDirectConversation(conversation),
       );
     }
-    return conversations.filter((conversation) => !isAgentDirectConversation(conversation));
+    return sortConversationsByActivity(mergeWaitingConversations(conversations, waitingConversations))
+      .filter((conversation) => !isAgentDirectConversation(conversation)
+        && conversationMatchesSidebarProjectionFilter(conversation, currentSidebarProjectionFilter()));
   });
   let visibleConversationSections = $derived.by(() => groupConversationsByActivity(visibleConversationList, historySectionNow));
   let visibleConversationLanes = $derived.by(() =>
@@ -9664,16 +10776,15 @@ import X from 'lucide-svelte/icons/x';
   });
 
   let visibleAgentDirectChats = $derived.by(() => {
-    return sortAgentDirectChats(agentDirectChats);
+    if (selectedProjectId || (selectedChannels.length > 0 && !selectedChannels.includes('web'))) return [];
+    return sortAgentDirectChats(agentDirectChats.filter(
+      item => selectedAgentIds.length === 0 || selectedAgentIds.includes(item.agent.agent_id),
+    ));
   });
 
   $effect(() => {
     const query = conversationSearch.trim();
-    const filterKey = JSON.stringify({
-      channels: selectedChannels,
-      agents: selectedAgentIds,
-      status: selectedConversationStatus,
-    });
+    const filterKey = sidebarProjectionCacheKey();
     if (!query || conversationSearchSubmitted) {
       conversationTitleSearchRequestId += 1;
       conversationTitleSearchResults = [];
@@ -9746,29 +10857,72 @@ import X from 'lucide-svelte/icons/x';
   $effect(() => {
     const id = currentConversation?.conversation_id;
     const nextKey = id ? DRAFT_PREFIX + id : null;
-    if (nextKey === currentDraftKey) return;
+    const generation = conversationLoadRequestId;
+    if (nextKey === currentDraftKey && generation === composerHydratedGeneration) return;
     if (currentDraftKey) writeDraft(currentDraftKey, composer);
-    const loaded = nextKey ? readDraft(nextKey) : '';
-    if (composer !== loaded) composer = loaded;
+    if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+    composerHydratedGeneration = generation;
+    composerLegacyRecovery = true;
+    composerRecoveryScope = null;
+    composerLegacyCandidates = [];
+    composer = '';
+    composerAttachments = [];
+    composerInputMode = null;
+    composerInputRevision = crypto.randomUUID();
+    composerRevision++;
+    if (composerElement) composerElement.value = '';
+    let hydrated;
+    try { hydrated = id ? liveComposer?.hydrate(id) ?? hydrateComposer(composerDrafts, id) : { input: emptyComposerInput(), legacy: [] }; }
+    catch (caught) {
+      error = caught instanceof Error ? caught.message : 'Draft recovery failed';
+      currentDraftKey = nextKey;
+      return;
+    }
+    const loaded = hydrated.input.text;
+    composerAttachments = hydrated.input.attachments;
+    composerInputRevision = hydrated.input.input_revision;
+    composerInputMode = hydrated.input.chat_mode;
+    composerLegacyCandidates = hydrated.legacy;
+    composerRecoveryScope = id ? { conversationId: id, generation,
+      lease: documentCoordination().capture(), candidates: composerLegacyCandidates } : null;
+    composerLegacyRecovery = hydrated.legacy.length > 0;
+    if (composer !== loaded) {
+      composer = loaded;
+      // The textarea height is set imperatively from its content. Swap the
+      // native value too (as send does) and re-measure after the flush, so a
+      // tall unsent draft from the previous conversation does not leave the
+      // composer expanded.
+      if (composerElement) composerElement.value = loaded;
+      void tick().then(syncComposerHeight);
+    }
     currentDraftKey = nextKey;
   });
 
-  // Debounce-persist the composer draft on every change. Clears the
-  // entry when composer becomes empty so we do not leave stale drafts.
   $effect(() => {
     const key = currentDraftKey;
-    const value = composer;
+    if (!key || !liveComposer) return;
+    return untrack(() => liveComposer.subscribe(key.slice(DRAFT_PREFIX.length), (input) => {
+      if (composerInputRevision === input.input_revision && sameSubmissionInput(compositeComposerInput(), input)) return;
+      composer = input.text; composerAttachments = input.attachments; composerInputMode = input.chat_mode;
+      composerInputRevision = input.input_revision; composerRevision++;
+      composerLegacyRecovery = false; composerLegacyCandidates = [];
+      void tick().then(syncComposerHeight);
+    }));
+  });
+
+  // Publish complete input immediately so other views cannot autosave a stale
+  // snapshot during a debounce window. The conversation owner serializes writes.
+  $effect(() => {
+    const key = currentDraftKey;
+    const captured = compositeComposerInput();
     if (!key) return;
     if (typeof window === 'undefined') return;
-    if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
-    draftSaveTimer = window.setTimeout(() => {
-      draftSaveTimer = null;
-      writeDraft(key, value);
-    }, 300);
+    if (!composerLegacyRecovery) untrack(() => liveComposer?.update(key.slice(DRAFT_PREFIX.length), captured));
   });
 
   onMount(() => {
-    browserVisible = document.visibilityState === 'visible';
+    browserVisible = document.visibilityState === 'visible' && hostAllowsObservation();
     const handleTaskControlEscape = (event: KeyboardEvent): void => {
       if (!isTaskControlMode || event.key !== 'Escape') return;
       event.preventDefault();
@@ -9777,13 +10931,15 @@ import X from 'lucide-svelte/icons/x';
     window.addEventListener('keydown', handleTaskControlEscape);
     window.addEventListener('keydown', handleTaskControlFocusBoundary, true);
     void loadUserPreferences(auth.getSnapshot().user?.email);
+    selectedProjectId = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedProject) ?? '';
+    void loadProjects();
     restoreSelectedChannel();
     restoreChatSidebarState();
     conversationFiltersOpen = initialConversationFiltersOpen(window.innerWidth);
     mobileListOpen = !conversationIdFromRoute();
     unsubscribeWs = wsClient.subscribe(handleSocketEvent);
     visibilityHandler = () => {
-      browserVisible = document.visibilityState === 'visible';
+      browserVisible = document.visibilityState === 'visible' && hostAllowsObservation();
       syncServiceWorkerActiveConversation();
       if (!document.hidden) {
         resumeControllerRecoveryIfPending();
@@ -9791,9 +10947,14 @@ import X from 'lucide-svelte/icons/x';
         scheduleTreeRefresh();
         if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
         void refreshPendingNotifications();
+        // Give the sidebar refresh a moment, then catch up running turns.
+        window.setTimeout(preloadActiveConversations, 1_500);
       } else {
+        flushPendingDraft();
+        saveCurrentConversationView();
       }
     };
+    pageHideHandler = () => flushPendingDraft();
     focusHandler = () => {
       syncServiceWorkerActiveConversation();
       void refreshConversationView('focus');
@@ -9813,6 +10974,15 @@ import X from 'lucide-svelte/icons/x';
     window.addEventListener('focus', focusHandler);
     window.addEventListener('pageshow', pageShowHandler);
     window.addEventListener('online', onlineHandler);
+    window.addEventListener('pagehide', pageHideHandler);
+    // Keep files still referenced by queued messages or by compact-chat
+    // composer drafts (see chat-v2/unsent-recovery.ts).
+    void chatV2Outbox.list()
+      .then((entries) => attachmentUploads.prune([
+        ...entries.map((entry) => entry.attachments ?? []),
+         ...allDraftAttachmentLists(composerDrafts),
+      ]))
+      .catch(() => undefined);
     startNotificationRefreshPolling();
     staleRuntimeGuardTimer = window.setInterval(() => {
       if (!currentConversation || document.hidden) return;
@@ -9905,6 +11075,9 @@ import X from 'lucide-svelte/icons/x';
       if (onlineHandler) {
         window.removeEventListener('online', onlineHandler);
       }
+      if (pageHideHandler) {
+        window.removeEventListener('pagehide', pageHideHandler);
+      }
       if (foregroundSyncTimer !== null) {
         window.clearTimeout(foregroundSyncTimer);
         foregroundSyncTimer = null;
@@ -9929,11 +11102,60 @@ import X from 'lucide-svelte/icons/x';
   });
 </script>
 
+{#snippet conversationMetadata(location: 'header' | 'sidebar')}
+  {#if currentConversation}
+    {@const agent = conversationAgentForDisplay(currentConversation)}
+    {@const usage = activeContextUsage()}
+    {@const modelBadge = runtimeModelPresentation(usage,
+      latestRuntimeSelection &&
+      latestRuntimeSelection.sessionId === (focusedSessionId ?? currentConversation.active_session_id)
+        ? latestRuntimeSelection.selection : null)}
+    <div class="flex min-w-0 flex-wrap items-center gap-2 text-sm text-muted" data-testid="conversation-metadata">
+      <div class="relative min-w-0 max-w-full">
+        <button type="button" class="flex max-w-full items-center gap-1.5 rounded-lg px-1 py-0.5 hover:bg-surface-hover" onclick={() => { showAgentProfile = showAgentProfile === location ? null : location; }}>
+          <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+          <span class="truncate">{agent.display_name ?? agent.name}</span>
+        </button>
+        {#if showAgentProfile === location}<AgentProfilePopover {agent} onClose={() => { showAgentProfile = null; }} />{/if}
+      </div>
+      {#if currentConversation.active_session_id}
+        <button class="flex items-center gap-1 font-mono text-xs text-quiet hover:text-secondary" onclick={copySessionId} type="button" title="Copy full session ID">
+          {currentConversation.active_session_id.slice(0, 12)}
+          {#if sessionIdCopied}<Check class="h-3 w-3 text-success" />{:else}<Copy class="h-3 w-3" />{/if}
+        </button>
+      {/if}
+      {#if activeAgentProfileLabel()}
+        <span class="max-w-full truncate rounded-full border border-blue-border bg-blue-subtle px-2 py-0.5 text-[10px] text-blue-tone" title="Agent profile">profile {activeAgentProfileLabel()}</span>
+      {/if}
+      {#if modelBadge.model}
+        <span class="max-w-full truncate rounded-full border border-control-border bg-raised/60 px-2 py-0.5 text-[10px]" title={modelBadge.selected ? 'Selected for next message' : 'Last measured model'}>{modelBadge.model}</span>
+        {#if modelBadge.effort}<span class="rounded-full border border-control-border px-2 py-0.5 text-[10px]" title="Thinking effort">thinking {modelBadge.effort}</span>{/if}
+      {/if}
+      {#if conversationTaskId(currentConversation)}
+        <a href="/tasks/{conversationTaskId(currentConversation)}" class="rounded-full border border-control-border px-2 py-0.5 text-[10px] uppercase tracking-widest text-accent hover:text-accent-hover">{contextTypeBadge(currentConversation)}</a>
+      {:else}
+        <span class="rounded-full border border-control-border px-2 py-0.5 text-[10px] uppercase tracking-widest">{contextTypeBadge(currentConversation)}</span>
+      {/if}
+      <ConversationProjectControl
+        conversation={currentConversation} {projects} busy={projectChangeBusy}
+        onchangeProject={(projectId) => void changeConversationProject(projectId)}
+        onchangeVisibility={(visibility) => void changeConversationVisibility(visibility)}
+      />
+      {#if backingSessionBadge}<span class="rounded-full border border-control-border px-2 py-0.5 text-[10px]" title="Backing sessions">{backingSessionBadge}</span>{/if}
+    </div>
+  {/if}
+{/snippet}
+
 <svelte:head>
   <title>{currentConversation ? `${conversationTitle(currentConversation)} · Chat · Cognis` : 'Chat · Cognis'}</title>
 </svelte:head>
 
-{#if initializing && !conversationIdFromRoute()}
+{#if timelineIdentityRequired}
+  <div class="space-y-3 p-6" role="alert" data-testid="timeline-identity-required">
+    <p>{timelineIdentityError}</p>
+    <Button variant="secondary" disabled={recoveringTimelineOwner} onclick={recoverTimelineOwner}>Verify session and retry</Button>
+  </div>
+{:else if initializing && !conversationIdFromRoute()}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
   <div
@@ -9951,7 +11173,7 @@ import X from 'lucide-svelte/icons/x';
       <button
         aria-label="Close conversation list"
         data-edge-swipe-surface="true"
-        class="fixed inset-0 z-30 bg-slate-950/80 backdrop-blur-sm lg:hidden"
+        class="fixed inset-0 z-30 bg-scrim/80 backdrop-blur-sm lg:hidden"
         onclick={closeMobileList}
         type="button"
         transition:fade={{ duration: 180 }}
@@ -9979,16 +11201,18 @@ import X from 'lucide-svelte/icons/x';
     -->
     {#if !isWindowMode}
     <aside
+      bind:this={conversationSidebar}
+      data-find-scope
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`chat-history-sidebar fixed left-3 right-3 top-[calc(1rem+var(--app-safe-area-top))] bottom-3 z-40 flex max-w-[22rem] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:right-auto lg:max-w-none lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      class={`chat-history-sidebar fixed left-3 right-3 top-[calc(1rem+var(--app-safe-area-top))] bottom-3 z-40 flex max-w-[22rem] min-h-0 flex-col rounded-[1.75rem] border border-separator bg-chrome/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:right-auto lg:max-w-none lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-separator lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
       style:--chat-sidebar-width={`${chatSidebarWidth}px`}
       inert={(!mobileListOpen && Boolean(currentConversation) && isMobileViewport()) || undefined}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
       <div
-        class="chat-sidebar-resizer touch-resize-handle touch-resize-handle--right absolute -right-1 top-0 z-30 hidden h-full w-2 cursor-col-resize touch-none focus-visible:bg-sky-400/40 lg:block"
+        class="chat-sidebar-resizer touch-resize-handle touch-resize-handle--right absolute -right-1 top-0 z-30 hidden h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent/40 lg:block"
         role="separator"
         tabindex="0"
         aria-label="Resize conversation history"
@@ -10001,12 +11225,19 @@ import X from 'lucide-svelte/icons/x';
         onkeydown={resizeChatSidebarWithKeyboard}
       ></div>
       <!-- Static top: filters -->
+      <WaitingRefreshStatus
+        error={waitingSnapshotScope === sidebarProjectionCacheKey() ? waitingLoadError : null}
+        scope={sidebarProjectionCacheKey()}
+        onRetry={() => void waitingReconciliation.request(
+          sidebarProjectionCacheKey(), { manual: true, urgent: true },
+        )}
+      />
       <div class={`shrink-0 space-y-2 p-4 ${visibleAgentDirectChats.length > 0 ? 'pb-0 sm:pb-0' : 'pb-2 sm:pb-2'}`}>
-        <div class="flex items-center justify-between gap-3 border-b border-slate-800/60 pb-2" role="group" aria-label="Conversation controls">
+        <div class="flex items-center justify-between gap-3 border-b border-separator pb-2" role="group" aria-label="Conversation controls">
           <div class="flex items-center gap-1">
             <Tooltip placement="bottom" text={conversationFiltersOpen ? 'Collapse filters' : 'Expand filters'} showOnTouch={false}>
               <button
-                class={`grid h-9 w-9 place-items-center rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 ${conversationFiltersOpen ? 'bg-sky-500/15 text-sky-300' : 'text-slate-500 hover:bg-slate-800 hover:text-sky-300'}`}
+                class={`grid h-9 w-9 place-items-center rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${conversationFiltersOpen ? 'bg-accent-subtle text-accent' : 'text-quiet hover:bg-surface-hover hover:text-accent'}`}
                 type="button"
                 aria-label={conversationFiltersOpen ? 'Collapse conversation filters' : 'Expand conversation filters'}
                 aria-expanded={conversationFiltersOpen}
@@ -10015,7 +11246,7 @@ import X from 'lucide-svelte/icons/x';
             </Tooltip>
             <Tooltip placement="bottom" text={conversationSearchOpen ? 'Collapse search' : 'Search conversations'} showOnTouch={false}>
               <button
-                class={`grid h-9 w-9 place-items-center rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 ${conversationSearchOpen ? 'bg-sky-500/15 text-sky-300' : 'text-slate-500 hover:bg-slate-800 hover:text-sky-300'}`}
+                class={`grid h-9 w-9 place-items-center rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${conversationSearchOpen ? 'bg-accent-subtle text-accent' : 'text-quiet hover:bg-surface-hover hover:text-accent'}`}
                 type="button"
                 aria-label={conversationSearchOpen ? 'Collapse conversation search' : 'Expand conversation search'}
                 aria-expanded={conversationSearchOpen}
@@ -10026,7 +11257,7 @@ import X from 'lucide-svelte/icons/x';
           <div class="flex items-center gap-1">
             <Tooltip placement="bottom" text="Refresh conversations" showOnTouch={false}>
               <button
-                class="grid h-9 w-9 place-items-center rounded-lg text-slate-500 transition hover:bg-slate-800 hover:text-sky-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 disabled:cursor-not-allowed disabled:text-slate-700"
+                class="grid h-9 w-9 place-items-center rounded-lg text-quiet transition hover:bg-surface-hover hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={conversationListRefreshing || conversationListLoading}
                 onclick={() => void forceRefreshConversationHistory()}
                 type="button"
@@ -10035,7 +11266,7 @@ import X from 'lucide-svelte/icons/x';
             </Tooltip>
             <Tooltip placement="bottom" text="New conversation" showOnTouch={false}>
               <button
-                 class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-sky-400/25 bg-sky-400/15 text-sky-300 transition hover:bg-sky-400/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-200 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500"
+                 class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-accent bg-accent-subtle text-accent transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-canvas disabled:cursor-not-allowed disabled:bg-raised disabled:text-quiet"
                 disabled={newChatCreating}
                 onclick={openNewConversationModal}
                 type="button"
@@ -10044,7 +11275,7 @@ import X from 'lucide-svelte/icons/x';
             </Tooltip>
             <button
               aria-label="Close conversation list"
-              class="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white lg:hidden"
+              class="rounded-lg p-1.5 text-muted transition hover:bg-surface-hover hover:text-strong lg:hidden"
               type="button"
               onclick={closeMobileList}
             ><X class="h-4 w-4" /></button>
@@ -10053,53 +11284,53 @@ import X from 'lucide-svelte/icons/x';
 
         {#if conversationSearchOpen}
           <form class="relative" onsubmit={(event) => { event.preventDefault(); void submitConversationSearch(); }}>
-            <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-            <Input id="conversation-sidebar-search" bind:value={conversationSearch} class="pl-9 pr-20" placeholder={searchEnabled ? 'Search conversations' : 'Filter by title'} />
+            <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-quiet" />
+            <Input find={{ scopeOnly: !!currentConversation && !mobileListOpen }} id="conversation-sidebar-search" bind:value={conversationSearch} class="pl-9 pr-20" placeholder={searchEnabled ? 'Search conversations' : 'Filter by title'} />
             {#if conversationSearch}
-              <button aria-label="Clear search" class="absolute right-10 top-1.5 rounded-lg p-1 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200" type="button" onclick={clearConversationSearch}>
+              <button aria-label="Clear search" class="absolute right-10 top-1.5 rounded-lg p-1 text-quiet transition hover:bg-surface-hover hover:text-foreground" type="button" onclick={clearConversationSearch}>
                 <X class="h-4 w-4" />
               </button>
             {/if}
-            <button aria-label="Search conversations" class="absolute right-2 top-1.5 rounded-lg p-1 text-sky-400 transition hover:bg-slate-800 hover:text-sky-300 disabled:text-slate-600" type="submit" disabled={!searchEnabled || !conversationSearch.trim() || conversationSearchLoading}>
+            <button aria-label="Search conversations" class="absolute right-2 top-1.5 rounded-lg p-1 text-accent transition hover:bg-surface-hover hover:text-accent-hover disabled:text-quiet" type="submit" disabled={!searchEnabled || !conversationSearch.trim() || conversationSearchLoading}>
               <Search class={`h-4 w-4 ${conversationSearchLoading ? 'animate-pulse' : ''}`} />
             </button>
           </form>
           {#if !searchEnabled}
-            <p class="text-xs text-slate-500">Content search disabled; title search remains available.</p>
+            <p class="text-xs text-quiet">Content search disabled; title search remains available.</p>
           {/if}
         {/if}
 
         {#if !sidebarProjectionLoaded && conversationListLoading}
           <div class="space-y-3">
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Loading setup</p>
-            <p class="text-sm leading-6 text-slate-400">Loading agents and conversations…</p>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Loading setup</p>
+            <p class="text-sm leading-6 text-muted">Loading agents and conversations…</p>
           </div>
         {:else if sidebarProjectionFailed && agents.length === 0}
           <div class="space-y-3">
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup unavailable</p>
-            <p class="text-sm leading-6 text-slate-400">Could not load agents and setup state.</p>
-            <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => void loadSidebarProjection()}>Retry</Button>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Setup unavailable</p>
+            <p class="text-sm leading-6 text-muted">Could not load agents and setup state.</p>
+            <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => void loadSidebarProjection({ manual: true })}>Retry</Button>
           </div>
         {:else if sidebarProjectionLoaded && agents.length === 0}
           <div class="space-y-3">
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
-            <p class="text-sm leading-6 text-slate-400">Create an agent to start chatting.</p>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Setup incomplete</p>
+            <p class="text-sm leading-6 text-muted">Create an agent to start chatting.</p>
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/agents/new')}>Create agent</Button>
           </div>
         {:else if isLlmUnavailableForSetup()}
           <div class="space-y-3">
-            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
-            <p class="text-sm leading-6 text-slate-400">Configure an LLM provider first.</p>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Setup incomplete</p>
+            <p class="text-sm leading-6 text-muted">Configure an LLM provider first.</p>
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
         {:else}
           <div class={`${conversationFiltersOpen ? 'grid' : 'hidden'} grid-cols-1 gap-2 sm:grid-cols-2`}>
             <div class="relative">
-              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-slate-500" for="conversation-agent-filter">Agent</label>
+              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-quiet" for="conversation-agent-filter">Agent</label>
               <button
                 id="conversation-agent-filter"
                 type="button"
-                class="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-left text-xs font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+                class="flex w-full items-center justify-between gap-2 rounded-lg border border-control-border bg-surface px-3 py-2 text-left text-xs font-medium text-foreground transition hover:border-border-strong"
                 onclick={() => {
                   agentFilterDropdownOpen = !agentFilterDropdownOpen;
                   channelFilterDropdownOpen = false;
@@ -10108,13 +11339,13 @@ import X from 'lucide-svelte/icons/x';
                 aria-expanded={agentFilterDropdownOpen}
               >
                 <span class="truncate">{selectedAgentFilterLabel()}</span>
-                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-quiet" />
               </button>
               {#if agentFilterDropdownOpen}
-                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-slate-700 bg-slate-950 p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
+                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-control-border bg-elevated p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
                   <button
                     type="button"
-                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedAgentIds.length === 0 ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedAgentIds.length === 0 ? 'bg-accent-subtle text-foreground' : 'text-secondary hover:bg-surface-hover hover:text-strong'}`}
                     onclick={() => { selectedAgentIds = []; void handleAgentFilterChange(); }}
                     aria-selected={selectedAgentIds.length === 0}
                     role="option"
@@ -10126,7 +11357,7 @@ import X from 'lucide-svelte/icons/x';
                     {@const selected = selectedAgentIds.includes(agent.agent_id)}
                     <button
                       type="button"
-                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-accent-subtle text-foreground' : 'text-secondary hover:bg-surface-hover hover:text-strong'}`}
                       onclick={() => void toggleSelectedAgent(agent.agent_id)}
                       aria-selected={selected}
                       role="option"
@@ -10142,11 +11373,11 @@ import X from 'lucide-svelte/icons/x';
             </div>
 
             <div class="relative">
-              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-slate-500" for="conversation-channel-filter">Channel</label>
+              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-quiet" for="conversation-channel-filter">Channel</label>
               <button
                 id="conversation-channel-filter"
                 type="button"
-                class="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-left text-xs font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+                class="flex w-full items-center justify-between gap-2 rounded-lg border border-control-border bg-surface px-3 py-2 text-left text-xs font-medium text-foreground transition hover:border-border-strong"
                 onclick={() => {
                   channelFilterDropdownOpen = !channelFilterDropdownOpen;
                   agentFilterDropdownOpen = false;
@@ -10155,13 +11386,13 @@ import X from 'lucide-svelte/icons/x';
                 aria-expanded={channelFilterDropdownOpen}
               >
                 <span class="truncate">{selectedChannelFilterLabel()}</span>
-                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-quiet" />
               </button>
               {#if channelFilterDropdownOpen}
-                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-slate-700 bg-slate-950 p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
+                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-control-border bg-elevated p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
                   <button
                     type="button"
-                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedChannels.length === 0 ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedChannels.length === 0 ? 'bg-accent-subtle text-foreground' : 'text-secondary hover:bg-surface-hover hover:text-strong'}`}
                     onclick={() => { selectedChannels = []; void persistSelectedChannels(); }}
                     aria-selected={selectedChannels.length === 0}
                     role="option"
@@ -10173,7 +11404,7 @@ import X from 'lucide-svelte/icons/x';
                     {@const selected = selectedChannels.includes(ch)}
                     <button
                       type="button"
-                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-accent-subtle text-foreground' : 'text-secondary hover:bg-surface-hover hover:text-strong'}`}
                       onclick={() => void toggleSelectedChannel(ch)}
                       aria-selected={selected}
                       role="option"
@@ -10186,7 +11417,27 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
           </div>
+          {#if conversationFiltersOpen && projects.length > 0}
+            <div data-testid="conversation-project-filter">
+              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-quiet" for="conversation-project-filter">Project</label>
+              <select
+                id="conversation-project-filter"
+                class="w-full rounded-lg border border-control-border bg-surface px-3 py-2 text-xs font-medium text-foreground focus:border-accent"
+                bind:value={selectedProjectId}
+                onchange={() => void handleProjectFilterChange()}
+              >
+                <option value="">All projects</option>
+                {#each projects.filter((project) => project.status === 'active') as project (project.project_id)}
+                  <option value={project.project_id}>{project.name}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
           {#if conversationFiltersOpen}
+            <label class="flex items-center gap-2 text-xs text-secondary">
+              <input type="checkbox" bind:checked={includeSharedChats} onchange={() => void handleProjectFilterChange()} />
+              Shared with me
+            </label>
             <div class="grid grid-cols-4 gap-1.5 sm:gap-2">
               <Button size="sm" variant={selectedConversationStatus === 'active' ? 'primary' : 'secondary'} onclick={() => void setConversationStatusFilter('active')}>Active</Button>
               <Button size="sm" variant={selectedConversationStatus === 'starred' ? 'primary' : 'secondary'} onclick={() => void setConversationStatusFilter('starred')}>Starred</Button>
@@ -10197,9 +11448,9 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if visibleAgentDirectChats.length > 0}
-          <section class="border-b border-slate-800/60 pb-0 pt-1" aria-labelledby="sidebar-agents-heading">
+          <section class="border-b border-separator pb-0 pt-1" aria-labelledby="sidebar-agents-heading">
             <div class="mb-2 flex items-center justify-between px-1">
-              <p id="sidebar-agents-heading" class="text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-400">Agents</p>
+              <p id="sidebar-agents-heading" class="text-[10px] font-semibold uppercase tracking-[0.24em] text-muted">Agents</p>
             </div>
             <div class="flex gap-2 overflow-x-auto pb-1">
               {#each visibleAgentDirectChats as item}
@@ -10214,7 +11465,7 @@ import X from 'lucide-svelte/icons/x';
                 {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
                 {@const attentionDescription = conversationAttentionDescription(conversation)}
                  <a
-                  class={`group flex min-w-[4.5rem] flex-col items-center gap-1 rounded-2xl px-2 py-1 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-300 hover:bg-slate-900/70'}`}
+                  class={`group flex min-w-[4.5rem] flex-col items-center gap-1 rounded-2xl px-2 py-1 transition ${isActive ? 'bg-accent-subtle text-strong' : 'text-secondary hover:bg-surface-hover'}`}
                   href={conversationUrl(conversation.conversation_id)}
                   onclick={closeMobileList}
                   aria-current={isActive ? 'page' : undefined}
@@ -10244,29 +11495,29 @@ import X from 'lucide-svelte/icons/x';
       >
         <div class="space-y-1 pb-3">
           {#if (conversationListLoading || conversationListRefreshing) && visibleConversationList.length === 0 && !(conversationSearchSubmitted && searchEnabled)}
-            <div class="rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-6 text-center text-sm text-slate-400">
-              <RefreshCw class="mx-auto mb-2 h-4 w-4 animate-spin text-slate-500" />
+            <div class="rounded-2xl border border-separator bg-surface/40 px-4 py-6 text-center text-sm text-muted">
+              <RefreshCw class="mx-auto mb-2 h-4 w-4 animate-spin text-quiet" />
               Loading conversation history...
             </div>
           {/if}
           {#if conversationSearchSubmitted && conversationSearchLoading && searchEnabled}
-            <p class="mb-3 rounded-2xl border border-slate-800 px-4 py-4 text-center text-sm text-slate-400">
+            <p class="mb-3 rounded-2xl border border-separator px-4 py-4 text-center text-sm text-muted">
               Searching conversation history...
             </p>
           {:else if conversationSearchSubmitted && conversationSearchError && searchEnabled}
-            <p class="mb-3 rounded-2xl border border-rose-900/50 bg-rose-950/30 px-4 py-4 text-center text-sm text-rose-200">
+            <p class="mb-3 rounded-2xl border border-danger-border bg-danger-subtle px-4 py-4 text-center text-sm text-danger">
               {conversationSearchError}
             </p>
           {:else if conversationSearchSubmitted && conversationSearchResults.length > 0}
             <div class="mb-3 space-y-1">
-              <p class="px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500">Search results</p>
+              <p class="px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-quiet">Search results</p>
               {#each conversationSearchResults as result}
                 {@const agent = searchResultAgent(result)}
                 {@const canExpand = result.match_count > 1 && result.extra_matches.length > 0}
                 {@const expanded = searchResultExpanded(result.intaris_session_id)}
                 {@const resultTime = searchMatchTime(result.top_match)}
-                <div class="rounded-xl transition hover:bg-slate-900/60">
-                  <div class="group flex items-start gap-3 rounded-xl px-3 py-2.5 text-left text-slate-200 transition hover:bg-slate-900/60">
+                <div class="rounded-xl transition hover:bg-surface-hover">
+                  <div class="group flex items-start gap-3 rounded-xl px-3 py-2.5 text-left text-foreground transition hover:bg-surface-hover">
                     <button
                       class="flex min-w-0 flex-1 items-start gap-3 text-left"
                       type="button"
@@ -10274,24 +11525,24 @@ import X from 'lucide-svelte/icons/x';
                     >
                       <AgentAvatar name={agent?.display_name ?? agent?.name ?? result.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8 shrink-0" />
                       <span class="min-w-0 flex-1">
-                        <span class="block break-words text-sm font-medium text-white">{searchResultConversationTitle(result)}</span>
+                        <span class="block break-words text-sm font-medium text-strong">{searchResultConversationTitle(result)}</span>
                         <span class="mt-0.5 flex items-center gap-2">
-                          <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? result.agent_id}</span>
+                          <span class="truncate text-xs text-muted">{agent?.display_name ?? agent?.name ?? result.agent_id}</span>
                           {#if result.match_count > 1}
-                            <span class="shrink-0 text-[10px] font-medium text-slate-500">{result.match_count} matches</span>
+                            <span class="shrink-0 text-[10px] font-medium text-quiet">{result.match_count} matches</span>
                           {/if}
                           {#if resultTime}
-                            <span class="shrink-0 text-[10px] text-slate-500">{resultTime}</span>
+                            <span class="shrink-0 text-[10px] text-quiet">{resultTime}</span>
                           {/if}
-                          <span class="shrink-0 text-[10px] text-slate-500">{searchMatchScore(result.top_match)}</span>
+                          <span class="shrink-0 text-[10px] text-quiet">{searchMatchScore(result.top_match)}</span>
                         </span>
-                        <span class="mt-1 line-clamp-2 text-xs leading-5 text-slate-400">{searchResultSnippet(result)}</span>
+                        <span class="mt-1 line-clamp-2 text-xs leading-5 text-muted">{searchResultSnippet(result)}</span>
                       </span>
                     </button>
                     {#if canExpand}
                       <button
                         aria-label={expanded ? 'Collapse matches' : 'Expand matches'}
-                        class="mt-1 shrink-0 rounded-lg p-1 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200"
+                        class="mt-1 shrink-0 rounded-lg p-1 text-quiet transition hover:bg-surface-hover hover:text-foreground"
                         type="button"
                         onclick={() => toggleSearchResultExpanded(result.intaris_session_id)}
                       >
@@ -10304,15 +11555,15 @@ import X from 'lucide-svelte/icons/x';
                     {/if}
                   </div>
                   {#if expanded}
-                    <div class="ml-11 mr-3 mb-2 space-y-1 border-l border-slate-800 pl-2">
+                    <div class="ml-11 mr-3 mb-2 space-y-1 border-l border-separator pl-2">
                       {#each result.extra_matches as match}
                         {@const matchTime = searchMatchTime(match)}
                         <button
-                          class="block w-full rounded-lg px-2 py-1.5 text-left text-xs leading-5 text-slate-400 transition hover:bg-slate-800/70 hover:text-slate-200"
+                          class="block w-full rounded-lg px-2 py-1.5 text-left text-xs leading-5 text-muted transition hover:bg-surface-hover hover:text-foreground"
                           type="button"
                           onclick={() => void openConversationSearchResult(result, match)}
                         >
-                          <span class="mb-0.5 block text-[10px] text-slate-500">
+                          <span class="mb-0.5 block text-[10px] text-quiet">
                             {#if matchTime}{matchTime} · {/if}{searchMatchScore(match)}
                           </span>
                           <span>{searchMatchSnippet(match)}</span>
@@ -10324,7 +11575,7 @@ import X from 'lucide-svelte/icons/x';
               {/each}
             </div>
           {:else if conversationSearchSubmitted && !conversationSearchLoading && searchEnabled}
-            <p class="mb-3 rounded-2xl border border-dashed border-slate-700 px-4 py-4 text-center text-sm text-slate-400">
+            <p class="mb-3 rounded-2xl border border-dashed border-control-border px-4 py-4 text-center text-sm text-muted">
               No content matches found.
             </p>
           {/if}
@@ -10333,21 +11584,21 @@ import X from 'lucide-svelte/icons/x';
             <!-- Content search replaces the normal list; empty state is handled above. -->
           {:else}
             {#if conversationTitleSearchError}
-            <p class="rounded-2xl border border-rose-900/50 bg-rose-950/30 px-4 py-4 text-center text-sm text-rose-200">
+            <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-4 text-center text-sm text-danger">
               {conversationTitleSearchError}
             </p>
             {/if}
             {#if visibleConversationList.length === 0 && !(conversationListLoading || conversationListRefreshing || conversationTitleSearchLoading) && !conversationTitleSearchError}
-            <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
+            <p class="rounded-2xl border border-dashed border-control-border px-4 py-6 text-center text-sm text-muted">
               No conversations found.
             </p>
             {:else if visibleConversationList.length > 0}
             {@const sidebarSectionsEnabled = $userPreferences.display.conversation_sidebar_sections}
             {#if sidebarSectionsEnabled && visibleConversationLanes.active.length > 0}
               <section class="mb-3 flex min-h-0 flex-col" aria-labelledby="sidebar-active-heading" data-testid="sidebar-conversations-active">
-                <div id="sidebar-active-heading" class="mb-1 flex shrink-0 items-center justify-between gap-2 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-sky-300">
+                <div id="sidebar-active-heading" class="mb-1 flex shrink-0 items-center justify-between gap-2 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-info">
                   <span>Active</span>
-                  <span class="rounded-full bg-sky-400/10 px-1.5 py-0.5 text-[9px] tabular-nums tracking-normal" aria-label={`${visibleConversationLanes.active.length} active conversations`}>
+                  <span class="rounded-full bg-info-subtle px-1.5 py-0.5 text-[9px] tabular-nums tracking-normal" aria-label={`${visibleConversationLanes.active.length} active conversations`}>
                     {visibleConversationLanes.active.length}
                   </span>
                 </div>
@@ -10357,6 +11608,7 @@ import X from 'lucide-svelte/icons/x';
                     {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
                     {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
                     <SidebarConversationRow
+                      {selectedProjectId} onToggleProject={toggleSidebarProject}
                       {conversation}
                       href={conversationUrl(conversation.conversation_id)}
                       agentName={agent?.display_name ?? agent?.name ?? conversation.agent_id}
@@ -10380,9 +11632,9 @@ import X from 'lucide-svelte/icons/x';
             {/if}
             {#if sidebarSectionsEnabled && visibleConversationLanes.waiting.length > 0}
               <section class="mb-3 flex min-h-0 flex-col" aria-labelledby="sidebar-waiting-heading" data-testid="sidebar-conversations-waiting">
-                <div id="sidebar-waiting-heading" class="mb-1 flex shrink-0 items-center justify-between gap-2 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-amber-300">
+                <div id="sidebar-waiting-heading" class="mb-1 flex shrink-0 items-center justify-between gap-2 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-warning">
                   <span>Waiting</span>
-                  <span class="rounded-full bg-amber-400/10 px-1.5 py-0.5 text-[9px] tabular-nums tracking-normal" aria-label={`${visibleConversationLanes.waiting.length} waiting conversations`}>
+                  <span class="rounded-full bg-warning-subtle px-1.5 py-0.5 text-[9px] tabular-nums tracking-normal" aria-label={`${visibleConversationLanes.waiting.length} waiting conversations`}>
                     {visibleConversationLanes.waiting.length}
                   </span>
                 </div>
@@ -10392,6 +11644,7 @@ import X from 'lucide-svelte/icons/x';
                     {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
                     {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
                     <SidebarConversationRow
+                      {selectedProjectId} onToggleProject={toggleSidebarProject}
                       {conversation}
                       href={conversationUrl(conversation.conversation_id)}
                       agentName={agent?.display_name ?? agent?.name ?? conversation.agent_id}
@@ -10417,17 +11670,18 @@ import X from 'lucide-svelte/icons/x';
             {#if !sidebarSectionsEnabled || visibleHistorySections.length > 0}
             <section aria-labelledby={sidebarSectionsEnabled ? 'sidebar-history-heading' : undefined} data-testid="sidebar-conversations-history">
               {#if sidebarSectionsEnabled}
-              <p id="sidebar-history-heading" class="mb-1 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-400">History</p>
+              <p id="sidebar-history-heading" class="mb-1 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-muted">History</p>
               {/if}
               <div class="space-y-1">
             {#each (sidebarSectionsEnabled ? visibleHistorySections : visibleConversationSections) as section (section.key)}
               <section class="space-y-1" aria-labelledby={`history-section-${section.key}`}>
-                <p id={`history-section-${section.key}`} class="sticky top-0 z-10 py-0.5 pr-2 text-right text-[10px] font-medium italic tracking-wide text-slate-400 first:mt-0">{section.label}</p>
+                <p id={`history-section-${section.key}`} class="sticky top-0 z-10 py-0.5 pr-2 text-right text-[10px] font-medium italic tracking-wide text-muted first:mt-0">{section.label}</p>
                 {#each section.conversations as conversation (conversation.conversation_id)}
                   {@const agent = conversationAgentForDisplay(conversation)}
                   {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
                   {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
                   <SidebarConversationRow
+                    {selectedProjectId} onToggleProject={toggleSidebarProject}
                     {conversation}
                     href={conversationUrl(conversation.conversation_id)}
                     agentName={agent?.display_name ?? agent?.name ?? conversation.agent_id}
@@ -10451,7 +11705,7 @@ import X from 'lucide-svelte/icons/x';
                 {#if visibleConversationsHaveMore}
                   <div class="flex h-8 items-center justify-center" use:observeConversationListEnd role="status" aria-live="polite">
                     {#if conversationListLoading || conversationTitleSearchLoading}
-                      <RefreshCw class="h-4 w-4 animate-spin text-slate-500" />
+                      <RefreshCw class="h-4 w-4 animate-spin text-quiet" />
                       <span class="sr-only">Loading more conversations</span>
                     {/if}
                   </div>
@@ -10465,7 +11719,7 @@ import X from 'lucide-svelte/icons/x';
           {#if visibleConversationsHaveMore && $userPreferences.display.conversation_sidebar_sections && visibleHistorySections.length === 0}
             <div class="flex h-8 items-center justify-center" use:observeConversationListEnd role="status" aria-live="polite">
               {#if conversationListLoading || conversationTitleSearchLoading}
-                <RefreshCw class="h-4 w-4 animate-spin text-slate-500" />
+                <RefreshCw class="h-4 w-4 animate-spin text-quiet" />
                 <span class="sr-only">Loading more conversations</span>
               {/if}
             </div>
@@ -10503,13 +11757,13 @@ import X from 'lucide-svelte/icons/x';
       ondrop={(event) => void handleDrop(event)}
     >
       {#if switchingConversation}
-        <div class="pointer-events-none absolute inset-0 z-20 bg-slate-950/35 backdrop-blur-[1px]"></div>
+        <div class="pointer-events-none absolute inset-0 z-20 bg-canvas/35 backdrop-blur-[1px]"></div>
       {/if}
       {#if showDropZone}
-        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-sky-400 bg-sky-500/10 backdrop-blur-sm">
-          <div class="rounded-2xl bg-slate-900/90 px-6 py-4 text-center">
-            <p class="text-lg font-medium text-sky-300">Drop files here to attach</p>
-            <p class="mt-1 text-sm text-slate-400">Images, PDFs, audio, and other files</p>
+        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-accent bg-accent-subtle backdrop-blur-sm">
+          <div class="rounded-2xl bg-elevated/90 px-6 py-4 text-center">
+            <p class="text-lg font-medium text-accent">Drop files here to attach</p>
+            <p class="mt-1 text-sm text-muted">Images, PDFs, audio, and other files</p>
           </div>
         </div>
       {/if}
@@ -10517,7 +11771,7 @@ import X from 'lucide-svelte/icons/x';
       <!-- Shared CSS assigns status clearance to this header in mobile standalone
            mode and to the route frame otherwise. -->
       <div
-        class="app-keyboard-stable-header chat-header-shell relative z-20 border-b border-slate-800/80 px-2.5 py-1 sm:px-3 sm:py-1.5 lg:px-4 lg:py-1.5"
+        class="app-keyboard-stable-header chat-header-shell relative z-20 border-b border-separator px-2.5 py-1 sm:px-3 sm:py-1.5 lg:px-4 lg:py-1.5"
         style="padding-left: max(0.625rem, env(safe-area-inset-left)); padding-right: max(0.625rem, env(safe-area-inset-right));"
         data-testid="chat-header"
       >
@@ -10534,7 +11788,7 @@ import X from 'lucide-svelte/icons/x';
               -->
               {#if !isWindowMode}
               <button
-                class="hidden rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white lg:inline-flex"
+                class="hidden rounded-lg p-1.5 text-muted transition hover:bg-surface-hover hover:text-strong lg:inline-flex"
                 onclick={toggleChatSidebar}
                 type="button"
                 title={chatSidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
@@ -10562,14 +11816,14 @@ import X from 'lucide-svelte/icons/x';
                 <!-- svelte-ignore a11y_autofocus -->
                 <div class="flex min-w-0 flex-1 items-center gap-1.5">
                   <input
-                    class="min-w-0 flex-1 rounded-lg border border-sky-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-sky-300 sm:text-xl"
+                    class="min-w-0 flex-1 rounded-lg border border-accent bg-surface px-2 py-1 text-lg font-semibold text-strong focus:outline-none focus:ring-1 focus:ring-accent sm:text-xl"
                     bind:value={editTitleValue}
                     onblur={handleTitleBlur}
                     onkeydown={handleTitleKeydown}
                     autofocus
                   />
                   <button
-                    class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-sky-200 disabled:cursor-not-allowed disabled:opacity-50"
+                    class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
                     onpointerdown={handleTitleRefreshPointerDown}
                     onclick={() => void refreshTitleSuggestion()}
                     type="button"
@@ -10583,7 +11837,7 @@ import X from 'lucide-svelte/icons/x';
               {:else}
                 <div class="flex min-w-0 flex-1 flex-col justify-center">
                   <button
-                    class="min-w-0 truncate text-left text-[15px] font-semibold leading-5 text-white transition hover:text-sky-300 sm:text-lg sm:leading-6"
+                    class="min-w-0 truncate text-left text-[15px] font-semibold leading-5 text-strong transition hover:text-accent sm:text-lg sm:leading-6"
                     onclick={startEditTitle}
                     type="button"
                     title={currentConversation ? `${conversationTitle(currentConversation)} - click to edit title` : 'Click to edit title'}
@@ -10592,7 +11846,7 @@ import X from 'lucide-svelte/icons/x';
                   </button>
                   {#if currentConversation}
                     <span
-                      class="truncate text-[10px] font-medium uppercase leading-4 tracking-[0.12em] text-slate-500 sm:hidden"
+                      class="truncate text-[10px] font-medium uppercase leading-4 tracking-[0.12em] text-quiet sm:hidden"
                       role="status"
                       aria-live="polite"
                     >
@@ -10609,7 +11863,7 @@ import X from 'lucide-svelte/icons/x';
               {/if}
               {#if conversationYoloEnabled(currentConversation, currentConversation ? conversationAgent(currentConversation) ?? null : null)}
                 <span
-                  class="shrink-0 rounded-full border border-amber-500/70 bg-amber-950/80 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-200"
+                  class="shrink-0 rounded-full border border-warning-border bg-warning-subtle px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-warning"
                   role="status"
                   title="Dangerous: Intaris still evaluates and audits calls, but policy may allow evaluated denials."
                   data-testid="chat-header-yolo-badge"
@@ -10618,89 +11872,12 @@ import X from 'lucide-svelte/icons/x';
             </div>
 
             <!-- Sub-header info row -->
-            <div class="chat-header-meta mt-1.5 hidden items-center justify-between gap-3 text-sm text-slate-400 sm:flex">
-              <div class="flex min-w-0 flex-wrap items-center gap-3">
-              {#if currentConversation}
-                {@const agent = conversationAgentForDisplay(currentConversation)}
-                <div class="relative">
-                  <button
-                    type="button"
-                    class="flex items-center gap-1.5 rounded-lg px-1 py-0.5 transition hover:bg-slate-800"
-                    onclick={() => { showAgentProfile = !showAgentProfile; }}
-                  >
-                    <AgentAvatar
-                      name={agent.display_name ?? agent.name}
-                      avatarUrl={agent.avatar_url ?? null}
-                      class="h-5 w-5"
-                    />
-                    <span>{agent.display_name ?? agent.name}</span>
-                  </button>
-                  {#if showAgentProfile}
-                    <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
-                  {/if}
-                </div>
-
-                {#if currentConversation.active_session_id}
-                  <button
-                    class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
-                    onclick={copySessionId}
-                    type="button"
-                    title="Copy full session ID"
-                  >
-                    {currentConversation.active_session_id.slice(0, 12)}
-                    {#if sessionIdCopied}
-                      <Check class="h-3 w-3 text-emerald-400" />
-                    {:else}
-                      <Copy class="h-3 w-3" />
-                    {/if}
-                  </button>
-                {/if}
-
-                {#if activeAgentProfileLabel()}
-                  <span class="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 text-[10px] font-medium text-sky-100" title="Agent profile">
-                    profile {activeAgentProfileLabel()}
-                  </span>
-                {/if}
-
-                {@const usage = activeContextUsage()}
-                {#if usage?.model}
-                  <span class="max-w-[18rem] truncate rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-300" title={usage?.provider_id ? `${usage.model} (${usage.provider_id})` : usage.model}>
-                    {usage.model}
-                  </span>
-                  {#if usage.reasoning_effort}
-                    <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Thinking effort">
-                      thinking {usage.reasoning_effort}
-                    </span>
-                  {/if}
-                {/if}
-
-                {#if conversationTaskId(currentConversation)}
-                  <a
-                    href="/tasks/{conversationTaskId(currentConversation)}"
-                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
-                  >
-                    {contextTypeBadge(currentConversation)}
-                  </a>
-                {:else}
-                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                    {contextTypeBadge(currentConversation)}
-                  </span>
-                {/if}
-
-                {#if backingSessionBadge}
-                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Backing sessions">
-                    {backingSessionBadge}
-                  </span>
-                {/if}
-
-              {:else}
-                <span>No active conversation selected</span>
-              {/if}
-              </div>
+            <div class="chat-header-meta mt-1.5 hidden items-center justify-between gap-3 text-sm text-muted sm:flex">
+              {@render conversationMetadata('header')}
               {#if activeContextUsage() && !isStandalonePwa}
                 {@const usage = activeContextUsage()}
                 <button
-                  class={`relative ml-auto hidden h-8 w-8 shrink-0 items-center justify-center rounded-full border bg-slate-900/70 transition hover:border-sky-400/40 hover:bg-slate-800/80 sm:inline-flex ${headerInfoOpen && headerInfoMode === 'context' ? 'border-sky-400/50' : 'border-slate-700'}`}
+                  class={`relative ml-auto hidden h-8 w-8 shrink-0 items-center justify-center rounded-full border bg-surface/70 transition hover:border-accent hover:bg-surface-hover sm:inline-flex ${headerInfoOpen && headerInfoMode === 'context' ? 'border-accent' : 'border-control-border'}`}
                   title={contextUsageTooltip(usage)}
                   aria-label={headerInfoOpen && headerInfoMode === 'context' ? 'Close context usage details' : 'Open context usage details'}
                   aria-expanded={headerInfoOpen && headerInfoMode === 'context'}
@@ -10709,7 +11886,7 @@ import X from 'lucide-svelte/icons/x';
                   type="button"
                 >
                   <svg class="absolute inset-1 -rotate-90" viewBox="0 0 36 36" aria-hidden="true">
-                    <circle cx="18" cy="18" r={CONTEXT_DONUT_RADIUS} fill="none" stroke="rgba(100,116,139,0.35)" stroke-width="3" />
+                    <circle cx="18" cy="18" r={CONTEXT_DONUT_RADIUS} fill="none" stroke="rgb(var(--color-muted) / 0.35)" stroke-width="3" />
                     <circle
                       cx="18"
                       cy="18"
@@ -10733,9 +11910,10 @@ import X from 'lucide-svelte/icons/x';
             touch-safe without creating a second info-only header band.
           -->
           <div class="flex shrink-0 items-center gap-1 sm:items-start sm:gap-2" data-testid="chat-header-controls">
+            {#if !isTaskControlMode}<PinConversationButton conversation={currentConversation} />{/if}
             {#if isTaskControlMode && !isStandalonePwa}
               <button
-                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-foreground"
                 onclick={requestTaskAgentDockMinimize}
                 type="button"
                 title="Return to task"
@@ -10746,7 +11924,7 @@ import X from 'lucide-svelte/icons/x';
             {/if}
             {#if !isWindowMode && canOpenAuxiliaryWindow}
               <button
-                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-foreground"
                 onclick={openCurrentConversationInSeparateWindow}
                 type="button"
                 title="Open in separate window"
@@ -10757,8 +11935,19 @@ import X from 'lucide-svelte/icons/x';
               </button>
             {/if}
             <button
-              class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100"
+              class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-foreground"
               onclick={() => openChatSearch()}
+               use:findTarget={{
+                 primary: true,
+                 enabled: !!currentConversation,
+                 identity: () => currentConversation?.conversation_id,
+                 open: async () => {
+                   if (!chatSearchOpen) findOnlySearchConversationId = currentConversation?.conversation_id ?? null;
+                   chatSearchOpen = true;
+                   await tick();
+                   return chatSearchInput;
+                 },
+               }}
               type="button"
               title="Search conversation"
               aria-label="Search conversation"
@@ -10769,7 +11958,7 @@ import X from 'lucide-svelte/icons/x';
             {#if inspectorPresentation === 'pinned' || (!headerInfoOpen && canPinInspector)}
               <button
                 type="button"
-                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground"
                 aria-label={headerInfoOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'}
                 aria-expanded={headerInfoOpen}
                 aria-controls="conversation-info-drawer"
@@ -10786,6 +11975,7 @@ import X from 'lucide-svelte/icons/x';
       {#if chatSearchOpen}
         <div class="col-start-1 row-start-2 min-w-0">
           <ChatSearchBar
+            bind:inputElement={chatSearchInput}
             bind:query={chatSearchQuery}
             results={chatSearchResults}
             selectedIndex={chatSearchSelectedIndex}
@@ -10838,14 +12028,21 @@ import X from 'lucide-svelte/icons/x';
             role={headerInfoMode === 'context' ? undefined : 'tabpanel'}
             aria-labelledby={headerInfoMode === 'context' ? undefined : `conversation-info-tab-${headerInfoMode}`}
           >
+           <section class="mb-4 min-w-0 border-b border-separator pb-4" aria-label="Conversation details" data-testid="conversation-sidebar-metadata">
+             <h3 class="mb-2 text-xs font-semibold uppercase tracking-widest text-quiet">Conversation</h3>
+             {@render conversationMetadata('sidebar')}
+           </section>
+           {#if !childView}
+             <TimelineDiagnosticExport clientState={chatV2Store.snapshot} visibleItems={chatV2Store.visibleItems} />
+           {/if}
            {#if focusedSessionId}
-              <button type="button" class="mb-3 inline-flex items-center gap-1 text-xs text-sky-300" onclick={navigateToStructuralParent}>
+              <button type="button" class="mb-3 inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover" onclick={navigateToStructuralParent}>
                <ArrowLeft class="h-3.5 w-3.5" /> Back
              </button>
             {/if}
             {#if headerInfoMode === 'overview' || headerInfoMode === 'context'}
                {#if overviewReadPresentation.loading}
-                <p class="text-xs text-slate-500">
+                <p class="text-xs text-quiet">
                   {activityOverviewReadState.root.pending
                     ? 'Loading execution tree…'
                     : 'Loading focused activity…'}
@@ -10870,18 +12067,18 @@ import X from 'lucide-svelte/icons/x';
                  />
               {:else if overviewReadPresentation.error}
                 <div class="space-y-2">
-                  <p class="text-xs text-rose-300">{overviewReadPresentation.error}</p>
+                  <p class="text-xs text-danger">{overviewReadPresentation.error}</p>
                   <button
                     type="button"
-                    class="text-xs text-sky-300 hover:text-sky-200"
+                    class="text-xs text-accent hover:text-accent-hover"
                     onclick={() => void loadVisibleActivityOverview(true)}
                   >Retry</button>
                 </div>
               {:else}
-                <p class="text-xs text-slate-500">Loading activity overview…</p>
+                <p class="text-xs text-quiet">Loading activity overview…</p>
               {/if}
            {:else if headerInfoMode === 'work'}
-                 <WorkView
+                  <LazyWorkView
                   scope={inspectorScope ?? conversationTimelineScope(currentConversation.conversation_id)}
                    initialTab={focusedWorkCategory === 'deliverables' ? 'results' : focusedWorkCategory}
                     forceInitialTab
@@ -10889,44 +12086,8 @@ import X from 'lucide-svelte/icons/x';
                    onViewSession={handleViewSession}
                 />
            {:else}
-           <div class="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden">
-            <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
-              <AgentAvatar name={panelAgent.display_name ?? panelAgent.name} avatarUrl={panelAgent.avatar_url ?? null} class="h-5 w-5" />
-              <span>{panelAgent.display_name ?? panelAgent.name}</span>
-            </div>
-            {#if conversationTaskId(currentConversation)}
-              <a
-                href="/tasks/{conversationTaskId(currentConversation)}"
-                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
-              >
-                {contextTypeBadge(currentConversation)}
-              </a>
-            {:else}
-              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400">
-                {contextTypeBadge(currentConversation)}
-              </span>
-            {/if}
-            {#if backingSessionBadge}
-              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Backing sessions">{backingSessionBadge}</span>
-            {/if}
-            {#if currentConversation.active_session_id}
-              <button
-                class="flex items-center gap-1 font-mono text-xs text-slate-500 transition hover:text-slate-300"
-                onclick={copySessionId}
-                type="button"
-                title="Copy full session ID"
-              >
-                {currentConversation.active_session_id.slice(0, 12)}
-                {#if sessionIdCopied}
-                  <Check class="h-3 w-3 text-emerald-400" />
-                {:else}
-                  <Copy class="h-3 w-3" />
-                {/if}
-              </button>
-            {/if}
-          </div>
           {#if !sessionInfo && latestRuntimeSelection?.sessionId === currentConversation.active_session_id}
-            <section class="text-xs text-slate-300" data-testid="pending-session-selected-runtime">
+            <section class="text-xs text-secondary" data-testid="pending-session-selected-runtime">
               <p>Selected for next message</p>
               <p>Profile: {latestRuntimeSelection.selection.profile_id}</p>
                <p>Model: {latestRuntimeSelection.selection.provider_id ? `${latestRuntimeSelection.selection.provider_id}/` : ''}{latestRuntimeSelection.selection.model ?? 'Provider default'}</p>
@@ -10934,10 +12095,10 @@ import X from 'lucide-svelte/icons/x';
             </section>
           {/if}
           {#if sessionInfoLoading && !sessionInfo}
-            <p class="text-xs text-slate-500">Loading session details…</p>
+            <p class="text-xs text-quiet">Loading session details…</p>
           {:else if sessionInfo}
             {@const loadedSessionInfo = sessionInfo!}
-            {@const panelContextUsage = (contextUsage ?? loadedSessionInfo.context_usage)!}
+            {@const panelContextUsage = mergeContextUsage(activeContextUsage(), loadedSessionInfo.context_usage ?? null)!}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
             {#if true}
               <SessionDetailsContent
@@ -10968,10 +12129,10 @@ import X from 'lucide-svelte/icons/x';
             {:else}
             {#if narrativeText}
               <div class="mb-3">
-                <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{sessionNarrativeLabel(sessionInfo)}</p>
-                <p class={`mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200 ${sessionNarrativeExpanded ? '' : 'line-clamp-3 sm:line-clamp-none'}`}>{narrativeText}</p>
+                <p class="text-[10px] font-semibold uppercase tracking-widest text-quiet">{sessionNarrativeLabel(sessionInfo)}</p>
+                <p class={`mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground ${sessionNarrativeExpanded ? '' : 'line-clamp-3 sm:line-clamp-none'}`}>{narrativeText}</p>
                 <button
-                  class="mt-1 inline text-xs font-medium text-sky-300 underline-offset-4 hover:text-sky-200 hover:underline sm:hidden"
+                  class="mt-1 inline text-xs font-medium text-accent underline-offset-4 hover:text-accent-hover hover:underline sm:hidden"
                   type="button"
                   onclick={() => { sessionNarrativeExpanded = !sessionNarrativeExpanded; }}
                 >
@@ -10981,66 +12142,66 @@ import X from 'lucide-svelte/icons/x';
             {/if}
             {#if headerInfoMode !== 'context'}
             <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
-                <span>Status: <span class="text-slate-200">{loadedSessionInfo.status}</span></span>
-                <span>Calls: <span class="text-slate-200">{loadedSessionInfo.total_calls}</span></span>
-                <span class="text-emerald-400">{loadedSessionInfo.approved_count} approved</span>
-                <span class="text-rose-400">{loadedSessionInfo.denied_count} denied</span>
-                <span class="text-sky-400">{loadedSessionInfo.escalated_count} escalated</span>
+              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+                <span>Status: <span class="text-foreground">{loadedSessionInfo.status}</span></span>
+                <span>Calls: <span class="text-foreground">{loadedSessionInfo.total_calls}</span></span>
+                <span class="text-success">{loadedSessionInfo.approved_count} approved</span>
+                <span class="text-danger">{loadedSessionInfo.denied_count} denied</span>
+                <span class="text-info">{loadedSessionInfo.escalated_count} escalated</span>
               </div>
               <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(sessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
             </div>
             {/if}
             {#if headerInfoMode !== 'context'}
               <div class="mt-4 grid gap-3 lg:grid-cols-2">
-                <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
-                  <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Runtime</p>
+                <section class="rounded-2xl border border-separator bg-inset/50 p-3">
+                  <p class="text-[10px] font-semibold uppercase tracking-widest text-quiet">Runtime</p>
                   <dl class="mt-2 grid gap-2 text-xs sm:grid-cols-2">
                     <div>
-                      <dt class="text-slate-500">Model</dt>
-                      <dd class="mt-0.5 break-all text-slate-200">{panelPerformance?.model ?? panelContextUsage?.model ?? 'Unknown'}</dd>
+                      <dt class="text-quiet">Model</dt>
+                      <dd class="mt-0.5 break-all text-foreground">{panelPerformance?.model ?? panelContextUsage?.model ?? 'Unknown'}</dd>
                     </div>
                     <div>
-                      <dt class="text-slate-500">Provider</dt>
-                      <dd class="mt-0.5 text-slate-200">{panelPerformance?.provider_name ?? panelPerformance?.provider_id ?? panelContextUsage?.provider_id ?? 'Cloud or default'}</dd>
+                      <dt class="text-quiet">Provider</dt>
+                      <dd class="mt-0.5 text-foreground">{panelPerformance?.provider_name ?? panelPerformance?.provider_id ?? panelContextUsage?.provider_id ?? 'Cloud or default'}</dd>
                     </div>
                     {#if panelPerformance?.runtime}
                       <div>
-                        <dt class="text-slate-500">Runtime</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.runtime}</dd>
+                        <dt class="text-quiet">Runtime</dt>
+                        <dd class="mt-0.5 text-foreground">{panelPerformance?.runtime}</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.executor_name || panelPerformance?.executor_id}
                       <div>
-                        <dt class="text-slate-500">Executor</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.executor_name ?? panelPerformance?.executor_id}</dd>
+                        <dt class="text-quiet">Executor</dt>
+                        <dd class="mt-0.5 text-foreground">{panelPerformance?.executor_name ?? panelPerformance?.executor_id}</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.configured_context_tokens}
                       <div>
-                        <dt class="text-slate-500">Configured context</dt>
-                        <dd class="mt-0.5 text-slate-200">{formatTokenCount(panelPerformance?.configured_context_tokens)} tokens</dd>
+                        <dt class="text-quiet">Configured context</dt>
+                        <dd class="mt-0.5 text-foreground">{formatTokenCount(panelPerformance?.configured_context_tokens)} tokens</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.quantization}
                       <div>
-                        <dt class="text-slate-500">Quantization</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.quantization}</dd>
+                        <dt class="text-quiet">Quantization</dt>
+                        <dd class="mt-0.5 text-foreground">{panelPerformance?.quantization}</dd>
                       </div>
                     {/if}
                   </dl>
                 </section>
-                <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
+                <section class="rounded-2xl border border-separator bg-inset/50 p-3">
                   <div class="flex flex-wrap items-start justify-between gap-2">
                     <div>
-                      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Last generation</p>
-                      <p class="mt-1 text-xs text-slate-500">
+                      <p class="text-[10px] font-semibold uppercase tracking-widest text-quiet">Last generation</p>
+                      <p class="mt-1 text-xs text-quiet">
                         {performanceMeasurementLabel(panelPerformance)}
                       </p>
                     </div>
                     {#if panelResponsiveness}
                       <span
-                        class={`rounded-full border px-2 py-1 text-[10px] font-semibold ${panelResponsiveness?.tone === 'good' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : panelResponsiveness?.tone === 'slow' ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-sky-400/30 bg-sky-400/10 text-sky-100'}`}
+                        class={`rounded-full border px-2 py-1 text-[10px] font-semibold ${panelResponsiveness?.tone === 'good' ? 'border-success-border bg-success-subtle text-success' : panelResponsiveness?.tone === 'slow' ? 'border-warning-border bg-warning-subtle text-warning' : 'border-info-border bg-info-subtle text-info'}`}
                         title={panelResponsiveness?.detail}
                       >
                         {panelResponsiveness?.label}
@@ -11050,17 +12211,17 @@ import X from 'lucide-svelte/icons/x';
                   {#if panelPerformance}
                     <div class="mt-3 grid gap-2 sm:grid-cols-2">
                       {#each optionalPerformanceMetrics(panelPerformance) as metric}
-                        <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
-                          <p class="text-[10px] uppercase tracking-wide text-slate-500">{metric.label} · {metric.raw}</p>
-                          <p class="mt-1 text-xs font-medium text-slate-100">{metric.value}</p>
+                        <div class="rounded-xl border border-separator bg-inset/40 px-2.5 py-2">
+                          <p class="text-[10px] uppercase tracking-wide text-quiet">{metric.label} · {metric.raw}</p>
+                          <p class="mt-1 text-xs font-medium text-foreground">{metric.value}</p>
                         </div>
                       {/each}
                     </div>
                     {#if panelResponsiveness}
-                      <p class="mt-2 text-[11px] text-slate-500">{panelResponsiveness?.label} for {panelResponsiveness?.detail}.</p>
+                      <p class="mt-2 text-[11px] text-quiet">{panelResponsiveness?.label} for {panelResponsiveness?.detail}.</p>
                     {/if}
                     {#if panelPerformance?.processor || panelPerformance?.gpu_residency || panelPerformance?.digest}
-                      <p class="mt-2 break-all text-[11px] text-slate-500">
+                      <p class="mt-2 break-all text-[11px] text-quiet">
                         {performanceHardwareLabel(panelPerformance)}
                       </p>
                     {/if}
@@ -11070,10 +12231,10 @@ import X from 'lucide-svelte/icons/x';
             {/if}
             {#if panelContextUsage}
               {@const policy = panelContextUsage.projection_policy}
-              <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
+              <div class="mt-4 rounded-2xl border border-separator bg-inset/50 p-3">
                 <div class="mb-3 flex items-center gap-3">
                   <svg class="h-12 w-12 shrink-0 -rotate-90" viewBox="0 0 36 36" aria-hidden="true">
-                    <circle cx="18" cy="18" r={CONTEXT_DONUT_RADIUS} fill="none" stroke="rgba(100,116,139,0.35)" stroke-width="3" />
+                    <circle cx="18" cy="18" r={CONTEXT_DONUT_RADIUS} fill="none" stroke="rgb(var(--color-muted) / 0.35)" stroke-width="3" />
                     <circle
                       cx="18"
                       cy="18"
@@ -11087,28 +12248,28 @@ import X from 'lucide-svelte/icons/x';
                     />
                   </svg>
                   <div>
-                    <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Context window</p>
-                    <p class="mt-1 text-sm font-medium text-white">
+                    <p class="text-[10px] font-semibold uppercase tracking-widest text-quiet">Context window</p>
+                    <p class="mt-1 text-sm font-medium text-strong">
                       {formatTokenCount(panelContextUsage.prompt_tokens)} / {formatTokenCount(panelContextUsage.max_context_tokens)}
                       <span class={contextUsageColor(panelContextUsage)}>({formatPercent(contextWindowUsagePercentage(panelContextUsage))})</span>
                     </p>
-                    <p class="mt-0.5 text-xs text-slate-500">
+                    <p class="mt-0.5 text-xs text-quiet">
                       {panelContextUsage.model}
                       {panelContextUsage.reasoning_effort ? ` · thinking ${panelContextUsage.reasoning_effort}` : ''}
                       {contextUsageProfileLabel(panelContextUsage) ? ` · profile ${contextUsageProfileLabel(panelContextUsage)}` : ''}
                     </p>
                   </div>
                 </div>
-                <div class="grid gap-2 text-xs text-slate-400 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.45fr)]">
+                <div class="grid gap-2 text-xs text-muted xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.45fr)]">
                   <div class="space-y-2">
                     {#each contextBudgetBars(panelContextUsage) as metric}
-                      <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
+                      <div class="rounded-xl border border-separator bg-inset/40 px-2.5 py-2">
                         <div class="mb-1.5 flex items-center justify-between gap-3">
                           <span class="inline-flex items-center gap-1.5">
                             {metric.label}
                             <Popover text={metric.description} placement="top">
                               <button
-                                class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-700 text-[10px] font-semibold text-slate-500 transition hover:border-sky-400/40 hover:text-sky-200"
+                                class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-control-border text-[10px] font-semibold text-quiet transition hover:border-accent hover:text-accent"
                                 type="button"
                                 aria-label={`${metric.label} help`}
                               >
@@ -11116,9 +12277,9 @@ import X from 'lucide-svelte/icons/x';
                               </button>
                             </Popover>
                           </span>
-                          <span class="text-slate-200">{metric.value}</span>
+                          <span class="text-foreground">{metric.value}</span>
                         </div>
-                        <div class="h-1.5 overflow-hidden rounded-full bg-slate-800">
+                        <div class="h-1.5 overflow-hidden rounded-full bg-raised">
                           <div class={`h-full rounded-full ${metric.color}`} style={`width: ${metric.percent}%`}></div>
                         </div>
                       </div>
@@ -11126,13 +12287,13 @@ import X from 'lucide-svelte/icons/x';
                   </div>
                   <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-1">
                     {#each contextBudgetChips(panelContextUsage) as metric}
-                      <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
+                      <div class="rounded-xl border border-separator bg-inset/40 px-2.5 py-2">
                         <div class="flex items-baseline justify-between gap-2">
                           <span class="inline-flex items-center gap-1.5">
                             {metric.label}
                             <Popover text={metric.description} placement="top">
                               <button
-                                class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-700 text-[10px] font-semibold text-slate-500 transition hover:border-sky-400/40 hover:text-sky-200"
+                                class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-control-border text-[10px] font-semibold text-quiet transition hover:border-accent hover:text-accent"
                                 type="button"
                                 aria-label={`${metric.label} help`}
                               >
@@ -11140,7 +12301,7 @@ import X from 'lucide-svelte/icons/x';
                               </button>
                             </Popover>
                           </span>
-                          <span class="text-slate-200">{metric.value}</span>
+                          <span class="text-foreground">{metric.value}</span>
                         </div>
                       </div>
                     {/each}
@@ -11150,7 +12311,7 @@ import X from 'lucide-svelte/icons/x';
             {/if}
             {/if}
           {:else}
-            <p class="text-xs text-slate-500">Unable to load session details.</p>
+            <p class="text-xs text-quiet">Unable to load session details.</p>
           {/if}
           {/if}
           </div>
@@ -11169,18 +12330,18 @@ import X from 'lucide-svelte/icons/x';
         <ProviderUnavailableNotices />
 
         {#if showPushPrompt}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-sm text-foreground">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="min-w-0 flex-1">
                 <p class="font-medium">Native notifications</p>
-                <p class="mt-1 text-sky-100/80">{pushPromptText()}</p>
+                <p class="mt-1 text-secondary">{pushPromptText()}</p>
                 {#if pushPromptError}
-                  <p class="mt-2 text-xs text-rose-200">{pushPromptError}</p>
+                  <p class="mt-2 text-xs text-danger">{pushPromptError}</p>
                 {/if}
                 {#if pushDeliveryError}
-                  <p class="mt-2 break-words font-mono text-xs text-amber-100">Last delivery error: {pushDeliveryError}</p>
+                  <p class="mt-2 break-words font-mono text-xs text-warning">Last delivery error: {pushDeliveryError}</p>
                 {/if}
-                <button class="mt-2 text-xs font-medium text-sky-100 underline-offset-4 hover:underline" type="button" onclick={() => goto('/settings?tab=notifications')}>
+                <button class="mt-2 text-xs font-medium text-accent hover:text-accent-hover underline-offset-4 hover:underline" type="button" onclick={() => goto('/settings?tab=notifications')}>
                   Manage in Settings
                 </button>
               </div>
@@ -11192,7 +12353,7 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
                 <button
                   aria-label="Dismiss notification prompt"
-                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-sky-100 transition hover:bg-sky-500/20"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-foreground transition hover:bg-surface-hover"
                   onclick={() => {
                     pushPromptDismissed = true;
                     setWebPushPromptDismissed(true);
@@ -11207,7 +12368,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if retryWaitingTurn}
-          <div class="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+          <div class="rounded-2xl border border-warning-border bg-warning-subtle px-3 py-3 text-sm text-warning">
             <p>
               Waiting to retry at {new Date(retryWaitingTurn.retry_at ?? '').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               because {retryWaitingTurn.retry_reason === 'rate_limit' ? 'the provider rate-limited this turn' : 'the provider requested a retry'}.
@@ -11215,11 +12376,24 @@ import X from 'lucide-svelte/icons/x';
                 {queuedCount} later message{queuedCount === 1 ? ' is' : 's are'} queued behind it.
               {/if}
             </p>
+            {#if retryWaitingTurn.retry_reason === 'rate_limit' && currentConversation && !isReadOnly(currentConversation)}
+              {@const retryConversationId = currentConversation.conversation_id}
+              <RateLimitProviderSwitch
+                conversationId={retryConversationId}
+                turnId={retryWaitingTurn.turn_id}
+                providerId={retryWaitingTurn.provider_id ?? null}
+                model={retryWaitingTurn.model ?? null}
+                retryAt={retryWaitingTurn.retry_at ?? null}
+                onResponse={async (response) => {
+                  if (currentConversation?.conversation_id === retryConversationId) await applyCommandResponse(response);
+                }}
+              />
+            {/if}
           </div>
         {/if}
 
         {#if queuedCount > 0}
-          <div class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-3 py-2 text-sm text-foreground">
             {#if queuedMessages.length > 0}
               <div class="space-y-1.5">
                 {#each queuedMessages as queued (queued.queue_id)}
@@ -11228,36 +12402,38 @@ import X from 'lucide-svelte/icons/x';
                   {@const canMutateQueue = !automaticContinuation && !committing && canMutateQueuedMessages()}
                   {@const isExpanded = queueIsExpanded(queued.queue_id)}
                   {@const accessibleLabel = queuedMessageAccessibleLabel(queued)}
-                  <div class="chat-queue-item-enter rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
+                  <div class="chat-queue-item-enter rounded-xl border border-info-border bg-surface px-2.5 py-2">
                     <div class="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
                       {#if automaticContinuation || committing}
-                        <span class="shrink-0 text-[11px] uppercase tracking-wide text-sky-200/70">{automaticContinuation ? 'automatic' : 'committing'}</span>
+                        <span class="shrink-0 text-[11px] uppercase tracking-wide text-info">{automaticContinuation ? 'automatic' : 'committing'}</span>
                       {/if}
-                      <p class="min-w-0 flex-1 truncate text-slate-100">{queuedMessageLabel(queued)}</p>
+                      <p class="min-w-0 flex-1 truncate text-foreground">{queuedMessageLabel(queued)}</p>
                       {#if queued.attachments?.length}
-                        <span class="shrink-0 rounded-full border border-sky-300/20 px-2 py-0.5 text-[11px] text-sky-100/80">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'}</span>
+                        <span class="shrink-0 rounded-full border border-control-border px-2 py-0.5 text-[11px] text-secondary">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'}</span>
                       {/if}
                       <div class="ml-auto flex shrink-0 items-center gap-1.5">
                         <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queued message: ${accessibleLabel}`} onclick={() => toggleQueuedMessage(queued.queue_id)}>{isExpanded ? 'Collapse' : 'Details'}</Button>
                         {#if canMutateQueue}
+                          {#if queued.can_edit}
                           <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} aria-label={`Edit queued message: ${accessibleLabel}`} onclick={() => startQueuedMessageEdit(queued)}>Edit</Button>
+                          {/if}
                           <Button size="sm" variant="danger" disabled={queueBusyId === queued.queue_id} aria-label={`Delete queued message: ${accessibleLabel}`} onclick={() => void deleteQueuedMessage(queued.queue_id)}>Delete</Button>
                         {/if}
                       </div>
                     </div>
-                      {#if queueEditingId === queued.queue_id && !committing}
-                      <div class="mt-2 rounded-lg border border-slate-800/70 bg-slate-950/70 p-2.5">
+                      {#if queueEditingId === queued.queue_id && !committing && queued.can_edit}
+                      <div class="mt-2 rounded-lg border border-separator bg-inset p-2.5">
                         <textarea
-                          class="min-h-24 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-sky-400"
+                          class="min-h-24 w-full resize-y rounded-lg border border-control-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition placeholder:text-quiet focus:border-accent"
                           bind:value={queueEditContent}
                           disabled={queueBusyId === queued.queue_id}
                           aria-label={`Edit queued message: ${accessibleLabel}`}
                         ></textarea>
                         {#if queueEditError}
-                          <p class="mt-2 text-xs text-rose-200">{queueEditError}</p>
+                          <p class="mt-2 text-xs text-danger">{queueEditError}</p>
                         {/if}
                         {#if queued.attachments?.length}
-                          <p class="mt-2 text-xs text-sky-100/70">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
+                          <p class="mt-2 text-xs text-secondary">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
                         {/if}
                         <div class="mt-2 flex justify-end gap-2">
                           <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} onclick={cancelQueuedMessageEdit}>Cancel</Button>
@@ -11267,10 +12443,10 @@ import X from 'lucide-svelte/icons/x';
                         </div>
                       </div>
                     {:else if isExpanded}
-                      <div class="mt-2 rounded-lg border border-slate-800/70 bg-slate-950/70 p-2.5">
-                        <p class="max-h-[32vh] overflow-auto whitespace-pre-wrap break-words text-slate-100">{queued.content || queuedMessageLabel(queued)}</p>
+                      <div class="mt-2 rounded-lg border border-separator bg-inset p-2.5">
+                        <p class="max-h-[32vh] overflow-auto whitespace-pre-wrap break-words text-foreground">{queued.content || queuedMessageLabel(queued)}</p>
                         {#if queued.attachments?.length}
-                          <p class="mt-2 text-xs text-sky-100/70">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
+                          <p class="mt-2 text-xs text-secondary">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
                         {/if}
                       </div>
                     {/if}
@@ -11278,13 +12454,13 @@ import X from 'lucide-svelte/icons/x';
                 {/each}
               </div>
             {:else}
-              <p class="mt-1 text-sky-100/80">{queuedCount} queued message{queuedCount === 1 ? '' : 's'} waiting. Details are syncing…</p>
+              <p class="mt-1 text-secondary">{queuedCount} queued message{queuedCount === 1 ? '' : 's'} waiting. Details are syncing…</p>
             {/if}
           </div>
         {/if}
 
         {#if error}
-          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
+          <div class="rounded-2xl border border-danger-border bg-danger-subtle px-3 py-3 text-sm text-danger">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="min-w-0 flex-1 break-words">{error}</p>
               <div class="flex shrink-0 items-center gap-2">
@@ -11293,7 +12469,7 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
                 <button
                   aria-label="Dismiss error"
-                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-100 transition hover:bg-rose-500/20"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-danger transition hover:bg-surface-hover"
                   onclick={() => { error = ''; lastRecoverableMessage = ''; lastRecoverableTurnId = null; }}
                   type="button"
                 >
@@ -11305,7 +12481,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if !error && canRetryFailedTurn}
-          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
+          <div class="rounded-2xl border border-danger-border bg-danger-subtle px-3 py-3 text-sm text-danger">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="min-w-0 flex-1 break-words">
                 The last turn failed after your message. Retry it instead of typing continue.
@@ -11315,12 +12491,12 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if initialLoadTimedOut && !currentConversation && !error}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
+        {#if initialLoadTimedOut && !currentConversation && !error && !connectivityOwnsNotices}
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-4 py-4 text-sm text-foreground">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium">Still loading conversation</p>
-                <p class="mt-1 text-sky-100/80">History or live session setup is taking longer than expected.</p>
+                <p class="mt-1 text-secondary">History or live session setup is taking longer than expected.</p>
               </div>
               <div class="flex gap-2">
                 <Button size="sm" variant="secondary" onclick={() => void openConversation(conversationIdFromRoute())}>Retry</Button>
@@ -11330,10 +12506,10 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if controllerRecoveryPending}
+        {#if controllerRecoveryPending && (criticalEventStoreError || !connectivityOwnsNotices)}
           <div class={criticalEventStoreError
-            ? 'rounded-2xl border border-red-500/50 bg-red-500/15 px-4 py-3 text-sm text-red-100'
-            : 'rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100'}>
+            ? 'rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger'
+            : 'rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-sm text-foreground'}>
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>
                 {criticalEventStoreError
@@ -11347,8 +12523,8 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if sessionsError && !isPreSessionConversation && !controllerRecoveryPending}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-3 text-sm text-sky-100">
+        {#if sessionsError && !isPreSessionConversation && !controllerRecoveryPending && !connectivityOwnsNotices}
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-3 py-3 text-sm text-foreground">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Session details are temporarily unavailable: {sessionsError}</p>
               <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry</Button>
@@ -11356,8 +12532,8 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if historyError && !isPreSessionConversation && !controllerRecoveryPending}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+        {#if historyError && !isPreSessionConversation && !controllerRecoveryPending && !connectivityOwnsNotices}
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-sm text-foreground">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>{historyError}</p>
               <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry history</Button>
@@ -11365,8 +12541,8 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if escalationError && !controllerRecoveryPending}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+        {#if escalationError && !controllerRecoveryPending && !connectivityOwnsNotices}
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-sm text-foreground">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Escalation updates are temporarily unavailable: {escalationError}</p>
               <Button size="sm" variant="secondary" onclick={() => refreshEscalations()}>Refresh escalations</Button>
@@ -11374,8 +12550,8 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if cachedConversationRefreshing && currentConversation && !historyError && !sessionsError}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+        {#if cachedRefreshBannerVisible && cachedConversationRefreshing && currentConversation && !historyError && !sessionsError && !connectivityOwnsNotices}
+          <div class="rounded-2xl border border-info-border bg-info-subtle px-3 py-2 text-sm text-foreground">
             <div class="flex items-center gap-2">
               <RefreshCw class="h-3.5 w-3.5 animate-spin" />
               <span>Showing cached conversation, refreshing latest messages…</span>
@@ -11391,7 +12567,7 @@ import X from 'lucide-svelte/icons/x';
           bind:viewportElement={timelineEl}
           bind:contentElement={timelineContentEl}
           bind:userScrolledUp
-          class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:auto] px-2.5 pb-1.5 pt-0 sm:px-4 sm:pb-4"
+          class="relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain [overflow-anchor:auto] px-2.5 pb-1.5 pt-0 sm:px-4 sm:pb-4"
           contentClass="space-y-3 [overflow-anchor:auto]"
            onScroll={handleTimelineScroll}
            onPointerDown={handleTimelinePointerDown}
@@ -11413,16 +12589,20 @@ import X from 'lucide-svelte/icons/x';
             {/if}
 
             {#if !currentConversation && !error}
-              <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
-                {#if initialLoadTimedOut}
+              <div class="rounded-2xl border border-dashed border-control-border px-4 py-10 text-center text-sm text-muted">
+                {#if connectivityOwnsNotices}
+                  Waiting for the connection to load this conversation.
+                {:else if initialLoadTimedOut}
                   Conversation data is still loading. Use Retry above if it stays stuck.
                 {:else}
                   Loading conversation history and preparing the live stream.
                 {/if}
               </div>
             {:else if renderableVisibleItems.length === 0}
-              {#if (conversationSubloadsLoading || cachedConversationRefreshing || !canonicalTimelineIsReady(currentConversation?.conversation_id ?? '')) && !historyError && !sessionsError}
-                <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
+              {#if connectivityOwnsNotices && (historyError || sessionsError)}
+                <p class="px-4 py-16 text-center text-sm text-quiet" role="status">Waiting for the connection to load this conversation.</p>
+              {:else if (conversationSubloadsLoading || cachedConversationRefreshing || !canonicalTimelineIsReady(currentConversation?.conversation_id ?? '')) && !historyError && !sessionsError}
+                <div class="rounded-2xl border border-dashed border-control-border px-4 py-10 text-center text-sm text-muted">
                   {#if initialLoadTimedOut}
                     Conversation data is still loading. Use Retry above if it stays stuck.
                   {:else}
@@ -11430,17 +12610,31 @@ import X from 'lucide-svelte/icons/x';
                   {/if}
                 </div>
               {:else if !historyError && !sessionsError && !hasOlderMessages && !olderMessagesCursor && !hasAnyActiveTurnTimelineItem() && !turnInProgress && !pendingDirectQuestion && !pendingCredentialRequest && queuedMessages.length === 0}
-                <p class="px-4 py-16 text-center text-sm text-slate-500">
+                <p class="px-4 py-16 text-center text-sm text-quiet">
                   Send the first message to start this conversation.
                 </p>
               {:else if !historyError && !sessionsError}
-                <p class="px-4 py-16 text-center text-sm text-slate-500" role="status">Loading conversation history.</p>
+                <p class="px-4 py-16 text-center text-sm text-quiet" role="status">Loading conversation history.</p>
               {/if}
             {:else}
               <ChatV2TimelineList
+                onHandoffConversation={(item) => {
+                  openNewConversationModal();
+                  if (!currentConversation) return;
+                  newChatHandoff = item;
+                  newChatHandoffSource = currentConversation.conversation_id;
+                  newChatAgentId = currentConversation.agent_id;
+                  newChatAgentProfileId = currentConversation.agent_profile_id || activeAgentProfileLabel() || '';
+                  newChatProjectId = currentConversation.project_id || '';
+                }}
                 items={displayedTimeline}
                 scope={currentConversation ? { key: `conversation:${currentConversation.conversation_id}`, kind: 'conversation', conversation_id: currentConversation.conversation_id } : undefined}
                 cycleStates={chatV2Store.cycleStates}
+                 runtime={chatV2Store.snapshot.runtime}
+                 onProviderSwitchResponse={currentConversation && !isReadOnly(currentConversation)
+                   ? async (response) => {
+                     if (response.conversation_id === currentConversation?.conversation_id) await applyCommandResponse(response);
+                   } : undefined}
                 agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
                 searchQuery={chatSearchQuery}
                 searchMatchedIds={chatSearchOpen ? chatSearchMatchedMessageIds : emptySearchMatchedIds}
@@ -11477,7 +12671,7 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {:else if escalationSettledAck}
             <div class="px-3" data-testid="escalation-settled-ack">
-              <div class={`w-full rounded-[1.4rem] border px-4 py-3 shadow-card sm:rounded-3xl ${escalationSettledAck.decision === 'approve' ? 'border-emerald-400/35 bg-emerald-500/15 text-emerald-50' : 'border-amber-400/35 bg-amber-500/15 text-amber-50'}`}>
+              <div class={`w-full rounded-[1.4rem] border px-4 py-3 shadow-card sm:rounded-3xl ${escalationSettledAck.decision === 'approve' ? 'border-success-border bg-success-subtle text-success' : 'border-warning-border bg-warning-subtle text-warning'}`}>
                 <div class="flex items-center gap-2.5">
                   <span class="h-2 w-2 shrink-0 rounded-full bg-current opacity-80" aria-hidden="true"></span>
                   <div class="min-w-0 flex-1">
@@ -11615,20 +12809,30 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
             -->
+          {:else if currentConversation && currentConversation.is_readonly_for_caller}
+            <div class="mx-3 mb-2 flex h-9 items-center justify-between gap-2 rounded-xl border border-control-border bg-surface/60 px-3 text-xs text-muted sm:mx-5" data-testid="shared-conversation-banner">
+              <span class="truncate" title={`Shared by ${sharedConversationAuthor(currentConversation)}${canContinueSharedConversation(currentConversation) ? '' : '. Agent access is required to continue in your own chat.'}`}>
+                Read-only
+                <span class="text-quiet"> · {sharedConversationAuthor(currentConversation)}</span>
+              </span>
+              {#if canContinueSharedConversation(currentConversation)}
+                <button type="button" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary hover:bg-surface-hover hover:text-strong disabled:opacity-50" aria-label="Continue in my chat" title="Continue in my chat" disabled={newChatCreating} onclick={() => void continueSharedConversation()}><GitFork class="h-4 w-4" /></button>
+              {/if}
+            </div>
           {:else if currentConversation && !isWebConversation(currentConversation)}
-            <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
-              This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
+            <div class="rounded-2xl border border-control-border bg-surface/60 px-4 py-3 text-center text-sm text-muted">
+              This conversation is from <span class="font-medium text-secondary">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
             </div>
           {:else if currentConversation && currentConversation.status === 'archived'}
-            <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
+            <div class="rounded-2xl border border-control-border bg-surface/60 px-4 py-3 text-center text-sm text-muted">
               This conversation is archived.
             </div>
           {:else if currentConversation && currentConversation.status === 'deleted'}
-            <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-center text-sm text-rose-100">
+            <div class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-center text-sm text-danger">
               This conversation has been deleted.
             </div>
           {:else if isSessionBlocked()}
-            <div class="space-y-3 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-center text-sm text-sky-100">
+            <div class="space-y-3 rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-center text-sm text-info">
               <p>
                 {#if activeSessionStatus() === 'suspended'}
                   This session is suspended.
@@ -11663,20 +12867,20 @@ import X from 'lucide-svelte/icons/x';
               instead of bubbling to the timeline.
             -->
             {#if pendingDirectQuestionVisible && pendingDirectQuestion && !directQuestionAck}
-              <div id="pending-direct-question-panel" class="flex max-h-[min(58vh,calc(var(--app-viewport-height,100dvh)-9.5rem))] min-h-0 flex-col overflow-hidden rounded-2xl border border-sky-500/30 bg-sky-500/10 text-sm text-sky-50 shadow-lg sm:max-h-[min(50vh,calc(var(--app-viewport-height,100dvh)-12rem))]">
-                <div class="shrink-0 border-b border-sky-400/15 px-4 py-3">
+              <div id="pending-direct-question-panel" class="flex max-h-[min(58vh,calc(var(--app-viewport-height,100dvh)-9.5rem))] min-h-0 flex-col overflow-hidden rounded-2xl border border-info-border bg-info-subtle text-sm text-foreground shadow-lg sm:max-h-[min(50vh,calc(var(--app-viewport-height,100dvh)-12rem))]">
+                <div class="shrink-0 border-b border-info-border px-4 py-3">
                   <div class="flex items-center justify-between gap-3">
                     <button
                       type="button"
-                      class="flex min-w-0 flex-1 items-center gap-2 rounded-xl text-left transition hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/35"
+                      class="flex min-w-0 flex-1 items-center gap-2 rounded-xl text-left transition hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/35"
                       aria-expanded={!directQuestionCollapsed}
                       aria-controls="pending-direct-question-panel"
                       onclick={() => { directQuestionCollapsed = !directQuestionCollapsed; }}
                     >
                       {#if directQuestionCollapsed}
-                        <ChevronDown class="h-4 w-4 shrink-0 text-sky-200/80" />
+                        <ChevronDown class="h-4 w-4 shrink-0 text-info" />
                       {:else}
-                        <ChevronUp class="h-4 w-4 shrink-0 text-sky-200/80" />
+                        <ChevronUp class="h-4 w-4 shrink-0 text-info" />
                       {/if}
                       <span class="truncate font-semibold">Assistant requested more input</span>
                     </button>
@@ -11684,56 +12888,56 @@ import X from 'lucide-svelte/icons/x';
                       {#if directQuestionSubmitting}
                         <LiveDots inline={true} size="sm" label="Answering" />
                       {:else if directQuestionVisibleItems.length > 1}
-                        <span class="rounded-full border border-sky-300/25 bg-slate-950/40 px-2 py-0.5 font-mono text-[11px] text-sky-100">
+                        <span class="rounded-full border border-info-border bg-inset/40 px-2 py-0.5 font-mono text-[11px] text-info">
                           {directQuestionCurrentIndex + 1}/{directQuestionVisibleItems.length}
                         </span>
                       {/if}
                     </div>
                   </div>
                   {#if pendingDirectQuestion.context && !directQuestionCollapsed}
-                    <p class="mt-2 max-h-16 overflow-y-auto overscroll-contain text-xs leading-5 text-sky-100/80">{pendingDirectQuestion.context}</p>
+                    <p class="mt-2 max-h-16 overflow-y-auto overscroll-contain text-xs leading-5 text-secondary">{pendingDirectQuestion.context}</p>
                   {/if}
                 </div>
                 {#if directQuestionCollapsed}
-                  <p class="px-4 py-3 text-xs text-sky-100/70">
+                  <p class="px-4 py-3 text-xs text-secondary">
                     Question prompt collapsed. Expand it to answer.
                   </p>
                 {:else}
                 <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3">
                   {#if currentDirectQuestion}
                     {#key `${currentDirectQuestion.id}:${directQuestionCurrentIndex}`}
-                    <div class="rounded-2xl border border-sky-400/20 bg-slate-950/30 p-3">
+                    <div class="rounded-2xl border border-info-border bg-surface p-3">
                       {#if currentDirectQuestion.header}
-                        <p class="text-xs uppercase tracking-[0.2em] text-sky-100/70">{currentDirectQuestion.header}</p>
+                        <p class="text-xs uppercase tracking-[0.2em] text-secondary">{currentDirectQuestion.header}</p>
                       {/if}
-                      <p class="text-sm font-medium text-sky-50">{currentDirectQuestion.question}</p>
+                      <p class="text-sm font-medium text-foreground">{currentDirectQuestion.question}</p>
                       {#if currentDirectQuestion.required}
-                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-sky-100/55">Required</p>
+                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-secondary">Required</p>
                       {:else}
-                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-sky-100/45">Optional</p>
+                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-muted">Optional</p>
                       {/if}
                       {#if currentDirectQuestion.options.length > 0}
                         <div class="mt-3 space-y-2">
                           {#each currentDirectQuestion.options as option (option.id)}
                             <button
-                              class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs transition ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-sky-300/70 bg-sky-300/20 text-white' : 'border-sky-400/30 bg-sky-400/10 text-sky-100 hover:bg-sky-400/20'}`}
+                              class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs transition ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-accent bg-accent-subtle text-strong' : 'border-control-border bg-surface text-foreground hover:bg-surface-hover'}`}
                               type="button"
                               disabled={directQuestionSubmitting}
                               onclick={() => { submitDirectQuestionOption(currentDirectQuestion, option.id); }}
                             >
-                              <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${currentDirectQuestion.multiple ? 'rounded' : 'rounded-full'} ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-sky-200 bg-sky-300 text-slate-950' : 'border-sky-300/50 bg-slate-950/40'}`}>
+                              <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${currentDirectQuestion.multiple ? 'rounded' : 'rounded-full'} ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-accent bg-accent text-on-accent' : 'border-control-border bg-surface'}`}>
                                 {#if directQuestionOptionSelected(currentDirectQuestion.id, option.id)}
                                   {#if currentDirectQuestion.multiple}
                                     ✓
                                   {:else}
-                                    <span class="h-1.5 w-1.5 rounded-full bg-slate-950"></span>
+                                    <span class="h-1.5 w-1.5 rounded-full bg-on-accent"></span>
                                   {/if}
                                 {/if}
                               </span>
                               <span class="min-w-0">
                                 <span class="block font-medium">{option.label}</span>
                                 {#if option.description}
-                                  <span class="mt-0.5 block text-sky-100/60">{option.description}</span>
+                                  <span class="mt-0.5 block text-secondary">{option.description}</span>
                                 {/if}
                               </span>
                             </button>
@@ -11744,7 +12948,7 @@ import X from 'lucide-svelte/icons/x';
                         <textarea
                           value={directQuestionState(currentDirectQuestion.id).custom}
                           oninput={(event) => setDirectQuestionCustom(currentDirectQuestion.id, event.currentTarget.value)}
-                          class="mt-3 min-h-[72px] w-full rounded-2xl border border-sky-400/20 bg-slate-950/60 px-3 py-2 text-sm text-sky-50 placeholder:text-sky-100/50"
+                          class="mt-3 min-h-[72px] w-full rounded-2xl border border-control-border bg-inset px-3 py-2 text-sm text-foreground placeholder:text-muted focus:border-accent"
                           placeholder={currentDirectQuestion.options.length > 0 ? 'Optional custom answer' : 'Type your answer'}
                           disabled={directQuestionSubmitting}
                         ></textarea>
@@ -11752,25 +12956,25 @@ import X from 'lucide-svelte/icons/x';
                     </div>
                     {/key}
                   {:else}
-                    <p class="rounded-2xl border border-sky-400/20 bg-slate-950/30 p-3 text-sky-100/80">Waiting for question details…</p>
+                    <p class="rounded-2xl border border-info-border bg-surface p-3 text-secondary">Waiting for question details…</p>
                   {/if}
                   {#if currentDirectQuestion?.options.length}
-                    <p class="mt-2 text-xs text-sky-100/55">Selecting an option only updates this answer. Use Next or Submit to continue.</p>
+                    <p class="mt-2 text-xs text-secondary">Selecting an option only updates this answer. Use Next or Submit to continue.</p>
                   {/if}
                   {#if directQuestionVisibleItems.length > 1}
                     <div class="mt-3 grid gap-1" style={`grid-template-columns: repeat(${Math.min(directQuestionVisibleItems.length, 7)}, minmax(0, 1fr));`} aria-hidden="true">
                       {#each directQuestionVisibleItems as item, index (item.id)}
-                        <span class={`h-1.5 rounded-full ${index === directQuestionCurrentIndex ? 'bg-sky-200' : directQuestionAnswerSatisfies(item) && (directQuestionState(item.id).selected.length > 0 || directQuestionState(item.id).custom.trim()) ? 'bg-sky-400/60' : 'bg-sky-900/70'}`}></span>
+                        <span class={`h-1.5 rounded-full ${index === directQuestionCurrentIndex ? 'bg-accent' : directQuestionAnswerSatisfies(item) && (directQuestionState(item.id).selected.length > 0 || directQuestionState(item.id).custom.trim()) ? 'bg-accent/60' : 'bg-control-border'}`}></span>
                       {/each}
                     </div>
                   {/if}
                 </div>
                 {#if currentDirectQuestion}
-                  <div class="flex shrink-0 items-center gap-2 border-t border-sky-400/15 bg-slate-950/90 px-4 py-3 backdrop-blur">
+                  <div class="flex shrink-0 items-center gap-2 border-t border-info-border bg-chrome/90 px-4 py-3 backdrop-blur">
                     <Button
                       size="sm"
                       variant="secondary"
-                      class="border-rose-300/30 bg-rose-500/10 text-rose-100 hover:bg-rose-500/20"
+                      class="border-danger-border bg-danger-subtle text-danger hover:bg-surface-hover"
                       disabled={directQuestionSubmitting}
                       onclick={() => { void cancelDirectQuestionRequest(); }}
                     >
@@ -11822,18 +13026,18 @@ import X from 'lucide-svelte/icons/x';
               />
             {:else}
             {#if directQuestionAck}
-              <div data-testid="direct-question-ack" class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-50 shadow-lg">
+              <div data-testid="direct-question-ack" class="rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-sm text-foreground shadow-lg">
                 <div class="flex items-center gap-2.5">
                   <span class="h-2 w-2 shrink-0 rounded-full bg-current opacity-80" aria-hidden="true"></span>
                   <div class="min-w-0 flex-1">
                     <p class="text-sm font-semibold">{directQuestionAckMessage(directQuestionAck.kind)}</p>
                     {#if directQuestionAckManagedLabel(directQuestionAck)}
-                      <p class="mt-0.5 truncate text-xs text-sky-100/70">{directQuestionAckManagedLabel(directQuestionAck)}</p>
+                      <p class="mt-0.5 truncate text-xs text-secondary">{directQuestionAckManagedLabel(directQuestionAck)}</p>
                     {/if}
                   </div>
                   {#if directQuestionAckOriginConversationId(directQuestionAck)}
                     <a
-                      class="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-sky-100 underline-offset-4 hover:underline"
+                      class="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-accent hover:text-accent-hover underline-offset-4 hover:underline"
                       href={conversationUrl(directQuestionAckOriginConversationId(directQuestionAck) ?? '')}
                     >
                       Open conversation
@@ -11844,21 +13048,40 @@ import X from 'lucide-svelte/icons/x';
               </div>
             {/if}
             {#if !childView}
+            {@const quickProfileAgent = currentConversation ? conversationAgent(currentConversation) : null}
+            {#snippet composerSettings()}
+             {#if quickProfileAgent && !turnInProgress && !awaitingAssistantStart}
+              <AgentQuickProfileSwitcher
+                 agent={quickProfileAgent}
+                  runtimeSelection={currentConversation?.active_session_id
+                    ? quickProfileRuntimeBySession[currentConversation.active_session_id] ?? null
+                    : null}
+                profileId={latestRuntimeSelection && latestRuntimeSelection.sessionId === currentConversation?.active_session_id
+                  ? latestRuntimeSelection.selection.profile_id
+                  : activeAgentProfileLabel()}
+                disabled={turnInProgress || awaitingAssistantStart || composerAdmissionBusy || voiceTranscribing}
+                busy={quickProfileBusy}
+                hasDraft={Boolean(composer.trim() || composerAttachments.length)}
+                conversationId={currentConversation?.conversation_id}
+                onSelect={(profileId) => { void selectQuickProfile(profileId); }}
+              />
+            {/if}
+            {/snippet}
             {#if voiceTranscribing}
-              <div class="flex items-center gap-2 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-100" aria-live="polite">
-                <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-300"></span>
+              <div class="flex items-center gap-2 rounded-2xl border border-info-border bg-info-subtle px-3 py-2 text-xs text-info" aria-live="polite">
+                <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-info"></span>
                 Transcribing voice message…
               </div>
             {/if}
             {#if persistentChatMode === 'plan'}
-              <div class="flex items-center justify-between gap-3 rounded-2xl border border-sky-300/25 bg-sky-300/[0.055] px-3 py-2 text-xs text-sky-100" aria-live="polite">
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-blue-border bg-blue-subtle px-3 py-2 text-xs text-blue-tone" aria-live="polite">
                 <span><strong class="font-semibold">Plan mode active.</strong> This chat is read-only until you send <span class="font-mono">/build</span> or <span class="font-mono">/default</span>.</span>
-                <span class="rounded-full border border-sky-300/25 bg-sky-300/[0.055] px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-sky-100">Plan</span>
+                <span class="rounded-full border border-blue-border bg-blue-subtle px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-blue-tone">Plan</span>
               </div>
             {:else if persistentChatMode === 'build'}
-              <div class="flex items-center justify-between gap-3 rounded-2xl border border-amber-300/35 bg-amber-300/[0.075] px-3 py-2 text-xs text-amber-100" aria-live="polite">
+              <div class="flex items-center justify-between gap-3 rounded-2xl border border-orange-border bg-orange-subtle px-3 py-2 text-xs text-orange-tone" aria-live="polite">
                 <span><strong class="font-semibold">Build mode active.</strong> This chat is using implementation mode until you send <span class="font-mono">/default</span>.</span>
-                <span class="rounded-full border border-amber-300/35 bg-amber-300/[0.075] px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-100">Build</span>
+                <span class="rounded-full border border-orange-border bg-orange-subtle px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-orange-tone">Build</span>
               </div>
             {/if}
             <!--
@@ -11880,21 +13103,34 @@ import X from 'lucide-svelte/icons/x';
                * Software-keyboard Enter inserts a newline. Physical-keyboard
                * Enter follows the persisted Enter-to-send preference.
             -->
-            <ChatV2Composer
-              bind:value={composer}
-              bind:attachments={composerAttachments}
+              {@const capturedComposerRecovery = composerRecoveryScope}
+              <LegacyComposerRecovery candidates={composerLegacyCandidates} onSelect={(candidate, mode) => {
+                if (!canSelectRecovery(capturedComposerRecovery, composerRecoveryScope, conversationIdFromRoute(),
+                  conversationLoadRequestId, composerAlive, candidate)) return;
+                const chosen = selectLegacyInput(candidate, mode);
+                composer = chosen.text; composerAttachments = chosen.attachments;
+                composerInputRevision = chosen.input_revision; composerInputMode = chosen.chat_mode; composerRevision++;
+                composerLegacyCandidates = []; composerLegacyRecovery = false;
+                if (currentDraftKey) writeDraft(currentDraftKey, composer);
+              }} />
+             <ChatV2Composer
+                bind:value={() => composer, (value) => { editComposerInput(); composer = value; }}
+                bind:attachments={() => composerAttachments, (value) => { editComposerInput(); composerAttachments = value; }}
               bind:textarea={composerElement}
               conversationId={currentConversation?.conversation_id}
               placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Message ${currentAgentDisplayName}`}
               ariaLabel="Chat message"
+              settings={composerSettings}
               disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting || voiceTranscribing}
-              busy={directQuestionSubmitting || voiceTranscribing}
+               busy={directQuestionSubmitting || voiceTranscribing || quickProfileBusy}
               active={turnInProgress}
               stopping={cancelTurnPending}
               allowQueue
               onSend={handleSend}
               onStop={() => { haptic.warning(); cancelActiveTurnWithChatV2(); }}
               onFiles={uploadFiles}
+              onRemoveAttachment={cancelComposerAttachment}
+              onRetryAttachment={retryComposerAttachment}
               onInput={syncComposerHeight}
               onPaste={handlePaste}
               onOpenMode={() => { conversationModeOpen = true; }}
@@ -11911,15 +13147,32 @@ import X from 'lucide-svelte/icons/x';
       </div>
 
       {#if showNewChatModal}
-        <NewChatModal
+        {#await import('$lib/components/NewChatModal.svelte')}
+          <div class="fixed inset-0 z-50 grid place-content-center gap-3 bg-base/90" role="status">
+            <span>Loading new chat…</span>
+            <Button variant="secondary" onclick={closeNewConversationModal}>Cancel</Button>
+          </div>
+        {:then module}
+        <module.default
+          profileOnly={newChatHandoff !== null}
+          title={newChatHandoff ? 'Continue from handoff' : 'New chat'}
+          description={newChatHandoff ? 'Choose a profile. The handoff opens as an unsent draft.' : 'Choose the primary agent for the new conversation.'}
           agents={agents}
           bind:selectedAgentId={newChatAgentId}
           bind:selectedAgentProfileId={newChatAgentProfileId}
+          {projects}
+          bind:selectedProjectId={newChatProjectId}
           busy={newChatCreating}
           error={newChatError}
           oncancel={closeNewConversationModal}
           onconfirm={() => void createNewConversation()}
         />
+        {:catch}
+          <div class="fixed inset-0 z-50 grid place-content-center gap-3 bg-base/90" role="alert">
+            <span>Could not load new chat. Close and try again.</span>
+            <Button variant="secondary" onclick={closeNewConversationModal}>Close</Button>
+          </div>
+        {/await}
       {/if}
       </div>
 

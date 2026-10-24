@@ -76,6 +76,49 @@ describe('WorkspaceLayer stable window identity', () => {
     ]);
   });
 
+  it.each(['desktop', 'tablet'] as const)(
+    'consumes the first background click and minimizes all %s windows with a restorable snapshot',
+    async (deviceClass) => {
+      const manager = new WorkspaceManager(deviceClass, safe);
+      openConversation(manager, 'a');
+      openConversation(manager, 'b');
+      render(WorkspaceLayer, { manager, deviceClass });
+      const windowA = await screen.findByTestId('workspace-window-conversation:a');
+      const draftA = screen.getByTestId('workspace-chat-draft-a');
+      await fireEvent.input(draftA, { target: { value: 'retained' } });
+      const backgroundClick = vi.fn();
+      window.addEventListener('click', backgroundClick);
+      try {
+        const backdrop = screen.getByTestId('workspace-dismiss-backdrop');
+        expect(await fireEvent.pointerDown(backdrop)).toBe(false);
+        expect(manager.snapshot().every((window) => !window.minimized)).toBe(true);
+        await fireEvent.click(backdrop);
+
+        expect(backgroundClick).not.toHaveBeenCalled();
+        expect(manager.snapshot().every((window) => window.minimized)).toBe(true);
+        expect(manager.hasDashboardSnapshot()).toBe(true);
+        await waitFor(() => {
+          expect(screen.queryByTestId('workspace-dismiss-backdrop')).not.toBeInTheDocument();
+        });
+
+        manager.restoreDashboard();
+        await waitFor(() => expect(windowA).toHaveAttribute('data-minimized', 'false'));
+        expect(screen.getByTestId('workspace-window-conversation:a')).toBe(windowA);
+        expect(draftA).toHaveValue('retained');
+      } finally {
+        window.removeEventListener('click', backgroundClick);
+      }
+    },
+  );
+
+  it('does not intercept the background when no windows are visible', () => {
+    const manager = new WorkspaceManager('desktop', safe);
+    openConversation(manager, 'a');
+    manager.minimize('conversation:a');
+    render(WorkspaceLayer, { manager, deviceClass: 'desktop' });
+    expect(screen.queryByTestId('workspace-dismiss-backdrop')).not.toBeInTheDocument();
+  });
+
   it('retains mounted identity through minimize, dashboard restore, and removes it on close', async () => {
     const manager = new WorkspaceManager('desktop', safe);
     openConversation(manager, 'a');

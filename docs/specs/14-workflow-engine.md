@@ -114,6 +114,25 @@ fenced recovery can make it claimable without changing the recovery deadline.
 Only gates, caller questions, credentials, authentication, or an explicit user
 action can put a task in `paused`.
 
+Gate recovery resumes the durable pause before re-entering the originating run
+or deterministic step. Controller restarts do not repeat completed work, clear
+its output, reevaluate gate conditions, or renew the gate's original deadline.
+The notification is the durable decision record. Operator and configured timeout
+decisions use a conditional write bound to the current task attempt and pause ID.
+The fenced workflow owner consumes the decision by persisting pause removal,
+retry/continuation destination, operator instruction, and task status together.
+An interrupted transition can replay the recorded decision without repeating an
+already committed transition.
+
+New pause records include the original gate definition, origin step/index, task
+attempt, deadline, and timeout action. Legacy derived pauses are reconstructed
+only when their pinned workflow, saved output, and notification identify the
+continuation unambiguously. Missing records without a recoverable original
+deadline remain paused for reconciliation; they never imply permission to rerun.
+Cancellation clears persisted pause fields in the same transaction that marks
+the task terminal and invalidates its execution lease. Terminal tasks do not
+expose actionable gates, even when older stored state contains a stale pause.
+
 Scheduler-created tasks receive immutable trigger context from
 `ScheduleFireRow.scheduled_fire_at` and the schedule timezone. Queue
 eligibility in `Task.scheduled_for` does not define the target date.

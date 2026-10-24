@@ -27,7 +27,7 @@ export function sidebarTooltip(
     el.setAttribute('role', 'tooltip');
     el.setAttribute('aria-hidden', 'true');
     el.className =
-      'pointer-events-none fixed z-[100] whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 shadow-lg transition-opacity duration-100';
+      'pointer-events-none fixed z-[100] whitespace-nowrap rounded-lg border border-control-border bg-elevated px-2 py-1 text-xs text-foreground shadow-overlay transition-opacity duration-100';
     el.style.opacity = '0';
     document.body.appendChild(el);
     tip = el;

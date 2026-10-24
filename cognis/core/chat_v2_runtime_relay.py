@@ -673,6 +673,10 @@ class RuntimeAuthoritySource:
         self.epoch = epoch
         self.max_entries = max_entries
         self.revisions: OrderedDict[tuple[str, ...], int] = OrderedDict()
+        # Cache eviction/invalidation must not roll ordering backwards inside
+        # this source epoch. Remember the highest discarded counter without
+        # retaining every historical generation.
+        self._retired_revision_floor = 0
 
     def next_revision(self, context: RelayGenerationContext) -> int:
         key = (
@@ -685,14 +689,15 @@ class RuntimeAuthoritySource:
             str(context.fencing_token),
             self.epoch,
         )
-        current = self.revisions.pop(key, 0)
+        current = self.revisions.pop(key, self._retired_revision_floor)
         if current >= MAX_REDIS_SAFE_INTEGER:
             self.revisions[key] = current
             raise ValueError("source_revision exceeds Redis-safe integer range")
         revision = current + 1
         self.revisions[key] = revision
         while len(self.revisions) > self.max_entries:
-            self.revisions.popitem(last=False)
+            _, retired = self.revisions.popitem(last=False)
+            self._retired_revision_floor = max(self._retired_revision_floor, retired)
         return revision
 
     def authority(
@@ -714,7 +719,8 @@ class RuntimeAuthoritySource:
     def invalidate(self, conversation_id: str) -> None:
         for key in list(self.revisions):
             if key[0] == conversation_id:
-                self.revisions.pop(key, None)
+                retired = self.revisions.pop(key)
+                self._retired_revision_floor = max(self._retired_revision_floor, retired)
 
 
 class ChatV2RuntimeRedisRelay:

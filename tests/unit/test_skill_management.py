@@ -110,9 +110,9 @@ async def test_skill_load_accepts_claude_native_skill_argument_by_name(tmp_path)
         )
         await create_skill(
             session,
-            skill_id="skill_lumilens_alertmanager_ops",
-            name="lumilens-alertmanager-ops",
-            instructions="Inspect Lumilens Alertmanager safely.",
+            skill_id="skill_demo_catalog_review",
+            name="demo-catalog-review",
+            instructions="Review the fictional sample catalog without changing records.",
             owner_email="user@example.com",
         )
         await session.commit()
@@ -120,12 +120,12 @@ async def test_skill_load_accepts_claude_native_skill_argument_by_name(tmp_path)
     load_result = await _handle_skill_load(
         session_factory,
         "user@example.com",
-        {"skill": "lumilens-alertmanager-ops"},
+        {"skill": "demo-catalog-review"},
     )
 
     assert load_result.is_error is False
     payload = json.loads(load_result.output)
-    assert payload["skill_id"] == "skill_lumilens_alertmanager_ops"
+    assert payload["skill_id"] == "skill_demo_catalog_review"
 
     await engine.dispose()
 

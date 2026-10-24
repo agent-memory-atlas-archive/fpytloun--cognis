@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_USER_PREFERENCES, normalizeUserPreferences } from './user-preferences';
 
+describe('automatic recap preference', () => {
+  it('defaults absent and legacy preferences to enabled', () => {
+    expect(DEFAULT_USER_PREFERENCES.chat.auto_recap).toBe(true);
+    expect(normalizeUserPreferences(undefined).chat.auto_recap).toBe(true);
+    expect(normalizeUserPreferences({ chat: {} }).chat.auto_recap).toBe(true);
+  });
+
+  it('preserves an explicit opt-out', () => {
+    expect(normalizeUserPreferences({ chat: { auto_recap: false } }).chat.auto_recap).toBe(false);
+  });
+});
+
 describe('dashboard workspace window preference', () => {
   it('defaults legacy and invalid payloads to enabled', () => {
     expect(DEFAULT_USER_PREFERENCES.display.dashboard_workspace_windows).toBe(true);
@@ -44,6 +56,25 @@ describe('conversation sidebar display preferences', () => {
     });
     expect(preferences.display.conversation_sidebar_sections).toBe(false);
     expect(preferences.display.conversation_sidebar_dense).toBe(true);
+  });
+});
+
+describe('pinned agent display preferences', () => {
+  it('defaults legacy and invalid values to collapsed, activity-ordered avatars', () => {
+    for (const payload of [undefined, { display: {} }, { display: {
+      pinned_agents_collapsed: 'false', pinned_agents_order_by_activity: null,
+    } }]) {
+      const preferences = normalizeUserPreferences(payload);
+      expect(preferences.display.pinned_agents_collapsed).toBe(true);
+      expect(preferences.display.pinned_agents_order_by_activity).toBe(true);
+    }
+  });
+  it('preserves independent opt-outs', () => {
+    const preferences = normalizeUserPreferences({ display: {
+      pinned_agents_collapsed: false, pinned_agents_order_by_activity: false,
+    } });
+    expect(preferences.display.pinned_agents_collapsed).toBe(false);
+    expect(preferences.display.pinned_agents_order_by_activity).toBe(false);
   });
 });
 

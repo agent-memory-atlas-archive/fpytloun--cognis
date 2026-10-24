@@ -21,6 +21,19 @@ export interface ConversationRetryScope {
   history: boolean;
 }
 
+export function parseStoredMultiFilter(stored: string | null): string[] {
+  if (!stored || stored === 'all') return [];
+  try {
+    const parsed = JSON.parse(stored);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
+    }
+  } catch {
+    // Supported single-value storage from the original select.
+  }
+  return [stored];
+}
+
 export function canShowConversationLifecycleActions(
   scope: TimelineScope | null,
   rootConversationId: string | null,
@@ -61,7 +74,18 @@ export async function refreshCachedTimeline<Snapshot, Watermark>(operations: {
   applyIfUnchanged: (snapshot: Snapshot, watermark: Watermark) => boolean;
   snapshot: () => Promise<void>;
   sync: () => Promise<void>;
+  /**
+   * The restored view already holds a non-empty canonical timeline with a
+   * sync cursor. A cursor delta is then the cheapest correct refresh (the
+   * sync path itself falls back to a snapshot on reset or cursor mismatch),
+   * so skip the cache probe and any full snapshot download.
+   */
+  trustedBase?: boolean;
 }): Promise<'cache-hit' | 'snapshot' | 'sync'> {
+  if (operations.trustedBase) {
+    await operations.sync();
+    return 'sync';
+  }
   const watermark = operations.captureWatermark();
   const snapshot = await operations.probe();
   if (snapshot === null) {
@@ -156,6 +180,8 @@ export interface SidebarProjectionFilter {
   selectedChannels: string[];
   selectedAgentIds: string[];
   selectedConversationStatus: ConversationStatusFilter;
+  /** Empty or absent means all projects. */
+  selectedProjectId?: string;
 }
 
 /**
@@ -1046,18 +1072,40 @@ export class SerialInvalidationCoalescer {
   private dirty = false;
   private disposed = false;
   private flight: Promise<void> | null = null;
+  private lastRunEndedAt = Number.NEGATIVE_INFINITY;
+  private urgent = false;
+  private wake: (() => void) | null = null;
 
-  constructor(private readonly run: () => Promise<void>) {}
+  /**
+   * @param minIntervalMs Minimum time between the end of one run and the start
+   *   of the next. An invalidation after a quiet period runs immediately;
+   *   bursts collapse into one trailing run per interval.
+   */
+  constructor(
+    private readonly run: () => Promise<void>,
+    private readonly minIntervalMs = 0,
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly now: () => number = () => Date.now(),
+  ) {}
 
-  invalidate(): void {
+  /**
+   * @param urgent Skip the spacing for the next run (user-initiated changes
+   *   such as a filter switch must not wait for the interval).
+   */
+  invalidate(urgent = false): void {
     if (this.disposed) return;
     this.dirty = true;
+    if (urgent) {
+      this.urgent = true;
+      this.wake?.();
+    }
     if (!this.flight) this.flight = this.drain();
   }
 
   dispose(): void {
     this.disposed = true;
     this.dirty = false;
+    this.wake?.();
   }
 
   async whenIdle(): Promise<void> {
@@ -1067,12 +1115,24 @@ export class SerialInvalidationCoalescer {
   private async drain(): Promise<void> {
     try {
       while (!this.disposed && this.dirty) {
+        const wait = this.lastRunEndedAt + this.minIntervalMs - this.now();
+        if (wait > 0 && !this.urgent) {
+          await Promise.race([
+            this.sleep(wait),
+            new Promise<void>((resolve) => { this.wake = resolve; }),
+          ]);
+          this.wake = null;
+          if (this.disposed || !this.dirty) break;
+        }
         // Consume the dirty state only when the next attempt is admitted.
         this.dirty = false;
+        this.urgent = false;
         try {
           await this.run();
         } catch {
           // A later invalidation can start another attempt after this failure.
+        } finally {
+          this.lastRunEndedAt = this.now();
         }
       }
     } finally {
@@ -1128,6 +1188,29 @@ export class SidebarRevisionAdmission {
   private observedDurableRevision: string | null = null;
   private readonly conversationRevisions = new Map<string, string>();
   private readonly legacyConversationRevisions = new Map<string, string>();
+  private scope: string | null = null;
+  private sequence = 0;
+  private readonly pushSequences = new Map<string, number>();
+
+  selectScope(scope: string): void {
+    if (this.scope === scope) return;
+    this.scope = scope;
+    this.restCursor = null;
+  }
+
+  get pushSequence(): number { return this.sequence; }
+
+  pushedSince(sequence: number): Set<string> {
+    return new Set([...this.pushSequences]
+      .filter(([, value]) => value > sequence).map(([id]) => id));
+  }
+
+  newerConversationIds(revision: string | null | undefined): Set<string> {
+    if (!isDurableSidebarRevision(revision)) return new Set();
+    return new Set([...this.conversationRevisions]
+      .filter(([, value]) => compareDurableSidebarRevisions(value, revision!) > 0)
+      .map(([id]) => id));
+  }
 
   get authoritativeRestCursor(): string | null {
     return this.restCursor;
@@ -1148,7 +1231,7 @@ export class SidebarRevisionAdmission {
       );
   }
 
-  observeInvalidation(revision: string | null | undefined): void {
+  observeInvalidation(revision: string | null | undefined): boolean {
     const durableRevision = isDurableSidebarRevision(revision) ? revision as string : null;
     if (
       durableRevision !== null
@@ -1159,6 +1242,7 @@ export class SidebarRevisionAdmission {
     ) {
       this.observedDurableRevision = durableRevision;
     }
+    return durableRevision === null || this.needsReconciliation;
   }
 
   admitProjection(revision: string | null | undefined): SidebarPushAdmission {
@@ -1167,12 +1251,16 @@ export class SidebarRevisionAdmission {
       return { apply: this.observedDurableRevision === null, reconcile: true };
     }
     if (
-      this.observedDurableRevision !== null
-      && compareDurableSidebarRevisions(durableRevision, this.observedDurableRevision) < 0
+      this.restCursor !== null
+      && compareDurableSidebarRevisions(durableRevision, this.restCursor) < 0
     ) {
       return { apply: false, reconcile: true };
     }
-    return { apply: true, reconcile: false };
+    return {
+      apply: true,
+      reconcile: this.observedDurableRevision !== null
+        && compareDurableSidebarRevisions(durableRevision, this.observedDurableRevision) < 0,
+    };
   }
 
   recordProjection(
@@ -1189,7 +1277,10 @@ export class SidebarRevisionAdmission {
       this.observedDurableRevision = durableRevision;
     }
     for (const conversationId of conversationIds) {
-      this.conversationRevisions.set(conversationId, durableRevision);
+      const previous = this.conversationRevisions.get(conversationId);
+      if (!previous || compareDurableSidebarRevisions(previous, durableRevision) <= 0) {
+        this.conversationRevisions.set(conversationId, durableRevision);
+      }
       this.legacyConversationRevisions.delete(conversationId);
     }
   }
@@ -1209,6 +1300,7 @@ export class SidebarRevisionAdmission {
           || previousLegacy === undefined
           || revision > previousLegacy
         );
+      if (apply) this.pushSequences.set(conversationId, ++this.sequence);
       if (apply && revision) this.legacyConversationRevisions.set(conversationId, revision);
       return { apply, reconcile: true };
     }
@@ -1230,6 +1322,7 @@ export class SidebarRevisionAdmission {
       );
 
     if (apply) {
+      this.pushSequences.set(conversationId, ++this.sequence);
       this.conversationRevisions.set(conversationId, durableRevision);
       this.legacyConversationRevisions.delete(conversationId);
     }
@@ -1312,6 +1405,9 @@ export function cloneSidebarProjection(projection: SidebarProjection): SidebarPr
       cursor: projection.conversations.cursor,
       has_more: projection.conversations.has_more,
     },
+    ...(projection.waiting_conversations !== undefined ? {
+      waiting_conversations: projection.waiting_conversations.map((item) => ({ ...item })),
+    } : {}),
     context_types: [...projection.context_types],
     removed_conversation_ids: [...(projection.removed_conversation_ids ?? [])],
     full_resync_required: projection.full_resync_required,
@@ -1383,6 +1479,9 @@ export function conversationMatchesSidebarProjectionFilter(
 ): boolean {
   const selectedAgentIds = new Set(filter.selectedAgentIds);
   if (selectedAgentIds.size > 0 && !selectedAgentIds.has(conversation.agent_id)) {
+    return false;
+  }
+  if (filter.selectedProjectId && conversation.project_id !== filter.selectedProjectId) {
     return false;
   }
 
@@ -1479,6 +1578,7 @@ const CONVERSATION_STATUS_FILTERS = new Set<ConversationStatusFilter>([
 export const CHAT_STORAGE_KEYS = {
   selectedAgent: 'cognis-chat-selected-agent',
   selectedChannel: 'cognis-chat-selected-channel',
+  selectedProject: 'cognis-chat-selected-project',
   sidebarCollapsed: 'cognis-chat-sidebar-collapsed',
   sidebarWidth: 'cognis-chat-sidebar-width',
   lastOpenedConversation: 'cognis-chat-last-opened-conversation'
@@ -1850,6 +1950,30 @@ export function windowAfterPrepend(
   return { start: 0, end: end >= total ? null : end };
 }
 
+/** Reconcile a reading window against membership identities, not elapsed-request
+ * count growth (which may include live appends). The requesting view may reveal
+ * newly loaded history; other views retain their independent reading range. */
+export function reconcileTimelineMembership(
+  window: TimelineWindow,
+  before: readonly { id: string }[],
+  after: readonly { id: string }[],
+  revealBefore = false,
+): TimelineWindow {
+  const positions = new Map(after.map((item, index) => [item.id, index]));
+  const retained = before.slice(window.start, timelineWindowEnd(window, before.length))
+    .flatMap(item => {
+      const position = positions.get(item.id);
+      return position === undefined ? [] : [position];
+    });
+  if (!retained.length) return clampWindow(window, after.length);
+  const end = Math.max(...retained) + 1;
+  let start = Math.min(...retained);
+  if (revealBefore && window.start === 0) {
+    start = Math.max(0, end - Math.max(TIMELINE_WINDOW_MAX_ROWS * 3, retained.length));
+  }
+  return clampWindow({ start, end }, after.length);
+}
+
 /**
  * Recompute the window after an automatic viewport-fill backfill. When the user
  * has not explicitly scrolled up and the tail is live, keep the tail live and
@@ -1968,6 +2092,21 @@ export function conversationAttentionTone(conversation: {
   pending_notification_types?: string[] | null;
   last_read_at?: string | null;
 }): ConversationAttentionTone {
+  const sessionUpdatedAt = timestampValue(conversation.active_session_updated_at);
+  const lastReadAt = timestampValue(conversation.last_read_at);
+  return conversationAttentionOutcomeTone({
+    ...conversation,
+    session_observed: sessionUpdatedAt > 0 && lastReadAt >= sessionUpdatedAt,
+  });
+}
+
+/** Shared policy for conversation rows and grouped navigation summaries. */
+export function conversationAttentionOutcomeTone(conversation: {
+  active_session_status?: string | null;
+  active_session_completion_reason?: string | null;
+  pending_notification_types?: string[] | null;
+  session_observed: boolean;
+}): ConversationAttentionTone {
   const pendingNotificationTypes = conversation.pending_notification_types ?? [];
   if (pendingNotificationTypes.some((type) => ROSE_PENDING_NOTIFICATION_TYPES.has(type))) {
     return 'rose';
@@ -1979,9 +2118,7 @@ export function conversationAttentionTone(conversation: {
   // Session outcomes are historical once observed. Keep actionable
   // notifications persistent, but let a read after the latest session update
   // clear lifecycle attention without hiding a later terminal transition.
-  const sessionUpdatedAt = timestampValue(conversation.active_session_updated_at);
-  const lastReadAt = timestampValue(conversation.last_read_at);
-  if (sessionUpdatedAt > 0 && lastReadAt >= sessionUpdatedAt) return 'default';
+  if (conversation.session_observed) return 'default';
 
   const status = conversation.active_session_status ?? null;
   if (status && ROSE_SESSION_STATUSES.has(status)) return 'rose';
@@ -2018,9 +2155,9 @@ export function conversationTurnModeTone(
 }
 
 export function conversationAttentionDotClass(tone: ConversationAttentionTone): string {
-  if (tone === 'rose') return 'bg-rose-400';
-  if (tone === 'amber') return 'bg-amber-400';
-  return 'bg-sky-400';
+  if (tone === 'rose') return 'bg-danger';
+  if (tone === 'amber') return 'bg-warning';
+  return 'bg-info';
 }
 
 export function conversationAttentionOrbitClass(tone: ConversationAttentionTone): string {
@@ -2524,16 +2661,6 @@ export function shouldReconcileAfterReconnect(params: {
   if (remoteLastSeq > params.activeSessionLastSeq) return true;
   if (params.remoteHasActiveTurn === false && params.localTurnInProgress) return true;
   return false;
-}
-
-export function shouldRecoverChatV2ForInvalidation(params: {
-  activeConversationId: string;
-  invalidatedConversationId?: string;
-}): boolean {
-  return (
-    !params.invalidatedConversationId
-    || params.invalidatedConversationId === params.activeConversationId
-  );
 }
 
 export class ChatV2CanonicalRecoveryCoalescer {

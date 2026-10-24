@@ -9,15 +9,16 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import case, exists, literal, or_, select, update
+from sqlalchemy import case, exists, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased, defer
+from sqlalchemy.sql.elements import ColumnElement
 
 from cognis import json_codec as json
 from cognis.core.trusted_evidence import (
@@ -70,6 +71,16 @@ TERMINAL_STATUSES = frozenset(
 )
 NONTERMINAL_STATUSES = CLAIMABLE_STATUSES | ACTIVE_STATUSES
 OPERATOR_RECOVERY_LEASE_SECONDS = 30
+
+
+def direct_turn_content_is_editable(row: DirectTurnRequestRow) -> bool:
+    """Project the same queued-content restriction enforced by edit."""
+    metadata = row.payload.get("metadata") or {}
+    admission = deserialize_evidence_admission(metadata.get(TRUSTED_EVIDENCE_ADMISSION_KEY))
+    return row.status == DirectTurnStatus.QUEUED.value and not (
+        admission is not None and admission.admitted
+    )
+
 
 TOOL_IN_FLIGHT_PHASE = "tool_in_flight"
 TOOL_RESULT_PERSISTED_PHASE = "tool_result_persisted"
@@ -341,6 +352,14 @@ class DirectTurnPayloadV1(BaseModel):
             return RetryReason(value)
         except (TypeError, ValueError):
             return RetryReason.TRANSIENT_RUNTIME
+
+
+def foreground_admission_clause() -> ColumnElement[bool]:
+    """Classify persisted v1 admissions using their canonical metadata envelope."""
+    return cast(
+        ColumnElement[bool],
+        DirectTurnRequestRow.payload["metadata"]["system_initiated"].as_boolean().is_not(True),
+    )
 
 
 class ArtifactURLResolver(Protocol):
@@ -676,7 +695,11 @@ class DirectTurnStore:
         """Return FIFO conversation heads that are eligible for ownership."""
         earlier = aliased(DirectTurnRequestRow)
         async with self._session_factory() as session:
-            now = await database_now(session)
+            now = database_now_expression(session)
+            if session.bind is not None and session.bind.dialect.name == "sqlite":
+                # Match SQLAlchemy's bound DateTime representation, including at
+                # exact second boundaries, without another database-clock read.
+                now = func.strftime("%Y-%m-%d %H:%M:%S.000000", now)
             result = await session.execute(
                 select(DirectTurnRequestRow)
                 .options(self._payload_deferred())
@@ -752,7 +775,7 @@ class DirectTurnStore:
         *,
         session: AsyncSession | None = None,
     ) -> DirectTurnRequestRow | None:
-        """Return active state, or the latest formerly-active lifecycle row, in one query."""
+        """Return active state, or the latest execution generation, in one query."""
 
         if session is None:
             async with self._session_factory() as owned_session:
@@ -764,7 +787,9 @@ class DirectTurnStore:
         historical_values = [
             status.value
             for status in (
-                ACTIVE_STATUSES | {DirectTurnStatus.RECOVERABLE} | set(TERMINAL_STATUSES)
+                ACTIVE_STATUSES
+                | {DirectTurnStatus.RECOVERABLE}
+                | (TERMINAL_STATUSES - {DirectTurnStatus.ABSORBED})
             )
         ]
         result = await session.execute(
@@ -778,6 +803,9 @@ class DirectTurnStore:
                     (DirectTurnRequestRow.status.in_(active_values), 0),
                     else_=1,
                 ),
+                # Recovery advances the fence without changing admission order.
+                # Absorbed messages never own the absorbing turn's lifecycle.
+                DirectTurnRequestRow.fencing_token.desc().nullslast(),
                 DirectTurnRequestRow.admission_order.desc(),
             )
             .limit(1)
@@ -1074,19 +1102,20 @@ class DirectTurnStore:
     async def list_pending_failure_visibility(
         self, *, limit: int = 100
     ) -> list[DirectTurnRequestRow]:
+        """Discover pending visibility work without loading admitted payloads."""
         async with self._session_factory() as session:
             result = await session.execute(
                 select(DirectTurnRequestRow)
-                .where(DirectTurnRequestRow.status == DirectTurnStatus.FAILED.value)
+                .options(self._payload_deferred())
+                .where(
+                    DirectTurnRequestRow.status == DirectTurnStatus.FAILED.value,
+                    DirectTurnRequestRow.outcome["phase"].as_string()
+                    == "permanent_payload_visibility_pending",
+                )
                 .order_by(DirectTurnRequestRow.admission_order)
                 .limit(max(1, limit))
             )
-            return [
-                row
-                for row in result.scalars().all()
-                if isinstance(row.outcome, dict)
-                and row.outcome.get("phase") == "permanent_payload_visibility_pending"
-            ]
+            return list(result.scalars().all())
 
     async def complete_failure_visibility(self, request_id: str) -> DirectTurnRequestRow | None:
         async with self._session_factory() as session:
@@ -1156,8 +1185,7 @@ class DirectTurnStore:
                 dict(raw_current_metadata) if isinstance(raw_current_metadata, dict) else {}
             )
             current_admission = current_metadata.get(TRUSTED_EVIDENCE_ADMISSION_KEY)
-            parsed_current_admission = deserialize_evidence_admission(current_admission)
-            if parsed_current_admission is not None and parsed_current_admission.admitted:
+            if not direct_turn_content_is_editable(current):
                 bound_fields_changed = any(
                     payload.get(field) != current.payload.get(field)
                     for field in ("content", "attachments")
@@ -2116,6 +2144,17 @@ class DirectTurnStore:
         if lease.owner_id != _owner_id(controller_id, incarnation_id):
             raise ValueError("lease owner does not match controller incarnation")
         async with self._session_factory() as session:
+            # Match admission/cancellation lock order: conversation, then request.
+            await session.execute(
+                select(Conversation.conversation_id)
+                .where(
+                    Conversation.conversation_id
+                    == select(DirectTurnRequestRow.conversation_id)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .scalar_subquery()
+                )
+                .with_for_update()
+            )
             now = await database_now(session)
             values: dict[str, Any] = {
                 "status": DirectTurnStatus.CLAIMED.value,
@@ -2138,6 +2177,17 @@ class DirectTurnStore:
                 statuses=CLAIMABLE_STATUSES,
                 values=values,
             )
+            if row is not None and row.attempt_count == 1:
+                # The pin survives turns, but its recovery budget belongs to
+                # active work. Takeover/retry must retain the original clock.
+                await session.execute(
+                    update(Conversation)
+                    .where(
+                        Conversation.conversation_id == row.conversation_id,
+                        Conversation.lineage_task_id.is_(None),
+                    )
+                    .values(active_executor_unavailable_since=None)
+                )
             await session.commit()
             return row
 
@@ -2812,6 +2862,37 @@ class DirectTurnStore:
                 CoordinationLeaseRow.lease_expires_at > database_now_expression(session),
             )
         )
+
+    async def effective_channel_delivery(
+        self, request_id: str
+    ) -> tuple[ChannelDeliveryDescriptor | None, str | None]:
+        """Resolve the latest committed absorbed route without changing admission payloads."""
+        async with self._session_factory() as session:
+            request = await session.scalar(
+                select(DirectTurnRequestRow).where(DirectTurnRequestRow.request_id == request_id)
+            )
+            if request is None:
+                return None, None
+            absorbed = (
+                await session.scalars(
+                    select(DirectTurnRequestRow)
+                    .where(
+                        DirectTurnRequestRow.conversation_id == request.conversation_id,
+                        DirectTurnRequestRow.absorbed_by_turn_id == request.turn_id,
+                        DirectTurnRequestRow.status == DirectTurnStatus.ABSORBED.value,
+                    )
+                    .order_by(DirectTurnRequestRow.admission_order.desc())
+                )
+            ).all()
+            for row in [*absorbed, request]:
+                payload = row.payload or {}
+                route = payload.get("channel_delivery")
+                if isinstance(route, dict):
+                    return (
+                        ChannelDeliveryDescriptor.model_validate(route),
+                        payload.get("metadata", {}).get("channel_assistant_delivery_mode"),
+                    )
+        return None, None
 
     async def create_fenced_channel_delivery(
         self,

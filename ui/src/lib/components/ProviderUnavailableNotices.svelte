@@ -21,14 +21,14 @@
 </script>
 
 {#if notices.length > 0}
-  <div class={compact ? 'space-y-1.5 border-t border-slate-800 px-3 py-2' : 'space-y-2'} data-testid="provider-unavailable-notices">
+  <div class={compact ? 'space-y-1.5 border-t border-separator px-3 py-2' : 'space-y-2'} data-testid="provider-unavailable-notices">
     {#each notices as notice (notice.id)}
       {@const NoticeIcon = iconFor(notice.id)}
       <div
         class={`rounded-xl border text-sm ${
           notice.severity === 'warning'
-            ? 'border-amber-500/30 bg-amber-500/10 text-amber-100'
-            : 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+            ? 'border-warning-border bg-warning-subtle text-warning'
+            : 'border-danger-border bg-danger-subtle text-danger'
         } ${compact ? 'px-3 py-2' : 'px-3 py-3'}`}
         data-testid={`provider-unavailable-${notice.id}`}
         role="status"

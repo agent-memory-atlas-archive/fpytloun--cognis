@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from collections.abc import Awaitable, Callable
 
@@ -48,6 +49,7 @@ async def with_retry[T](
     max_delay: float = 30.0,
     jitter: bool = True,
     retryable_check: Callable[[Exception], bool] | None = None,
+    respect_retry_after: bool = False,
     operation: str = "provider call",
     **kwargs: object,
 ) -> T:
@@ -62,6 +64,17 @@ async def with_retry[T](
             if attempt >= max_retries:
                 raise
             delay = compute_delay(attempt, base_delay, max_delay, jitter)
+            if respect_retry_after:
+                # Opt-in delta-seconds support for dependency cooldowns. Never
+                # let an upstream header extend the configured delay bound.
+                response = getattr(exc, "response", None)
+                headers = getattr(response, "headers", {})
+                try:
+                    retry_after = float(headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+                if math.isfinite(retry_after) and retry_after > 0:
+                    delay = min(max(delay, retry_after), max_delay)
             logger.warning(
                 "%s failed (attempt %d/%d), retrying in %.1fs",
                 operation,

@@ -201,6 +201,8 @@ def test_duplicate_preserves_unavailable_backend_fail_closed_configuration(
             "guardrails_backend": "intaris",
             "minimum_outcome": None,
             "maximum_outcome": None,
+            "intaris_evaluation": "balanced",
+            "approval_mode": "ask",
             "escalation_timeout_seconds": None,
         }
         assert body["agent_profiles"]["specialist"]["memory_backend_options"] == {
@@ -284,7 +286,17 @@ def test_system_agent_update_accepts_runtime_profile_overrides(
 
         assert update.status_code == 200
         body = update.json()
-        assert body["agent_profiles"] == profiles
+        # Responses are normalized: quick-switch settings default when omitted.
+        quick_switch_defaults = {
+            "quick_switch": False,
+            "quick_switch_color": "neutral",
+            "quick_switch_index": 0,
+        }
+        normalized_profiles = {
+            profile_id: {**profile, **quick_switch_defaults}
+            for profile_id, profile in profiles.items()
+        }
+        assert body["agent_profiles"] == normalized_profiles
         assert body["default_agent_profile_id"] == "junior"
         assert body["has_overrides"] is True
 
@@ -294,7 +306,7 @@ def test_system_agent_update_accepts_runtime_profile_overrides(
             json={"llm_config": {"reasoning_effort": "medium"}},
         )
         assert partial.status_code == 200
-        assert partial.json()["agent_profiles"] == profiles
+        assert partial.json()["agent_profiles"] == normalized_profiles
         assert partial.json()["default_agent_profile_id"] == "junior"
 
         disabled = client.post(
@@ -307,12 +319,12 @@ def test_system_agent_update_accepts_runtime_profile_overrides(
             headers=headers,
         )
         assert enabled.status_code == 200
-        assert enabled.json()["agent_profiles"] == profiles
+        assert enabled.json()["agent_profiles"] == normalized_profiles
         assert enabled.json()["default_agent_profile_id"] == "junior"
 
         detail = client.get("/api/v1/agents/system:implement", headers=headers)
         assert detail.status_code == 200
-        assert detail.json()["agent_profiles"] == profiles
+        assert detail.json()["agent_profiles"] == normalized_profiles
         assert detail.json()["default_agent_profile_id"] == "junior"
 
 

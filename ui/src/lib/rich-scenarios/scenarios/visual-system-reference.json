@@ -32,7 +32,7 @@
             "href": "https://example.org/fixture/health",
             "media": {
               "artifact_id": "fixture-visual-system-health",
-              "href": "/fixtures/daily-pulse-lovosice.svg",
+              "href": "/fixtures/daily-pulse-sample-town.svg",
               "alt": "Abstract blue editorial illustration",
               "credit": "Cognis fixture",
               "placement": "top",
@@ -80,7 +80,7 @@
             "href": "https://example.org/fixture/visual",
             "media": {
               "artifact_id": "fixture-visual-system-card",
-              "href": "/fixtures/daily-pulse-lovosice.svg",
+              "href": "/fixtures/daily-pulse-sample-town.svg",
               "alt": "Abstract blue editorial illustration, full-bleed card variant",
               "credit": "Cognis fixture",
               "aspect_ratio": "16 / 7",

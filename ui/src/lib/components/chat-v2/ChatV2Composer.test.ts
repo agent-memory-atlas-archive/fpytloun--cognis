@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { api } from '$lib/api/client';
 import ChatV2Composer from './ChatV2Composer.svelte';
+import SettingsFixture from './ChatV2Composer.settings-test-fixture.svelte';
 
 function props(overrides: Record<string, unknown> = {}) {
   return {
@@ -16,6 +17,14 @@ function props(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ChatV2Composer', () => {
+  it('hides settings during an active turn and restores them when idle', async () => {
+    const { rerender } = render(SettingsFixture, { active: false });
+    expect(screen.getByRole('button', { name: 'Chat settings' })).toBeVisible();
+    await rerender({ active: true });
+    expect(screen.queryByRole('button', { name: 'Chat settings' })).not.toBeInTheDocument();
+    await rerender({ active: false });
+    expect(screen.getByRole('button', { name: 'Chat settings' })).toBeVisible();
+  });
   it('uses the same attachment and microphone controls on every surface', async () => {
     const onFiles = vi.fn();
     render(ChatV2Composer, props({ onFiles }));

@@ -70,6 +70,29 @@ def _login(client: TestClient, email: str = "admin@example.com") -> None:
     assert response.status_code == 200
 
 
+def test_browser_refresh_accepts_sqlite_expiry_and_rejects_expired_session(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    from cognis.store.models import BrowserSession
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        _seed_user(client)
+        _login(client)
+        refreshed = client.post("/api/auth/refresh")
+        assert refreshed.status_code == 200
+        assert refreshed.json()["user"]["email"] == "admin@example.com"
+        assert client.get("/api/auth/me").status_code == 200
+
+        async def expire() -> None:
+            async with client.app.state.session_factory() as session:
+                browser = (await session.execute(select(BrowserSession))).scalar_one()
+                browser.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                await session.commit()
+
+        asyncio.run(expire())
+        assert client.post("/api/auth/refresh").status_code == 401
+
+
 def _set_mfa_policy(client: TestClient, policy: str) -> None:
     async def _set() -> None:
         async with client.app.state.session_factory() as session:

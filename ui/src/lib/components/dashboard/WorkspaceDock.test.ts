@@ -47,8 +47,8 @@ describe('WorkspaceDock', () => {
 
     expect(screen.getByTestId('workspace-dock-dashboard')).toHaveAttribute('title', 'Show dashboard');
     expect(screen.getByTestId('workspace-dock-item-conversation:conversation-1')).toHaveClass(
-      'border-sky-400',
-      'bg-sky-500/15',
+      'border-accent',
+      'bg-accent-subtle',
     );
     expect(screen.getByTestId('workspace-dock-restore-conversation:conversation-1')).toHaveAttribute(
       'aria-current',
@@ -83,7 +83,7 @@ describe('WorkspaceDock', () => {
     expect(screen.getByRole('navigation', { name: 'Workspace windows' })).toBeInTheDocument();
     expect(screen.getByTestId('workspace-dock-restore-conversation:conversation-1')).toBeInTheDocument();
     expect(screen.getByTestId('workspace-dock-restore-task:task-1')).toHaveAttribute('aria-current', 'true');
-    expect(screen.getByTestId('workspace-dock-item-task:task-1')).toHaveClass('border-sky-400', 'bg-sky-500/15');
+    expect(screen.getByTestId('workspace-dock-item-task:task-1')).toHaveClass('border-accent', 'bg-accent-subtle');
   });
 
   it('focuses a visible window, minimizes the focused window, and restores a minimized window', async () => {

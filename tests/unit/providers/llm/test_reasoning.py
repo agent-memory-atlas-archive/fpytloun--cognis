@@ -243,6 +243,26 @@ def test_unknown_future_anthropic_models_are_not_classified_as_adaptive(model_id
     assert "thinking" not in prepared.request_kwargs
 
 
+def test_claude_haiku_55_uses_documented_adaptive_effort_defaults() -> None:
+    model_id = "claude-haiku-5-5"
+    prepared = apply_reasoning_config(
+        {},
+        model_id=model_id,
+        provider_preset="anthropic",
+        model_info=_model_info(model_id),
+    )
+
+    assert prepared.family == "anthropic_adaptive"
+    assert prepared.request_kwargs["thinking"] == {"type": "adaptive"}
+    assert "output_config" not in prepared.request_kwargs
+    assert apply_reasoning_config(
+        {"reasoning_effort": "xhigh"},
+        model_id=model_id,
+        provider_preset="anthropic",
+        model_info=_model_info(model_id),
+    ).request_kwargs["output_config"] == {"effort": "xhigh"}
+
+
 @pytest.mark.parametrize("model_id", ["claude-haiku-5", "claude-opus-4-9", "claude-sonnet-5-1"])
 def test_unknown_future_anthropic_models_reject_explicit_effort(model_id: str) -> None:
     with pytest.raises(ValueError, match="not supported"):

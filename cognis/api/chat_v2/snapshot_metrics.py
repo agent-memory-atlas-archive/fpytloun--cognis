@@ -81,6 +81,12 @@ REQUEST_LATENCY = Histogram(
     ["tier", "outcome"],
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
 )
+REQUEST_STAGE_LATENCY = Histogram(
+    "cognis_chat_snapshot_request_stage_latency_seconds",
+    "Chat snapshot context, immutable cache/build, and request-time hydration latency.",
+    ["stage"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30, 60, 120),
+)
 WARM_FAILURES = Counter(
     "cognis_chat_snapshot_warm_failures_total",
     "Failed Chat v2 snapshot warm attempts by fixed reason.",
@@ -132,6 +138,11 @@ CLIENT_PERFORMANCE_MS = Histogram(
 
 
 class SnapshotCacheMetrics:
+    def request_stage(self, stage: str, seconds: float) -> None:
+        if stage not in {"context", "immutable", "attachments"}:
+            raise ValueError("invalid snapshot request stage")
+        REQUEST_STAGE_LATENCY.labels(stage=stage).observe(seconds)
+
     def hit(self, tier: str) -> None:
         if tier not in {"l1", "redis"}:
             raise ValueError("invalid snapshot cache tier")

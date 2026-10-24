@@ -9,10 +9,13 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import type { Notification } from '$lib/types/api';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
 
   let loading = $state(true);
   let error = $state('');
   let notification = $state<Notification | null>(null);
+  // Hidden while the global connection banner applies; reload on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(error), retry: () => loadNotification() });
 
   async function loadNotification(): Promise<void> {
     loading = true;
@@ -42,27 +45,27 @@
 </svelte:head>
 
 <div class="mx-auto flex min-h-full w-full max-w-2xl flex-col justify-center px-4 py-8">
-  {#if loading}
+  {#if loading || (error && net.hideErrors)}
     <LoadingState label="Loading credential request..." />
   {:else if error}
     <Card class="p-6">
-      <p class="text-sm text-rose-200">{error}</p>
+      <p class="text-sm text-danger">{error}</p>
       <Button class="mt-4" variant="secondary" onclick={() => goto('/chat')}>Back to Cognis</Button>
     </Card>
   {:else if !notification}
     <Card class="p-6">
-      <p class="text-sm text-slate-300">Credential request not found.</p>
+      <p class="text-sm text-secondary">Credential request not found.</p>
     </Card>
   {:else if notification.notification_type !== 'credential_request'}
     <Card class="p-6">
-      <p class="text-sm text-slate-300">This notification is not a credential request.</p>
+      <p class="text-sm text-secondary">This notification is not a credential request.</p>
       <Button class="mt-4" variant="secondary" onclick={() => goto('/chat')}>Back to Cognis</Button>
     </Card>
   {:else if notification.status !== 'pending'}
     <Card class="p-6">
-      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-emerald-300">Resolved</p>
-      <h1 class="mt-2 text-xl font-semibold text-white">Credential request is no longer pending</h1>
-      <p class="mt-2 text-sm text-slate-400">Decision: {String(notification.resolution?.decision ?? 'resolved')}</p>
+      <p class="text-xs font-semibold uppercase tracking-[0.25em] text-success">Resolved</p>
+      <h1 class="mt-2 text-xl font-semibold text-strong">Credential request is no longer pending</h1>
+      <p class="mt-2 text-sm text-muted">Decision: {String(notification.resolution?.decision ?? 'resolved')}</p>
       <Button class="mt-4" onclick={() => notification?.task_id ? goto(`/tasks/${notification.task_id}`) : goto('/chat')}>Continue</Button>
     </Card>
   {:else}

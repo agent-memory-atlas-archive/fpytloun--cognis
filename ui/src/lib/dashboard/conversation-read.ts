@@ -1,4 +1,5 @@
 import type { Conversation } from '$lib/types/api';
+import { hostAllowsObservation } from '$lib/native/host';
 
 export interface DashboardConversationReadDependencies {
   markRead(conversationId: string): Promise<unknown>;
@@ -30,6 +31,7 @@ export class ObservedConversationReadTracker {
   constructor(private readonly dependencies: ObservedConversationReadDependencies) {}
 
   observe(observation: ObservedConversationVersion): Promise<void> | null {
+    if (!hostAllowsObservation()) return null;
     if (!this.dependencies.isObserved(observation.conversationId)) return null;
     if (this.attemptedVersions.get(observation.conversationId) === observation.version) return null;
 
@@ -118,6 +120,7 @@ export class DashboardConversationReadTracker {
   }
 
   initialLoaded(conversation: Conversation): Promise<void> | null {
+    if (!hostAllowsObservation()) return null;
     if (!this.openConversationIds.has(conversation.conversation_id)) {
       this.pendingInitialLoads.set(conversation.conversation_id, conversation);
       return null;
@@ -129,6 +132,7 @@ export class DashboardConversationReadTracker {
   }
 
   observe(conversations: Conversation[]): Promise<void> | null {
+    if (!hostAllowsObservation()) return null;
     const unread = conversations.filter((conversation) => (
       this.openConversationIds.has(conversation.conversation_id)
       && conversation.has_unread

@@ -130,3 +130,78 @@ async def test_create_verifies_stored_maximum_not_intention_ack(
         await provider.client.aclose()
 
     assert requests[0:2] == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minimum", ["escalate", "deny"])
+async def test_hybrid_create_reads_persisted_minimum_missing_from_compact_ack(minimum):
+    requests = []
+    active = {"evaluation_policy_version": "hybrid_v1", "profile": "balanced"}
+    policy = {**active, "minimum_outcome": minimum}
+
+    def respond(request):
+        requests.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(200, json={"ok": True, "active_policy": active})
+        return httpx.Response(200, json={"policy": policy, "active_policy": active})
+
+    provider = IntarisProvider(
+        "http://intaris.test",
+        SimpleNamespace(sign_service_jwt=lambda *args, **kwargs: "signed-token"),
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="http://intaris.test", transport=httpx.MockTransport(respond)
+    )
+    try:
+        await provider.create_session(
+            "session-minimum", "Review", "agent-1", "user@example.com", policy=policy
+        )
+    finally:
+        await provider.client.aclose()
+    assert requests == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_mode", ["strict", "legacy"])
+async def test_nested_creation_and_refresh_accept_canonical_changed_parent_mode(canonical_mode):
+    calls = []
+    version = "legacy" if canonical_mode == "legacy" else "hybrid_v1"
+    canonical = {"evaluation_policy_version": version}
+    if version == "hybrid_v1":
+        canonical["profile"] = canonical_mode
+    stored = {"policy": canonical, "parent_session_id": "nested-parent"}
+    if version == "hybrid_v1":
+        stored["active_policy"] = canonical
+
+    def respond(request):
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json=stored)
+
+    provider = IntarisProvider(
+        "http://intaris.test",
+        SimpleNamespace(sign_service_jwt=lambda *args, **kwargs: "signed-token"),
+    )
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(
+        base_url="http://intaris.test", transport=httpx.MockTransport(respond)
+    )
+    stale = {"evaluation_policy_version": "hybrid_v1", "profile": "balanced"}
+    try:
+        await provider.create_session(
+            "grandchild",
+            "Research",
+            "agent-1",
+            "user@example.com",
+            parent_session_id="nested-parent",
+            policy=stale,
+        )
+        refreshed = await provider.update_session_policy(
+            "grandchild", policy=stale, agent_id="agent-1", user_id="user@example.com"
+        )
+        assert refreshed == canonical
+    finally:
+        await provider.client.aclose()
+    assert calls == ["POST", "GET", "PATCH"]

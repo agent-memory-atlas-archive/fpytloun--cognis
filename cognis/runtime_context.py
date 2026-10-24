@@ -26,6 +26,8 @@ class RuntimeAccessContext:
     delegation_mode: str | None = None
     workflow_step: bool = False
     interaction_mode: str | None = None
+    # The task's own explicit interaction mode; it outranks the agent approval mode.
+    interaction_mode_override: str | None = None
     session_policy: dict[str, Any] | None = None
     control_surface: str | None = None
 

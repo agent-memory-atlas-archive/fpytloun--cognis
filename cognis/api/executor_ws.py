@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from cognis.api.executor_runtime import (
+    cancel_executor_mcp_retries,
     persist_executor_call_snapshot,
     persist_executor_resource_snapshot,
     reconcile_executor,
@@ -404,6 +405,7 @@ async def handle_executor_websocket(
             exc_info=True,
         )
     finally:
+        await cancel_executor_mcp_retries(ws.app, executor_id, conn)
         is_current = ws_provider.owns_connection(executor_id, conn) and await ownership.is_current(
             connection_owner
         )
@@ -455,6 +457,9 @@ async def handle_executor_websocket(
                 )
                 await session.commit()
             await ownership.release(connection_owner)
+            from cognis.api.executor_monitor import publish_executor_monitor_change
+
+            await publish_executor_monitor_change(ws.app, executor_id)
 
 
 async def _resolve_executor_mcp_payload(

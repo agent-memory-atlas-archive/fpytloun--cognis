@@ -20,6 +20,14 @@ Reuse a child only when its role, responsibility, authority, tools, and output c
 
 Core guidance does not require named execution modes, a coding hierarchy, or a specific team structure.
 
+The built-in Explore specialist provides lightweight, read-only discovery and
+analysis of existing information, including documents, files, configuration,
+and code, using the tools and sources available to it. Use it for well-scoped
+questions that benefit from separate context; handle straightforward lookups
+directly. Explore returns evidence-backed findings and conclusions. The owning
+agent retains complex diagnosis, trade-offs, and final decisions. This role does
+not grant additional tools or access.
+
 ### 2. Reusable skills
 
 Skills supply optional procedures for a class of work. The built-in `Cognis Coding` skill defines generic software-delivery conventions.
@@ -156,6 +164,14 @@ These examples use conventions, not reserved syntax. You can use different words
 The one-turn `plan` and `build` chat modes affect how a turn approaches the work. They do not define team ownership and do not enforce prompt conventions.
 
 Use `plan` for planning-only analysis. Use `build` for implementation-oriented execution when the assignment and safety constraints permit it.
+
+Plan mode exposes native executor Bash for read-only diagnostics. Each command
+must pass Intaris evaluation with the protected read-only requirement; agent
+allow rules and permissive outcome settings cannot bypass that assessment.
+With guardrails disabled, Bash fails closed because Cognis cannot prove the
+command is read-only. Definite file writes and mutating native operations remain
+blocked before execution. This requires an Intaris deployment that enforces the
+read-only overlay, including approval and YOLO paths.
 
 ## What customization cannot change
 

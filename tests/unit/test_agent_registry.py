@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.core.orchestration_targets import OrchestrationTarget, OrchestrationTargetSnapshot
 from cognis.core.system_skills import get_system_skill_default
+from cognis.tools.builtin.orchestration import DELEGATE_TOOL, enrich_orchestration_target_catalog
 
 
 def test_system_implement_agent_is_registered() -> None:
@@ -66,6 +68,34 @@ def test_system_explore_agent_uses_real_listing_tool() -> None:
     tools = agent.tools or {}
 
     assert tools.get("builtin_tools") == ["read", "grep", "glob", "lsp", "list_directory", "bash"]
+
+
+def test_system_explore_agent_defines_general_read_only_evidence_role() -> None:
+    agent = SYSTEM_AGENTS["system:explore"]
+    prompt = agent.system_prompt
+
+    assert "Lightweight read-only exploration" in agent.description
+    assert "documents, files, configuration, and code" in agent.description
+    assert "leaving final decisions to the caller" in agent.description
+    assert "documents, files, configuration, and code" in prompt
+    assert "commands that change system state" in prompt
+    assert "evidence-backed conclusions" in prompt
+    assert "trade-offs and final decisions to the parent agent" in prompt
+    assert "Adapt depth to the caller's question" in prompt
+    assert "source references" in prompt
+    assert "file paths and line" in prompt
+
+
+def test_explore_evidence_role_reaches_caller_delegate_catalog() -> None:
+    target = OrchestrationTarget.from_agent(SYSTEM_AGENTS["system:explore"])
+    tool = enrich_orchestration_target_catalog(
+        DELEGATE_TOOL, OrchestrationTargetSnapshot(delegate=(target,), managed=())
+    )
+    description = tool.parameters["properties"]["agent_id"]["description"]
+
+    assert target.description in description
+    assert "documents, files, configuration, and code" in description
+    assert "leaving final decisions to the caller" in description
 
 
 def test_code_navigating_system_agents_expose_lsp() -> None:

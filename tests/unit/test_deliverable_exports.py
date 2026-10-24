@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import fields
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock
@@ -17,10 +18,12 @@ from fastapi import FastAPI
 from pypdf import PdfReader
 from starlette.testclient import TestClient
 
+from cognis.api.authentication import AuthenticatedUser
 from cognis.api.middleware import AuthenticationMiddleware
 from cognis.api.routes import deliverables as deliverable_routes
 from cognis.core import deliverable_links
 from cognis.models.deliverable import CANONICAL_CHART_TYPES as MODEL_CHART_TYPES
+from cognis.rendering import offline_deliverables
 from cognis.rendering.deliverables import (
     DeliverableRenderError,
     PublicationContext,
@@ -45,6 +48,18 @@ from cognis.rendering.rich_visuals import (
     render_chart_svg,
 )
 from cognis.security import RequestRateLimiter
+from cognis.ui_assets import StandaloneAssetManifest
+
+
+@pytest.fixture(autouse=True)
+def offline_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route tests exercise serialization independently of a local UI build."""
+    (tmp_path / "renderer.js").write_text("window.offlineRenderer = true;", encoding="utf-8")
+    (tmp_path / "renderer.css").write_text("body { margin: 0; }", encoding="utf-8")
+    manifest = StandaloneAssetManifest(tmp_path, "renderer.js", ("renderer.css",))
+    monkeypatch.setattr(
+        offline_deliverables, "resolve_standalone_manifest", lambda **_kwargs: manifest
+    )
 
 
 def _share_token(url: str) -> str:
@@ -78,10 +93,17 @@ def _client(factory: object, monkeypatch: pytest.MonkeyPatch, *, email: str) -> 
     app.state.session_factory = factory
     app.state.artifact_store = factory.artifact_store  # type: ignore[attr-defined]
     app.state.config = SimpleNamespace(deliverable_share_link_ttl_seconds=604800)
+    user = AuthenticatedUser(email=email, role="user")
+
+    @app.middleware("http")
+    async def authenticate(request, call_next):
+        request.state.user = user
+        return await call_next(request)
+
     monkeypatch.setattr(
         deliverable_routes,
         "require_current_user",
-        lambda _request: SimpleNamespace(email=email),
+        lambda _request: user,
     )
     return TestClient(app)
 
@@ -451,11 +473,11 @@ async def test_missing_payload_exports_return_structured_errors(
     token = _share_token(share.url)
     await task_continuation_db.artifact_store.async_delete_object("deliverables", "dlv_owner")
     with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
-        for suffix in ("", "/view", "/download.pdf"):
+        for suffix in ("", "/view", "/download.pdf", "/download.html", "/download.md"):
             response = client.get(f"/api/v1/deliverables/dlv_owner{suffix}")
             assert response.status_code == 404
             assert response.json()["detail"]["code"] == "not_found"
-        for suffix in ("view", "download.pdf"):
+        for suffix in ("view", "download.pdf", "download.html", "download.md"):
             response = client.get(f"/api/v1/deliverables/share/{token}/{suffix}")
             assert response.status_code == 409
             assert response.json()["detail"]["code"] == "deliverable_payload_unavailable"
@@ -481,16 +503,24 @@ async def test_managed_deliverable_has_no_owner_global_browser_or_public_fallbac
         detail = client.get("/api/v1/deliverables/dlv_child")
         view = client.get("/api/v1/deliverables/dlv_child/view")
         pdf = client.get("/api/v1/deliverables/dlv_child/download.pdf")
+        html_download = client.get("/api/v1/deliverables/dlv_child/download.html")
+        markdown_download = client.get("/api/v1/deliverables/dlv_child/download.md")
         share_link = client.post("/api/v1/deliverables/dlv_child/share-link")
         public_view = client.get(f"/api/v1/deliverables/share/{token}/view")
         public_pdf = client.get(f"/api/v1/deliverables/share/{token}/download.pdf")
+        public_html = client.get(f"/api/v1/deliverables/share/{token}/download.html")
+        public_markdown = client.get(f"/api/v1/deliverables/share/{token}/download.md")
 
     assert detail.status_code == 404
     assert view.status_code == 404
     assert pdf.status_code == 404
+    assert html_download.status_code == 404
+    assert markdown_download.status_code == 404
     assert share_link.status_code == 404
     assert public_view.status_code == 404
     assert public_pdf.status_code == 404
+    assert public_html.status_code == 404
+    assert public_markdown.status_code == 404
 
 
 def test_day_agenda_renders_canonical_source_and_sanitizes_url_with_compatibility_fallback() -> (
@@ -3105,6 +3135,146 @@ async def test_authenticated_view_authz_and_cache(
 
 
 @pytest.mark.asyncio
+async def test_single_html_fails_explicitly_without_offline_bundle(
+    task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(offline_deliverables, "resolve_standalone_manifest", lambda **_kwargs: None)
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        response = client.get("/api/v1/deliverables/dlv_rich/download.html")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "export_unavailable"
+
+
+def test_offline_publication_preserves_inert_payload_and_raw_text_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cognis import json_codec
+
+    (tmp_path / "renderer.js").write_text('const text = "</script><script>";', encoding="utf-8")
+    (tmp_path / "renderer.css").write_text('body::after { content: "</style>"; }', encoding="utf-8")
+    monkeypatch.setattr(
+        offline_deliverables,
+        "resolve_standalone_manifest",
+        lambda **_kwargs: StandaloneAssetManifest(tmp_path, "renderer.js", ("renderer.css",)),
+    )
+    payload = {"blocks": [{"type": "markdown", "content": "</template><script>alert(1)</script>"}]}
+    document = offline_deliverables.render_offline_html(
+        _row(), payload=payload, media_resolver=lambda *_args: None
+    )
+    soup = BeautifulSoup(document, "html.parser")
+    assert len(soup.select("script")) == 1
+    assert len(soup.select("style")) == 1
+    assert json_codec.loads(soup.select_one("template").get_text())["payload"] == payload
+    assert "default-src 'none'" in soup.select_one("meta[http-equiv]")["content"]
+
+
+@pytest.mark.asyncio
+async def test_download_formats_are_offline_and_scoped(
+    task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        html_response = client.get("/api/v1/deliverables/dlv_rich/download.html")
+        markdown_response = client.get("/api/v1/deliverables/dlv_rich/download.md")
+    assert html_response.status_code == 200
+    assert html_response.headers["content-disposition"].startswith("attachment;")
+    assert html_response.headers["cache-control"] == "private, no-store"
+    assert html_response.headers["content-type"].startswith("text/html")
+    soup = BeautifulSoup(html_response.text, "html.parser")
+    assert "Rich report" in soup.get_text(" ", strip=True)
+    assert not soup.select("script[src], link[rel=stylesheet], img[src^='/']")
+    assert "/api/v1/deliverables/" not in html_response.text
+    assert "cognis-asset:" not in html_response.text
+    assert markdown_response.status_code == 200
+    assert markdown_response.headers["content-type"].startswith("text/markdown")
+    assert markdown_response.headers["content-disposition"].startswith("attachment;")
+    assert markdown_response.text
+
+    with _client(task_continuation_db, monkeypatch, email="other@example.com") as client:
+        assert client.get("/api/v1/deliverables/dlv_rich/download.html").status_code == 404
+        assert client.get("/api/v1/deliverables/dlv_rich/download.md").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_markdown_export_excludes_plain_and_html_formats(
+    task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def authorized(_request: object, _id: str) -> object:
+        return _row(format="plain")
+
+    monkeypatch.setattr(deliverable_routes, "_authorized_deliverable", authorized)
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        assert client.get("/api/v1/deliverables/dlv_render/download.md").status_code == 404
+
+        async def html_format(_request: object, _id: str) -> object:
+            return _row(format="html")
+
+        monkeypatch.setattr(deliverable_routes, "_authorized_deliverable", html_format)
+        assert client.get("/api/v1/deliverables/dlv_render/download.md").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pdf_without_media_keeps_restricted_local_fonts(
+    task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    documents: list[str] = []
+
+    async def render(document: str) -> object:
+        documents.append(document)
+        return SimpleNamespace(content=b"%PDF-local-fonts")
+
+    monkeypatch.setattr(deliverable_routes, "render_pdf_bytes", render)
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        response = client.get("/api/v1/deliverables/dlv_rich/download.pdf")
+    assert response.status_code == 200
+    assert documents and "url('cognis-asset:archivo')" in documents[0]
+    assert "data:font/woff2;base64," not in documents[0]
+
+
+@pytest.mark.asyncio
+async def test_single_html_embeds_manifest_media_and_fails_if_missing(
+    task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "media_" + "a" * 24
+    image = b"\x89PNG\r\n\x1a\n"
+    row = _row(
+        rich_payload={
+            "media_manifest": {key: {"size_bytes": len(image)}},
+            "blocks": [{"type": "figure", "media": {"key": key, "alt": "Pixel"}}],
+        }
+    )
+
+    async def authorized(_request: object, _id: str) -> object:
+        return row
+
+    async def media(_session: object, _store: object, _row: object, _key: str) -> object:
+        return image, {"mime_type": "image/png", "filename": "pixel.png"}, None
+
+    monkeypatch.setattr(deliverable_routes, "_authorized_deliverable", authorized)
+    monkeypatch.setattr(deliverable_routes, "resolve_deliverable_media", media)
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        response = client.get("/api/v1/deliverables/dlv_render/download.html")
+        assert response.status_code == 200
+        from cognis import json_codec
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        data = json_codec.loads(soup.select_one("template").get_text())
+        assert data["media"][key].startswith("data:image/png;base64,")
+        assert "/api/v1/deliverables/" not in response.text
+
+        monkeypatch.setattr(
+            deliverable_routes, "resolve_deliverable_media", AsyncMock(return_value=None)
+        )
+        missing = client.get("/api/v1/deliverables/dlv_render/download.html")
+        assert missing.status_code == 409
+        assert missing.json()["detail"]["code"] == "deliverable_media_unavailable"
+
+        monkeypatch.setattr(deliverable_routes, "resolve_deliverable_media", media)
+        monkeypatch.setattr(deliverable_routes, "MAX_SINGLE_HTML_BYTES", 100)
+        oversized = client.get("/api/v1/deliverables/dlv_render/download.html")
+        assert oversized.status_code == 413
+
+
+@pytest.mark.asyncio
 async def test_share_token_valid_tampered_and_expired(
     task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3148,8 +3318,12 @@ async def test_public_share_routes_bypass_session_auth_but_verify_token(
     with _middleware_client(task_continuation_db) as client:
         viewed = client.get(f"/api/v1/deliverables/share/{token}/view")
         downloaded = client.get(f"/api/v1/deliverables/share/{token}/download.pdf")
+        downloaded_html = client.get(f"/api/v1/deliverables/share/{token}/download.html")
+        downloaded_md = client.get(f"/api/v1/deliverables/share/{token}/download.md")
         tampered_view = client.get(f"/api/v1/deliverables/share/{token}x/view")
         tampered_pdf = client.get(f"/api/v1/deliverables/share/{token}x/download.pdf")
+        tampered_html = client.get(f"/api/v1/deliverables/share/{token}x/download.html")
+        tampered_md = client.get(f"/api/v1/deliverables/share/{token}x/download.md")
 
         assert viewed.status_code == 200
         assert "Rich report" in viewed.text
@@ -3158,8 +3332,14 @@ async def test_public_share_routes_bypass_session_auth_but_verify_token(
         assert downloaded.content == b"%PDF-public"
         assert downloaded.headers["content-type"] == "application/pdf"
         assert downloaded.headers["cache-control"] == "no-store"
+        assert downloaded_html.status_code == 200
+        assert downloaded_html.headers["cache-control"] == "no-store"
+        assert downloaded_md.status_code == 200
+        assert downloaded_md.headers["cache-control"] == "no-store"
         assert tampered_view.status_code == 404
         assert tampered_pdf.status_code == 404
+        assert tampered_html.status_code == 404
+        assert tampered_md.status_code == 404
 
         assert link.expires_at is not None
         monkeypatch.setattr(
@@ -3169,8 +3349,12 @@ async def test_public_share_routes_bypass_session_auth_but_verify_token(
         )
         expired_view = client.get(f"/api/v1/deliverables/share/{token}/view")
         expired_pdf = client.get(f"/api/v1/deliverables/share/{token}/download.pdf")
+        expired_html = client.get(f"/api/v1/deliverables/share/{token}/download.html")
+        expired_md = client.get(f"/api/v1/deliverables/share/{token}/download.md")
         assert expired_view.status_code == 404
         assert expired_pdf.status_code == 404
+        assert expired_html.status_code == 404
+        assert expired_md.status_code == 404
 
 
 @pytest.mark.asyncio

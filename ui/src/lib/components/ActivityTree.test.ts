@@ -62,7 +62,7 @@ describe('ActivityTree', () => {
     expect(identityTooltip).toHaveTextContent('Profile: developer-senior');
     expect(identityTooltip).toHaveTextContent('Kind: Managed');
     expect(identityTooltip.parentElement).toBe(document.body);
-    expect(identityTooltip).toHaveClass('z-[2147483647]', 'whitespace-pre-line', 'bg-slate-950');
+    expect(identityTooltip).toHaveClass('z-[2147483647]', 'whitespace-pre-line', 'bg-elevated');
     expect(screen.getByText('Running')).toBeTruthy();
     expect(screen.getAllByTestId('activity-avatar-orbit')).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'View session child' })).toHaveClass('scrollbar-hidden-x');
@@ -181,7 +181,7 @@ describe('ActivityTree', () => {
     const rotated = { ...node('rotated', 'root', 'closed'), backing_session_ids: ['session-old-rotation'] };
     render(ActivityTree, { nodes: [root, rotated], focusedSessionId: 'session-old-rotation' });
     expect(screen.getByTestId('activity-node-rotated')).toBeTruthy();
-    expect(screen.getByTestId('activity-node-rotated').firstElementChild).toHaveClass('border-sky-400/60');
+    expect(screen.getByTestId('activity-node-rotated').firstElementChild).toHaveClass('border-accent');
     expect(screen.getByRole('button', { name: 'Collapse root' })).toHaveAttribute('aria-expanded', 'true');
   });
 
@@ -331,7 +331,7 @@ describe('ActivityTree', () => {
     expect(screen.getByTestId('activity-node-managed')).toBeTruthy();
     expect(screen.getByTestId('activity-node-delegate')).toBeTruthy();
     expect(screen.getByTestId('activity-node-sibling')).toBeTruthy();
-    expect(screen.getByTestId('activity-node-delegate').firstElementChild).toHaveClass('border-sky-400/60');
+    expect(screen.getByTestId('activity-node-delegate').firstElementChild).toHaveClass('border-accent');
     expect(screen.getByTestId('activity-node-delegate').firstElementChild).not.toHaveClass('ring-1');
     expect(screen.getByTestId('activity-node-managed').firstElementChild).toHaveClass('border-transparent');
     expect(screen.queryByText(/Main is the top session/)).toBeNull();

@@ -1,11 +1,18 @@
 <script lang="ts">
+  import { setContext } from 'svelte';
+  import { writable } from 'svelte/store';
+  import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
+  import AssistantDeliverableBlock from '$lib/components/AssistantDeliverableBlock.svelte';
   import { goto } from '$app/navigation';
 
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import ConversationModalWorkspace from '$lib/components/dashboard/ConversationModalWorkspace.svelte';
+  import CompactConversationChat from '$lib/components/chat-v2/CompactConversationChat.svelte';
   import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';
   import ScheduleDashboardModal from '$lib/components/dashboard/ScheduleDashboardModal.svelte';
+  import ScheduleDetailWorkspace from '$lib/components/schedules/ScheduleDetailWorkspace.svelte';
   import TaskBrief from '$lib/components/task-cockpit/TaskBrief.svelte';
   import AttentionPanel from '$lib/components/task-cockpit/AttentionPanel.svelte';
   import WorkflowPhases from '$lib/components/task-cockpit/WorkflowPhases.svelte';
@@ -18,6 +25,8 @@
   import { api, asApiError } from '$lib/api/client';
   import { auth } from '$lib/stores/auth';
   import type { Agent, Conversation, QuestionSetAnswer, StepRun, TaskControlChatResponse, TaskDetail } from '$lib/types/api';
+  import PinConversationButton from '$lib/components/chat/PinConversationButton.svelte';
+  import { conversationWorkspace as retainedWorkspace } from '$lib/dashboard/conversation-workspace';
 
   type TaskTab = 'description' | 'steps' | 'control' | 'control-chat' | 'activity' | 'deliverable';
 
@@ -37,6 +46,9 @@
     inspectorOpen = true,
     inspectorControlInHeader = false,
     onInspectorStateChange,
+    onContinueConversation,
+    onOpenTask,
+    canMutateSchedule = true,
   } = $props<{
     kind: 'task' | 'conversation' | 'schedule';
     taskId?: string | null;
@@ -57,6 +69,9 @@
     inspectorOpen?: boolean;
     inspectorControlInHeader?: boolean;
     onInspectorStateChange?: (open: boolean) => void;
+    onContinueConversation?: (conversation: Conversation) => void;
+    onOpenTask?: (taskId: string) => void;
+    canMutateSchedule?: boolean;
   }>();
 
   let conversationTab = $state<'chat' | 'activity'>('chat');
@@ -65,9 +80,17 @@
   let error = $state<string | null>(null);
   let refreshing = $state(false);
   let refreshError = $state<string | null>(null);
+  // Load/refresh errors stay hidden while the global connection banner
+  // applies; the detail reloads when the connection is restored.
+  const net = useSectionConnectivity({
+    hasError: () => Boolean(error || refreshError),
+    retry: () => load(false),
+  });
   let actionBusy = $state(false);
   let actionError = $state<string | null>(null);
   let taskDetail = $state<TaskDetail | null>(null);
+  const sharingPermission = writable(false);
+  setContext(DELIVERABLE_SHARING_CONTEXT, sharingPermission);
   let taskChat = $state<TaskControlChatResponse | null>(null);
   let taskChatLoading = $state(false);
   let taskChatError = $state<string | null>(null);
@@ -94,19 +117,25 @@
     modalInspectorOpen = inspectorOpen;
   });
 
-  const taskTabs = [
+  const taskTabs = $derived([
     { id: 'description', label: 'Description' },
     { id: 'steps', label: 'Steps' },
     { id: 'control', label: 'Control' },
     { id: 'control-chat', label: 'Control chat' },
     { id: 'activity', label: 'Activity' },
     { id: 'deliverable', label: 'Final deliverable' }
-  ];
+  ].filter((tab) => canMutateTask || !['control-chat', 'activity'].includes(tab.id)));
   const resolvedConversationId = $derived(kind === 'task' ? taskChat?.conversation_id ?? null : conversationId);
   const agentId = $derived(kind === 'task' ? taskDetail?.agent_id ?? null : conversationDetail?.agent_id ?? null);
   const agent = $derived<Agent | null>(agents.find((item: Agent) => item.agent_id === agentId) ?? null);
   const statusLabel = $derived(kind === 'task' ? taskDetail?.status ?? null : conversationDetail?.status ?? null);
-  const canMutateTask = $derived($auth.user !== null && $auth.user.role !== 'viewer');
+  const canMutateTask = $derived(
+    $auth.user !== null && $auth.user.role !== 'viewer'
+      && taskDetail?.created_by === $auth.user.email
+  );
+  $effect(() => {
+    sharingPermission.set(kind === 'task' ? canMutateTask : Boolean(conversationDetail && !conversationDetail.is_readonly_for_caller));
+  });
   const title = $derived(kind === 'task' ? taskDetail?.title ?? 'Task' : conversationDetail?.title ?? 'Conversation');
   const canonicalHref = $derived(kind === 'task' && taskId ? `/tasks/${taskId}` : conversationId ? `/chat/${conversationId}` : null);
   const canonicalDeliverableId = $derived(
@@ -128,7 +157,7 @@
   );
 
   async function loadTaskChat(): Promise<void> {
-    if (!taskId || taskChat || taskChatLoading) return;
+    if (!canMutateTask || !taskId || taskChat || taskChatLoading) return;
     taskChatLoading = true;
     taskChatError = null;
     try {
@@ -163,7 +192,9 @@
         taskDetail = detail;
         onMetadataChange?.({ title: detail.title ?? 'Task', status: detail.status, agentId: detail.agent_id });
         if (setDefaultTab) {
-          taskTab = ['completed', 'failed', 'cancelled'].includes(detail.status)
+          taskTab = detail.created_by !== $auth.user?.email
+            ? 'description'
+            : ['completed', 'failed', 'cancelled'].includes(detail.status)
             ? 'deliverable'
             : detail.pending_pause
               ? 'description'
@@ -173,6 +204,7 @@
         const detail = await api.conversations.detail(conversationId, { includeState: false });
         if (request !== loadRequest || requestKey !== boundKey) return 'superseded';
         conversationDetail = detail;
+        retainedWorkspace.updateConversation(detail);
         onMetadataChange?.({
           title: detail.title ?? 'Conversation',
           status: detail.status ?? null,
@@ -201,6 +233,7 @@
     actionError = null;
     try {
       await api.tasks.gateResponse(taskId, {
+        pause_id: activePause.pause_id,
         step_name: activePause.step_name,
         action,
         feedback: instruction?.trim() || null
@@ -208,6 +241,7 @@
       await load(false);
     } catch (caught) {
       actionError = asApiError(caught).message || 'Could not submit the task response.';
+      await load(false);
     } finally {
       actionBusy = false;
     }
@@ -365,6 +399,13 @@
 </script>
 
 {#if kind === 'schedule' && scheduleId}
+  {#if onOpenTask}
+    <DashboardModalShell title="Schedule" {embedded} {onClose} testId="dashboard-schedule-modal">
+      <div class="min-h-0 min-w-0 flex-1 overflow-auto">
+        {#key scheduleId}<ScheduleDetailWorkspace id={scheduleId} embedded canMutate={canMutateSchedule} onBack={onClose} {onOpenTask} />{/key}
+      </div>
+    </DashboardModalShell>
+  {:else}
   <ScheduleDashboardModal
     {scheduleId}
     {agents}
@@ -373,6 +414,7 @@
     {onClose}
     {onMetadataChange}
   />
+  {/if}
 {:else}
   <DashboardModalShell
     {title}
@@ -391,18 +433,18 @@
       ? () => { void toggleInspector(); }
       : undefined}
   >
-    {#if !loading && refreshError}
+    {#if !loading && refreshError && !net.hideErrors}
       <div
-        class="shrink-0 border-b border-amber-500/20 bg-amber-500/5 px-4 py-1.5 text-xs text-amber-200"
+        class="shrink-0 border-b border-warning-border bg-warning-subtle px-4 py-1.5 text-xs text-warning"
         data-testid="dashboard-entity-modal-refresh-status"
       >
         {`Could not refresh: ${refreshError}`}
       </div>
     {/if}
-    {#if loading}
-      <p class="p-6 text-center text-sm text-slate-400">Loading…</p>
+    {#if loading || (error && net.hideErrors)}
+      <p class="p-6 text-center text-sm text-muted">Loading…</p>
     {:else if error}
-      <div class="m-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" role="alert">
+      <div class="m-4 rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" role="alert">
         <p>{error}</p>
         <Button class="mt-3" size="sm" variant="secondary" onclick={() => void load()}>Try again</Button>
       </div>
@@ -424,18 +466,18 @@
       >
         {#if taskTab === 'description'}
           <div class="space-y-4">
-            {#if activePause}
+            {#if activePause && canMutateTask}
               <AttentionPanel pause={activePause} compact busy={actionBusy} onGate={respondToGate} onQuestion={respondToQuestion} />
             {:else if taskDetail.pending_pause}
-              <div class="rounded-2xl border border-amber-500/30 bg-amber-500/5 p-4" data-testid="task-attention-summary">
-                <p class="text-xs font-semibold uppercase tracking-[0.22em] text-amber-300">Attention</p>
-                <p class="mt-2 text-sm text-slate-200">
+              <div class="rounded-2xl border border-warning-border bg-warning-subtle p-4" data-testid="task-attention-summary">
+                <p class="text-xs font-semibold uppercase tracking-[0.22em] text-warning">Attention</p>
+                <p class="mt-2 text-sm text-foreground">
                   {taskDetail.pending_pause.question ?? 'This task needs your decision.'}
                 </p>
-                <p class="mt-1 text-xs text-slate-400">Open the full task to complete this protected action.</p>
+                <p class="mt-1 text-xs text-muted">Open the full task to complete this protected action.</p>
               </div>
             {/if}
-            {#if actionError}<p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{actionError}</p>{/if}
+            {#if actionError}<p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{actionError}</p>{/if}
             <TaskBrief
               task={taskDetail}
               workflowLabel={taskDetail.workflow_id ?? 'No workflow'}
@@ -448,14 +490,14 @@
             <WorkflowPhases
               projection={taskDetail.workflow_projection}
               onStepSelect={() => undefined}
-              onStepLogsOpen={(stepName) => { void openStepLogs(stepName); }}
-              onStepOutputOpen={(stepName) => { void openStepOutput(stepName); }}
+              onStepLogsOpen={canMutateTask ? (stepName) => { void openStepLogs(stepName); } : undefined}
+              onStepOutputOpen={canMutateTask ? (stepName) => { void openStepOutput(stepName); } : undefined}
             />
             <TaskProgressPanel projection={taskDetail.progress} />
             {#if stepViewerLoading}
-              <p class="rounded-xl border border-slate-800 p-3 text-sm text-slate-400" data-testid="dashboard-step-viewer-loading">Loading step details…</p>
+              <p class="rounded-xl border border-separator p-3 text-sm text-muted" data-testid="dashboard-step-viewer-loading">Loading step details…</p>
             {:else if stepViewerError}
-              <p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{stepViewerError}</p>
+              <p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{stepViewerError}</p>
             {/if}
           </div>
         {:else if taskTab === 'control'}
@@ -470,25 +512,51 @@
             <TaskControlChat chat={taskChat} {agent} onSent={async () => { await load(false); }} />
           </div>
         {:else if taskTab === 'control-chat' && taskChatLoading}
-          <p class="p-6 text-center text-sm text-slate-400">Opening control chat…</p>
+          <p class="p-6 text-center text-sm text-muted">Opening control chat…</p>
         {:else if taskTab === 'control-chat' && taskChatError}
-          <div class="m-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-100" role="alert">
+          <div class="m-4 rounded-xl border border-warning-border bg-warning-subtle p-4 text-sm text-warning" role="alert">
             <p>{taskChatError}</p>
             <Button class="mt-3" size="sm" variant="secondary" onclick={() => { taskChatError = null; void loadTaskChat(); }}>Try again</Button>
           </div>
         {:else if taskTab === 'activity'}
           <TaskWorkPanel stepRuns={taskDetail.step_runs} {agents} {canonicalDeliverableId} view="activity" />
-        {:else if taskTab === 'deliverable'}
-          <TaskWorkPanel
+          {:else if taskTab === 'deliverable'}
+            {#if !canMutateTask}
+              {#if canonicalDeliverableId}
+                <AssistantDeliverableBlock
+                  item={{ id: canonicalDeliverableId, kind: 'assistant_deliverable', deliverableId: canonicalDeliverableId, format: 'markdown' }}
+                  loadDeliverable={(id) => api.deliverables.get(id)}
+                  allowSharing={false}
+                />
+              {:else}
+                <p class="text-sm text-muted">No published final deliverable. Other outputs are available in the project's Resources section.</p>
+              {/if}
+            {:else}
+            <TaskWorkPanel
             stepRuns={taskDetail.step_runs}
             {agents}
             {canonicalDeliverableId}
             view="deliverable"
             deliverableCollapsedByDefault={false}
-          />
+            />
+            {/if}
         {/if}
       </div>
     {:else if kind === 'conversation' && resolvedConversationId}
+      {#if !embedded}
+        <div class="flex shrink-0 justify-end border-b border-separator px-3"><PinConversationButton conversation={conversationDetail} /></div>
+      {/if}
+      {#if conversationDetail?.is_readonly_for_caller}
+        <div class="flex items-center justify-between gap-3 border-b border-separator px-4 py-3 text-sm text-secondary" data-testid="shared-modal-readonly">
+          <span>Shared conversation · Read-only</span>
+          {#if onContinueConversation && conversationDetail.can_continue}
+            <Button size="sm" variant="secondary" onclick={() => onContinueConversation?.(conversationDetail!)}>Continue in my chat</Button>
+          {/if}
+        </div>
+        <div class="min-h-0 flex-1">
+          <CompactConversationChat conversationId={resolvedConversationId} {agent} readOnly embedded />
+        </div>
+      {:else}
       <ConversationModalWorkspace
         bind:this={conversationWorkspace}
         conversationId={resolvedConversationId}
@@ -500,6 +568,7 @@
         inspectorControlInHeader={modalInspectorControlInHeader}
         onInspectorStateChange={handleInspectorStateChange}
       />
+      {/if}
     {/if}
   </DashboardModalShell>
 {/if}

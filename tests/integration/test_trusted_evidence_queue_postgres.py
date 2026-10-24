@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -16,7 +17,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from cognis.core.remember_queue import RememberRetryQueue
+from cognis.core.remember_queue import RememberRetryQueue, _EvidenceUnavailableError
 from cognis.core.trusted_evidence import (
     EVIDENCE_QUEUE_KIND,
     ORDINARY_ASSISTANT_QUEUE_KIND,
@@ -30,7 +31,9 @@ from cognis.core.trusted_evidence import (
 from cognis.core.trusted_evidence import (
     event_hash as calculate_event_hash,
 )
+from cognis.models.session import ConversationLineage
 from cognis.providers.memory.evidence import EvidenceRememberRequest
+from cognis.store import queries
 from cognis.store.database import create_session_factory
 from cognis.store.models import Agent, Conversation, RememberQueueRow, Session, User
 
@@ -539,6 +542,62 @@ async def test_expired_evidence_dispatch_lease_is_taken_over_once() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_session",
+        "missing_conversation",
+        "rotated_stream",
+        "session_tenant",
+        "payload_binding",
+    ],
+)
+async def test_locked_signing_authority_rejects_deleted_rotated_or_mismatched_rows(change) -> None:
+    async with _database() as (factory, user_email):
+        payload, body = _signing_payload_and_body(user_email)
+        async with factory() as db:
+            if change in {"missing_session", "missing_conversation"}:
+                await db.execute(sa.delete(Session).where(Session.session_id == "cognis-session"))
+                if change == "missing_conversation":
+                    await db.execute(
+                        sa.delete(Conversation).where(
+                            Conversation.conversation_id == "conversation"
+                        )
+                    )
+            elif change == "rotated_stream":
+                await db.execute(
+                    sa.update(Session)
+                    .where(Session.session_id == "cognis-session")
+                    .values(intaris_session_id="rotated-stream")
+                )
+            elif change == "session_tenant":
+                db.add(User(email="other-tenant@test.local"))
+                await db.flush()
+                await db.execute(
+                    sa.update(Session)
+                    .where(Session.session_id == "cognis-session")
+                    .values(user_email="other-tenant@test.local")
+                )
+            else:
+                await queries.create_conversation(
+                    db, user_email, "agent", "chat", conversation_id="other-conversation"
+                )
+                payload["conversation_id"] = "other-conversation"
+            await db.commit()
+        auth = Mock()
+        queue = RememberRetryQueue(
+            SimpleNamespace(auth_provider=auth),
+            session_factory=factory,
+            trusted_evidence_admission_key=ADMISSION_KEY,
+        )
+        with pytest.raises((ValueError, _EvidenceUnavailableError)):
+            await queue._revalidate_evidence_signing_inputs(
+                SimpleNamespace(item_id=payload["item_id"], payload=payload), body
+            )
+        auth.sign_evidence_jwt.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_two_controllers_claim_ordinary_once_without_history_reconciliation() -> None:
     async with _database() as (factory, user_email):
         remember_called = asyncio.Event()
@@ -605,3 +664,188 @@ async def test_two_controllers_claim_ordinary_once_without_history_reconciliatio
 
         assert worker.calls == 1
         assert all(not hasattr(queue, "_reconciliation_task") for queue in queues)
+
+
+def _signing_payload_and_body(user_email: str) -> tuple[dict[str, Any], EvidenceRememberRequest]:
+    payload = _evidence_payload("a" * 64, user_email, max_attempts=2)
+    admission = payload[TRUSTED_EVIDENCE_ADMISSION_KEY]
+    payload["admission_event_id"] = admission["event_binding"]["event_id"]
+    payload["marker_admitted_at"] = admission["admitted_at"]
+    body = EvidenceRememberRequest.model_validate(
+        {
+            "version": 1,
+            "actor": {"user_id": user_email, "owner_id": user_email},
+            "event": {
+                "id": "intaris-session:7",
+                "event_hash": payload["event_hash"],
+                "cognis_session_id": "cognis-session",
+                "conversation_id": "conversation",
+                "turn_id": "turn",
+            },
+            "messages": [{"role": "user", "content": "event"}],
+        }
+    )
+    return payload, body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["evidence", "lineage"])
+@pytest.mark.parametrize("drift", [False, True])
+async def test_todo_fk_lock_schedule_completes_without_deadlock(operation, drift) -> None:
+    """Hold C, observe the real wait on C, then flush TODO's FK lock on S."""
+    async with _database() as (factory, user_email):
+        async with factory() as setup:
+            await setup.execute(
+                sa.update(Conversation)
+                .where(Conversation.conversation_id == "conversation")
+                .values(active_session_id="cognis-session")
+            )
+            await setup.commit()
+        engine = factory.kw["bind"]
+        attempting_conversation = asyncio.Event()
+        actor_pid: list[int] = []
+        payload, body = _signing_payload_and_body(user_email)
+        auth = Mock()
+
+        class ObservedSession(AsyncSession):
+            async def execute(self, statement, *args, **kwargs):
+                if getattr(
+                    statement, "_for_update_arg", None
+                ) is not None and "FROM conversations" in str(statement):
+                    actor_pid.append(await self.scalar(sa.text("SELECT pg_backend_pid()")))
+                    attempting_conversation.set()
+                return await super().execute(statement, *args, **kwargs)
+
+        actor_factory = async_sessionmaker(engine, class_=ObservedSession, expire_on_commit=False)
+        queue = RememberRetryQueue(
+            SimpleNamespace(auth_provider=auth),
+            session_factory=actor_factory,
+            trusted_evidence_admission_key=ADMISSION_KEY,
+        )
+
+        async def actor():
+            if operation == "evidence":
+                item = SimpleNamespace(item_id=payload["item_id"], payload=payload)
+                return await queue._revalidate_evidence_signing_inputs(item, body)
+            async with actor_factory() as db:
+                # Exercise preloaded identity-map state as well as fresh reads.
+                source = await db.get(Session, "cognis-session")
+                result = await queries.create_lineage_conversation(
+                    db,
+                    user_email,
+                    "agent",
+                    "chat",
+                    lineage=ConversationLineage(
+                        kind="conversation",
+                        source_conversation_id="conversation",
+                        source_session_id=source.session_id,
+                    ),
+                )
+                await db.commit()
+                return result
+
+        async with asyncio.timeout(10):
+            async with factory() as todos:
+                await queries.replace_conversation_todos(
+                    todos,
+                    "conversation",
+                    [{"content": "Lock regression", "status": "pending"}],
+                    source_session_id="cognis-session",
+                )
+                task = asyncio.create_task(actor())
+                try:
+                    await attempting_conversation.wait()
+                    async with factory() as observer:
+                        while not await observer.scalar(
+                            sa.text("SELECT cardinality(pg_blocking_pids(:pid)) > 0"),
+                            {"pid": actor_pid[0]},
+                        ):
+                            await asyncio.sleep(0.001)
+                    if drift:
+                        await queries.create_conversation(
+                            todos, user_email, "agent", "chat", conversation_id="moved-conversation"
+                        )
+                        await todos.execute(
+                            sa.update(Session)
+                            .where(Session.session_id == "cognis-session")
+                            .values(conversation_id="moved-conversation")
+                        )
+                    await queries.replace_session_todos(
+                        todos,
+                        "cognis-session",
+                        [{"content": "Lock regression", "status": "pending"}],
+                    )
+                    await todos.commit()
+                    if drift:
+                        with pytest.raises((_EvidenceUnavailableError, PermissionError)):
+                            await task
+                        auth.sign_evidence_jwt.assert_not_called()
+                    else:
+                        await task
+                        if operation == "evidence":
+                            auth.sign_evidence_jwt.assert_called_once()
+                    async with factory() as db:
+                        assert len(await queries.list_session_todos(db, "cognis-session")) == 1
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_presigning_database_failure_rolls_back_and_durably_exhausts_retries(
+    monkeypatch,
+) -> None:
+    async with _database() as (factory, user_email):
+        payload, body = _signing_payload_and_body(user_email)
+        worker = SimpleNamespace(auth_provider=Mock(), remember_evidence=AsyncMock())
+        queue = RememberRetryQueue(
+            worker,
+            session_factory=factory,
+            trusted_evidence_admission_key=ADMISSION_KEY,
+        )
+        queue.backoff_max = 3
+        monkeypatch.setattr(queue, "_resolve_evidence_body", AsyncMock(return_value=body))
+        monkeypatch.setattr(queue, "_hard_memory_disable_applies", AsyncMock(return_value=False))
+        await queue.enqueue(payload)
+
+        class FailingSigningSession(AsyncSession):
+            async def execute(self, statement, *args, **kwargs):
+                if getattr(
+                    statement, "_for_update_arg", None
+                ) is not None and "FROM sessions" in str(statement):
+                    await super().execute(
+                        sa.update(Conversation)
+                        .where(Conversation.conversation_id == "conversation")
+                        .values(title="must roll back")
+                    )
+                    # Real PostgreSQL transaction failure before signing.
+                    await super().execute(sa.text("SELECT 1 / 0"))
+                return await super().execute(statement, *args, **kwargs)
+
+        queue._session_factory = async_sessionmaker(
+            factory.kw["bind"], class_=FailingSigningSession, expire_on_commit=False
+        )
+        for attempt in (1, 2):
+            items = await queue._claim_due_durable_items(1)
+            assert len(items) == 1
+            await queue._process_evidence_item(items[0])
+            async with factory() as db:
+                row = await db.get(RememberQueueRow, payload["item_id"])
+                conversation = await db.get(Conversation, "conversation")
+                assert conversation.title is None
+                assert row.attempts == attempt
+                assert row.lease_token is None
+                assert row.lease_expires_at is None
+                if attempt == 1:
+                    assert row.status == "pending"
+                    delay = (row.next_retry_at - row.updated_at).total_seconds()
+                    assert delay == 2
+                    assert await queue._claim_due_durable_items(1) == []
+                    row.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+                    await db.commit()
+                else:
+                    assert row.status == "abandoned"
+            worker.auth_provider.sign_evidence_jwt.assert_not_called()
+            worker.remember_evidence.assert_not_awaited()
+        assert await queue._claim_due_durable_items(1) == []

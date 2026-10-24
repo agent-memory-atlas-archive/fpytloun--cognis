@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import quote
 
 import sqlalchemy as sa
 from sqlalchemy import select
@@ -15,14 +18,18 @@ from cognis.api.models import (
     DashboardIssuesResponse,
     DashboardIssuesSummary,
 )
+from cognis.core.provider_monitor import project_monitor
 from cognis.models.tool import effective_mcp_auth_config
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import (
     ExecutorRow,
+    LLMProvider,
     MCPOAuthTokenRow,
     MCPServerRow,
     NotificationRow,
+    ProviderMonitorSnapshot,
     Schedule,
+    Task,
 )
 from cognis.store.queries import mcp_oauth_resource_key
 
@@ -32,6 +39,22 @@ TOOL_OBSERVATION_STALE_AFTER = timedelta(minutes=10)
 EXECUTOR_OFFLINE_GRACE = timedelta(seconds=30)
 _SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 _UNHEALTHY_RUNTIME_STATES = {"offline", "stale", "blocked", "error", "unavailable"}
+
+
+@dataclass(frozen=True)
+class ExecutorIssueSnapshot:
+    """Detached issue inputs; tool inventories are never hydrated."""
+
+    executor_id: str
+    name: str
+    status: str
+    executor_type: str
+    runtime_state: str | None
+    last_observed_at: datetime | None
+    desired_config_version: int | None
+    applied_config_version: int | None
+    runtime_metadata: Any
+    has_observed_tools: bool
 
 
 def schedule_incident_token(
@@ -53,12 +76,37 @@ async def collect_dashboard_issues(
     *,
     user_email: str,
     now: datetime | None = None,
+    candidate_limit: int | None = CANDIDATE_LIMIT,
+    issue_limit: int | None = ISSUE_LIMIT,
 ) -> DashboardIssuesResponse:
     generated_at = _as_utc(now or datetime.now(UTC))
+    # PostgreSQL JSON is stored as text: casting serializes the entire catalog.
+    # Inspect its type instead; empty arrays still represent an observation.
+    observed_tools_present = (
+        sa.func.coalesce(sa.func.json_typeof(ExecutorRow.observed_tools) != "null", False)
+        if session.get_bind().dialect.name == "postgresql"
+        # SQLite already stores JSON as text; compare its stored null sentinel
+        # directly rather than parsing multi-megabyte arrays just for presence.
+        else sa.and_(
+            ExecutorRow.observed_tools.is_not(None),
+            ExecutorRow.observed_tools != sa.literal("null", type_=sa.String),
+        )
+    )
     executor_rows = list(
         (
-            await session.scalars(
-                select(ExecutorRow)
+            await session.execute(
+                select(
+                    ExecutorRow.executor_id,
+                    ExecutorRow.name,
+                    ExecutorRow.status,
+                    ExecutorRow.executor_type,
+                    ExecutorRow.runtime_state,
+                    ExecutorRow.last_observed_at,
+                    ExecutorRow.desired_config_version,
+                    ExecutorRow.applied_config_version,
+                    ExecutorRow.runtime_metadata,
+                    observed_tools_present.label("has_observed_tools"),
+                )
                 .where(
                     sa.or_(
                         ExecutorRow.owner_email == user_email,
@@ -67,7 +115,7 @@ async def collect_dashboard_issues(
                     )
                 )
                 .order_by(ExecutorRow.executor_id)
-                .limit(CANDIDATE_LIMIT)
+                .limit(candidate_limit)
             )
         ).all()
     )
@@ -82,7 +130,7 @@ async def collect_dashboard_issues(
                     )
                 )
                 .order_by(MCPServerRow.server_id)
-                .limit(CANDIDATE_LIMIT)
+                .limit(candidate_limit)
             )
         ).all()
     )
@@ -100,14 +148,21 @@ async def collect_dashboard_issues(
                     ),
                 )
                 .order_by(MCPOAuthTokenRow.token_id)
-                .limit(CANDIDATE_LIMIT)
+                .limit(candidate_limit)
             )
         ).all()
     )
     schedule_rows = list(
         (
-            await session.scalars(
-                select(Schedule)
+            await session.execute(
+                select(Schedule, Task)
+                .outerjoin(
+                    Task,
+                    sa.and_(
+                        Task.task_id == Schedule.last_terminal_task_id,
+                        Task.created_by == user_email,
+                    ),
+                )
                 .outerjoin(
                     NotificationRow,
                     NotificationRow.notification_id
@@ -128,14 +183,18 @@ async def collect_dashboard_issues(
                     ),
                 )
                 .order_by(Schedule.updated_at.desc(), Schedule.schedule_id)
-                .limit(CANDIDATE_LIMIT)
+                .limit(candidate_limit)
             )
         ).all()
     )
 
     issues: list[DashboardIssue] = []
     for row in executor_rows:
-        issues.extend(_executor_issues(row, server_by_id=server_by_id, now=generated_at))
+        issues.extend(
+            _executor_issues(
+                ExecutorIssueSnapshot(*row), server_by_id=server_by_id, now=generated_at
+            )
+        )
     oauth_by_server: dict[str, list[MCPOAuthTokenRow]] = {}
     for oauth_row in oauth_rows:
         oauth_by_server.setdefault(oauth_row.mcp_server_id, []).append(oauth_row)
@@ -145,12 +204,50 @@ async def collect_dashboard_issues(
             issue = _oauth_issue(rows, server)
             if issue is not None:
                 issues.append(issue)
-    for schedule in schedule_rows:
-        issues.append(_schedule_issue(schedule))
+    for schedule, task in schedule_rows:
+        issue = _schedule_issue(schedule)
+        if task is not None:
+            issue.task_id = task.task_id
+            issue.task_retry_available = task.status == "failed"
+        issues.append(issue)
+
+    provider_rows = (
+        await session.execute(
+            select(LLMProvider, ProviderMonitorSnapshot)
+            .join(ProviderMonitorSnapshot)
+            .where(
+                LLMProvider.status == "active",
+                LLMProvider.owner_email.in_([user_email, SYSTEM_USER_EMAIL]),
+            )
+            .order_by(LLMProvider.provider_id)
+            .limit(candidate_limit)
+        )
+    ).all()
+    for provider, snapshot in provider_rows:
+        observation = project_monitor(provider, snapshot, now=generated_at)
+        if observation.alert_severity:
+            unhealthy = observation.health_status in {"error", "warning"} or bool(observation.error)
+            issues.append(
+                DashboardIssue(
+                    id=f"provider-monitor:{provider.provider_id}",
+                    severity=observation.alert_severity,
+                    kind="provider_health" if unhealthy else "provider_quota",
+                    title=f"{provider.display_name}: {'health check needs attention' if unhealthy else 'low available quota'}",
+                    detail=observation.error or observation.health_detail
+                    if unhealthy
+                    else f"Remaining usage is at or below the configured {observation.alert_severity} threshold.",
+                    resource=DashboardIssueResource(
+                        type="llm_provider", id=provider.provider_id, label=provider.display_name
+                    ),
+                    observed_at=observation.checked_at,
+                    action_url=f"/settings?tab=providers&provider={quote(provider.provider_id, safe='')}",
+                    action_label="Provider",
+                )
+            )
 
     issues.sort(key=_issue_sort_key)
     total = len(issues)
-    selected = issues[:ISSUE_LIMIT]
+    selected = issues[:issue_limit]
     return DashboardIssuesResponse(
         generated_at=generated_at,
         issues=selected,
@@ -159,17 +256,17 @@ async def collect_dashboard_issues(
             critical=sum(issue.severity == "critical" for issue in issues),
             warning=sum(issue.severity == "warning" for issue in issues),
             info=sum(issue.severity == "info" for issue in issues),
-            truncated=total > ISSUE_LIMIT
-            or len(executor_rows) == CANDIDATE_LIMIT
-            or len(server_rows) == CANDIDATE_LIMIT
-            or len(oauth_rows) == CANDIDATE_LIMIT
-            or len(schedule_rows) == CANDIDATE_LIMIT,
+            truncated=(issue_limit is not None and total > issue_limit)
+            or any(
+                len(rows) == candidate_limit
+                for rows in (executor_rows, server_rows, oauth_rows, schedule_rows, provider_rows)
+            ),
         ),
     )
 
 
 def _executor_issues(
-    row: ExecutorRow,
+    row: ExecutorIssueSnapshot,
     *,
     server_by_id: dict[str, MCPServerRow],
     now: datetime,
@@ -229,7 +326,7 @@ def _executor_issues(
             )
         )
     if row.executor_type == "websocket" and runtime_state in {"active", "degraded"}:
-        if observed_at is None or row.observed_tools is None:
+        if observed_at is None or not row.has_observed_tools:
             issues.append(
                 _issue(
                     kind="tool_observation_missing",
@@ -338,7 +435,7 @@ def _schedule_issue(
         title=(f"{row.name} was automatically disabled" if auto_disabled else f"{row.name} failed"),
         detail=f"{int(row.consecutive_errors or 0)} consecutive failures.",
         observed_at=_optional_utc(row.updated_at),
-        action_url=f"/schedules/{row.schedule_id}",
+        action_url=f"/schedules/{quote(row.schedule_id, safe='')}",
         action_label="View schedule",
         dismiss_token=schedule_incident_token(
             row.schedule_id,

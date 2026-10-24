@@ -213,7 +213,7 @@ def test_classify_llm_exception_artifact_fetch_payload() -> None:
         body={
             "error": {
                 "param": "url",
-                "details": {"url": "https://cognis.fpy.cz/api/v1/artifacts/content/a/b.png"},
+                "details": {"url": "https://cognis.example.com/api/v1/artifacts/content/a/b.png"},
             }
         },
     )
@@ -221,7 +221,9 @@ def test_classify_llm_exception_artifact_fetch_payload() -> None:
     payload = classify_llm_exception(exc)
 
     assert payload["category"] == MidStreamErrorCategory.ARTIFACT_FETCH.value
-    assert payload["artifact_urls"] == ["https://cognis.fpy.cz/api/v1/artifacts/content/a/b.png"]
+    assert payload["artifact_urls"] == [
+        "https://cognis.example.com/api/v1/artifacts/content/a/b.png"
+    ]
 
 
 def test_classify_llm_exception_codex_attachment_download_timeout() -> None:
@@ -479,14 +481,13 @@ def test_direct_codex_prompt_cache_key_disabled_and_rejection_cached(
         status="active",
     )
 
-    disabled = _apply_responses_request_defaults(
+    default = _apply_responses_request_defaults(
         {},
         provider=provider,
         resolved_model="gpt-5.6-sol",
         instructions="stable prefix",
         session_id=session_id,
     )
-    provider.config["use_prompt_cache_key"] = True
     rejected = _apply_responses_request_defaults(
         {},
         provider=provider,
@@ -495,9 +496,30 @@ def test_direct_codex_prompt_cache_key_disabled_and_rejection_cached(
         session_id=session_id,
         prompt_cache_key_broken_keys={("codex", "gpt-5.6-sol")},
     )
+    provider.config["use_prompt_cache_key"] = False
+    disabled = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="stable prefix",
+        session_id=session_id,
+    )
+    provider.config.pop("use_prompt_cache_key")
+    monkeypatch.setenv("COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED", "false")
+    env_disabled = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="stable prefix",
+        session_id=session_id,
+    )
 
-    assert "prompt_cache_key" not in disabled
+    # Direct Codex keys the cache by session by default, like the Codex CLI.
+    assert default["prompt_cache_key"] == "9f1c6a48-5c5d-4f98-ae57-82bd54017773"
+    assert "prompt_cache_retention" not in default
     assert "prompt_cache_key" not in rejected
+    assert "prompt_cache_key" not in disabled
+    assert "prompt_cache_key" not in env_disabled
 
 
 def _jwt_with_claims(claims: Mapping[str, object]) -> str:
@@ -893,7 +915,7 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
             },
         ]
 
-    monkeypatch.setattr(LLMService, "_prepare_direct_codex_messages", _prepare)
+    monkeypatch.setattr(LLMService, "_prepare_native_image_messages", _prepare)
     result = await provider.generate(
         messages=[
             {"role": "system", "content": "Answer tersely."},
@@ -915,6 +937,7 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
             "owner_email": "owner@example.com",
             "conversation_id": "conv_123",
             "agent_id": "agent_123",
+            "session_id": None,
         }
     ]
     assert result["choices"][0]["message"]["content"] == "hello"
@@ -1050,8 +1073,9 @@ async def test_chatgpt_json_generate_uses_streaming_direct_codex_transport(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_event_type", ["response.failed", "error"])
 async def test_chatgpt_json_generate_retries_stream_without_reasoning_summary(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, failure_event_type: str
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -1077,7 +1101,7 @@ async def test_chatgpt_json_generate_retries_stream_without_reasoning_summary(
 
     async def _failing_stream() -> object:
         yield {
-            "type": "response.failed",
+            "type": failure_event_type,
             "response": {"status": "failed"},
             "error": {
                 "message": "Unsupported parameter: reasoning.summary",
@@ -1187,7 +1211,7 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
             }
         ]
 
-    monkeypatch.setattr(LLMService, "_prepare_direct_codex_messages", _prepare)
+    monkeypatch.setattr(LLMService, "_prepare_native_image_messages", _prepare)
     chunks = [
         chunk
         async for chunk in provider.stream_generate(
@@ -3036,7 +3060,7 @@ def test_reasoning_translation_maps_none_to_google_thinking_budget_zero() -> Non
         model_info=DEFAULT_MODEL_INFO.model_copy(update={"supports_reasoning": True}),
     )
 
-    assert prepared.request_kwargs["thinking_config"] == {"thinking_budget": 0}
+    assert prepared.request_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 0}
 
 
 def test_reasoning_translation_strips_sampling_and_translates_max_tokens() -> None:
@@ -3402,7 +3426,7 @@ async def test_litellm_provider_does_not_infer_native_apply_patch_for_compatible
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_id", ["gpt-5.5", "gpt-6-sol", "gpt-6-luna"])
+@pytest.mark.parametrize("model_id", ["gpt-5.5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
 async def test_litellm_provider_infers_native_apply_patch_for_direct_openai(
     tmp_path: object,
     model_id: str,
@@ -3426,7 +3450,16 @@ async def test_litellm_provider_infers_native_apply_patch_for_direct_openai(
 
     assert model_info.supports_responses_api is True
     assert model_info.supports_openai_apply_patch is True
-    if model_id.startswith("gpt-6-"):
+    if model_id == "gpt-6.1-sol":
+        assert model_info.context_window == 1_050_000
+        assert model_info.max_input_tokens == 922_000
+        assert model_info.max_context_window == 1_050_000
+        assert model_info.max_output_tokens == 128_000
+        assert model_info.reasoning_efforts == ["low", "medium", "high", "xhigh", "max"]
+        assert model_info.supports_vision is True
+        assert model_info.supports_tool_search is True
+        assert model_info.openai_apply_patch_tool_type == "freeform"
+    elif model_id.startswith("gpt-6-"):
         assert model_info.context_window == 400_000
         assert model_info.max_input_tokens == 272_000
         assert model_info.max_context_window == 1_000_000
@@ -3889,6 +3922,103 @@ async def test_litellm_provider_maps_ollama_context_window_to_num_ctx(
     assert result["choices"][0]["message"]["content"] == "ok"
     assert captured["model"] == "ollama/llama3.2"
     assert captured["num_ctx"] == 16384
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("llm_api", ["chat_completions", "responses"])
+async def test_provider_boundary_strips_first_turn_markers_for_executor(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, stream: bool, llm_api: str
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={"preset": "ollama", "default_model": "llama3.2"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    async def _fake_generate(
+        _model: str,
+        messages: list[dict[str, object]],
+        _provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        captured["messages"] = messages
+        captured["kwargs"] = request_kwargs
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    async def _fake_stream(
+        _model: str,
+        messages: list[dict[str, object]],
+        _provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ):
+        captured["messages"] = messages
+        captured["kwargs"] = request_kwargs
+        yield {"choices": [{"delta": {"content": "ok"}}]}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_generate)
+    monkeypatch.setattr(provider, "_executor_stream_generate", _fake_stream)
+    messages = [
+        {
+            "role": "user",
+            "content": "first turn",
+            "_candidate_history": True,
+            "_candidate_current_turn": True,
+            "_responses_output_items": [
+                {"type": "reasoning", "id": "rs_replay", "encrypted_content": "sealed"}
+            ],
+        }
+    ]
+
+    if stream:
+        chunks = [
+            chunk
+            async for chunk in provider.stream_generate(
+                messages=messages,
+                model="llama3.2",
+                cognis_llm_api=llm_api,
+            )
+        ]
+        assert chunks
+    else:
+        result = await provider.generate(
+            messages=messages,
+            model="llama3.2",
+            cognis_llm_api=llm_api,
+        )
+        assert result["choices"]
+
+    provider_messages = captured["messages"]
+    assert isinstance(provider_messages, list)
+    assert provider_messages[0]["role"] == "user"
+    assert provider_messages[0]["content"] == "first turn"
+    assert "_candidate_history" not in provider_messages[0]
+    assert "_candidate_current_turn" not in provider_messages[0]
+    if llm_api == "responses":
+        assert (
+            provider_messages[0]["_responses_output_items"]
+            == messages[0]["_responses_output_items"]
+        )
+    else:
+        assert "_responses_output_items" not in provider_messages[0]
+    assert "_candidate_current_turn" in messages[0]
     await engine.dispose()
 
 
@@ -4424,7 +4554,7 @@ async def test_litellm_provider_explicit_anthropic_projection_for_openai_compati
         provider_id="meridian",
     )
 
-    assert captured["model"] == "openai/claude-via-meridian"
+    assert captured["model"] == "litellm_proxy/claude-via-meridian"
     messages = captured["messages"]
     assert isinstance(messages, list)
     assert all(message["role"] != "developer" for message in messages)
@@ -4766,6 +4896,221 @@ async def test_litellm_provider_generate_uses_responses_bridge_for_supported_mod
     ]
     assert captured["max_output_tokens"] == 123
     assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("llm_api", ["chat_completions", "responses"])
+async def test_public_generate_provider_transport_strips_controller_envelope_fields(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    llm_api: str,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _ChatResponse:
+        def model_dump(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    class _ResponsesResponse:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {"total_tokens": 1},
+            }
+
+    async def _chat_stream():
+        yield {"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+    async def _responses_stream():
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "ok"}
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _chat_stream() if stream else _ChatResponse()
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _responses_stream() if stream else _ResponsesResponse()
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    if llm_api == "responses":
+        monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+
+    provider = LiteLLMProvider(session_factory)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "first turn",
+                }
+            ],
+            "_candidate_history": True,
+            "_candidate_current_turn": True,
+            "_private_controller_note": "remove",
+        }
+    ]
+    original = [dict(message) for message in messages]
+    arguments = {
+        "messages": messages,
+        "model": "gpt-5.4",
+        "provider_id": "proxy",
+        "cognis_llm_api": llm_api,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect",
+                    "description": "Inspect",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"_provider_extension": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    }
+    if stream:
+        chunks = [chunk async for chunk in provider.stream_generate(**arguments)]
+        assert chunks
+    else:
+        result = await provider.generate(**arguments)
+        assert result["choices"]
+
+    if llm_api == "responses":
+        provider_input = captured["input"]
+        assert isinstance(provider_input, list)
+    else:
+        provider_messages = captured["messages"]
+        assert isinstance(provider_messages, list)
+    final_messages = captured["input"] if llm_api == "responses" else captured["messages"]
+    assert isinstance(final_messages, list)
+    assert all(not key.startswith("_") for message in final_messages for key in message)
+    assert "_provider_extension" in str(captured["tools"])
+    assert messages == original
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_public_native_anthropic_rejects_incompatible_replay_before_final_transport(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cognis.models.config import ModelInfo
+    from cognis.providers.llm.anthropic.contracts import AnthropicNativeEnvelope
+    from cognis.providers.llm.anthropic.integration import (
+        NATIVE_CONTINUATION_REQUIRED_KWARG,
+        NATIVE_REQUEST_CONTEXT_KWARG,
+        NATIVE_TOOL_BUNDLE_KWARG,
+        AnthropicContinuationRejected,
+        build_native_chain,
+    )
+
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "claude-sonnet-4-6",
+                    "api_base": "https://api.anthropic.com",
+                    "auth_config": {"mode": "secret", "secret_name": "anthropic"},
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+        provider_row = await session.get(LLMProvider, "anthropic")
+    assert provider_row is not None
+    model = "claude-sonnet-4-6"
+    context, bundle = build_native_chain(
+        provider=provider_row,
+        model=model,
+        model_info=ModelInfo(model_id=model, supports_tools=True),
+        exposed_tools=[],
+        alias_map={},
+        stable_id_map={},
+        argument_alias_map={},
+        thinking=None,
+        credential_ref="$credential:anthropic-api-key",
+    )
+    invalid_envelope = AnthropicNativeEnvelope(
+        native_blocks=({"type": "text", "text": "Prior answer"},),
+        stop_reason="end_turn",
+        stop_details={},
+        usage={},
+        pending_client_message_id=None,
+        pending_server_message_id=None,
+        bundle_fingerprint=bundle.fingerprint,
+        provider_fingerprint=context.chain_id,
+        model_fingerprint="claude-opus-5-5",
+        thinking_fingerprint=context.thinking_fingerprint,
+    ).to_dict()
+
+    class _FinalClient:
+        calls = 0
+
+        async def complete(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    final_client = _FinalClient()
+
+    async def _fake_native_client(*_args: object, **_kwargs: object):
+        return final_client, "$credential:anthropic-api-key"
+
+    monkeypatch.setattr(
+        LiteLLMProvider,
+        "_native_anthropic_client",
+        _fake_native_client,
+    )
+    provider = LiteLLMProvider(session_factory)
+
+    with pytest.raises(AnthropicContinuationRejected):
+        await provider.generate(
+            messages=[
+                {"role": "user", "content": "Continue"},
+                {
+                    "role": "assistant",
+                    "content": "Prior answer",
+                    "_anthropic_native_envelope": invalid_envelope,
+                    "_candidate_current_turn": True,
+                },
+            ],
+            model=model,
+            provider_id="anthropic",
+            **{
+                NATIVE_REQUEST_CONTEXT_KWARG: context.to_dict(),
+                NATIVE_TOOL_BUNDLE_KWARG: bundle.to_dict(),
+                NATIVE_CONTINUATION_REQUIRED_KWARG: True,
+            },
+        )
+    assert final_client.calls == 0
     await engine.dispose()
 
 
@@ -6330,7 +6675,7 @@ async def test_litellm_provider_discover_models_rejects_non_ollama_executor(
         await session.commit()
 
     provider = LiteLLMProvider(session_factory, inference_router=object())
-    with pytest.raises(ValueError, match="supports Ollama providers only"):
+    with pytest.raises(ValueError, match="unsupported for this preset"):
         await provider.discover_models("remote")
     await engine.dispose()
 
@@ -6432,14 +6777,20 @@ def test_apply_model_prefix_returns_unchanged_when_provider_is_none() -> None:
     assert LiteLLMProvider._apply_model_prefix("gpt-4o", None) == "gpt-4o"
 
 
-def test_apply_model_prefix_returns_unchanged_when_model_contains_slash() -> None:
+def test_apply_model_prefix_preserves_literal_slashes_for_compatible_endpoints() -> None:
     provider = _make_provider_row("openai_compatible")
-    assert LiteLLMProvider._apply_model_prefix("ollama/llama3", provider) == "ollama/llama3"
+    assert (
+        LiteLLMProvider._apply_model_prefix("ollama/llama3", provider)
+        == "litellm_proxy/ollama/llama3"
+    )
 
 
-def test_apply_model_prefix_adds_openai_prefix_for_openai_compatible() -> None:
+def test_apply_model_prefix_uses_passthrough_for_openai_compatible() -> None:
     provider = _make_provider_row("openai_compatible")
-    assert LiteLLMProvider._apply_model_prefix("gpt-oss-120b", provider) == "openai/gpt-oss-120b"
+    assert (
+        LiteLLMProvider._apply_model_prefix("gpt-oss-120b", provider)
+        == "litellm_proxy/gpt-oss-120b"
+    )
 
 
 def test_apply_model_prefix_adds_litellm_proxy_prefix() -> None:

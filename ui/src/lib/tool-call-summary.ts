@@ -1512,8 +1512,11 @@ export function memoryToolPresentation(item: ToolCallSummaryInput): MemoryToolPr
   const resultItems = memoryResultItems(parsed, name);
   const answer = stringField(parsed?.answer);
   const text = stringField(parsed?.text) || (name === 'memorygetartifact' ? stringField(parsed?.content) : '');
-  const error = item.isError || parsed?.error === true
-    ? (stringField(parsed?.message) || firstOutputLine(cleanToolResult(item.result)) || 'Memory operation failed.')
+  const structuredError = parsed?.error && typeof parsed.error === 'object'
+    ? parsed.error as Record<string, unknown> : null;
+  const error = item.isError || parsed?.error === true || structuredError
+    ? (stringField(structuredError?.detail) || stringField(structuredError?.message)
+      || stringField(parsed?.message) || firstOutputLine(cleanToolResult(item.result)) || 'Memory operation failed.')
     : '';
   return {
     kind: 'memory_tool',
@@ -1525,7 +1528,7 @@ export function memoryToolPresentation(item: ToolCallSummaryInput): MemoryToolPr
     requestDetails: memoryRequestDetails(name, args),
     badges: memoryBadges(args),
     resultLabel: error ? 'Problem' : 'Result',
-    resultSummary: memoryResultSummary(name, item, parsed, resultItems),
+    resultSummary: error ? '' : memoryResultSummary(name, item, parsed, resultItems),
     resultDetails: memoryResultDetails(parsed),
     resultItems,
     answer,

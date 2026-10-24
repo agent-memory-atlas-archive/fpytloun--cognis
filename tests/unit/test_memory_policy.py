@@ -202,6 +202,8 @@ def test_management_rejects_new_or_changed_unavailable_backend_configuration() -
         },
     ) == {
         **current,
+        "intaris_evaluation": "balanced",
+        "approval_mode": "ask",
         "minimum_outcome": None,
         "maximum_outcome": None,
         "escalation_timeout_seconds": None,
@@ -348,6 +350,7 @@ async def test_compaction_remember_obeys_frozen_policy(
             method="summary",
             summary="Durable summary",
             turns_compacted=1,
+            events_compacted=4,
         ),
         trigger="test",
     )

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -38,6 +38,20 @@ describe('rich deliverables', () => {
   it('rejects executable URLs', () => {
     expect(safeUrl('javascript:alert(1)')).toBe('');
     expect(safeUrl('https://example.com/a')).toBe('https://example.com/a');
+  });
+
+  it('preserves absolute publication links and rejects local paths at a file origin', () => {
+    vi.stubGlobal('window', { location: { origin: 'null' } });
+    try {
+      expect(safeUrl('https://cognis.example.com/research')).toBe('https://cognis.example.com/research');
+      expect(safeUrl('mailto:research@cognis.example.com')).toBe('mailto:research@cognis.example.com');
+      expect(safeUrl('/api/v1/deliverables')).toBe('');
+      expect(safeUrl('relative.html')).toBe('');
+      expect(safeUrl('file:///etc/passwd')).toBe('');
+      expect(safeUrl('javascript:alert(1)')).toBe('');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('resolves only controller manifest media keys through the supplied private resolver', () => {

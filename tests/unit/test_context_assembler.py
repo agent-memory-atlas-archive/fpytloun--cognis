@@ -4,12 +4,15 @@ import asyncio
 import json
 import re
 import time
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 
 import pytest
 
+import cognis.core.context as context_module
 from cognis.core.agent_profiles import resolve_conversation_agent_profile
 from cognis.core.context import (
     ContextAssembler,
@@ -43,6 +46,7 @@ from cognis.core.message_markers import (
     IMMUTABLE_PREFIX,
     LATEST_MEMORY_RECALL_CONTEXT,
     PROJECT_CONTEXT,
+    TOKEN_ESTIMATE,
     TURN_BOUNDARY,
 )
 from cognis.core.project_context import ProjectContextEntry, build_project_instruction_message
@@ -330,6 +334,7 @@ class _SessionCache:
         self.mark_prefix_repair_calls = 0
         self.project_contexts: dict[str, ProjectContextEntry] = {}
         self.memory_aliases = MemoryAliasState()
+        self.projection_decisions: dict[str, list[dict[str, object]]] = {}
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -377,11 +382,19 @@ class _SessionCache:
             last_event_seq=self.entry.last_event_seq,
             last_compaction_seq=0,
             projection_revision=0,
+            projection_decisions=deepcopy(self.projection_decisions),
         )
 
     def get_memory_aliases(self, session_id: str) -> MemoryAliasState:
         del session_id
         return self.memory_aliases
+
+    def get_projection_decisions(self, session_id: str) -> dict[str, list[dict[str, object]]]:
+        del session_id
+        return {
+            call_id: [dict(decision) for decision in decisions]
+            for call_id, decisions in self.projection_decisions.items()
+        }
 
     def get_intention(self, session_id: str) -> str | None:
         del session_id
@@ -436,9 +449,25 @@ class _SessionCache:
     async def append_recorded_events(
         self, session: SessionModel, events: list, result: object
     ) -> None:
-        del session
+        intaris_events: list[dict[str, object]] = []
         seq = int(getattr(result, "first_seq", 0))
         for event in events:
+            intaris_event = {"seq": seq, "type": event.type, "data": event.data}
+            intaris_events.append(intaris_event)
+            seq += 1
+            if event.type == "lifecycle" and event.data.get("event") == "context_projection":
+                for decision in event.data.get("decisions", []):
+                    if isinstance(decision, dict):
+                        key = str(decision.get("call_id") or f"event:{decision.get('event_seq')}")
+                        self.projection_decisions.setdefault(key, []).append(
+                            {
+                                "operation": decision.get("operation"),
+                                "rendering_policy_version": decision.get(
+                                    "rendering_policy_version"
+                                ),
+                                "parameters": dict(decision.get("parameters", {})),
+                            }
+                        )
             if event.type not in {"system_message", "developer_message"}:
                 continue
             self.prefix_entries.append(
@@ -446,10 +475,21 @@ class _SessionCache:
                     role=str(event.data.get("role") or "developer"),
                     source=str(event.data.get("source") or ""),
                     content=str(event.data.get("content") or ""),
-                    seq=seq,
+                    seq=seq - 1,
                 )
             )
-            seq += 1
+        projection_events = [
+            event
+            for event in intaris_events
+            if event["type"] == "lifecycle" and event["data"].get("event") == "context_projection"
+        ]
+        self.history_events.extend(projection_events)
+        if hasattr(self, "_events"):
+            self._events.extend(projection_events)
+
+    async def invalidate_canonical(self, session_id: str) -> None:
+        del session_id
+        self.entry = None
 
     async def store_prefix_snapshot(
         self,
@@ -495,6 +535,27 @@ class _HistorySessionCache(_SessionCache):
     def __init__(self, events: list[dict[str, object]]) -> None:
         super().__init__()
         self._events = list(events)
+        for event in events:
+            data = event.get("data")
+            if (
+                event.get("type") != "lifecycle"
+                or not isinstance(data, dict)
+                or data.get("event") != "context_projection"
+            ):
+                continue
+            for raw_decision in data.get("decisions", []):
+                if not isinstance(raw_decision, dict):
+                    continue
+                call_id = raw_decision.get("call_id")
+                if not isinstance(call_id, str):
+                    continue
+                self.projection_decisions.setdefault(call_id, []).append(
+                    {
+                        "operation": raw_decision.get("operation"),
+                        "rendering_policy_version": raw_decision.get("rendering_policy_version"),
+                        "parameters": dict(raw_decision.get("parameters", {})),
+                    }
+                )
 
     def get_events_since_compaction(self, session_id: str, types: list[str] | None = None) -> list:
         del session_id, types
@@ -655,7 +716,7 @@ def test_projection_uses_steady_not_legacy_compaction_threshold(
     messages.append({"role": "user", "content": "Continue"})
     raw = _LLM().count_messages_tokens(messages, "test-model")
     assert 250240 * 0.85 < raw < 250240 * 0.88
-    projected, _, _, _, _, tokens = assembler._finalize_assembled_messages(
+    projected, _, _, _, _, tokens, _ = assembler._finalize_assembled_messages(
         messages=messages,
         resolved_model="test-model",
         max_context_tokens=400000,
@@ -663,11 +724,14 @@ def test_projection_uses_steady_not_legacy_compaction_threshold(
         max_prompt_tokens=237728,
         tool_schema_tokens=0,
     )
-    assert tokens == raw
+    if recoverable:
+        assert tokens <= 250240 * 0.35
+    else:
+        assert tokens == raw
     assert projected[0]["content"] == "Keep this instruction"
 
 
-@pytest.mark.parametrize("ratio", [1.0, 2.361])
+@pytest.mark.parametrize("ratio", [1.0, 2.361, 3.0])
 def test_cross_turn_projection_uses_calibrated_savings(ratio: float) -> None:
     import math
 
@@ -718,11 +782,11 @@ def test_cross_turn_projection_uses_calibrated_savings(ratio: float) -> None:
         calibration_ratio=ratio,
     )
     remaining = llm.count_messages_tokens(projected, "test-model") + 10000
-    assert math.ceil(remaining * ratio) <= 320000
     assert projected[0]["content"] == "Preserve this instruction"
-    if ratio == 1.0:
+    if raw * ratio <= 839232 * 0.75:
         assert projected == messages
     else:
+        assert math.ceil(remaining * ratio) <= 839232 * 0.35
         assert remaining < raw
 
 
@@ -909,6 +973,152 @@ def test_pruning_protects_current_turn_boundary_over_later_user_attachment() -> 
     assert current_turn in pruned
     assert all("old history" not in str(message.get("content", "")) for message in pruned)
     assert all("attachment context" not in str(message.get("content", "")) for message in pruned)
+
+
+@pytest.mark.parametrize("group_count", [64, 512])
+@pytest.mark.parametrize("underestimate", [False, True])
+def test_pruning_visits_tool_groups_linearly(
+    monkeypatch: pytest.MonkeyPatch, group_count: int, underestimate: bool
+) -> None:
+    from unittest.mock import Mock
+
+    llm = _LLM()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    messages = [{"role": "system", "content": "prefix", IMMUTABLE_PREFIX: True}]
+    for index in range(group_count):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"call-{index}",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path":"large.py"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call-{index}",
+                    "content": "large output " * 1000,
+                },
+            ]
+        )
+    protected_result = {
+        "role": "tool",
+        "tool_call_id": "protected-call",
+        "content": "protected evidence " * 1000,
+        "_protected_tool_output": True,
+    }
+    messages.extend(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "protected-call", "function": {"name": "read"}}],
+            },
+            protected_result,
+            {"role": "user", "content": "current instruction", TURN_BOUNDARY: True},
+            {"role": "system", "content": "tail reminder"},
+        ]
+    )
+    original = deepcopy(messages)
+    expected = list(messages)
+    for replacements in context_module._compact_droppable_tool_groups(expected):
+        for index, message in replacements.items():
+            expected[index] = message
+    budget = llm.count_messages_tokens(expected, "test-model") + 100
+    if underestimate:
+        monkeypatch.setattr(assembler, "_message_token_estimate", lambda *_: 1)
+    protection_check = Mock(wraps=context_module._is_protected_context_message)
+    monkeypatch.setattr(context_module, "_is_protected_context_message", protection_check)
+
+    pruned = assembler._prune_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_prompt_tokens=budget,
+        tool_schema_tokens=100,
+    )
+
+    assert pruned == expected
+    assert messages == original
+    assert protected_result in pruned
+    assert all(pruned[2 + 2 * index]["_projected_compacted"] for index in range(group_count))
+    assert protection_check.call_count <= 3 * len(messages)
+    assert llm.count_messages_tokens(pruned, "test-model") + 100 <= budget
+
+
+def test_pruning_stops_compacting_when_budget_is_met() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "old-call", "function": {"name": "read"}}]},
+        {"role": "tool", "tool_call_id": "old-call", "content": "old evidence " * 1000},
+        {"role": "assistant", "tool_calls": [{"id": "new-call", "function": {"name": "read"}}]},
+        {"role": "tool", "tool_call_id": "new-call", "content": "new evidence " * 1000},
+        {"role": "user", "content": "current instruction", TURN_BOUNDARY: True},
+    ]
+    pruned = assembler._prune_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_prompt_tokens=4000,
+        tool_schema_tokens=0,
+    )
+
+    assert len(pruned) == len(messages)
+    assert pruned[1]["_projected_compacted"]
+    assert pruned[3] is messages[3]
+
+
+def test_pruning_refreshes_cached_assistant_estimate_with_unchanged_arguments() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "cached-call",
+                    "function": {"name": "read", "arguments": '{"path":"large.py"}'},
+                }
+            ],
+            TOKEN_ESTIMATE: 100_000,
+        },
+        {"role": "tool", "tool_call_id": "cached-call", "content": "large evidence " * 1000},
+        {"role": "user", "content": "current instruction", TURN_BOUNDARY: True},
+    ]
+
+    pruned = assembler._prune_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_prompt_tokens=1000,
+        tool_schema_tokens=0,
+    )
+
+    assert len(pruned) == len(messages)
+    assert pruned[0]["tool_calls"] == messages[0]["tool_calls"]
+    assert TOKEN_ESTIMATE not in pruned[0]
+    assert pruned[1]["_projected_compacted"]
+    assert messages[0][TOKEN_ESTIMATE] == 100_000
 
 
 class _SessionManager:
@@ -1458,7 +1668,7 @@ async def test_context_assembler_skips_disabled_artifact_urls() -> None:
         max_context_tokens=4096,
         compaction_threshold=0.85,
     )
-    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    blocked_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
 
     result = await assembler.assemble(
         session=_session(),
@@ -1486,7 +1696,7 @@ async def test_context_assembler_skips_disabled_artifact_urls() -> None:
 @pytest.mark.asyncio
 async def test_context_assembler_skips_disabled_artifact_urls_from_history() -> None:
     cache = _SessionCache()
-    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    blocked_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
     cache.history_events = [
         {
             "type": "user_message",
@@ -1796,7 +2006,7 @@ async def test_context_assembler_prioritizes_current_attachments_over_bounded_hi
 @pytest.mark.asyncio
 async def test_context_assembler_skips_disabled_artifact_ids_from_history() -> None:
     cache = _SessionCache()
-    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    artifact_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
     cache.history_events = [
         {
             "type": "user_message",
@@ -1849,7 +2059,7 @@ async def test_context_assembler_skips_disabled_artifact_ids_from_current_turn()
         max_context_tokens=4096,
         compaction_threshold=0.85,
     )
-    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    artifact_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
 
     result = await assembler.assemble(
         session=_session(),
@@ -2400,6 +2610,389 @@ def test_events_to_messages_replays_only_marked_developer_context_injections() -
     )
 
 
+def test_events_to_messages_preserves_accepted_tool_json_and_result_metadata() -> None:
+    accepted_arguments = '{"path": "café",  "line": 3}'
+    events = [
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "read",
+                "call_id": "call-accepted-json",
+                "arguments": {"path": "café", "line": 3},
+                "provider_arguments_json": accepted_arguments,
+            },
+        },
+        {
+            "type": "tool_result",
+            "data": {
+                "name": "read",
+                "call_id": "call-accepted-json",
+                "result": "read failed",
+                "is_error": True,
+                "recovery_call_id": "recovery-1",
+                "has_full_output": True,
+            },
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == accepted_arguments
+    assert messages[1]["_tool_is_error"] is True
+    assert messages[1]["_recovery_call_id"] == "recovery-1"
+    assert messages[1]["_has_full_output"] is True
+
+
+def test_event_omission_replay_removes_synthetic_orphan_with_owning_tool_call() -> None:
+    messages = events_to_messages(
+        [
+            {
+                "seq": 41,
+                "type": "tool_call",
+                "data": {
+                    "name": "read",
+                    "call_id": "call-interrupted",
+                    "arguments": {"path": "large.txt"},
+                },
+            },
+            {
+                "seq": 42,
+                "type": "assistant_message",
+                "data": {"content": "The turn resumed after interruption."},
+            },
+        ],
+        projection_decisions={
+            "event:41": [
+                {
+                    "operation": "omit_event",
+                    "rendering_policy_version": 1,
+                    "parameters": {"event_seq": 41},
+                }
+            ]
+        },
+    )
+
+    assert not any(
+        message.get("role") == "tool" and message.get("tool_call_id") == "call-interrupted"
+        for message in messages
+    )
+    assert not any(message.get("tool_calls") for message in messages)
+    assert any(
+        message.get("content") == "The turn resumed after interruption." for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_projection_delta_is_durable_and_replayed_without_a_second_write() -> None:
+    events = [
+        {
+            "seq": 11,
+            "type": "tool_call",
+            "data": {
+                "name": "read",
+                "call_id": "call-projected",
+                "arguments": {"path": "large.txt"},
+            },
+        },
+        {
+            "seq": 12,
+            "type": "tool_result",
+            "data": {
+                "name": "read",
+                "call_id": "call-projected",
+                "result": "large result",
+                "is_error": False,
+                "has_full_output": True,
+                "recovery_call_id": "recovery-projected",
+            },
+        },
+    ]
+    cache = _HistorySessionCache(events)
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    decision = {
+        "call-projected": [
+            {
+                "operation": "compact_result",
+                "rendering_policy_version": 1,
+                "parameters": {},
+            }
+        ]
+    }
+
+    await assembler._persist_projection_decisions(
+        session=_session(),
+        agent=_agent(),
+        decisions=decision,
+    )
+    stored_events = guardrails.record_event_calls[0]["events"]
+    assert len(stored_events) == 1
+    assert stored_events[0].type == "lifecycle"
+    assert stored_events[0].data["event"] == "context_projection"
+    assert cache.get_projection_decisions(_session().session_id) == decision
+
+    replayed = await assembler._events_to_messages(
+        cache.get_events_since_compaction(_session().session_id),
+        model_info=ModelInfo(model_id="test-model", context_window=200_000, max_output_tokens=256),
+        owner_email="user@example.com",
+        projection_decisions=cache.get_projection_decisions(_session().session_id),
+    )
+    result_message = next(message for message in replayed if message.get("role") == "tool")
+    assert result_message["content"] != "large result"
+    assert result_message["_projected_compacted"] is True
+    import httpx
+
+    from cognis.providers.llm.message_projection import project_messages_for_provider
+    from cognis.providers.llm.responses_bridge import messages_to_responses_input
+
+    anthropic_request = project_messages_for_provider(
+        replayed,
+        provider=type("Provider", (), {"config": {"preset": "anthropic"}})(),
+        llm_api="messages",
+    )
+    responses_request = project_messages_for_provider(
+        replayed,
+        provider=None,
+        llm_api="responses",
+    )
+    assert (
+        next(message for message in responses_request.messages if message["role"] == "tool")[
+            "content"
+        ]
+        != "large result"
+    )
+    responses_input = messages_to_responses_input(responses_request.messages)
+    assert anthropic_request.messages
+    anthropic_request_bytes = len(
+        httpx.Request(
+            "POST",
+            "http://provider.invalid/messages",
+            json={"messages": anthropic_request.messages},
+        ).content
+    )
+    responses_request_bytes = len(
+        httpx.Request(
+            "POST",
+            "http://provider.invalid/responses",
+            json={"input": responses_input},
+        ).content
+    )
+    assert anthropic_request_bytes < 64 * 1024
+    assert responses_request_bytes < 64 * 1024
+
+    new_decision = assembler._new_projection_decisions(
+        decision,
+        cache.get_projection_decisions(_session().session_id),
+    )
+    await assembler._persist_projection_decisions(
+        session=_session(),
+        agent=_agent(),
+        decisions=new_decision,
+    )
+    assert len(guardrails.record_event_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_decision_event_stays_within_encoded_request_bounds() -> None:
+    import httpx
+
+    cache = _HistorySessionCache([])
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    decisions = {
+        f"call-{index:04d}": [
+            {
+                "operation": "clear_arguments",
+                "rendering_policy_version": 1,
+                "parameters": {"threshold": 24_000},
+            }
+        ]
+        for index in range(150)
+    }
+
+    await assembler._persist_projection_decisions(
+        session=_session(),
+        agent=_agent(),
+        decisions=decisions,
+    )
+
+    assert [len(call["events"]) for call in guardrails.record_event_calls] == [1]
+    assert len(guardrails.record_event_calls[0]["events"][0].data["decisions"]) == 150
+    request_sizes = [
+        len(
+            httpx.Request(
+                "POST",
+                "http://intaris.invalid/events",
+                json=[event.model_dump() for event in call["events"]],
+            ).content
+        )
+        for call in guardrails.record_event_calls
+    ]
+    assert max(request_sizes) < 256 * 1024
+
+
+@pytest.mark.asyncio
+async def test_large_projection_delta_uses_bounded_independently_replayable_batches() -> None:
+    cache = _HistorySessionCache([])
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    decisions = {
+        f"{'c' * 240}{index:04d}": [
+            {
+                "operation": "clear_arguments",
+                "rendering_policy_version": 1,
+                "parameters": {"threshold": 24_000},
+            }
+        ]
+        for index in range(1_000)
+    }
+
+    await assembler._persist_projection_decisions(
+        session=_session(),
+        agent=_agent(),
+        decisions=decisions,
+    )
+    assert len(guardrails.record_event_calls) > 1
+    recorded = []
+    for call in guardrails.record_event_calls:
+        assert len(call["events"]) == 1
+        event = call["events"][0]
+        assert event.data["event"] == "context_projection"
+        assert len(json.dumps([event.model_dump()], ensure_ascii=False).encode()) < 256 * 1024
+        recorded.extend(event.data["decisions"])
+    assert len(recorded) == len(decisions)
+    assert {item["call_id"] for item in recorded} == set(decisions)
+
+
+@pytest.mark.asyncio
+async def test_pressured_detached_handoff_snapshot_never_persists_projection() -> None:
+    cache = _SessionCache()
+    cache.prefix_entries = [
+        ImmutablePrefixEntry(role="system", source="identity", content="Agent identity", seq=1)
+    ]
+    for index in range(40):
+        call_id = f"call_snapshot_read_{index}"
+        cache.history_events.extend(
+            [
+                {
+                    "seq": 2 * index + 2,
+                    "type": "tool_call",
+                    "data": {
+                        "call_id": call_id,
+                        "name": "read",
+                        "arguments": {"path": "/repo"},
+                    },
+                },
+                {
+                    "seq": 2 * index + 3,
+                    "type": "tool_result",
+                    "data": {
+                        "call_id": call_id,
+                        "name": "read",
+                        "result": "evidence " * 2500,
+                        "recovery_call_id": call_id,
+                    },
+                },
+            ]
+        )
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    before_events = deepcopy(cache.history_events)
+    result = await assembler.assemble_snapshot(
+        snapshot=cache.get_context_snapshot(_session().session_id),
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        instruction="Summarize this history for a handoff.",
+        tool_schema_tokens=0,
+    )
+    assert result.projection_compacted_tool_group_anchors
+    assert not guardrails.record_event_calls
+    assert cache.history_events == before_events
+
+
+@pytest.mark.asyncio
+async def test_projection_event_retry_reuses_idempotency_key_after_append_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _HistorySessionCache([])
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    keys: list[str] = []
+    attempt = 0
+
+    async def record_events(**kwargs: object) -> object:
+        nonlocal attempt
+        attempt += 1
+        keys.append(str(kwargs["idempotency_key"]))
+        if attempt == 1:
+            raise RuntimeError("temporary Intaris failure")
+        return SimpleNamespace(ok=True, first_seq=3, last_seq=3)
+
+    monkeypatch.setattr(guardrails, "record_events", record_events)
+    decisions = {
+        "call-retry": [
+            {
+                "operation": "compact_result",
+                "rendering_policy_version": 1,
+                "parameters": {},
+            }
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="temporary Intaris failure"):
+        await assembler._persist_projection_decisions(
+            session=_session(),
+            agent=_agent(),
+            decisions=decisions,
+        )
+    assert cache.entry is None
+
+    await assembler._persist_projection_decisions(
+        session=_session(),
+        agent=_agent(),
+        decisions=decisions,
+    )
+
+    assert len(keys) == 2
+    assert keys[0] == keys[1]
+
+
 def test_events_to_messages_replays_managed_policy_as_developer_once() -> None:
     policy = {
         "type": "developer_message",
@@ -2652,7 +3245,11 @@ async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> Non
         for message in memoryless.messages
     )
     assert any(
-        message.get("content") == "Continue the existing request under the new profile."
+        message.get("_audit_source") == "routing_reminder"
+        and str(message.get("content")).endswith(
+            "Continue the existing request under the new profile."
+        )
+        and message.get(AUDIT_METADATA, {}).get("replayable") is True
         for message in memoryless.messages
     )
     assert not any(
@@ -3251,7 +3848,7 @@ async def test_immutable_prefix_idempotency_key_includes_counter_and_content_has
     keys = [
         str(call.get("idempotency_key"))
         for call in guardrails.record_event_calls
-        if call.get("idempotency_key")
+        if ":immutable_prefix:" in str(call.get("idempotency_key"))
     ]
     assert any(":immutable_prefix:bootstrap:42:" in key for key in keys)
     suffix_parts = [key.split(":")[-4:] for key in keys]
@@ -3703,7 +4300,7 @@ async def test_context_assembler_injects_routing_reminder_before_attachment_noti
     )
 
     contents = [str(message.get("content", "")) for message in result.messages]
-    reminder_index = contents.index(reminder)
+    reminder_index = next(index for index, content in enumerate(contents) if reminder in content)
     attachment_index = contents.index("Attachment notice")
     user_index = next(
         index
@@ -4033,7 +4630,7 @@ async def test_context_assembler_keeps_routing_reminder_out_of_immutable_prefix(
 
 
 @pytest.mark.asyncio
-async def test_context_assembler_clears_follow_up_markers_in_skip_memory_path() -> None:
+async def test_provider_boundary_clears_follow_up_markers_in_skip_memory_path() -> None:
     assembler = ContextAssembler(
         memory=_Memory(),
         guardrails=_Guardrails(),
@@ -4070,7 +4667,26 @@ async def test_context_assembler_clears_follow_up_markers_in_skip_memory_path() 
         skip_memory=True,
     )
 
-    assert all(not any(str(key).startswith("_") for key in message) for message in result.messages)
+    # Assembly retains rendering inputs for subsequent within-turn projection;
+    # no controller-only fields may escape the actual provider boundary.
+    from cognis.providers.llm.message_projection import project_messages_for_provider
+
+    provider_messages = project_messages_for_provider(
+        result.messages, provider=None, llm_api="responses"
+    ).messages
+    assert all(
+        not any(str(key).startswith("_") for key in message) for message in provider_messages
+    )
+    from types import SimpleNamespace
+
+    from cognis.providers.llm.message_projection import project_messages_for_provider
+
+    projected = project_messages_for_provider(
+        result.messages,
+        provider=SimpleNamespace(config={"preset": "anthropic"}),
+        llm_api="chat_completions",
+    ).messages
+    assert all(not any(str(key).startswith("_") for key in message) for message in projected)
 
 
 def _profile_tool(name: str, *, category: str, read_only: bool) -> ToolDefinition:

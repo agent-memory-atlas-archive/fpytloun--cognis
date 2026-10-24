@@ -193,6 +193,124 @@ For changes to `agent_loop.py`, `turn_scheduler.py`, `tool_router.py`,
 Keep this note proportional. Routine local changes do not need architecture
 boilerplate.
 
+### Session preamble lifetime
+
+`ContextAssembler` owns the rendered pre-history preamble and append-only
+superseding context updates. Intaris `lifecycle/context_preamble` events are
+the durable representation; `SessionCache` snapshots reconstruct them from
+events, including after Redis loss. They are scoped to the Intaris session;
+rotation starts a fresh freeze. Existing sessions without these events freeze
+on their first assembly after upgrade (one cache miss is expected).
+
+Turn admission serializes writers. Assembly persists before exposing a new
+preamble/update, without a DB transaction over external I/O. Cancellation
+remains owned by the turn scheduler; interrupted persistence invalidates the
+canonical cache so retry reconciles with Intaris. Append idempotency includes
+the captured event head and content digest. Read-only candidates never append.
+Updates carry an explicit admitted-user sequence anchor when they must replay
+before an already-recorded user message. Mid-turn project exposures are recorded
+after tool batches, separately from project discovery events. Policy evidence
+is historical context, not authorization, and refresh appends rather than edits.
+No Cognis DB schema or provider API changes are involved.
+
+Full-transcript `prompt_injections` snapshots are retired: do not write, decode,
+or replay them. Existing events remain stored in Intaris but have no effect on
+canonical history. The outgoing boundary preserves accepted tool bytes only in
+the live turn; canonical replay uses the original per-message events.
+`context_projection.py` retains the 75% trigger and 35% target, with critical/hard
+budget handling and 85% session compaction as independent safety gates.
+Cross-turn byte identity of transient notices and projected tool results is
+maintained through canonical per-message Intaris events plus small
+`context_projection` lifecycle events. These events contain only call/event
+identifiers, projection operations, a rendering-policy version, and bounded
+numeric parameters; they never store prompts, copied histories, or rendered
+tool output. `SessionCache` reconstructs decisions from Intaris after cold-cache
+recovery, and replay reapplies them to canonical events. Projection events use
+the existing Intaris append, idempotency, retry, and turn-scheduler cancellation
+behavior. No Cognis DB content storage, new lock, or new retry framework is
+involved.
+
+Live inference commits new notice events and projection deltas before exposing
+the prompt. Unchanged cycles append no decision event. Writes are bounded by
+encoded UTF-8 bytes and use deterministic idempotency keys; a complete parallel
+tool-group omission is one operation. After interrupted writes the next assembly
+reconciles the accepted events. Output-limit responses persist one canonical
+assistant segment per model response rather than repeatedly copying accumulated
+text. Chat v2 coalesces those segments and hydrates missing segment predecessors
+when projecting a partial snapshot/sync/backfill window. Existing assistant events
+remain authoritative full replacements unless explicitly marked as segments.
+Executor assignment notices use that same canonical message boundary. Assembly
+keeps the latest identical notice in its historical position, appends changed
+assignments, and appends explicit revocation when the assigned pool disappears.
+Existing audit-only records without replay metadata are not reinterpreted.
+
+Routing notices also use canonical per-message events with explicit request-only
+scope. Their content and turn identity prevent duplicate exposure on retry or
+profile-switch reassembly; later requests retain them as historical context.
+`switch_executor` schema exposure depends on assigned pool size, not transient
+usability, and uses the canonical definition without a live executor-ID enum.
+Runtime assignment/usability validation remains owned by executor switching.
+These changes reuse serialized turn admission and the existing delivery commit;
+they add no transaction, lock, external side effect, or cancellation owner.
+
+Cached projection results retain their compact decision delta alongside their
+rendering. Reusing a result after failed persistence must carry the same delta
+through the existing delivery commit; durability filtering prevents repeated
+writes after success. The metadata lives with the turn-owned projection result
+and follows the existing offload/cancellation boundary; thresholds are unchanged.
+Executor per-call schema overlays use observed, enabled tools on assigned targets,
+including temporarily unavailable targets. Actual routing retains its usable-target
+requirement. Native Responses message items are persisted per assistant event under
+the existing native-envelope byte cap so cold/profile replay preserves their wire
+shape. Oversized text envelopes must not evict otherwise valid reasoning/call items.
+No session snapshots, content-table storage, or new external side effects are added.
+
+Whole-group projection state records only fully compacted parallel batches;
+partial pruning retains per-result markers and committed sibling preservation.
+The below-threshold loop path can reuse that accepted mixed rendering after
+pressure recovery, retaining pending decisions and its prefix-mutation guard.
+Synthetic interruption evidence is protected when reconstructed. Existing
+rendering-policy decisions remain authoritative, including for older markers.
+This uses turn-owned projection/cache state and the existing offload, cancellation,
+and delivery-commit boundaries, with no new writes, locks, or persisted format.
+
+Tool-call event builders share sanitized native replay metadata for regular and
+controller calls. Preserve original argument bytes only when sanitization leaves
+their values unchanged; signed native envelopes and the existing byte caps remain
+authoritative. These are per-event fields, not snapshots. Projection diagnostics
+are content-free logs and add no durable content or inference. Bundled hook
+startup tool hints use persisted child hook identity and the existing filtered
+inventory; they add no permissions. Existing hook fences, turn cancellation,
+event append idempotency and retry ownership are unchanged.
+
+Canonical replay regroups tool calls owned by one native provider response into
+that response's assistant message when only the batch's own results separate
+them, matching the live request shape. A numeric marker on newly recorded native
+assistant or tool-call events opts into regrouping; unmarked batches retain their old grouping
+and omission scope without migration. Projection replaces a textual tool result
+only when its placeholder at most halves it; persisted decisions stay
+authoritative. Both are pure replay/projection rules with no new events, writes,
+locks or new event types. Controller discovery and rejected-tool repair append
+results and bridge guidance without promoting direct schemas; call_tool retains
+the existing permission, validation and execution boundary.
+
+Skill activation grants session-scoped eligibility, not direct schema exposure.
+Skill-load-capable sessions select the stable controller discovery kernel before
+their first inference, even on Anthropic; inventory names are not embedded in
+schema descriptions. The shared exposure boundary applies this policy to fallback
+candidates too. Loaded-skill instructions and resolved eligibility use the
+existing canonical developer-message event and loaded-skill cache replay path.
+Auxiliary tool notices record their originating call; attachment context renders
+from sanitized canonical references through one shared formatter. New markers
+are forward-only. UI-only skill notices are excluded from model replay. These
+changes use the existing turn serialization, incremental event append, strict
+delivery, cancellation and idempotency boundaries, with no new locks, schema,
+snapshots or content stores.
+New loaded-skill events preserve earlier instruction notices while updating latest
+skill state, including slash-command reloads. Legacy events retain their original
+supersession behavior. Live project-exposure notices carry their canonical audit
+source and role so provider wrappers do not change on cold replay.
+
 ### Controller tool contracts
 
 - Controller-injected tool schemas have one source of truth in
@@ -297,7 +415,29 @@ a change pass.
 | Controller/common/executor package boundary | `COGNIS_RUN_ISOLATED_PACKAGE_TESTS=1 uv run pytest tests/unit/test_package_split.py -q` |
 | Chat v2 backend frames or projection | Backend Chat v2 tests and canonical event replay |
 | Frontend state or rendering | Unit checks, Svelte check, standalone build, and focused Playwright coverage |
-| Release | Unit, contract, integration, E2E, browser, and package checks |
+| Release | Full unit/lint/type/build baseline; risk-based service, database, E2E, browser, and package qualification below |
+
+### Release qualification and test maintenance
+
+Prepare the qualification matrix from **all changes since the previous release**,
+not only the release-preparation diff. Always run the full unit suites, lint,
+package type checks, UI checks/builds, and changelog validation. Select relevant
+contract/integration/E2E/browser scenarios using the table above; run the full
+scenario suite for broad runtime/protocol changes. Schema changes require both
+SQLite and PostgreSQL evidence; package-boundary changes require isolated installs.
+Do not rerun unrelated exhaustive browser/device permutations solely because a
+release is being prepared. Record commands, environment, skips, and blockers;
+missing service credentials or infrastructure are **not passing checks**.
+
+Tests should assert supported behavior and ownership, not incidental query
+parameter order, private component placement, exact CSS spelling, or wall-clock
+speed. Keep mocks aligned with the canonical runtime models and cover explicit
+authorization failures when updating permission-aware fixtures. Correct an
+obsolete expectation only after verifying the intended contract in code and
+existing behavior tests. Never skip a regression, relax authorization, suppress
+type errors, or raise timing limits merely to make a release green.
+
+See `docs/development/release-validation.md` for the evidence format.
 
 ### Chat v2
 
@@ -389,6 +529,19 @@ include:
 
 Public diagrams must match the existing design language and retain editable
 sources. Diagrams must clarify boundaries and ownership rather than decorate.
+
+## Changelog Fragments
+
+- Add `changelog.d/<unique-name>.<category>.md` with every user/operator-visible
+  feature, fix, security change, deprecation/removal, or configuration change.
+  Categories: `added`, `changed`, `fixed`, `security`, `deprecated`, `removed`,
+  `upgrade`. Breaking changes also need an `upgrade` note with required action.
+- Write concise English user-facing prose, no heading/bullet prefix, secrets,
+  private URLs, or invented issue IDs. Skip pure refactors, tests, typos, and
+  docs that only explain existing behavior. Group related work, not commits.
+- Run `uv run python scripts/changelog.py` and commit the fragment plus generated
+  index; verify with `--check`. Do not edit generated JSON or finalize/consume
+  fragments during development. See `changelog.d/README.md` for release commands.
 
 ## Git and Delivery
 

@@ -11,7 +11,7 @@
 </script>
 
 <button
-  class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 disabled:opacity-60"
+  class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-raised hover:text-foreground disabled:opacity-60"
   {onclick}
   type="button"
   title="Session details"

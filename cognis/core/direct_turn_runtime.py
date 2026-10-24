@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from cognis.core import turn_latency
 from cognis.store.coordination import LEASE_RENEWAL_DELAY_SECONDS, DatabaseLeaseStore, Lease
 from cognis.store.direct_turns import (
     DirectTurnStatus,
@@ -217,12 +219,67 @@ class DirectTurnExecutionFence:
         raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
 
 
+@dataclass
+class BackgroundDirectTurnFence:
+    """Fence a child without writing checkpoints into its spawning turn.
+
+    Successful completion by the exact spawning owner permits background work
+    to continue. Lease loss, takeover, failure, and cancellation do not transfer
+    ownership to that child. Child dispatches are not parent recovery entries.
+    """
+
+    parent: DirectTurnExecutionFence
+
+    async def assert_current(self) -> None:
+        """Allow a live parent owner or its successfully completed turn only."""
+        if await self.parent.store.has_fence(self.parent.request_id, lease=self.parent.lease):
+            return
+        row = await self.parent.store.get(self.parent.request_id)
+        if (
+            row is not None
+            and row.status == DirectTurnStatus.COMPLETED.value
+            and row.cancel_requested_at is None
+            and row.fencing_token == self.parent.lease.fencing_token
+            and f"{row.owner_controller_id}:{row.owner_incarnation_id}"
+            == self.parent.lease.owner_id
+            and conversation_lease_key(row.conversation_id) == self.parent.lease.resource_key
+        ):
+            return
+        # Use the child cancellation path, not a model-visible tool error or
+        # failure follow-up from a controller that no longer owns this work.
+        raise asyncio.CancelledError("Background delegate lost its spawning direct-turn owner")
+
+    async def checkpoint(self, _name: str, **_metadata: Any) -> None:
+        """Check ownership without modifying the parent's recovery phase."""
+        await self.assert_current()
+
+    async def record_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        descriptors: list[dict[str, Any]],
+    ) -> None:
+        """Fence child dispatch without journaling it as a parent tool batch."""
+        await self.assert_current()
+
+    async def complete_tool_dispatch(
+        self,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        call_ids: list[str],
+    ) -> None:
+        """Fence child settlement without modifying the parent tool journal."""
+        await self.assert_current()
+
+
 ExecuteClaimedTurn = Callable[
     [DirectTurnRequestRow, MaterializedDirectTurnPayload, DirectTurnExecutionFence],
     Awaitable[None],
 ]
 ReconcileCanonicalAppend = Callable[[DirectTurnRequestRow], Awaitable[bool]]
-CanClaimTurn = Callable[[DirectTurnRequestRow], bool]
+CanClaimTurn = Callable[[DirectTurnRequestRow], bool | Awaitable[bool]]
 PermanentFailureHandler = Callable[
     [DirectTurnRequestRow, PermanentDirectTurnPayloadError], Awaitable[None]
 ]
@@ -333,7 +390,13 @@ class DurableDirectTurnRuntime:
                     continue
                 if row.conversation_id in self._active:
                     continue
-                if self._can_claim_turn is not None and not self._can_claim_turn(row):
+                if self._can_claim_turn is not None:
+                    eligible = self._can_claim_turn(row)
+                    if inspect.isawaitable(eligible):
+                        eligible = await eligible
+                    if not eligible:
+                        continue
+                if not self._accepting_claims or row.conversation_id in self._active:
                     continue
                 lease = await self._lease_store.acquire(
                     conversation_lease_key(row.conversation_id),
@@ -351,7 +414,11 @@ class DurableDirectTurnRuntime:
                 if claimed is None:
                     await self._lease_store.release(lease)
                     continue
-                await self._notify_state_changed(claimed)
+                turn_latency.observe_first_claim(
+                    claimed.created_at, claimed.claimed_at, claimed.attempt_count
+                )
+                with turn_latency.measure("claim_notification"):
+                    await self._notify_state_changed(claimed)
                 task = asyncio.create_task(
                     self._execute(claimed, lease),
                     name=f"direct-turn:{claimed.request_id}",
@@ -604,8 +671,15 @@ class DurableDirectTurnRuntime:
     async def _recover_failure_visibility(self) -> None:
         if self._on_permanent_failure is None:
             return
-        for row in await self.store.list_pending_failure_visibility():
+        for candidate in await self.store.list_pending_failure_visibility():
+            # The callback reconstructs user-visible history from the payload.
+            # Hydrate only pending work and recheck after discovery's transaction.
+            row = await self.store.get(candidate.request_id)
+            if row is None or row.status != DirectTurnStatus.FAILED.value:
+                continue
             outcome = row.outcome if isinstance(row.outcome, dict) else {}
+            if outcome.get("phase") != "permanent_payload_visibility_pending":
+                continue
             error_class = (
                 PermanentDirectTurnControllerError
                 if outcome.get("failure_kind") == "controller"

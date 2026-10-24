@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { get } from 'svelte/store';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { WorkspaceManager } from '$lib/dashboard/workspace';
@@ -31,8 +32,8 @@ describe('WorkspaceWindow pointer controls', () => {
       canonicalHref: '/chat/conversation-1',
     });
     const windowState = get(manager)[0];
-    render(WorkspaceWindowFixture, { window: windowState, manager });
-    return { manager, windowState };
+    const component = render(WorkspaceWindowFixture, { window: windowState, manager });
+    return { manager, windowState, component };
   }
 
   it.each(['mouse', 'touch'])('drags with %s pointer capture and keeps page scroll unchanged', async (pointerType) => {
@@ -50,6 +51,110 @@ describe('WorkspaceWindow pointer controls', () => {
     expect(get(manager)[0].rect.y).toBe(windowState.rect.y + 40);
     expect(HTMLElement.prototype.setPointerCapture).toHaveBeenCalledWith(7);
     expect(window.scrollY).toBe(pageScroll);
+  });
+
+  it.each(['up', 'cancel', 'blur', 'lostcapture'] as const)(
+    'flushes final pending movement on %s and releases capture without reentrant commit', async (ending) => {
+      const frames = new Map<number, FrameRequestCallback>();
+      const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+        frames.set(1, callback);
+        return 1;
+      });
+      const cancel = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => { frames.delete(id); });
+      try {
+        const { manager, windowState } = setup();
+        const handle = screen.getByTestId(`workspace-window-drag-${windowState.key}`);
+        const panel = screen.getByTestId(`workspace-window-${windowState.key}`);
+        const preview = vi.spyOn(manager, 'finishInteraction');
+        await fireEvent.pointerDown(handle, { pointerId: 17, button: 0, clientX: 400, clientY: 200 });
+        const publication = vi.fn();
+        const stop = manager.subscribe(publication);
+        publication.mockClear();
+        await fireEvent.pointerMove(handle, { pointerId: 17, clientX: 420, clientY: 210 });
+        await fireEvent.pointerMove(handle, { pointerId: 17, clientX: 460, clientY: 240 });
+        expect(raf).toHaveBeenCalledTimes(1);
+        expect(publication).not.toHaveBeenCalled();
+        expect(panel).toHaveStyle({ left: `${windowState.rect.x}px` });
+        const release = vi.spyOn(HTMLElement.prototype, 'releasePointerCapture').mockImplementation(() => {
+          handle.dispatchEvent(new PointerEvent('lostpointercapture', { pointerId: 17, bubbles: true }));
+        });
+        if (ending === 'up') await fireEvent.pointerUp(handle, { pointerId: 17 });
+        if (ending === 'cancel') await fireEvent.pointerCancel(handle, { pointerId: 17 });
+        if (ending === 'blur') await fireEvent(window, new Event('blur'));
+        if (ending === 'lostcapture') await fireEvent(handle, new PointerEvent('lostpointercapture', { pointerId: 17 }));
+        expect(get(manager)[0].rect.x).toBe(windowState.rect.x + 60);
+        expect(get(manager)[0].rect.y).toBe(windowState.rect.y + 40);
+        expect(publication).toHaveBeenCalledTimes(1);
+        expect(preview).toHaveBeenCalledTimes(1);
+        expect(frames.size).toBe(0);
+        expect(panel).toHaveAttribute('data-interacting', 'false');
+        release.mockRestore();
+        stop();
+      } finally {
+        raf.mockRestore();
+        cancel.mockRestore();
+      }
+    },
+  );
+
+  it('paints one coalesced preview frame without publication and reconciles safe bounds', async () => {
+    let queued: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      queued = callback;
+      return 23;
+    });
+    const cancel = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+    try {
+      const { manager, windowState } = setup();
+      const handle = screen.getByTestId(`workspace-window-drag-${windowState.key}`);
+      const panel = screen.getByTestId(`workspace-window-${windowState.key}`);
+      await fireEvent.pointerDown(handle, { pointerId: 21, button: 0, clientX: 400, clientY: 200 });
+      const publication = vi.fn();
+      const stop = manager.subscribe(publication);
+      publication.mockClear();
+      await fireEvent.pointerMove(handle, { pointerId: 21, clientX: 430, clientY: 220 });
+      await fireEvent.pointerMove(handle, { pointerId: 21, clientX: 450, clientY: 230 });
+      expect(raf).toHaveBeenCalledTimes(1);
+      queued!(0);
+      await tick();
+      expect(panel).toHaveStyle({ left: `${windowState.rect.x + 50}px`, top: `${windowState.rect.y + 30}px` });
+      expect(publication).not.toHaveBeenCalled();
+      manager.setSafeRect({ x: 100, y: 50, width: 400, height: 350 });
+      await tick();
+      publication.mockClear();
+      queued!(1);
+      await tick();
+      expect(panel).toHaveStyle({ left: '100px', top: '50px', width: '400px', height: '350px' });
+      expect(publication).not.toHaveBeenCalled();
+      await fireEvent.pointerUp(handle, { pointerId: 21 });
+      expect(publication).toHaveBeenCalledTimes(1);
+      stop();
+    } finally {
+      raf.mockRestore();
+      cancel.mockRestore();
+    }
+  });
+
+  it.each(['unmount', 'minimize', 'close'] as const)('abandons pending frames on %s', async (action) => {
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(19);
+    const cancel = vi.spyOn(window, 'cancelAnimationFrame');
+    try {
+      const { manager, windowState, component } = setup();
+      const handle = screen.getByTestId(`workspace-window-drag-${windowState.key}`);
+      await fireEvent.pointerDown(handle, { pointerId: 18, button: 0, clientX: 400, clientY: 200 });
+      await fireEvent.pointerMove(handle, { pointerId: 18, clientX: 450, clientY: 230 });
+      const finish = vi.spyOn(manager, 'finishInteraction');
+      if (action === 'unmount') component.unmount();
+      if (action === 'minimize') manager.minimize(windowState.key);
+      if (action === 'close') await manager.close(windowState.key);
+      await waitFor(() => expect(cancel).toHaveBeenCalledWith(19));
+      expect(finish).not.toHaveBeenCalled();
+      if (action !== 'close') expect(get(manager)[0].rect).toEqual(windowState.rect);
+      else expect(get(manager)).toHaveLength(0);
+    } finally {
+      raf.mockRestore();
+      cancel.mockRestore();
+    }
   });
 
   it('resizes through a border-corner handle without covering window content', async () => {
@@ -142,10 +247,10 @@ describe('WorkspaceWindow pointer controls', () => {
       minimize,
       close,
     ]);
-    expect(layout).toHaveClass('rounded-lg', 'h-8', 'w-8', 'bg-emerald-400/5');
+    expect(layout).toHaveClass('rounded-lg', 'h-8', 'w-8', 'bg-success-subtle');
     expect(layout).not.toHaveClass('rounded-full');
-    expect(minimize).toHaveClass('rounded-lg', 'bg-amber-400/5');
-    expect(close).toHaveClass('rounded-lg', 'bg-rose-400/5');
+    expect(minimize).toHaveClass('rounded-lg', 'bg-warning-subtle');
+    expect(close).toHaveClass('rounded-lg', 'bg-danger-subtle');
   });
 
   it('places the conversation inspector control before the full-page action', async () => {

@@ -81,6 +81,45 @@ class _CreateService(_Service):
         return _CreatedKnowledgebase(knowledgebase_id="kb_created", name=name)
 
 
+@pytest.mark.asyncio
+async def test_kb_discovery_filters_names_and_distinguishes_management_metadata() -> None:
+    from cognis.models.knowledgebase import KnowledgebaseModel
+
+    class DiscoveryService:
+        async def list(self, *, owner_email, access_context):
+            assigned = KnowledgebaseModel(
+                knowledgebase_id="kb_assigned", owner_email=owner_email, name="Travel Egypt"
+            )
+            owned = KnowledgebaseModel(
+                knowledgebase_id="kb_owned", owner_email=owner_email, name="Private Egypt"
+            )
+            shared = KnowledgebaseModel(
+                knowledgebase_id="kb_shared", owner_email="another@example.com", name="Shared Egypt"
+            )
+            if access_context.agent_id:
+                return [assigned]
+            return [assigned, owned, shared]
+
+    handlers = build_knowledgebase_tool_handlers(DiscoveryService())
+    context = ToolExecutionContext(
+        executor_handle=None,  # type: ignore[arg-type]
+        runtime_metadata={
+            "user_email": "owner@example.com",
+            "runtime_access": {
+                "agent_id": "travel-agent",
+                "agent_owner_email": "owner@example.com",
+            },
+        },
+    )
+    available = await handlers["knowledgebase_list"]({"query": "EGYPT"}, context)
+    assert [row["knowledgebase_id"] for row in available] == ["kb_assigned"]
+    assert available[0]["effective_permissions"] == {"view": True, "use": True, "manage": True}
+    assert await handlers["knowledgebase_list"]({"query": "absent"}, context) == []
+    owned = await handlers["knowledgebase_list_owned"]({"query": "egypt"}, context)
+    assert {row["knowledgebase_id"] for row in owned} == {"kb_assigned", "kb_owned"}
+    assert all("settings" not in row and "use" not in row["effective_permissions"] for row in owned)
+
+
 def test_knowledgebase_tool_definitions_cover_agent_operations() -> None:
     tools = {tool.name: tool for tool in knowledgebase_tools()}
 

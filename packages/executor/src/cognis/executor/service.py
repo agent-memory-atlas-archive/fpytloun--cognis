@@ -7,8 +7,11 @@ the foreground executor recursively.
 
 from __future__ import annotations
 
+import getpass
+import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 from collections import deque
@@ -254,6 +257,135 @@ class MacOSServiceManager(ServiceManager):
                 if not content[-1].endswith("\n"):
                     sys.stdout.write("\n")
         return LogResult(0)
+
+    def companion_status(self) -> dict[str, object]:
+        """Versioned local-only contract; connectivity is deliberately not inferred."""
+        result: dict[str, object] = {
+            "schema": 1,
+            "state": "unknown",
+            "owned": False,
+            "controller": "unknown",
+            "ok": False,
+            "code": "status_unavailable",
+        }
+        if not self.brew:
+            return {**result, "state": "not_installed", "code": "not_installed"}
+        try:
+            from cognis import json_codec as json
+
+            installed = _run((self.brew, "list", "--versions", SERVICE_NAME))
+            if installed.returncode == 1:
+                return {**result, "state": "not_installed", "code": "not_installed"}
+            if installed.returncode != 0:
+                return result
+            completed = _run((self.brew, "services", "list", "--json"))
+            records = json.loads(completed.stdout) if completed.returncode == 0 else None
+            if not isinstance(records, list):
+                return result
+            record = next(
+                (
+                    item
+                    for item in records
+                    if isinstance(item, dict) and item.get("name") == SERVICE_NAME
+                ),
+                None,
+            )
+            if record is None:
+                return result
+            status = record.get("status")
+            stopped = status in {"none", "stopped"}
+            owned = record.get("user") == getpass.getuser() or (stopped and not record.get("user"))
+            state = (
+                "running"
+                if status in {"started", "running"}
+                else "stopped"
+                if stopped
+                else "unknown"
+            )
+            return {
+                **result,
+                "state": state,
+                "owned": owned,
+                "ok": owned and state != "unknown",
+                "code": "observed" if owned else "ownership_unknown",
+            }
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            return result
+
+    def companion_operation(self, action: str, *, configured: bool = False) -> dict[str, object]:
+        """Operate only an installed current-user service; never enroll or probe a controller."""
+        before = self.companion_status()
+        if action == "status" or not before["owned"] or not before["ok"]:
+            return before
+        if action == "logs":
+            return {**before, "preview": self._companion_log_summary()}
+        if action not in {"start", "stop", "restart"}:
+            return {**before, "ok": False, "code": "unsupported_action"}
+        if action in {"start", "restart"} and not configured:
+            return {**before, "ok": False, "code": "configuration_required"}
+        result = self._operation(action)
+        observed = self.companion_status()
+        return {
+            **observed,
+            "ok": result.ok,
+            "code": "requested" if result.ok else "operation_uncertain",
+        }
+
+    def _companion_log_summary(self) -> list[str]:
+        # Free-form logs cannot be perfectly redacted. Expose only severity counts
+        # from bounded tails; never return arbitrary text, URLs, IDs or credentials.
+        paths = self._log_paths()
+        if isinstance(paths, LogResult):
+            return ["Log summary unavailable"]
+        summaries = []
+        for label, path in zip(("stderr", "stdout"), paths, strict=True):
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                        summaries.append(f"{label}: unavailable")
+                        continue
+                    stream.seek(max(0, info.st_size - 8192))
+                    tail = stream.read(8192).splitlines()[-50:]
+                counts = {
+                    level: sum(level.encode() in line.split()[:4] for line in tail)
+                    for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+                }
+                summaries.append(
+                    f"{label}: " + ", ".join(f"{level}={count}" for level, count in counts.items())
+                )
+            except OSError:
+                summaries.append(f"{label}: unavailable")
+        return summaries
+
+
+def companion_service(action: str, *, configured: bool = False) -> dict[str, object]:
+    """Discover a conventional Homebrew service without PATH/prose fallbacks."""
+    for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
+        binary = prefix / "bin/brew"
+        try:
+            target = binary.resolve(strict=True)
+            info = target.stat()
+            if (
+                target.is_relative_to(prefix)
+                and info.st_uid in {0, os.getuid()}
+                and not info.st_mode & 0o022
+                and os.access(target, os.X_OK)
+            ):
+                return MacOSServiceManager(brew=str(binary)).companion_operation(
+                    action, configured=configured
+                )
+        except OSError:
+            continue
+    return {
+        "schema": 1,
+        "state": "not_installed",
+        "owned": False,
+        "controller": "unknown",
+        "ok": False,
+        "code": "homebrew_unavailable",
+    }
 
 
 class LinuxSystemdServiceManager(ServiceManager):

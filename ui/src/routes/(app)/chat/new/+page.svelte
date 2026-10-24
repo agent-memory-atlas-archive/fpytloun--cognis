@@ -6,8 +6,8 @@
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { api } from '$lib/api/client';
-  import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
-  import type { Agent, HealthResponse } from '$lib/types/api';
+  import { preferredNewChatAgentId } from '$lib/chat/new-chat-agent';
+  import type { Agent, HealthResponse, Project } from '$lib/types/api';
 
   let loading = true;
   let error = '';
@@ -15,6 +15,8 @@
   let agents: Agent[] = [];
   let selectedAgentId = '';
   let selectedAgentProfileId = '';
+  let projects: Project[] = [];
+  let selectedProjectId = '';
   let health: HealthResponse | null = null;
 
   function isLlmUnavailableForSetup(): boolean {
@@ -23,20 +25,7 @@
   }
 
   async function resolveInitialAgentId(allAgents: Agent[]): Promise<string> {
-    const primary = allAgents.filter((agent) => agent.agent_type === 'primary' && agent.status === 'active');
-    const requestedAgentId = $page.url.searchParams.get('agent_id');
-    if (requestedAgentId && primary.some((agent) => agent.agent_id === requestedAgentId)) {
-      return requestedAgentId;
-    }
-
-    if (typeof window !== 'undefined') {
-      const storedAgentId = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
-      if (storedAgentId && primary.some((agent) => agent.agent_id === storedAgentId)) {
-        return storedAgentId;
-      }
-    }
-
-    return primary[0]?.agent_id ?? '';
+    return preferredNewChatAgentId(allAgents, [$page.url.searchParams.get('agent_id')]);
   }
 
   async function createConversation(): Promise<void> {
@@ -56,6 +45,7 @@
       const conversation = await api.conversations.create({
         agent_id: selectedAgentId,
         agent_profile_id: selectedAgentProfileId || null,
+        project_id: selectedProjectId || null,
         context: {
           type: 'web',
           ref: null,
@@ -80,8 +70,15 @@
     void (async () => {
       try {
         health = await api.system.health();
-        agents = await api.agents.listAll();
+        [agents, projects] = await Promise.all([
+          api.agents.listAll(),
+          api.projects.list().catch(() => [] as Project[])
+        ]);
         selectedAgentId = await resolveInitialAgentId(agents);
+        const requestedProjectId = $page.url.searchParams.get('project_id');
+        if (requestedProjectId && projects.some((project) => project.project_id === requestedProjectId)) {
+          selectedProjectId = requestedProjectId;
+        }
       } catch (caughtError) {
         error = caughtError instanceof Error ? caughtError.message : 'Unable to prepare a new conversation.';
       } finally {
@@ -102,6 +99,8 @@
     {agents}
     bind:selectedAgentId
     bind:selectedAgentProfileId
+    {projects}
+    bind:selectedProjectId
     title="Start a new chat"
     description="Pick the primary agent for this new web conversation. The current filter or your saved agent preference is preselected when possible."
     confirmLabel="Create conversation"

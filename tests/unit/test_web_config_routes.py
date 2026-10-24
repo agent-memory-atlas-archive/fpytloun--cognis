@@ -228,6 +228,7 @@ async def test_web_config_status_separates_configured_and_enabled(
 
     monkeypatch.setattr(settings_routes, "require_admin", lambda _request: None)
     monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
+    monkeypatch.setattr("cognis.core.web_management.get_setting_value", _get_setting_value)
     response = await settings_routes.web_config_status(
         _request([], _Secrets([], {"tavily_api_key"}))
     )

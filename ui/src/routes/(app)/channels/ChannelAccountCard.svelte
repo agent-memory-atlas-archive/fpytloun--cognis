@@ -21,39 +21,39 @@
   export let onDelete: () => void;
 </script>
 
-<Card class={`p-5 ${selected ? 'border-sky-400/40 bg-sky-500/10' : ''}`}>
+<Card class={`p-5 ${selected ? 'border-accent/40 bg-accent-subtle' : ''}`}>
   <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
     <div class="min-w-0 space-y-3">
       <div class="flex flex-wrap items-center gap-2">
-        <div class="inline-flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-200">
-          <MessagesSquare class="h-3.5 w-3.5 text-sky-300" />
+        <div class="inline-flex items-center gap-2 rounded-full border border-control-border px-3 py-1 text-xs text-foreground">
+          <MessagesSquare class="h-3.5 w-3.5 text-accent" />
           <span>{meta?.label ?? account.channel_type}</span>
         </div>
         <span class={`rounded-full px-3 py-1 text-xs font-medium ${statusClass(account)}`}>{statusText(account)}</span>
         {#if pendingCount > 0}
-          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-3 py-1 text-xs text-sky-300">{pendingCount} pending pairing</span>
+          <span class="rounded-full border border-accent/30 bg-accent-subtle px-3 py-1 text-xs text-accent">{pendingCount} pending pairing</span>
         {/if}
         {#if account.preferred_for_task_delivery}
-          <span class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-300">Preferred task delivery</span>
+          <span class="rounded-full border border-success-border bg-success-subtle px-3 py-1 text-xs text-success">Preferred task delivery</span>
         {/if}
         {#if meta?.connection_mode}
-          <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{meta.connection_mode}</span>
+          <span class="rounded-full border border-control-border px-3 py-1 text-xs text-secondary">{meta.connection_mode}</span>
         {/if}
       </div>
       <div>
-        <h2 class="text-lg font-semibold text-white">{account.display_name}</h2>
-        <p class="mt-1 text-sm text-slate-300">Agent: {agentName}</p>
+        <h2 class="text-lg font-semibold text-strong">{account.display_name}</h2>
+        <p class="mt-1 text-sm text-secondary">Agent: {agentName}</p>
       </div>
-      <div class="flex flex-wrap gap-2 text-xs text-slate-400">
-        <span class="rounded-full border border-slate-700 px-3 py-1">DM: {account.dm_policy}</span>
-        <span class="rounded-full border border-slate-700 px-3 py-1">Groups: {account.group_policy}</span>
-        <span class="rounded-full border border-slate-700 px-3 py-1">New conversations: {account.allow_new_conversations ? 'yes' : 'no'}</span>
+      <div class="flex flex-wrap gap-2 text-xs text-muted">
+        <span class="rounded-full border border-control-border px-3 py-1">DM: {account.dm_policy}</span>
+        <span class="rounded-full border border-control-border px-3 py-1">Groups: {account.group_policy}</span>
+        <span class="rounded-full border border-control-border px-3 py-1">New conversations: {account.allow_new_conversations ? 'yes' : 'no'}</span>
         {#if account.adapter_location === 'executor'}
-          <span class="rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1 text-cyan-300">executor</span>
+          <span class="rounded-full border border-cyan-border bg-cyan-subtle px-3 py-1 text-cyan-tone">executor</span>
         {/if}
       </div>
       {#if account.status && 'last_error' in account.status && account.status.last_error}
-        <p class="text-sm text-rose-300">Last error: {account.status.last_error}</p>
+        <p class="text-sm text-danger">Last error: {account.status.last_error}</p>
       {/if}
     </div>
     <div class="flex flex-wrap gap-2">

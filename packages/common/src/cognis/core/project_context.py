@@ -11,9 +11,21 @@ from cognis import json_codec as json
 
 PROJECT_INSTRUCTIONS_DYNAMIC_SOURCE = "project_instructions_dynamic"
 PROJECT_METADATA_DYNAMIC_SOURCE = "project_metadata_dynamic"
+PROJECT_CONTEXT_EXPOSURE_SOURCE = "project_context_exposure"
 PROJECT_CONTEXT_STATUS_LOADED = "loaded"
 PROJECT_CONTEXT_STATUS_MISSING = "missing"
 INTERNAL_PROJECT_CONTEXT_PROBE_TOOL = "_project_context_probe"
+
+
+def project_context_exposure_message(content: str) -> dict[str, Any]:
+    """Build a live notice with the same canonical role as its durable replay."""
+    return {
+        "role": "system",
+        "content": content,
+        "_project_context": True,
+        "_audit_source": PROJECT_CONTEXT_EXPOSURE_SOURCE,
+        "_audit_role": "developer",
+    }
 
 
 @dataclass(slots=True)

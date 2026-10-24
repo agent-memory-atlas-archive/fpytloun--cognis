@@ -1,4 +1,5 @@
 import type { Agent, AgentRuntimeProfile, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+import { DEFAULT_INTARIS_EVALUATION } from '$lib/session-policy';
 
 export interface MCPEnvVar {
   key: string;
@@ -27,6 +28,9 @@ export interface AgentRuntimeProfileFormState {
   memoryBackendOptions: Record<string, unknown>;
   enabled: boolean;
   agentSwitchable: boolean;
+  quickSwitch: boolean;
+  quickSwitchIndex: number;
+  quickSwitchColor?: AgentRuntimeProfile['quick_switch_color'];
 }
 
 /**
@@ -76,8 +80,10 @@ export interface AgentFormState {
   memoryMode: string;
   memoryBackendOptions: Record<string, unknown>;
   guardrailsBackend: 'intaris' | 'none';
+  intarisEvaluation: 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy';
   minimumOutcome: '' | 'deny' | 'escalate' | 'approve';
   maximumOutcome: '' | 'deny' | 'escalate' | 'approve';
+  approvalMode: 'ask' | 'unattended';
   escalationTimeoutSeconds: string;
   agentProfiles: AgentRuntimeProfileFormState[];
   defaultAgentProfileId: string;
@@ -212,7 +218,8 @@ function profileFormStateFromAgentProfiles(
         ? profile.profile_id.trim()
         : profileId,
       description: typeof profile.description === 'string' ? profile.description : '',
-      providerId: typeof profile.provider_id === 'string' ? profile.provider_id : '',
+      providerId: typeof profile.model === 'string' && profile.model.startsWith('cognis/')
+        ? 'cognis' : typeof profile.provider_id === 'string' ? profile.provider_id : '',
       model: typeof profile.model === 'string' ? profile.model : '',
       reasoningEffort: typeof profile.reasoning_effort === 'string' ? profile.reasoning_effort : '',
       fastMode: (
@@ -233,7 +240,10 @@ function profileFormStateFromAgentProfiles(
           : '',
       memoryBackendOptions: { ...(profile.memory_backend_options ?? {}) },
       enabled: profile.enabled !== false,
-      agentSwitchable: profile.agent_switchable === true
+      agentSwitchable: profile.agent_switchable === true,
+      quickSwitch: profile.quick_switch === true,
+      quickSwitchIndex: profile.quick_switch_index ?? 0,
+      quickSwitchColor: profile.quick_switch_color ?? 'neutral'
     }))
     .sort((left, right) => left.profileId.localeCompare(right.profileId));
 }
@@ -253,7 +263,7 @@ function serializeAgentProfiles(
     serialized[profileId] = {
       profile_id: profileId,
       description: profile.description.trim(),
-      provider_id: profile.providerId.trim() || null,
+      provider_id: profile.providerId === 'cognis' ? null : profile.providerId.trim() || null,
       model: profile.model.trim() || null,
       reasoning_effort: profile.reasoningEffort.trim() || null,
       fast_mode:
@@ -267,7 +277,10 @@ function serializeAgentProfiles(
             : null,
       memory_backend_options: memoryBackendOptions,
       enabled: profile.enabled,
-      agent_switchable: profile.agentSwitchable
+      agent_switchable: profile.agentSwitchable,
+      quick_switch: profile.quickSwitch,
+      quick_switch_index: profile.quickSwitchIndex,
+      quick_switch_color: profile.quickSwitchColor ?? 'neutral'
     };
   }
   return serialized;
@@ -315,8 +328,10 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     memoryMode: 'full_auto',
     memoryBackendOptions: {},
     guardrailsBackend: 'intaris',
+    intarisEvaluation: DEFAULT_INTARIS_EVALUATION,
     minimumOutcome: '',
     maximumOutcome: '',
+    approvalMode: 'ask',
     escalationTimeoutSeconds: '',
     agentProfiles: [],
     defaultAgentProfileId: '',
@@ -410,7 +425,8 @@ export function agentToFormState(agent: Agent): AgentFormState {
       permissions.tool_permissions && typeof permissions.tool_permissions === 'object'
         ? (permissions.tool_permissions as Record<string, string>)
         : {},
-    providerId: typeof llmConfig.provider_id === 'string' ? llmConfig.provider_id : '',
+    providerId: typeof llmConfig.model === 'string' && llmConfig.model.startsWith('cognis/')
+      ? 'cognis' : typeof llmConfig.provider_id === 'string' ? llmConfig.provider_id : '',
     model: typeof llmConfig.model === 'string' ? llmConfig.model : '',
     temperature:
       typeof llmConfig.temperature === 'number' ? String(llmConfig.temperature) : '',
@@ -435,7 +451,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     guardrailsBackend:
       agent.capabilities?.guardrails_backend === 'none' ? 'none' : 'intaris',
     minimumOutcome: agent.capabilities?.minimum_outcome ?? '',
+    intarisEvaluation: agent.capabilities?.intaris_evaluation ?? DEFAULT_INTARIS_EVALUATION,
     maximumOutcome: agent.capabilities?.maximum_outcome ?? '',
+    approvalMode: agent.capabilities?.approval_mode ?? 'ask',
     escalationTimeoutSeconds: agent.capabilities?.escalation_timeout_seconds?.toString() ?? '',
     agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
     defaultAgentProfileId:
@@ -705,7 +723,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         }
       : null,
     llm_config: {
-      provider_id: form.providerId || undefined,
+      provider_id: form.providerId === 'cognis' ? undefined : form.providerId || undefined,
       model: form.model || undefined,
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
@@ -723,6 +741,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
             ...(form.memoryMode ? { mode: form.memoryMode } : {})
           },
       guardrails_backend: form.guardrailsBackend,
+      intaris_evaluation: form.intarisEvaluation,
+      approval_mode: form.guardrailsBackend === 'intaris' ? form.approvalMode : 'ask',
       ...(form.guardrailsBackend === 'intaris' && form.minimumOutcome
         ? { minimum_outcome: form.minimumOutcome } : {}),
       ...(form.guardrailsBackend === 'intaris' && form.maximumOutcome
@@ -790,7 +810,7 @@ export function formStateToSystemOverridePayload(form: AgentFormState): Record<s
       items: skillItems(form)
     },
     llm_config: {
-      provider_id: form.providerId || undefined,
+      provider_id: form.providerId === 'cognis' ? undefined : form.providerId || undefined,
       model: form.model || undefined,
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,

@@ -1,0 +1,28 @@
+name: Project release tag gate
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    outputs:
+      project:
+        value: ${{ jobs.validate.outputs.project }}
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.tag.outputs.project }}
+    steps:
+      - id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          project = bool(re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", os.environ["RELEASE_TAG"]))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"project={str(project).lower()}\n")
+          PY

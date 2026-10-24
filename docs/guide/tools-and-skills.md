@@ -2,8 +2,6 @@
 
 The `Tools` workspace helps you understand what Cognis can execute and how those capabilities are exposed to agents.
 
-![Tools and skills registry](../assets/screenshots/tools-skills.webp)
-
 ## Tool registry
 
 The tool registry lists available tools from multiple sources, including:
@@ -18,6 +16,11 @@ Use the filters to narrow by category or source when you want to understand what
 
 Tool categories also drive workflow step tool profiles. A step profile can reduce which categories and capabilities are exposed by default for a specific step without changing the agent's underlying capability boundary.
 
+Built-in, controller, and executor-native tools have declared classifications.
+Their profile group and capabilities come from structured tool metadata, not
+keywords in descriptions. Native definitions are audited at registration.
+Only external MCP and executable skill tools use dynamic classification.
+
 ## Why the registry matters
 
 The registry is a reference view, not the final permission model.
@@ -30,6 +33,36 @@ Whether an agent can actually use a tool depends on:
 - which Intaris MCP servers are allowed directly on the agent
 - which restrictions the agent applies on top
 - whether Intaris allows, escalates, or denies the runtime call
+
+For direct chat, tools in an explicitly assigned `tool_groups` collection that
+belongs to the core `filesystem`, `shell`, `development`, or `web` groups are
+normally visible under `system:direct-default` (soft). This does not override
+other soft profiles or their intended defaults. Explicit exclusions, hard
+profiles, and the effective authorization inventory still constrain exposure.
+Long-tail MCP, administration, and skill tools remain deferred; discover them
+with `search_tools`. A tool name mentioned in guidance is not itself callable
+unless its schema is currently visible.
+
+Controller discovery appends results to the conversation without promoting found
+tools into the initial tool list. Use `describe_tool` for a discovered tool's schema
+and `call_tool` to invoke it, unless it is already directly visible. The existing
+discovery events retain handles across turns; every invocation still checks the
+current permissions and step profile. Skill activation also appends instructions
+and eligibility without changing direct schemas. Sessions that can load skills use
+the fixed controller discovery surface from the first request, including Anthropic
+and inference fallback candidates. Other Anthropic sessions may use native deferred
+tool references. Permissions, model changes or external inventory changes can
+intentionally change exposure.
+
+The agent-loop turn owner owns rejected-tool repair state, retry budgeting, and
+lifecycle events. Typed recovery state is keyed to the controller `turn_id` and
+survives same-turn profile switches and compaction reentry; a new turn resets it.
+The recovery planner is pure: it proposes safe bridge guidance from the
+current authorized inventory instead of adding a direct tool schema. The retry passes through normal exposure
+planning and `ToolRouter`/Intaris authorization; rejected arguments and
+incomplete provider tool calls are discarded. Successful recovery records
+discovery through the canonical `tool_discovery` lifecycle event so session
+cache replay restores the handle consistently.
 
 ## Model-specific file editors
 
@@ -95,6 +128,32 @@ This means:
 - after `skill_load`, the loaded skill's linked runtime tools and bundled executable tools become eligible for subsequent model calls in the turn
 - if a skill carries saved decomposition, tasks and schedules that use that skill materialize from the latest saved skill version
 
+### Portable skill assets
+
+`skill_load` automatically verifies and caches the current version's assets under
+`COGNIS_DATA_DIR/skill_assets` (default `~/.cognis/skill_assets`) on the active
+authorized executor. The returned manifest and loaded context include each
+asset's `local_path`, executor ID, version ID, and SHA-256 hash. Relative bundle
+directories are preserved. Matching cached files are reused; replacements are
+atomic and versions have separate paths.
+Asset preparation currently supports Linux and macOS executors. Unsupported
+platforms return an explicit preparation error rather than reporting a load as
+successful.
+
+Reload after publishing or replacing assets, switching executors, or losing
+cached files. Load sends the authorized version directly, so it does not depend
+on a configure-time executor snapshot or a restart. The separate
+`skill_asset_materialize` tool is retired. Automatically injected instructions
+without prepared paths still require `skill_load` before using asset-only helpers.
+
+Publish required helper scripts, templates, and static resources as versioned
+skill assets. Do not depend on scratch files, absolute executor paths, unbundled
+neighboring resources, or prior session state. Document external dependencies,
+discover runtime configuration at execution time, and never bundle secrets.
+Verify publication → load → execution without the original workspace before
+reporting a skill complete. A preparation failure is a runtime blocker, not
+permission to use an old local copy or claim end-to-end success.
+
 ### Agent skill selection
 
 In the agent editor, you can select which skills to attach to an agent. Attached skills are highlighted in prompt metadata and their tools are available immediately through the deferred tool-loading path.
@@ -125,6 +184,12 @@ Agents can manage skills through built-in tools:
 - `skill_export` -- export a skill as SKILL.md, YAML, or a full Cognis package
 
 All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates or imports a skill, Cognis automatically attaches it to that agent for future runs.
+
+An asset upsert can reuse `existing_asset_id` under a different filename. Renames
+copy verified bytes into a new immutable storage object; the original version
+remains loadable and restorable. Same-name reuse retains the existing storage
+object. Remove the old filename in the same patch when replacing rather than
+adding an asset.
 
 When a skill already has saved decomposition and its decomposition-driving inputs change, Cognis refreshes that decomposition before publishing the new current version. If the refresh fails, the update fails rather than leaving the latest saved version stale.
 
@@ -163,6 +228,25 @@ Skills can define tools with execution recipes. These bundled executable tools a
 
 Skills can also point at existing runtime tools through `linked_tool_ids`. These are references to already-registered builtin or MCP tools. They are useful when a skill should expose a known tool surface without re-declaring a bundled executor-side tool recipe.
 
+On explicit skill load, Cognis resolves links against the current registry and
+stores canonical tool IDs in session activation state. Links may use a canonical
+ID, the callable name, or a qualified MCP server name such as
+`mcp:slack-example:conversations_search_messages`. Server-name aliases and bare
+operation names must identify exactly one tool. Missing, ambiguous, denied, or
+step-excluded links are reported in the activation notice rather than silently
+treated as enabled. Loading a skill does not override tool permissions or hard
+step restrictions.
+Resolved links remain callable through `describe_tool` and `call_tool`, not newly
+added direct schemas. Canonical events preserve instructions and eligibility after
+cache loss. Loading or reloading a skill, including `/skill`, appends instructions
+without deleting earlier exposed instructions; the latest state controls eligibility.
+
+`describe_tool`, `validate_tool_call`, `call_tool`, and exact `search_tools`
+lookups use the same reference resolution within their authorized inventory.
+Exact discovery also returns a matching tool that is already visible. Natural
+language searches remain relevance-ranked; a failed lookup is not evidence that
+the underlying service is unavailable.
+
 Use linked runtime tools when:
 
 - the tool already exists in the registry
@@ -178,7 +262,61 @@ Skills can also carry reusable workflow step material, including step tool-profi
 
 When Cognis decomposes a skill into workflow steps, it automatically tries to align step profiles and per-step tool overrides with the skill's linked and bundled tools. The saved decomposition is editable through the workflow editor UI, but saving in that mode writes back to the skill version rather than creating a standalone workflow row.
 
-Skill assets are stored in Cognis itself (database metadata plus artifact storage) and are never managed as editable controller filesystem state. Executors only receive temporary staged copies for execution.
+Skill assets are stored in Cognis itself (database metadata plus artifact storage)
+and are never managed as editable controller filesystem state. Executors receive
+versioned cached copies for asset-only helpers and temporary staged copies for
+executable recipes.
+
+### Python asset environments
+
+`skill_load` and `/skill` transparently verify assets and prepare one shared Python
+virtualenv per owner and skill on the selected executor. This remains a read-only
+operation for the agent; no additional skill settings or preparation tool are needed.
+All Python assets in the skill contribute requirements to this environment.
+
+Use standard [PEP 723 inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/)
+to declare dependencies directly in each script:
+
+```python
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["requests==2.32.3", "rich>=13,<14"]
+# ///
+```
+
+Exact `==` versions pin direct dependencies, not the complete transitive dependency
+graph. Requirements across scripts are resolved together; incompatible pins are
+reported rather than assigned separate environments. Without a PEP 723 block,
+Cognis infers third-party imports best-effort, excluding standard-library and
+bundled Python modules. Import names do not always match package names; explicit
+PEP 723 dependencies are authoritative and recommended. Optional and dynamic imports
+cannot be inferred reliably.
+
+Run assets with the returned `python_environment.python_path` and their `local_path`
+on the named executor. Do not use system Python or make another ad-hoc virtualenv.
+The executor uses `uv` when available, otherwise Python's `venv` and `pip`. It uses
+its existing Python interpreter and does not download Python or install OS packages.
+Dependency installation may access package indexes and execute package build code.
+
+Each load verifies and repairs files, reuses a healthy environment without forced
+upgrades, installs missing requirements, and recreates a broken managed environment.
+Preparation is serialized, time-bounded, and safe to repeat. Published versions keep
+separate asset files but share the skill environment, so incompatible historical
+versions should not be run concurrently.
+
+Preparation failures **do not block skill instructions**. The load result and
+protected skill context include `preparation_warning` and, when available, an
+incomplete `python_environment` with the concrete error. Assets might not be runnable.
+The agent can correct missing OS dependencies, package declarations, or executor
+problems through normal authorized tools, then reload the skill to retry. Never
+claim runtime readiness solely because files were materialized.
+
+Python `script` recipes use the same shared interpreter automatically. During a
+rolling upgrade, older executors still return verified assets but no environment;
+new controllers expose that as an incomplete-environment warning. New executors
+preserve legacy recipe execution for old controller manifests lacking owner
+scoping. That compatibility branch can be removed once every controller supplies
+the owner-scoped manifest.
 
 Supported recipe modes:
 

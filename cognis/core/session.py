@@ -284,6 +284,7 @@ def _intaris_session_policy(
     session_policy: dict[str, Any] | None = None,
     agent: AgentDefinition | None = None,
     conversation_data: dict[str, Any] | None = None,
+    inherited_evaluation: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``policy`` payload for ``guardrails.create_session``.
 
@@ -321,6 +322,14 @@ def _intaris_session_policy(
         _add(raw_path)
 
     policy: dict[str, Any] = {"allow_paths": paths} if paths else {}
+    from cognis.core.intaris_policy import approvals_unattended
+
+    runtime_access = current_runtime_access_context.get()
+    task_interaction_mode_override = (
+        runtime_access.interaction_mode_override if runtime_access is not None else None
+    )
+    if approvals_unattended(interaction_mode, agent, task_interaction_mode_override):
+        interaction_mode = "none"
     if interaction_mode:
         policy["interaction_mode"] = interaction_mode
         if interaction_mode == "none":
@@ -329,15 +338,36 @@ def _intaris_session_policy(
                 "on_uncertain": "deny",
                 "allow_human_escalation": False,
             }
+    if session_policy is None and runtime_access is not None:
+        session_policy = runtime_access.session_policy
     policy.update(merge_session_policies(session_policy))
+    from cognis.models.intaris_policy import DEFAULT_INTARIS_EVALUATION
+
+    evaluation = (
+        inherited_evaluation
+        or policy.pop("intaris_evaluation", None)
+        or (
+            agent.capabilities.intaris_evaluation
+            if agent is not None
+            else DEFAULT_INTARIS_EVALUATION
+        )
+    )
+    policy.pop("intaris_evaluation", None)
+    policy["evaluation_policy_version"] = "legacy" if evaluation == "legacy" else "hybrid_v1"
+    if evaluation != "legacy":
+        policy["profile"] = evaluation
     maximum = agent.capabilities.maximum_outcome if agent is not None else None
     if (
         isinstance(conversation_data, dict)
         and conversation_data.get("maximum_outcome_override") == "approve"
     ):
         maximum = "approve"
-    if maximum is not None:
+    # Explicit null clears a previously configured ceiling in an existing
+    # Intaris session; omission would retain its stale value.
+    if agent is not None or maximum is not None:
         policy["maximum_outcome"] = maximum
+    if agent is not None and agent.capabilities.minimum_outcome is not None:
+        policy["minimum_outcome"] = agent.capabilities.minimum_outcome
     return policy
 
 
@@ -405,6 +435,28 @@ class SessionManager:
         if self.session_lock is not None:
             self.session_lock.evict(session_id)
 
+    async def _delegated_evaluation(self, parent: SessionModel) -> str:
+        """Read the effective parent mode without copying grants or bounds."""
+        async with self.session_factory() as db_session:
+            parent_agent = await self._require_agent(db_session, parent.agent_id)
+        remote = await self.providers.guardrails.get_session(
+            parent.intaris_session_id or parent.session_id,
+            user_email=parent.user_email,
+            agent_id=parent.agent_id,
+            agent_owner_email=parent_agent.owner_email,
+        )
+        policy = remote.policy or {}
+        version = policy.get("evaluation_policy_version", "legacy")
+        if version == "legacy":
+            return "legacy"
+        if version == "hybrid_v1" and policy.get("profile") in {
+            "strict",
+            "balanced",
+            "bounded_autonomy",
+        }:
+            return str(policy["profile"])
+        raise ValueError("Parent has an unsupported Intaris evaluation policy")
+
     async def set_conversation_yolo(
         self, conversation: ConversationModel, session: SessionModel, *, enabled: bool
     ) -> None:
@@ -441,8 +493,7 @@ class SessionManager:
                 agent=agent,
                 conversation_data=data,
             ).get("maximum_outcome")
-            if maximum is not None:
-                policy["maximum_outcome"] = maximum
+            policy["maximum_outcome"] = maximum
             return policy
 
         update = self.providers.guardrails.update_session_policy
@@ -488,8 +539,8 @@ class SessionManager:
         *,
         session_policy_override: dict[str, Any] | None = None,
         additional_allowed_paths: list[str] | None = None,
-    ) -> None:
-        """Refresh Intaris policy from runtime paths and any explicit inherited clauses."""
+    ) -> dict[str, Any] | None:
+        """Refresh runtime policy and return it only after provider acknowledgement."""
 
         workdir = _resolve_runtime_workdir()
         async with self.session_factory() as db_session:
@@ -499,6 +550,14 @@ class SessionManager:
                 db_session, session.conversation_id
             )
             project_paths = await _project_source_paths(db_session, project_id)
+        inherited_evaluation = None
+        if session.parent_session_id:
+            async with self.session_factory() as db_session:
+                parent_row = await queries.get_session_row(db_session, session.parent_session_id)
+                if parent_row is None or parent_row.user_email != session.user_email:
+                    raise ValueError("Delegated policy parent is unavailable")
+                parent = _to_session_model(parent_row)
+            inherited_evaluation = await self._delegated_evaluation(parent)
         runtime_access = current_runtime_access_context.get()
         session_policy = session_policy_override
         if session_policy is None and runtime_access and runtime_access.session_policy:
@@ -511,32 +570,34 @@ class SessionManager:
             session_policy=session_policy,
             agent=agent,
             conversation_data=conversation.context_data if conversation is not None else None,
+            inherited_evaluation=inherited_evaluation,
         )
-        if (
-            not new_policy.get("allow_paths")
-            and not new_policy.get("interaction_mode")
-            and not new_policy.get("allow_policies")
-            and not new_policy.get("deny_policies")
-        ):
-            return
+        # Evaluation profiles and outcome bounds are policy even without
+        # filesystem access or an interaction-mode override.
+        if not new_policy:
+            return None
         intaris_session_id = session.intaris_session_id or session.session_id
         if hasattr(self.providers.guardrails, "update_session_policy"):
             try:
-                await self.providers.guardrails.update_session_policy(
+                acknowledged_policy = await self.providers.guardrails.update_session_policy(
                     intaris_session_id,
                     agent_id=session.agent_id,
                     user_id=session.user_email,
                     details=_intaris_session_details(workdir),
                     policy=new_policy,
                 )
+                return acknowledged_policy if isinstance(acknowledged_policy, dict) else new_policy
             except Exception:
                 logger.warning(
                     "session: failed to refresh Intaris session policy",
                     extra={"extra_data": {"session_id": session.session_id}},
                     exc_info=True,
                 )
-                if new_policy.get("maximum_outcome") is not None:
+                if new_policy.get("maximum_outcome") is not None or new_policy.get(
+                    "evaluation_policy_version"
+                ) in ("legacy", "hybrid_v1"):
                     raise
+        return None
 
     async def create_conversation(
         self,
@@ -549,6 +610,7 @@ class SessionManager:
         title_source: str = "unset",
         conversation_id: str | None = None,
         project_id: str | None = None,
+        visibility: str | None = None,
     ) -> ConversationModel:
         """Create a conversation without creating a root session."""
 
@@ -567,6 +629,7 @@ class SessionManager:
                     memory_labels=dict(context.memory_labels),
                     conversation_id=conversation_id,
                     project_id=project_id,
+                    visibility=visibility,
                 )
                 await db_session.commit()
             except Exception:
@@ -855,6 +918,7 @@ class SessionManager:
         initial_active_executor_assigned_at: datetime | None = None,
         initial_active_executor_expires_at: datetime | None = None,
         initial_active_executor_source: str | None = None,
+        initial_active_executor_generation: int = 0,
         project_id: str | None = None,
         admission_guard: Any | None = None,
         conversation_id: str | None = None,
@@ -879,6 +943,7 @@ class SessionManager:
                     if lineage is not None
                     else queries.create_conversation
                 )
+                lineage_kwargs: dict[str, Any] = {"lineage": lineage} if lineage is not None else {}
                 conversation = await create_conversation(
                     db_session,
                     user_email=user_email,
@@ -892,7 +957,7 @@ class SessionManager:
                     memory_labels=dict(context.memory_labels),
                     project_id=project_id,
                     conversation_id=conversation_id,
-                    **({"lineage": lineage} if lineage is not None else {}),
+                    **lineage_kwargs,
                 )
                 # Stage 36: seed the conversation's active_executor_id from
                 # the task-level pin (if provided). The runtime factory
@@ -903,6 +968,7 @@ class SessionManager:
                     conversation.active_executor_assigned_at = initial_active_executor_assigned_at
                     conversation.active_executor_expires_at = initial_active_executor_expires_at
                     conversation.active_executor_source = initial_active_executor_source
+                    conversation.active_executor_generation = initial_active_executor_generation
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation.conversation_id,
@@ -975,6 +1041,7 @@ class SessionManager:
         event_filter: Any | None = None,
         admission_guard: Any | None = None,
         lineage: ConversationLineage | None = None,
+        conversation_id: str | None = None,
     ) -> tuple[ConversationModel, SessionModel, bool]:
         """Fork a source session into a new web conversation."""
 
@@ -1008,6 +1075,7 @@ class SessionManager:
             raise ValueError("Lineage source does not match the fork source")
         conversation, session = await self.create_conversation_with_root_session(
             user_email=user_email,
+            conversation_id=conversation_id,
             agent_id=agent.agent_id,
             agent_profile_id=explicit_profile_id,
             context=fork_context,
@@ -1405,8 +1473,16 @@ class SessionManager:
         intention: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
+        session_id: str | None = None,
     ) -> SessionModel:
         """Create a delegated child session and corresponding Intaris session."""
+
+        inherited_evaluation = None
+        if parent_session:
+            # Built-in specialists are execution roles, not separately configured
+            # policy owners. Read the parent's effective mode before opening
+            # the child-creation transaction; do not copy grants or bounds.
+            inherited_evaluation = await self._delegated_evaluation(parent_session)
 
         async with self.session_factory() as db_session:
             try:
@@ -1414,17 +1490,62 @@ class SessionManager:
                 conversation = await queries.get_conversation(
                     db_session, parent_session.conversation_id
                 )
-                session_row = await queries.create_session(
+                session_row = (
+                    await queries.get_session_row(db_session, session_id) if session_id else None
+                )
+                if session_row is not None:
+                    # Execution adds runtime observations and may switch profiles.
+                    # Neither changes the provisioned child's reservation identity.
+                    reservation_metadata = dict(session_row.delegation_metadata or {})
+                    reservation_metadata.pop("execution_runtime", None)
+                    if (
+                        session_row.conversation_id != parent_session.conversation_id
+                        or session_row.parent_session_id != parent_session.session_id
+                        or session_row.user_email != parent_session.user_email
+                        or session_row.agent_id != agent_id
+                        or (
+                            not session_row.intaris_session_id
+                            and session_row.agent_profile_id != agent_profile_id
+                        )
+                        or session_row.delegation_mode != mode
+                        or reservation_metadata != (delegation_metadata or {})
+                    ):
+                        raise ValueError("Child reservation identity mismatch")
+                    if session_row.intaris_session_id:
+                        return _to_session_model(session_row)
+                else:
+                    session_row = await queries.create_session(
+                        db_session,
+                        conversation_id=parent_session.conversation_id,
+                        user_email=parent_session.user_email,
+                        agent_id=agent_id,
+                        agent_profile_id=agent_profile_id,
+                        parent_session_id=parent_session.session_id,
+                        activity_scope_id=parent_session.activity_scope_id,
+                        delegation_mode=mode,
+                        delegation_task=task_description,
+                        delegation_metadata=delegation_metadata,
+                        session_id=session_id,
+                    )
+                import json
+
+                from cognis.core.artifact_sharing import grant_referenced_inputs
+
+                await grant_referenced_inputs(
                     db_session,
-                    conversation_id=parent_session.conversation_id,
-                    user_email=parent_session.user_email,
-                    agent_id=agent_id,
-                    agent_profile_id=agent_profile_id,
-                    parent_session_id=parent_session.session_id,
-                    activity_scope_id=parent_session.activity_scope_id,
-                    delegation_mode=mode,
-                    delegation_task=task_description,
-                    delegation_metadata=delegation_metadata,
+                    owner_email=parent_session.user_email,
+                    source_agent_id=parent_session.agent_id,
+                    source_session_id=parent_session.session_id,
+                    source_conversation_id=parent_session.conversation_id,
+                    target_session_id=session_row.session_id,
+                    text="\n".join(
+                        (
+                            task_description,
+                            expected_output or "",
+                            json.dumps(constraints or {}),
+                            json.dumps(delegation_metadata or {}),
+                        )
+                    ),
                 )
                 resolved_intention = _normalize_intention(
                     intention or self._build_child_intention(child_agent, task_description)
@@ -1446,6 +1567,17 @@ class SessionManager:
                         "delegation_metadata": delegation_metadata or {},
                     },
                 )
+                child_policy = _intaris_session_policy(
+                    workdir,
+                    project_paths=project_paths,
+                    agent=child_agent,
+                    inherited_evaluation=inherited_evaluation,
+                    conversation_data=conversation.context_data
+                    if conversation is not None
+                    else None,
+                )
+                if session_id is not None:
+                    await db_session.commit()
                 with scoped_runtime_context(
                     user_email=parent_session.user_email,
                     agent_id=parent_session.agent_id,
@@ -1459,14 +1591,7 @@ class SessionManager:
                         parent_session_id=parent_session.intaris_session_id
                         or parent_session.session_id,
                         details=child_details,
-                        policy=_intaris_session_policy(
-                            workdir,
-                            project_paths=project_paths,
-                            agent=child_agent,
-                            conversation_data=conversation.context_data
-                            if conversation is not None
-                            else None,
-                        ),
+                        policy=child_policy,
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -1776,6 +1901,22 @@ class SessionManager:
         )
         durable_summary_events: list[SessionEvent] = []
         summary_result: Any | None = None
+
+        # Compaction changes storage, not the task. Read the durable intention
+        # before taking rotation locks; retrieval failure leaves the old lane
+        # intact rather than silently creating a generic authorization scope.
+        if transition is SessionTransition.COMPACT:
+            async with self.session_factory() as db_session:
+                source_agent = await self._require_agent(db_session, current_session.agent_id)
+                source_owner = source_agent.owner_email
+            remote = await self.providers.guardrails.get_session(
+                current_session.intaris_session_id or current_session.session_id,
+                user_email=current_session.user_email,
+                agent_id=current_session.agent_id,
+                agent_owner_email=source_owner,
+            )
+            if remote.intention and remote.intention.strip():
+                intention = remote.intention
 
         async with self.session_factory() as db_session:
             try:
@@ -2560,6 +2701,9 @@ class SessionManager:
         recovered_ids: list[str] = []
         child_sessions = await queries.list_child_sessions(db_session, parent_session_id)
         for child_session in child_sessions:
+            if child_session.delegation_mode == "hook":
+                # HookRuntime owns fenced interruption and outcome publication.
+                continue
             if child_session.status == "active":
                 await queries.set_session_status(
                     db_session,
@@ -2597,6 +2741,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
             memory_labels=row.memory_labels or {},
         ),
         project_id=getattr(row, "project_id", None),
+        visibility=str(getattr(row, "visibility", None) or "private"),
         active_session_id=row.active_session_id,
         active_executor_id=getattr(row, "active_executor_id", None),
         active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),

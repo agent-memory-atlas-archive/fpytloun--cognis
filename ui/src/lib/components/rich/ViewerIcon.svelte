@@ -1,5 +1,5 @@
 <script lang="ts">
-  export let name: 'light' | 'dark' | 'system' | 'download' | 'copy' | 'check' | 'contents' | 'collapse' | 'close' | 'share';
+  export let name: 'light' | 'dark' | 'system' | 'download' | 'copy' | 'check' | 'contents' | 'collapse' | 'expand' | 'close' | 'share';
 </script>
 
 <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" data-viewer-icon={name}>
@@ -20,6 +20,8 @@
     <path d="M2.5 4h11M2.5 8h11M2.5 12h7" />
   {:else if name === 'collapse'}
     <path d="M9.8 4.2 6 8l3.8 3.8M13 4.2v7.6" />
+  {:else if name === 'expand'}
+    <path d="m6 4 4 4-4 4" />
   {:else if name === 'share'}
     <path d="M9 2h5v5M14 2 7 9M6 3H3v10h10v-3" />
   {:else}

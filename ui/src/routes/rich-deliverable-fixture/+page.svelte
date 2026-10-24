@@ -58,6 +58,8 @@
   <section class="fixture-shell" data-testid="rich-deliverable-fixture" data-scenario={scenario.id} data-theme={theme} data-width={width} data-surface={surface} style={`--fixture-review-width:${width}px`}>
     {#key scenario.id}
       <RichDeliverable title={scenario.title} content={scenario.content} payload={scenario.payload} instanceId={`fixture-${scenario.id}`}
+        internalUrl={page.url.searchParams.has('sharing') ? page.url.pathname + page.url.search : ''}
+        shareLinkCallback={page.url.searchParams.has('sharing') ? async () => page.url.href : null}
         standaloneUrl={`/rich-deliverable-fixture?scenario=${encodeURIComponent(scenario.id)}&theme=${theme}&width=${width}&surface=standalone&capture=viewer`} {surface} />
     {/key}
   </section>

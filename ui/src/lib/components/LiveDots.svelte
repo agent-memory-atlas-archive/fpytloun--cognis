@@ -15,11 +15,11 @@
 
   function dotClass(): string {
     const palette = {
-      sky: 'bg-sky-400',
-      slate: 'bg-slate-400',
-      cyan: 'bg-cyan-300',
-      emerald: 'bg-emerald-300',
-      amber: 'bg-amber-300'
+      sky: 'bg-info',
+      slate: 'bg-muted',
+      cyan: 'bg-cyan-tone',
+      emerald: 'bg-success',
+      amber: 'bg-warning'
     } as const;
     const safeTone: keyof typeof palette = tone in palette ? tone as keyof typeof palette : 'sky';
     const dimensions = size === 'sm' ? 'h-1.5 w-1.5' : 'h-2 w-2';
@@ -27,13 +27,13 @@
   }
 </script>
 
-<span class={`inline-flex items-center gap-2 ${inline ? '' : 'rounded-full border border-slate-800 bg-slate-900/80 px-3 py-1.5'} ${className}`}>
+<span class={`inline-flex items-center gap-2 ${inline ? '' : 'rounded-full border border-separator bg-surface/80 px-3 py-1.5'} ${className}`}>
   <span class="inline-flex items-center gap-1.5" aria-hidden="true">
     <span class={`${dotClass()} animate-bounce [animation-delay:0ms]`}></span>
     <span class={`${dotClass()} animate-bounce [animation-delay:150ms]`}></span>
     <span class={`${dotClass()} animate-bounce [animation-delay:300ms]`}></span>
   </span>
   {#if label}
-    <span class="text-xs font-medium text-slate-300">{label}</span>
+    <span class="text-xs font-medium text-secondary">{label}</span>
   {/if}
 </span>

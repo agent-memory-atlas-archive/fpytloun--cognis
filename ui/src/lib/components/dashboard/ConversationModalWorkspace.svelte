@@ -342,7 +342,7 @@
   data-testid="conversation-modal-workspace"
 >
   {#if !inspectorControlInHeader && narrowLayout}
-  <div class="flex shrink-0 items-center justify-end border-b border-slate-800 px-3 py-2" data-testid="conversation-mobile-inspector-control">
+  <div class="flex shrink-0 items-center justify-end border-b border-separator px-3 py-2" data-testid="conversation-mobile-inspector-control">
     <span bind:this={narrowToggleContainer} data-dashboard-conversation-inspector-toggle>
       <SessionDetailsButton
         open={inspectorVisible}
@@ -361,14 +361,14 @@
       aria-hidden={narrowLayout && inspectorVisible}
     >
       {#if selectedSession}
-        <div class="flex h-10 shrink-0 items-center gap-2 border-b border-slate-800 px-3" data-testid="dashboard-conversation-session-header">
+        <div class="flex h-10 shrink-0 items-center gap-2 border-b border-separator px-3" data-testid="dashboard-conversation-session-header">
           <button
-            class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white"
+            class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted hover:bg-raised hover:text-strong"
             type="button"
             aria-label="Back to parent conversation"
             onclick={() => { selectedSession = null; }}
           ><ArrowLeft class="h-4 w-4" /></button>
-          <span class="min-w-0 truncate text-xs font-medium text-slate-200">{selectedSession.title}</span>
+          <span class="min-w-0 truncate text-xs font-medium text-foreground">{selectedSession.title}</span>
         </div>
       {/if}
       <div class="min-h-0 flex-1">
@@ -388,14 +388,14 @@
     {#if narrowLayout && inspectorVisible}
       <button
         aria-label="Close conversation inspector"
-        class="absolute inset-0 z-10 bg-slate-950/35 backdrop-blur-[1px]"
+        class="absolute inset-0 z-10 bg-scrim/35 backdrop-blur-[1px]"
         type="button"
         onclick={() => { void toggleInspector(false); }}
       ></button>
       <div
         bind:this={narrowInspectorElement}
         id={inspectorIdBase}
-        class="absolute inset-0 z-20 isolate w-full overflow-y-auto bg-slate-950 p-4"
+        class="absolute inset-0 z-20 isolate w-full overflow-y-auto bg-canvas p-4"
         data-testid={`${inspectorIdBase}-mobile`}
         data-dashboard-conversation-inspector-overlay
         role="dialog"
@@ -419,7 +419,7 @@
     {#if !narrowLayout && inspectorVisible}
       <aside
         id={inspectorIdBase}
-        class="relative shrink-0 overflow-y-auto border-l border-slate-800 p-4"
+        class="relative shrink-0 overflow-y-auto border-l border-separator p-4"
         style={`width:${inspectorWidth}px`}
         data-testid={`${inspectorIdBase}-desktop`}
       >
@@ -433,7 +433,7 @@
           aria-valuemax={INSPECTOR_MAX_WIDTH}
           aria-valuenow={inspectorWidth}
           aria-valuetext={`${inspectorWidth} pixels wide`}
-          class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-sky-400/40"
+          class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent-subtle"
           data-testid={`${inspectorIdBase}-desktop-resizer`}
           onpointerdown={startResize}
           onkeydown={resizeWithKeyboard}

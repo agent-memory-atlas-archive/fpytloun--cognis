@@ -12,27 +12,27 @@
   const normalized = $derived(value == null ? null : Math.max(0, Math.min(100, value)));
   const tone = $derived(
     normalized == null
-      ? 'bg-slate-700'
+      ? 'bg-inset'
       : normalized >= 95
-        ? 'bg-rose-400'
+        ? 'bg-danger'
         : normalized >= 80
-          ? 'bg-sky-400'
-          : 'bg-emerald-400'
+          ? 'bg-accent'
+          : 'bg-success'
   );
 </script>
 
 <div class="space-y-2">
   <div class="flex items-baseline justify-between gap-3 text-sm">
-    <span class="font-medium text-slate-200">{label}</span>
-    <span class="text-right text-xs text-slate-400">{detail}</span>
+    <span class="font-medium text-foreground">{label}</span>
+    <span class="text-right text-xs text-muted">{detail}</span>
   </div>
   {#if normalized == null}
-    <div class="h-1.5 overflow-hidden rounded-full bg-slate-800" aria-hidden="true">
+    <div class="h-1.5 overflow-hidden rounded-full bg-raised" aria-hidden="true">
       <div class="h-full w-0"></div>
     </div>
   {:else}
     <div
-      class="h-1.5 overflow-hidden rounded-full bg-slate-800"
+      class="h-1.5 overflow-hidden rounded-full bg-raised"
       role="progressbar"
       aria-label={label}
       aria-valuemin="0"

@@ -55,6 +55,29 @@ def recover_trailing_json_object(raw: str) -> dict[str, Any] | None:
     return recovered
 
 
+def _is_structural_continuation(existing: str, incoming: str) -> bool:
+    """Recognize nested values and delimiters before replay heuristics."""
+
+    if _parse_json_object(incoming) is None and any(
+        char not in "{}[],: \t\r\n" for char in incoming
+    ):
+        return False
+    combined = (existing + incoming).strip()
+    if not combined.startswith("{"):
+        return False
+    try:
+        parsed = json.loads(combined)
+    except json.JSONDecodeError as error:
+        # A legal container prefix can still need a value, key, or closing
+        # delimiter. An earlier syntax error is not a valid continuation.
+        return error.pos == len(combined) and error.msg in {
+            "Expecting value",
+            "Expecting property name enclosed in double quotes",
+            "Expecting ',' delimiter",
+        }
+    return isinstance(parsed, dict)
+
+
 def merge_incremental_json_fragment(existing: str, incoming: str) -> IncrementalJsonMergeResult:
     """Merge a streamed JSON fragment into an accumulated string.
 
@@ -81,13 +104,15 @@ def merge_incremental_json_fragment(existing: str, incoming: str) -> Incremental
         return IncrementalJsonMergeResult(merged=existing, emitted="")
     if not existing:
         return IncrementalJsonMergeResult(merged=incoming, emitted=incoming)
-    if existing.startswith(incoming):
-        return IncrementalJsonMergeResult(merged=existing, emitted="")
     if incoming.startswith(existing):
         return IncrementalJsonMergeResult(
             merged=incoming,
             emitted=incoming[len(existing) :],
         )
+    if _is_structural_continuation(existing, incoming):
+        return IncrementalJsonMergeResult(merged=existing + incoming, emitted=incoming)
+    if existing.startswith(incoming):
+        return IncrementalJsonMergeResult(merged=existing, emitted="")
 
     existing_object = _parse_json_object(existing)
     incoming_object = _parse_json_object(incoming)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from jsonschema import Draft7Validator
@@ -748,6 +749,18 @@ async def test_agent_loop_dynamic_options_use_restricted_effective_inventory(
     monkeypatch.setattr("cognis.store.queries.list_executors", empty)
     monkeypatch.setattr("cognis.store.queries.list_llm_providers", empty)
     monkeypatch.setattr("cognis.store.queries.list_skills", empty)
+    monkeypatch.setattr("cognis.core.agent_management_catalog.list_workflows", empty)
+    monkeypatch.setattr("cognis.core.agent_management_catalog.list_knowledgebases", empty)
+    monkeypatch.setattr(
+        "cognis.core.agent_management_catalog.get_agent",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                owner_email="owner@example.com",
+                status="active",
+                permissions={},
+            )
+        ),
+    )
 
     class SessionContext:
         async def __aenter__(self) -> object:
@@ -761,7 +774,8 @@ async def test_agent_loop_dynamic_options_use_restricted_effective_inventory(
     resolved = await loop._resolve_introspection_dynamic_options(
         SimpleNamespace(
             session=SimpleNamespace(user_email="owner@example.com"),
-            agent=SimpleNamespace(permissions=None),
+            agent=SimpleNamespace(agent_id="caller", permissions=None),
+            tool_registry=SimpleNamespace(list_tools=lambda: [allowed]),
         ),
         [MANAGE_AGENTS_TOOL, allowed],
     )

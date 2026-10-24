@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cognis import __version__
 from cognis.api.chat_v2.cached_event_store import (
     CachedSessionEventStore,
     EventCacheBounds,
@@ -31,6 +32,7 @@ from cognis.api.chat_v2.routes import router as chat_v2_router
 from cognis.api.chat_v2.shared_snapshot_cache import SharedChatSnapshotCache
 from cognis.api.chat_v2.work_graph import AuthorizedWorkGraphResolver
 from cognis.api.common import error_response
+from cognis.api.effective_tools_preview_gate import EffectiveToolsPreviewGate
 from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.api.mcp_reconfigure import (
     schedule_mcp_server_executor_reconfigure_for_app,
@@ -40,6 +42,7 @@ from cognis.api.middleware import (
     KnowledgebaseDocumentUploadLimitMiddleware,
 )
 from cognis.api.routes.agents import router as agents_router
+from cognis.api.routes.artifact_documents import router as artifact_documents_router
 from cognis.api.routes.artifacts import router as artifacts_router
 from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.channels import router as channels_router
@@ -50,7 +53,9 @@ from cognis.api.routes.deliverables import router as deliverables_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
+from cognis.api.routes.inbox import router as inbox_router
 from cognis.api.routes.knowledgebases import router as knowledgebases_router
+from cognis.api.routes.library import router as library_router
 from cognis.api.routes.local_models import router as local_models_router
 from cognis.api.routes.mcp_oauth import (
     _mcp_oauth_status_payload_for_user,
@@ -63,6 +68,8 @@ from cognis.api.routes.mcp_oauth import (
 )
 from cognis.api.routes.notifications import attention_router
 from cognis.api.routes.notifications import router as notifications_router
+from cognis.api.routes.palette import router as palette_router
+from cognis.api.routes.profiling import router as profiling_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
 from cognis.api.routes.schedules import router as schedules_router
@@ -97,6 +104,7 @@ from cognis.core.local_model_runtime import LocalModelRuntimeManager
 from cognis.core.loop_watchdog import EventLoopWatchdog
 from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService
 from cognis.core.observability import ObservabilityService
+from cognis.core.palette import PaletteAdmission
 from cognis.core.redis_service import RedisService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
@@ -448,8 +456,12 @@ def create_app(
         from cognis.core.controller_directory import ControllerInstanceDirectory
         from cognis.core.controller_runtime import ControllerRuntime
         from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
+        from cognis.offline_runtime import preload_bundled_encodings
         from cognis.store.schema import expected_schema_heads
 
+        # Parse bundled tokenizer data once, off request paths. Missing data
+        # degrades token counting to logged estimates; it never downloads.
+        await asyncio.to_thread(preload_bundled_encodings)
         controller_runtime = ControllerRuntime(config.controller_id)
         app.state.controller_runtime = controller_runtime
         app.state.expected_schema_heads = expected_schema_heads()
@@ -471,6 +483,14 @@ def create_app(
         auth_provider = JWTAuthProvider(
             config_runtime.jwt_private_key_path, config_runtime.jwt_public_key_path
         )
+        if config_runtime.inference_credential_dir is not None:
+            from cognis.providers.auth.inference_credentials import provision_companion_tokens
+
+            await provision_companion_tokens(
+                config_runtime.inference_credential_dir,
+                session_factory,
+                auth_provider,
+            )
         from cognis.mfa import MfaSecretCipher
 
         mfa_cipher = MfaSecretCipher(config_runtime.secrets_key_path)
@@ -481,7 +501,13 @@ def create_app(
             max_age_seconds=config_runtime.trusted_evidence_max_age_seconds,
             owner_allowlist=config_runtime.trusted_evidence_owner_allowlist,
         )
-        providers = build_provider_registry(config_runtime, session_factory, auth_provider)
+        redis_service = RedisService(config_runtime.redis_url)
+        providers = build_provider_registry(
+            config_runtime, session_factory, auth_provider, redis_service=redis_service
+        )
+        from cognis.providers.llm.inference_api import InferenceAPIService
+
+        app.state.inference_api = InferenceAPIService(providers.llm, session_factory)
         await providers.executor.websocket.configure_cluster(
             enabled=config_runtime.runtime_mode == "ha",
             session_factory=session_factory,
@@ -491,6 +517,9 @@ def create_app(
         )
         local_model_catalog = LocalModelCatalog()
         event_bus = EventBus()
+        from cognis.core.inbox import InboxService
+
+        inbox_service = InboxService(session_factory, event_bus)
         from cognis.core.executor_pin_notice_dispatch import ExecutorPinNoticeDispatcher
 
         executor_pin_notice_dispatcher = ExecutorPinNoticeDispatcher(
@@ -577,7 +606,6 @@ def create_app(
         session_lock = SessionLock()
         session_lock_sweeper_task: asyncio.Task[None] | None = None
         optional_snapshot_warming_task: asyncio.Task[None] | None = None
-        redis_service = RedisService(config_runtime.redis_url)
         session_cache = SessionCache(
             providers.guardrails,
             max_entries=cache_max_entries,
@@ -640,6 +668,10 @@ def create_app(
         from cognis.store.coordination import DatabaseLeaseStore
 
         maintenance_leases = DatabaseLeaseStore(session_factory)
+        from cognis.core.provider_monitor import ProviderMonitor
+
+        provider_monitor = ProviderMonitor(session_factory, providers.llm)
+        app.state.provider_monitor = provider_monitor
         tool_output_maintenance = ToolOutputMaintenanceService(
             tool_output_store, lease_store=maintenance_leases
         )
@@ -729,6 +761,7 @@ def create_app(
         knowledgebase_enabled = knowledgebase_backend_enabled and kb_embedding_route is not None
         knowledgebase_service = KnowledgebaseService(
             session_factory=session_factory,
+            inbox_service=inbox_service,
             artifact_store=artifact_store,
             llm=providers.llm,
             vector_backend=kb_vector_backend,
@@ -755,6 +788,25 @@ def create_app(
         )
         await knowledgebase_indexer.start()
 
+        from cognis.core.maintenance_lease import run_periodic_maintenance
+        from cognis.core.video import VideoService
+
+        video_service = VideoService(
+            session_factory=session_factory, artifacts=artifact_store, llm=providers.llm
+        )
+        app.state.video_service = video_service
+        video_stop = asyncio.Event()
+        video_worker = asyncio.create_task(
+            run_periodic_maintenance(
+                video_service.tick,
+                stop=video_stop,
+                interval_seconds=3,
+                resource_key="video-provider-jobs",
+                lease_store=maintenance_leases,
+            ),
+            name="video-provider-jobs",
+        )
+
         tool_router = await ToolRouter.from_session_factory(
             providers.guardrails,
             session_factory,
@@ -777,11 +829,21 @@ def create_app(
         shared_runtime = await build_shared_runtime(
             providers, knowledgebase_enabled=knowledgebase_backend_enabled
         )
+        from cognis.core.project_management import ProjectManagementService
+
+        project_management_service = ProjectManagementService(
+            session_factory,
+            inbox_service=inbox_service,
+            artifact_store=artifact_store,
+            workflow_registry=workflow_registry,
+        )
+        app.state.project_management_service = project_management_service
         step_runtime_factory = build_step_runtime_factory(
             providers=providers,
             shared_registry=shared_runtime.tool_registry,
             shared_connection=shared_runtime.executor_connection,
             session_factory=session_factory,
+            project_management_service=project_management_service,
             artifact_store=artifact_store,
             knowledgebase_service=knowledgebase_service if knowledgebase_backend_enabled else None,
         )
@@ -811,12 +873,21 @@ def create_app(
                 "session.llm_stream_max_retries",
                 3,
             )
-            anthropic_cache_ttl = await get_setting_value(
-                session,
-                "session.anthropic_cache_ttl",
-                "5m",
-            )
+        from cognis.core.hook_runtime import HookRuntime
+
+        hook_runtime = HookRuntime(
+            session_factory=session_factory,
+            providers=providers,
+            session_manager=session_manager,
+            session_cache=session_cache,
+            event_bus=event_bus,
+            lease_store=maintenance_leases,
+            workflow_registry=workflow_registry,
+            agent_registry=agent_registry,
+        )
+        app.state.hook_runtime = hook_runtime
         agent_loop = AgentLoop(
+            hook_runtime=hook_runtime,
             providers=providers,
             session_manager=session_manager,
             session_cache=session_cache,
@@ -846,9 +917,6 @@ def create_app(
             ),
             default_llm_stream_max_retries=(
                 int(llm_stream_max_retries) if isinstance(llm_stream_max_retries, int) else 3
-            ),
-            default_anthropic_cache_ttl=(
-                str(anthropic_cache_ttl) if anthropic_cache_ttl is not None else "5m"
             ),
             tool_output_store=tool_output_store,
             step_runtime_factory=step_runtime_factory,
@@ -895,6 +963,7 @@ def create_app(
             pause_waiter=pause_waiter,
             event_bus=event_bus,
             providers=providers,
+            task_queue=task_queue,
         )
 
         async def _on_mcp_oauth_completed(
@@ -1060,6 +1129,16 @@ def create_app(
         agent_loop.set_turn_scheduler(turn_scheduler)
         task_queue.set_turn_scheduler(turn_scheduler)
 
+        from cognis.core.tool_backgrounding import ToolBackgroundingService
+        from cognis.store.direct_turns import DirectTurnStore
+
+        app.state.tool_backgrounding = ToolBackgroundingService(
+            direct_turn_store=(
+                DirectTurnStore(session_factory) if controller_runtime is not None else None
+            ),
+            executor_provider=providers.executor,
+        )
+
         from cognis.channels.managed import ManagedChannelService
         from cognis.core.managed_conversation_maintenance import (
             ManagedConversationMaintenanceService,
@@ -1079,6 +1158,7 @@ def create_app(
 
         # CommandDispatcher — transport-agnostic slash command handling.
         from cognis.core.commands import CommandDispatcher
+        from cognis.core.handoff import HandoffService
         from cognis.core.recap import RecapService
 
         recap_service = RecapService(
@@ -1090,6 +1170,15 @@ def create_app(
             lease_store=maintenance_leases,
         )
         app.state.recap_service = recap_service
+        handoff_service = HandoffService(
+            agent_loop=agent_loop,
+            providers=providers,
+            session_cache=session_cache,
+            runtime_factory=step_runtime_factory,
+            scheduler=turn_scheduler,
+            event_bus=event_bus,
+        )
+        app.state.handoff_service = handoff_service
 
         command_dispatcher = CommandDispatcher(
             session_factory=session_factory,
@@ -1101,6 +1190,10 @@ def create_app(
             notification_service=notification_service,
             turn_scheduler=turn_scheduler,
             recap_service=recap_service,
+            handoff_service=handoff_service,
+            skill_runtime_factory=step_runtime_factory,
+            artifact_store=artifact_store,
+            hook_runtime=hook_runtime,
         )
 
         from cognis.store.queries import get_setting_value
@@ -1208,6 +1301,7 @@ def create_app(
         app.state.providers = providers
         app.state.local_model_catalog = local_model_catalog
         app.state.login_rate_limiter = LoginRateLimiter()
+        app.state.effective_tools_preview_gate = EffectiveToolsPreviewGate()
         app.state.api_rate_limiter = RequestRateLimiter(
             read_requests_per_minute=api_read_requests_per_minute,
             write_requests_per_minute=api_write_requests_per_minute,
@@ -1268,14 +1362,42 @@ def create_app(
         app.state.startup_invariant_reports = [report.as_dict() for report in invariant_reports]
 
         app.state.notification_service = notification_service
+        app.state.inbox_service = inbox_service
         app.state.executor_pin_notice_dispatcher = executor_pin_notice_dispatcher
         app.state.mcp_oauth_service = mcp_oauth_service
         app.state.web_push_service = web_push_service
         app.state.turn_scheduler = turn_scheduler
+        video_service.scheduler = turn_scheduler
         app.state.tool_output_store = tool_output_store
         app.state.tool_output_spool = tool_output_spool
         app.state.tool_output_maintenance = tool_output_maintenance
         app.state.command_dispatcher = command_dispatcher
+
+        from cognis.api.routes.executors import management_dependencies
+        from cognis.api.web_reconfigure import finalize_web_executor_reconfigure_for_app
+        from cognis.core.settings_management import SettingsManagement
+        from cognis.core.step_profile_management import StepProfileManagement
+        from cognis.core.system_management import SystemManagementDependencies
+        from cognis.runtime_settings import apply_runtime_setting
+
+        tool_router.system_management = SystemManagementDependencies(
+            session_factory=session_factory,
+            llm=providers.llm,
+            settings=SettingsManagement(
+                session_factory=session_factory,
+                update_lock=app.state.settings_update_lock,
+                apply=lambda key, value: apply_runtime_setting(app, key, value),
+                secrets=providers.secrets,
+                finalize_web=lambda: finalize_web_executor_reconfigure_for_app(
+                    app, reason="web_setting_update"
+                ),
+            ),
+            executors=management_dependencies(app),
+            provider_monitor=app.state.provider_monitor,
+            provider_test_cooldowns=app.state.provider_test_cooldowns,
+            provider_test_results=app.state.provider_test_results,
+            step_profiles=StepProfileManagement(session_factory, step_profile_registry),
+        )
 
         ws_manager = WebSocketConnectionManager(app)
         app.state.ws_manager = ws_manager
@@ -1321,6 +1443,7 @@ def create_app(
         )
         app.state.cluster_signals = cluster_signals
         notification_service.cluster_signals = cluster_signals
+        inbox_service.cluster_signals = cluster_signals
         task_queue.cluster_signals = cluster_signals
         workflow_engine.cluster_signals = cluster_signals  # type: ignore[attr-defined]
         turn_scheduler.cluster_signals = cluster_signals  # type: ignore[attr-defined]
@@ -1577,6 +1700,7 @@ def create_app(
             channel_manager_ref=_get_channel_manager,
             turn_scheduler=turn_scheduler,
             public_base_url=config_runtime.public_base_url,
+            cluster_signals=cluster_signals,
         )
         providers.channel_binding_lookup = DatabaseManagedChannelBindingLookup(session_factory)
         channel_delivery.set_recipient_resolution_service(providers.recipient_resolution_service)
@@ -1612,6 +1736,7 @@ def create_app(
         app.state.loop_watchdog = loop_watchdog
         mcp_oauth_service.start_refresh_maintenance()
         await tool_output_maintenance.start()
+        await provider_monitor.start()
 
         await redis_service.start()
         if chat_v2_runtime_relay is not None:
@@ -1710,8 +1835,10 @@ def create_app(
         await observability_service.start()
         app.state.observability_service = observability_service
         recap_service.start()
+        hook_runtime.start(scheduler=turn_scheduler, task_queue=task_queue, agent_loop=agent_loop)
         yield
 
+        await hook_runtime.stop()
         await recap_service.stop()
         await shutdown_coordinator.drain()
         await turn_scheduler.stop_direct_turn_runtime()
@@ -1746,7 +1873,12 @@ def create_app(
         await local_model_reconciler.stop()
         await local_model_runtime_manager.stop()
         await tool_output_maintenance.stop()
+        await provider_monitor.stop()
         await managed_conversation_maintenance.stop()
+        video_stop.set()
+        video_worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await video_worker
         await knowledgebase_indexer.stop()
         await deliverable_chart_migration.stop()
         await artifact_maintenance.stop()
@@ -1776,23 +1908,37 @@ def create_app(
 
     @asynccontextmanager
     async def monitored_lifespan(app: FastAPI) -> AsyncIterator[None]:
-        from cognis.core.memory_diagnostics import MemoryDiagnostics
+        from cognis.core.profiling_control import ProfilingControl
 
-        diagnostics = MemoryDiagnostics()
-        diagnostics.start()
-        try:
-            async with lifespan(app):
-                diagnostics.mark_application_started()
+        async with lifespan(app):
+            control = ProfilingControl(
+                app.state.redis_service,
+                app.state.controller_directory,
+                app.state.controller_runtime.owner_id,
+                app.state.session_cache.resource_owner_accounting,
+            )
+            app.state.profiling_control = control
+            await control.start()
+            try:
                 yield
-        finally:
-            await diagnostics.stop()
+            finally:
+                await control.stop()
 
-    app = FastAPI(title="Cognis", version="0.17.1", lifespan=monitored_lifespan)
+    app = FastAPI(title="Cognis", version=__version__, lifespan=monitored_lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
     # 2. Auth middleware — authenticates /api/* routes
     # 3. CORS middleware — handles CORS preflight and headers
+    #
+    # Compression is innermost on purpose: BaseHTTPMiddleware wrappers (auth)
+    # re-emit every body as a stream, which would hide buffered responses
+    # from it. UI files are served precompressed by SPAMiddleware.
+    from cognis.api.compression import BufferedGZipMiddleware, ConditionalJsonGetMiddleware
+
+    # Conditional GET hashes the uncompressed body, so it sits inside gzip.
+    app.add_middleware(ConditionalJsonGetMiddleware)
+    app.add_middleware(BufferedGZipMiddleware)
     if config.serve_ui and ui_build_dir is not None:
         app.add_middleware(SPAMiddleware, directory=ui_build_dir)
     app.add_middleware(
@@ -1814,10 +1960,24 @@ def create_app(
         max_files=25,
         max_parts=52,
     )
+    from cognis.api.inference_limits import InferenceBodyLimitMiddleware
+
+    app.add_middleware(InferenceBodyLimitMiddleware)
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
+    app.include_router(profiling_router)
+    from cognis.api.routes.hooks import router as hooks_router
+
+    app.include_router(hooks_router)
+    from cognis.api.routes.inference import router as inference_router
+    from cognis.api.routes.inference_routes import router as inference_routes_router
+
+    app.include_router(inference_router)
+    app.include_router(inference_routes_router)
     app.include_router(system_router)
     app.include_router(artifacts_router)
+    app.include_router(artifact_documents_router)
+    app.include_router(library_router)
     app.include_router(channels_router)
     app.include_router(chat_v2_router)
     app.include_router(work_router)
@@ -1829,6 +1989,9 @@ def create_app(
     app.include_router(deliverables_router)
     app.include_router(agents_router)
     app.include_router(images_router)
+    from cognis.api.routes.videos import router as videos_router
+
+    app.include_router(videos_router)
     app.include_router(knowledgebases_router)
     app.include_router(local_models_router)
     app.include_router(sessions_router)
@@ -1838,12 +2001,15 @@ def create_app(
     app.include_router(workflows_router)
     app.include_router(secrets_router)
     app.include_router(search_router)
+    app.state.palette_admission = PaletteAdmission()
+    app.include_router(palette_router)
     app.include_router(tools_router)
     app.include_router(mcp_oauth_router)
     app.include_router(skills_router)
     app.include_router(executors_router)
     app.include_router(escalations_router)
     app.include_router(notifications_router)
+    app.include_router(inbox_router)
     app.include_router(attention_router)
     app.include_router(projects_router)
     app.include_router(push_router)
@@ -1866,6 +2032,17 @@ def create_app(
     async def request_validation_exception_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        if request.url.path.startswith("/v1/"):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "Unsupported or invalid inference parameters",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request",
+                    }
+                },
+            )
         return error_response(
             422,
             "validation_error",

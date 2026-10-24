@@ -21,3 +21,6 @@ cognis/ui_dist/
 .worktrees
 .env.local
 .local/
+ui/build-apple/
+ui/.svelte-kit-apple/
+ui/build-apple-manifest.json

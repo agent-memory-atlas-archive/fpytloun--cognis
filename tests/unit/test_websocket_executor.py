@@ -173,6 +173,71 @@ class RejectedSendWebSocket(FakeWebSocket):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expire_by", ["cancel", "timeout"])
+@pytest.mark.parametrize("response_kind", ["result", "error"])
+async def test_response_waiter_expires_during_ownership_fence(
+    expire_by: str, response_kind: str
+) -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws, "exec-1", ExecutorCapabilities(), connection_owner=_connection_owner()
+    )
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+    effect_count = 0
+
+    async def current() -> bool:
+        return True
+
+    async def dispatch(owner: ExecutorConnectionOwner, effect: Any) -> bool:
+        nonlocal effect_count
+        effect_count += 1
+        if effect_count == 2:  # Response resolution, after the inbound breaker reset.
+            fence_entered.set()
+            await release_fence.wait()
+        effect()
+        return True
+
+    conn.register_ownership_check_callback(current)
+    conn.register_owned_effect_dispatcher(dispatch)
+    conn.start_receiver()
+    pending = asyncio.create_task(
+        conn.rpc_call("tool.list", {}, timeout=0.1 if expire_by == "timeout" else 5.0)
+    )
+    try:
+        async with asyncio.timeout(2):
+            while not ws.sent:
+                await asyncio.sleep(0)
+            request_id = ws.sent[0]["id"]
+            response = (
+                {"result": {"tools": []}}
+                if response_kind == "result"
+                else {"error": {"code": -1, "message": "Request expired"}}
+            )
+            ws.inject_message({"jsonrpc": "2.0", "id": request_id, **response})
+            await fence_entered.wait()
+            if expire_by == "cancel":
+                pending.cancel()
+            with pytest.raises(asyncio.CancelledError if expire_by == "cancel" else TimeoutError):
+                await pending
+            assert request_id not in conn._pending
+            release_fence.set()
+
+            # An unrelated RPC still completes on this same physical connection.
+            following = asyncio.create_task(conn.rpc_call("tool.list", {}, timeout=1))
+            while len(ws.sent) < 2:
+                await asyncio.sleep(0)
+            ws.inject_message({"jsonrpc": "2.0", "id": ws.sent[1]["id"], "result": {"tools": []}})
+            assert await following == {"tools": []}
+            assert conn.connected
+            assert conn.close_metadata["error_type"] is None
+    finally:
+        release_fence.set()
+        await conn.close()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_rpc_call_binds_before_frame_and_marks_sent_after_frame() -> None:
     ws = FakeWebSocket()
     conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())

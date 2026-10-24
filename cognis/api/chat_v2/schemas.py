@@ -219,6 +219,7 @@ class MessageTimelineItem(TimelineItemBase):
     follow_up_session_id: str | None = None
     attachments: list[AttachmentRef] = Field(default_factory=list)
     partial: bool = False
+    text_streaming: bool | None = None
     chat_mode: ChatMode | None = None
     chat_mode_source: str | None = None
 
@@ -377,6 +378,8 @@ class ArtifactTimelineItem(TimelineItemBase):
 class AssistantDeliverableTimelineItem(TimelineItemBase):
     kind: Literal["assistant_deliverable"] = "assistant_deliverable"
     deliverable_id: str
+    lineage_id: str | None = None
+    revision: int | None = None
     format: str
     title: str | None = None
     content: str | None = None
@@ -388,6 +391,17 @@ class FileDiffTimelineItem(TimelineItemBase):
     kind: Literal["file_diff"] = "file_diff"
     file_diffs: list[FileDiffRef] = Field(default_factory=list)
     title: str | None = None
+
+
+class HandoffTimelineItem(TimelineItemBase):
+    kind: Literal["handoff"] = "handoff"
+    text: str
+    focus: str = ""
+    source_session_id: str
+    source_seq: int = Field(ge=0)
+    status: Literal["running", "complete", "failed"] = "complete"
+    error: str | None = None
+    recipient_conversation_id: str | None = None
 
 
 class RecapArtifact(StrictModel):
@@ -413,11 +427,30 @@ class RecapTimelineItem(TimelineItemBase):
     files: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class HookLifecycle(StrictModel):
+    """Presentation metadata only; never a parent model-context message."""
+
+    trigger: str | None = None
+    run_id: str
+    hook_id: str
+    status: str
+    child_conversation_id: str | None = None
+    child_session_id: str | None = None
+    task_id: str | None = None
+    outcome: str | None = None
+    outcome_partial: bool = False
+    outcome_available: bool | None = None
+    result_anchors: list[dict[str, Any]] = Field(default_factory=list)
+    result_truncated: bool = False
+    result_original_length: int | None = None
+
+
 class NoticeTimelineItem(TimelineItemBase):
     kind: Literal["notice"] = "notice"
     level: Literal["info", "warning"]
     title: str
     message: str | None = None
+    hook: HookLifecycle | None = None
 
 
 class CompactionTimelineItem(TimelineItemBase):
@@ -429,6 +462,7 @@ class CompactionTimelineItem(TimelineItemBase):
     summary: str | None = None
     method: str
     turns_compacted: int = Field(default=0, ge=0)
+    events_compacted: int = Field(default=0, ge=0)
     trigger: str | None = None
     reason: str | None = None
     previous_usage_percentage: float | None = None
@@ -439,6 +473,7 @@ class CompactionTimelineItem(TimelineItemBase):
 
 class ErrorTimelineItem(TimelineItemBase):
     kind: Literal["error"] = "error"
+    turn_id: str | None = None
     level: Literal["error"] = "error"
     title: str
     message: str | None = None
@@ -463,6 +498,7 @@ TimelineItem = Annotated[
     | AssistantDeliverableTimelineItem
     | FileDiffTimelineItem
     | RecapTimelineItem
+    | HandoffTimelineItem
     | NoticeTimelineItem
     | CompactionTimelineItem
     | ErrorTimelineItem,
@@ -592,6 +628,7 @@ class QueueMessage(StrictModel):
     updated_at: str | None = None
     status: Literal["queued", "recoverable", "committing"] = "queued"
     cancel_requested: bool = False
+    can_edit: bool = False
 
 
 class QueueState(StrictModel):
@@ -691,6 +728,8 @@ class WorkstreamRef(StrictModel):
 
 class WorkDeliverable(StrictModel):
     deliverable_id: str
+    lineage_id: str | None = None
+    revision: int | None = None
     sort_key: str = ""
     format: str
     title: str | None = None
@@ -1029,6 +1068,23 @@ class CommandV2Request(StrictModel):
     content: str = Field(min_length=1, max_length=100_000)
 
 
+class RetryProviderOption(StrictModel):
+    """One visible same-model provider without a known active rate limit."""
+
+    provider_id: str
+    display_name: str
+    model: str
+
+
+class RetryProviderOptionsResponse(StrictModel):
+    """Alternatives scoped to the current rate-limited turn."""
+
+    turn_id: str | None = None
+    provider_id: str | None = None
+    model: str | None = None
+    options: list[RetryProviderOption] = Field(default_factory=list)
+
+
 class ForkAssistantMessageV2Request(StrictModel):
     """Identify one completed assistant message as a conversation fork point."""
 
@@ -1092,6 +1148,20 @@ class CancelTurnV2Response(StrictModel):
     client_txn_id: str
     status: Literal["cancelled", "idle", "duplicate"]
     runtime: RuntimeOverlaySnapshot | None = None
+    server_time: str
+
+
+class BackgroundToolCallV2Response(StrictModel):
+    """Accepted request to move a running foreground tool call to the background.
+
+    The tool call's own terminal result reports the handoff; ``status`` only
+    says whether the executor accepted the request now or had already done so.
+    """
+
+    conversation_id: str
+    call_id: str
+    tool_name: str
+    status: Literal["requested", "already_requested"]
     server_time: str
 
 

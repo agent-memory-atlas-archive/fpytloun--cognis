@@ -22,11 +22,14 @@ IMMUTABLE_PREFIX = "_immutable_prefix"
 TURN_BOUNDARY = "_turn_boundary"
 
 # Set on system messages injected as per-turn routing reminders.
-# Stripped from history before recording to Intaris.
+# Recorded canonically with explicit request-only scope; stripped at dispatch.
 ROUTING_REMINDER = "_routing_reminder"
 
 # Set on messages that carry prior-step context (cross-step continuation).
 PRIOR_CONTEXT = "_prior_context"
+
+# Ordinary prompt content not yet represented by a canonical assistant event.
+PROMPT_TRANSIENT = "_prompt_transient"
 
 # Set on messages that carry follow-up context blocks.
 FOLLOW_UP_CONTEXT = "_follow_up_context"
@@ -47,6 +50,9 @@ EXECUTOR_REMINDER = "_executor_reminder"
 BACKGROUND_SHELL_STATUS_REMINDER = "_background_shell_status_reminder"
 BACKGROUND_WORK_STATUS_REMINDER = "_background_work_status_reminder"
 WORKFLOW_STEP_REMINDER = "_workflow_step_reminder"
+# Set on the one-off notice that the user moved a running tool call to the
+# background. The durable copy is a recorded system_notice lifecycle event.
+TOOL_BACKGROUND_NOTICE = "_tool_background_notice"
 FORCE_SUMMARY = "_force_summary"
 
 # ── Audit markers ─────────────────────────────────────────────────────────────
@@ -114,6 +120,11 @@ TOOL_NAME = "_tool_name"
 # compact placeholder.  Prevents double-compaction on subsequent passes.
 PROJECTED_COMPACTED = "_projected_compacted"
 
+# Intaris event sequence ids that contributed to a replayed message. Used only
+# to persist deterministic omission decisions when the hard prompt cap drops
+# complete history groups.
+PROJECTION_EVENT_SEQS = "_projection_event_seqs"
+
 # ── Token estimate cache ──────────────────────────────────────────────────────
 
 # Cached token count for a message dict (set by projection, reused on
@@ -130,6 +141,7 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         TURN_BOUNDARY,
         ROUTING_REMINDER,
         PRIOR_CONTEXT,
+        PROMPT_TRANSIENT,
         FOLLOW_UP_CONTEXT,
         PROJECT_CONTEXT,
         LATEST_MEMORY_RECALL_CONTEXT,
@@ -138,6 +150,7 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         BACKGROUND_SHELL_STATUS_REMINDER,
         BACKGROUND_WORK_STATUS_REMINDER,
         WORKFLOW_STEP_REMINDER,
+        TOOL_BACKGROUND_NOTICE,
         FORCE_SUMMARY,
         AUDIT_SOURCE,
         AUDIT_ROLE,
@@ -159,6 +172,7 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         TOOL_CALL_ID,
         TOOL_NAME,
         PROJECTED_COMPACTED,
+        PROJECTION_EVENT_SEQS,
         TOKEN_ESTIMATE,
     }
 )

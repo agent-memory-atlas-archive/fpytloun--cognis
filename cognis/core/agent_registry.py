@@ -24,6 +24,7 @@ from cognis.store.queries import (
     get_agent,
     get_system_agent_override,
     list_agents,
+    list_system_agent_overrides,
     list_visible_agents,
 )
 
@@ -35,28 +36,34 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _EXPLORE_PROMPT = """\
-You are a fast, read-only agent specialized for exploring codebases.
+You are a lightweight, read-only exploration agent for well-scoped questions
+about existing information, including documents, files, configuration, and code.
 
 ## Instructions
 
-- You CANNOT modify files. You have read-only access.
-- Find files by patterns, search code for keywords, and answer questions
-  about the codebase structure and implementation.
-- Start broad with pattern search, then narrow to specific files.
-- Prefer breadth-first exploration before deep dives.
-- Avoid reading large files end-to-end when targeted reads will answer the
+- Use only the tools and sources available in this session. Do not modify
+  files or run commands that change system state.
+- Locate relevant information, trace relationships or existing behavior, and
+  explain what the sources show.
+- Focus on understanding existing information rather than choosing an approach.
+  Explain findings and evidence-backed conclusions, flag uncertainty, and leave
+  trade-offs and final decisions to the parent agent.
+- Adapt depth to the caller's question. Start with known references when supplied;
+  otherwise search broadly enough to locate the relevant sources, then narrow.
+- Avoid reading large sources end-to-end when targeted reads will answer the
   question.
-- Be thorough in your exploration — check multiple locations, naming
-  conventions, and related files.
-- Report findings concisely with file paths and line numbers.
+- Check related sources when needed to resolve the question, but do not broaden
+  a targeted lookup into an exhaustive investigation.
+- Report findings concisely with source references, using file paths and line
+  numbers for file-based findings.
 - If the answer is incomplete, say so and identify the next most relevant
-  files or symbols to inspect.
+  sources to inspect or questions for the parent to resolve.
 - If you find something unexpected or noteworthy, mention it.
 
 ## Output
 
 Return a structured summary of your findings:
-- What you found (with file:line references)
+- What you found (with source references)
 - Key patterns or conventions observed
 - Anything notable or unexpected"""
 
@@ -542,7 +549,8 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
         _system_agent(
             "system:explore",
             "Explore",
-            "Fast read-only codebase exploration",
+            "Lightweight read-only exploration of documents, files, configuration, and code; "
+            "answers well-scoped questions with evidence, leaving final decisions to the caller",
             _EXPLORE_PROMPT,
             tools={"builtin_tools": ["read", "grep", "glob", "lsp", "list_directory", "bash"]},
             reasoning_effort="low",
@@ -729,15 +737,35 @@ class AgentRegistry:
         include_hidden: bool = False,
         include_system: bool = True,
         include_disabled: bool = False,
+        include_project_shared: bool = False,
+        session: AsyncSession | None = None,
     ) -> list[AgentDefinition]:
-        """List all available agents (system + user)."""
+        """List all available agents (system + user).
+
+        ``include_project_shared`` adds agents usable only through project
+        assignments, annotated with ``shared_via_project_ids``. Runtime target
+        discovery must not set it; those agents are valid only inside projects.
+        """
         result: list[AgentDefinition] = []
 
         if include_system:
+            overrides = {}
+            if owner_email and any(agent.allow_user_override for agent in SYSTEM_AGENTS.values()):
+                async with (
+                    contextlib.nullcontext(session)
+                    if session is not None
+                    else self._session_factory()
+                ) as db_session:
+                    overrides = {
+                        row.agent_id: row
+                        for row in await list_system_agent_overrides(
+                            db_session, owner_email=owner_email
+                        )
+                    }
             for agent in SYSTEM_AGENTS.values():
-                effective = await self._resolve_system_agent(
+                effective = self._apply_system_agent_override(
                     agent,
-                    owner_email=owner_email,
+                    overrides.get(agent.agent_id) if agent.allow_user_override else None,
                     include_disabled=include_disabled,
                 )
                 if effective is None:
@@ -748,7 +776,9 @@ class AgentRegistry:
                     continue
                 result.append(effective)
 
-        async with self._session_factory() as db_session:
+        async with (
+            contextlib.nullcontext(session) if session is not None else self._session_factory()
+        ) as db_session:
             rows = (
                 await list_visible_agents(db_session, owner_email)
                 if owner_email is not None
@@ -770,6 +800,38 @@ class AgentRegistry:
                 continue
             result.append(defn)
 
+        if include_project_shared and owner_email is not None:
+            from cognis.store.project_queries import list_project_shared_agents_for_user
+
+            async with (
+                contextlib.nullcontext(session) if session is not None else self._session_factory()
+            ) as db_session:
+                project_rows = await list_project_shared_agents_for_user(db_session, owner_email)
+            by_id = {defn.agent_id: defn for defn in result}
+            # Agents already visible (owned or directly shared) are usable
+            # anywhere; only project-only agents carry shared_via_project_ids.
+            direct_ids = set(by_id)
+            for row, assignment, project in project_rows:
+                if row.agent_id in direct_ids:
+                    continue
+                existing = by_id.get(row.agent_id)
+                if existing is not None:
+                    existing.shared_via_project_ids.append(str(project.project_id))
+                    continue
+                defn = _row_to_definition(row)
+                if row.status != "active" and not include_disabled:
+                    continue
+                if agent_type is not None and defn.agent_type != agent_type:
+                    continue
+                defn.is_shared_with_me = True
+                defn.shared_by_email = row.owner_email
+                defn.granted_permission = "use"
+                defn.executor_scope = normalize_executor_scope(str(assignment.executor_scope))
+                defn.is_readonly_for_caller = True
+                defn.shared_via_project_ids = [str(project.project_id)]
+                by_id[defn.agent_id] = defn
+                result.append(defn)
+
         return result
 
     async def _resolve_system_agent(
@@ -778,14 +840,23 @@ class AgentRegistry:
         *,
         owner_email: str | None,
         include_disabled: bool,
+        session: AsyncSession | None = None,
     ) -> AgentDefinition | None:
-        effective = base.model_copy(deep=True)
         if not owner_email or not base.allow_user_override:
-            return effective
-        async with self._session_factory() as db_session:
+            return base.model_copy(deep=True)
+        async with (
+            contextlib.nullcontext(session) if session is not None else self._session_factory()
+        ) as db_session:
             row = await get_system_agent_override(
                 db_session, owner_email=owner_email, agent_id=base.agent_id
             )
+        return self._apply_system_agent_override(base, row, include_disabled=include_disabled)
+
+    @staticmethod
+    def _apply_system_agent_override(
+        base: AgentDefinition, row: Any, *, include_disabled: bool
+    ) -> AgentDefinition | None:
+        effective = base.model_copy(deep=True)
         if row is None:
             return effective
         effective.has_overrides = True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from sqlalchemy import func, select, update
@@ -87,24 +88,45 @@ class ControllerInstanceDirectory:
     async def get_ready(self, owner_id: str) -> ControllerInstance | None:
         """Resolve one ready controller for new routing or admission."""
 
+        return (await self.get_ready_many([owner_id])).get(owner_id)
+
+    async def list_ready_owners(self, limit: int = 9) -> list[str]:
+        """Return bounded exact live incarnations for administrative targeting."""
+        async with self._session_factory() as session:
+            rows = await session.scalars(
+                select(ControllerInstanceRow.owner_id)
+                .where(
+                    ControllerInstanceRow.lifecycle_state == "ready",
+                    ControllerInstanceRow.expires_at > database_now_expression(session),
+                )
+                .order_by(ControllerInstanceRow.owner_id)
+                .limit(min(9, max(1, limit)))
+            )
+            return list(rows)
+
+    async def get_ready_many(self, owner_ids: Collection[str]) -> dict[str, ControllerInstance]:
+        """Resolve exact ready owners once per discovery pass without caching."""
+        if not owner_ids:
+            return {}
         async with self._session_factory() as session:
             now = database_now_expression(session)
-            row = await session.scalar(
+            rows = await session.scalars(
                 select(ControllerInstanceRow).where(
-                    ControllerInstanceRow.owner_id == owner_id,
+                    ControllerInstanceRow.owner_id.in_(owner_ids),
                     ControllerInstanceRow.lifecycle_state == "ready",
                     ControllerInstanceRow.expires_at > now,
                 )
             )
-        if row is None:
-            return None
-        return ControllerInstance(
-            owner_id=row.owner_id,
-            controller_id=row.controller_id,
-            incarnation_id=row.incarnation_id,
-            internal_url=row.internal_url,
-            lifecycle_state=row.lifecycle_state,
-        )
+            return {
+                row.owner_id: ControllerInstance(
+                    owner_id=row.owner_id,
+                    controller_id=row.controller_id,
+                    incarnation_id=row.incarnation_id,
+                    internal_url=row.internal_url,
+                    lifecycle_state=row.lifecycle_state,
+                )
+                for row in rows
+            }
 
     async def get_ready_replacement(self, owner_id: str) -> ControllerInstance | None:
         """Resolve a ready replacement for one draining controller incarnation."""

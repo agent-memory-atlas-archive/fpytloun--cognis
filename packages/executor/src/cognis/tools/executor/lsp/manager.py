@@ -238,8 +238,8 @@ class LSPManager:
 
         Spawns or reuses every semantic server for the file extension, waits
         for initialization, and synchronizes the current document text.
-        Diagnostics are not awaited: explicit queries only need the server
-        to know the latest document version.
+        Diagnostics are not normally awaited. A cold TypeScript server needs
+        one bounded project-ready barrier before semantic navigation.
         """
         if not self.enabled:
             return []
@@ -250,6 +250,17 @@ class LSPManager:
         for entry in prepared:
             if entry.client_key not in self._cold_clients:
                 continue
+            if entry.client.server_id == "typescript":
+                # tsserver can answer from an inferred single-file project
+                # before it reports any work-done progress. A first diagnostic
+                # publication establishes the configured project's imports.
+                try:
+                    await asyncio.wait_for(
+                        self._wait_client_diagnostics(entry.client, entry.uri, entry.version),
+                        timeout=_COLD_START_PROGRESS_TIMEOUT_S,
+                    )
+                except TimeoutError:
+                    logger.info("lsp: TypeScript project-ready diagnostics wait timed out")
             # Concurrent first queries all wait; the key is released afterwards.
             idle = await entry.client.wait_for_progress_idle(
                 grace_s=_COLD_START_PROGRESS_GRACE_S, timeout_s=_COLD_START_PROGRESS_TIMEOUT_S

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve, basename } from 'node:path';
 import { expect, test } from '@playwright/test';
+import { selectViewerTheme } from './viewer-theme';
 
 const build = resolve('standalone-build');
 const manifest = JSON.parse(readFileSync(resolve(build, '.vite/manifest.json'), 'utf8'));
@@ -28,9 +29,9 @@ for (const width of [390, 1440]) {
     await page.goto('/rich-canvas-smoke');
     const viewer = page.getByTestId('rich-deliverable');
     const chrome = page.getByTestId('rich-viewer-chrome');
-    for (const theme of ['light', 'dark']) {
+    for (const theme of ['light', 'dark'] as const) {
       await page.evaluate(() => window.scrollTo(0, 0));
-      await viewer.getByRole('button', { name: theme === 'light' ? 'Light theme' : 'Dark theme' }).click();
+      await selectViewerTheme(viewer, theme);
       await expect(viewer).toHaveAttribute('data-viewer-theme', theme);
       const box = await viewer.boundingBox();
       expect(box!.x).toBe(0);

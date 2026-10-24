@@ -42,14 +42,14 @@
   const badge = $derived(item.status === 'compacted' ? 'compacted' : item.status);
   const tone = $derived(
     item.status === 'failed'
-      ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+      ? 'border-danger-border bg-danger-subtle text-danger'
       : item.status === 'skipped'
-        ? 'border-slate-700 bg-slate-900/70 text-slate-300'
-        : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-100'
+        ? 'border-control-border bg-surface/70 text-secondary'
+        : 'border-cyan-border bg-cyan-subtle text-cyan-tone'
   );
 </script>
 
-<article class={`rounded-3xl border px-4 py-4 shadow-card ${tone}`}>
+<article class={`compaction-card rounded-3xl border px-4 py-4 shadow-card ${tone} ${item.status === 'failed' ? 'compaction-error' : item.status === 'skipped' ? '' : 'compaction-info'}`}>
   <div class="flex flex-wrap items-center justify-between gap-4">
     <div>
       <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">
@@ -59,7 +59,11 @@
         {#if item.status === 'running'}
           Reducing conversation history before the next response.
         {:else if item.status === 'compacted'}
-          {item.turnsCompacted} {item.turnsCompacted === 1 ? 'turn' : 'turns'} summarized
+          {#if item.turnsCompacted === 0 && (item.eventsCompacted ?? 0) > 0}
+            Earlier work in the current turn summarized
+          {:else}
+            {item.turnsCompacted} {item.turnsCompacted === 1 ? 'turn' : 'turns'} summarized
+          {/if}
           <span class="opacity-60">({item.method})</span>
         {:else}
           {item.reason || item.summaryPreview}
@@ -73,7 +77,7 @@
       {#if item.status === 'running'}
         <LiveDots inline={true} size="sm" tone="sky" label="Compacting" />
       {:else}
-        <span class="rounded-full border border-current/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
+        <span class="rounded-full border border-separator px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
           {badge}
         </span>
       {/if}
@@ -102,7 +106,7 @@
         Show compaction summary
       </summary>
       <div
-        class="chat-markdown prose prose-invert prose-sm mt-2 max-w-none overflow-x-auto break-words [overflow-wrap:anywhere] prose-code:text-sky-100 prose-code:before:content-none prose-code:after:content-none prose-pre:overflow-x-auto"
+        class="chat-markdown prose prose-sm mt-2 max-w-none overflow-x-auto break-words [overflow-wrap:anywhere] prose-code:text-accent prose-code:before:content-none prose-code:after:content-none prose-pre:overflow-x-auto"
       >
         {@html summaryHtml}
       </div>
@@ -121,3 +125,16 @@
     </div>
   {/if}
 </article>
+
+<style>
+  .compaction-error {
+    background: var(--compaction-error-bg, rgb(var(--color-danger-subtle)));
+    border-color: var(--compaction-error-border, rgb(var(--color-danger-border)));
+    color: var(--compaction-error-fg, rgb(var(--color-danger)));
+  }
+  .compaction-info {
+    background: var(--compaction-info-bg, rgb(var(--color-cyan-subtle)));
+    border-color: var(--compaction-info-border, rgb(var(--color-cyan-border)));
+    color: var(--compaction-info-fg, rgb(var(--color-cyan-tone)));
+  }
+</style>

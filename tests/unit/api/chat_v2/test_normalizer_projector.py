@@ -22,6 +22,7 @@ from cognis.api.chat_v2.schemas import (
     CredentialRequestTimelineItem,
     DelegationTimelineItem,
     FileDiffTimelineItem,
+    HandoffTimelineItem,
     ManagedConversationTimelineItem,
     MessageTimelineItem,
     NoticeTimelineItem,
@@ -33,6 +34,207 @@ from cognis.api.chat_v2.schemas import (
     ToolCallTimelineItem,
     UserInteractionTimelineItem,
 )
+
+
+def test_output_continuation_segments_rebuild_one_complete_assistant_bubble() -> None:
+    raw = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-continuation",
+            seq=index + 1,
+            type="assistant_message",
+            data={
+                "content": content,
+                "turn_id": "turn-continuation",
+                "message_id": "turn-continuation",
+                "assistant_phase_index": 0,
+                "turn_cycle_index": index,
+                "content_is_delta": index > 0,
+            },
+        )
+        for index, content in enumerate(("First segment.", "Second segment.", "Final segment."))
+    ]
+    timeline = project_timeline(normalize_session_events(raw).events).timeline
+    messages = [item for item in timeline.items if isinstance(item, MessageTimelineItem)]
+    assert len(messages) == 1
+    assert messages[0].content == "First segment.Second segment.Final segment."
+    assert [ref.seq for ref in messages[0].source_refs] == [1, 2, 3]
+    assert project_timeline(normalize_session_events(raw).events).timeline == timeline
+
+
+@pytest.mark.parametrize("event_type", ["assistant_message", "message"])
+def test_question_context_is_hidden_without_hiding_assistant_json(event_type: str) -> None:
+    content = json.dumps([{"id": "scope", "question": "Which scope?"}])
+    raw = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-1",
+            seq=1,
+            type=event_type,
+            data={
+                "role": "assistant",
+                "content": content,
+                "source": "question_context",
+                "question_id": "question-scope",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-1",
+            seq=2,
+            type="assistant_message",
+            data={"content": content},
+        ),
+    ]
+    normalized = normalize_session_events(raw)
+    assert normalized.skipped_count == 1
+    items = project_timeline(normalized.events).timeline.items
+    assert len(items) == 1
+    assert isinstance(items[0], MessageTimelineItem)
+    assert items[0].content == content
+    assert items[0].source_refs[0].seq == 2
+
+
+def test_handoff_lifecycle_restores_full_text_and_source_cutoff() -> None:
+    raw = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff-source",
+        seq=12,
+        type="lifecycle",
+        data={
+            "event": "conversation_handoff",
+            "text": "# Continue\n\nAwait approval.",
+            "focus": "Review",
+            "source_session_id": "sess-handoff-source",
+            "source_seq": 8,
+        },
+    )
+    normalized = normalize_session_events([raw])
+    result = project_timeline(normalized.events)
+    item = result.timeline.items[0]
+    assert isinstance(item, HandoffTimelineItem)
+    assert item.text == raw.data["text"]
+    assert item.focus == "Review"
+    assert item.source_seq == 8
+    assert item.source_session_id == "sess-handoff-source"
+    assert item.source_refs[0].seq == 12
+    assert project_timeline(normalize_session_events([raw]).events) == result
+
+
+def test_handoff_progress_result_and_link_coalesce_and_keep_initial_position() -> None:
+    base = {
+        "event": "conversation_handoff",
+        "request_id": "handoff-request",
+        "source_session_id": "sess-handoff",
+        "source_seq": 5,
+        "focus": "Review",
+    }
+    running = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=6,
+        type="lifecycle",
+        data={**base, "status": "running", "text": ""},
+    )
+    completed = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=10,
+        type="lifecycle",
+        data={**base, "status": "completed", "text": "Verified brief."},
+    )
+    linked = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=15,
+        type="lifecycle",
+        data={**completed.data, "recipient_conversation_id": "conv-recipient"},
+    )
+    initial = project_timeline(normalize_session_events([running]).events).timeline.items[0]
+    result = project_timeline(
+        normalize_session_events([running, completed, linked]).events
+    ).timeline.items
+    assert len(result) == 1
+    assert isinstance(result[0], HandoffTimelineItem)
+    assert result[0].id == initial.id
+    assert result[0].sort_key == initial.sort_key
+    assert result[0].status == "complete"
+    assert result[0].text == "Verified brief."
+    assert result[0].recipient_conversation_id == "conv-recipient"
+    assert [ref.seq for ref in result[0].source_refs] == [6, 10, 15]
+    replay = project_timeline(normalize_session_events([completed, linked, running]).events)
+    assert replay.timeline.items[0].status == "complete"
+
+
+def test_handoff_failure_and_legacy_recipient_link_preserve_card_identity() -> None:
+    legacy = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=8,
+        type="lifecycle",
+        data={"event": "conversation_handoff", "text": "Legacy brief."},
+    )
+    linked = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=11,
+        type="lifecycle",
+        data={**legacy.data, "handoff_seq": 8, "recipient_conversation_id": "conv-recipient"},
+    )
+    items = project_timeline(normalize_session_events([legacy, linked]).events).timeline.items
+    assert len(items) == 1
+    assert items[0].id == "handoff:sess-handoff:8"
+    failure = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess-handoff",
+        seq=12,
+        type="lifecycle",
+        data={
+            "event": "conversation_handoff",
+            "request_id": "failed-request",
+            "status": "failed",
+            "text": "",
+            "error": "Handoff cancelled.",
+        },
+    )
+    item = project_timeline(normalize_session_events([failure]).events).timeline.items[0]
+    assert item.status == "failed"
+    assert item.error == "Handoff cancelled."
+
+
+@pytest.mark.parametrize(
+    ("producer_status", "expected"),
+    [
+        ("started", "running"),
+        ("running", "running"),
+        ("completed", "complete"),
+        ("complete", "complete"),
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+    ],
+)
+def test_delegation_history_preserves_producer_status(producer_status: str, expected: str) -> None:
+    events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="parent",
+            seq=seq,
+            type="delegation",
+            data={
+                "child_session_id": "child",
+                "agent_id": "system:code-review",
+                "status": status,
+                "result_summary": "### Verdict\n**APPROVE**" if seq == 2 else None,
+            },
+        )
+        for seq, status in [(1, "started"), (2, producer_status)]
+    ]
+    result = project_timeline(normalize_session_events(events).events)
+    delegation = result.timeline.items[0]
+    assert isinstance(delegation, DelegationTimelineItem)
+    assert delegation.status == expected
+    assert delegation.result_summary == "### Verdict\n**APPROVE**"
+    assert project_timeline(normalize_session_events(events).events) == result
 
 
 @pytest.mark.parametrize(
@@ -71,6 +273,35 @@ def test_scheduler_admission_identity(metadata: dict[str, Any], expected: str) -
     )
     items = project_timeline(events.events).timeline.items
     assert [item.id for item in items] == [expected, "user:distinct-input"]
+
+
+@pytest.mark.parametrize("status", ["running", "completed"])
+@pytest.mark.parametrize("trigger", [None, "conversation_idle", "turn_completed"])
+def test_hook_card_preserves_type_and_session(status: str, trigger: str | None) -> None:
+    events = normalize_session_events(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=1,
+                type="lifecycle",
+                data={
+                    "event": "agent_hook",
+                    "hook_run_id": "run-card",
+                    "hook_id": "hook-card",
+                    "name": "Debrief",
+                    "status": status,
+                    "trigger": trigger,
+                    "child_session_id": "sess-child",
+                },
+            )
+        ]
+    )
+    item = project_timeline(events.events).timeline.items[0]
+    assert isinstance(item, NoticeTimelineItem)
+    assert item.hook is not None
+    assert item.hook.trigger == trigger
+    assert item.hook.child_session_id == "sess-child"
 
 
 def test_terminal_compaction_lifecycle_projects_with_occurrence_identity() -> None:
@@ -711,7 +942,7 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
                 "kind": "model_error",
                 "scope": "failed_turn",
                 "reason_class": "rate_limit",
-                "provider_id": "anthropic-lumilens",
+                "provider_id": "anthropic-sample",
                 "model": "claude-fable-5",
                 "retry_after_seconds": 23,
                 "provider_retry_after_seconds": 23,
@@ -745,7 +976,7 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
     assert item.notice_kind == "model_error"
     assert item.notice_scope == "failed_turn"
     assert item.reason_class == "rate_limit"
-    assert item.provider_id == "anthropic-lumilens"
+    assert item.provider_id == "anthropic-sample"
     assert item.model == "claude-fable-5"
     assert item.retry_after_seconds == 23
     assert item.provider_retry_after_seconds == 23
@@ -756,6 +987,32 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
     assert item.attempts_per_cycle == 1
     assert item.continuation_attempts == 2
     assert item.recoverable is True
+
+
+def test_turn_error_preserves_turn_identity() -> None:
+    projection = project_timeline(
+        normalize_session_events(
+            [
+                RawSessionEvent(
+                    store_id="intaris",
+                    session_id="sess_failure",
+                    seq=1,
+                    type="lifecycle",
+                    data={
+                        "event": "turn_error",
+                        "turn_id": "turn_failure",
+                        "error_id": "turn_failure",
+                        "error_code": "step_failed",
+                        "message": "Model stopped producing output.",
+                    },
+                )
+            ]
+        ).events
+    )
+    item = projection.timeline.items[0]
+    assert item.kind == "error"
+    assert item.turn_id == "turn_failure"
+    assert item.model_dump()["turn_id"] == "turn_failure"
 
 
 def test_lifecycle_system_notice_dedupes_by_notice_id() -> None:
@@ -849,6 +1106,7 @@ def test_compaction_summary_projects_to_compaction_card() -> None:
                 "summary": "Compacted history summary",
                 "method": "rotation",
                 "turns_compacted": 7,
+                "events_compacted": 140,
                 "trigger": "pressure",
                 "reason": "context_pressure",
                 "previous_usage_percentage": 86.1,
@@ -873,6 +1131,7 @@ def test_compaction_summary_projects_to_compaction_card() -> None:
     assert item.summary_preview == "Compacted history summary"
     assert item.method == "rotation"
     assert item.turns_compacted == 7
+    assert item.events_compacted == 140
     assert item.previous_usage_percentage == 86.1
     assert item.effective_usage_percentage == 72.5
     assert item.hard_pressure_exceeded is True

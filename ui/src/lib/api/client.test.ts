@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { authenticatedFixtureResponse, assertFixtureAccount, loginFixtureAccount } from '../../test/verified-account';
 
 import { ApiError, api, asApiError } from '$lib/api/client';
 import { auth } from '$lib/stores/auth';
+import { documentCoordination } from '$lib/document-coordination';
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
+beforeEach(loginFixtureAccount);
+afterEach(async () => { await auth.clear(); });
 
 describe('asApiError', () => {
   it('preserves structured errors from specialized API clients', () => {
@@ -31,8 +35,8 @@ describe('asApiError', () => {
 describe('api client session handling', () => {
   const originalFetch = global.fetch;
 
-  beforeEach(() => {
-    auth.clear();
+  beforeEach(async () => {
+    await auth.clear();
   });
 
   afterEach(() => {
@@ -44,12 +48,15 @@ describe('api client session handling', () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(
         new Response(
-          JSON.stringify({
-            user: { email: 'user@example.com', name: 'User', role: 'user' },
-            expires_at: new Date(Date.now() + 3_600_000).toISOString()
-          }),
+          JSON.stringify(authenticatedFixtureResponse()),
           { status: 200, headers: jsonHeaders }
         )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'expired' } }), {
+          status: 401,
+          headers: jsonHeaders
+        })
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'expired' } }), {
@@ -61,9 +68,13 @@ describe('api client session handling', () => {
     global.fetch = fetchMock;
 
     await auth.login('user@example.com', 'password123');
+    await assertFixtureAccount();
     await expect(api.auth.me()).rejects.toMatchObject({ status: 401, code: 'unauthorized' });
     expect(auth.getSnapshot().status).toBe('anonymous');
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/auth/login', '/api/auth/me', '/api/auth/refresh'
+    ]);
   });
 });
 
@@ -182,6 +193,9 @@ describe('conversation API client', () => {
       })
     );
     global.fetch = fetchMock;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      conversations: { items: [], cursor: null, has_more: false }, active_conversation_ids: [],
+    }), { status: 200, headers: jsonHeaders }));
 
     await expect(
       api.conversations.sidebar(null, {
@@ -192,9 +206,11 @@ describe('conversation API client', () => {
     ).resolves.toEqual(payload);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/v1/conversations/sidebar?limit=50&context_type=web&agent_id=agent-1&status=active'
-    );
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), 'http://localhost');
+    expect(url.pathname).toBe('/api/v1/conversations/sidebar');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      limit: '50', include_shared: 'true', context_type: 'web', agent_id: 'agent-1', status: 'active'
+    });
   });
 
   it('serializes multi-select sidebar filters as repeated query parameters', async () => {
@@ -211,6 +227,9 @@ describe('conversation API client', () => {
       })
     );
     global.fetch = fetchMock;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      conversations: { items: [], cursor: null, has_more: false }, active_conversation_ids: [],
+    }), { status: 200, headers: jsonHeaders }));
 
     await expect(
       api.conversations.sidebar(null, {
@@ -221,9 +240,13 @@ describe('conversation API client', () => {
     ).resolves.toEqual(payload);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/v1/conversations/sidebar?limit=50&context_types=web&context_types=agent_work&agent_ids=laforge&agent_ids=riker&status=active'
-    );
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), 'http://localhost');
+    expect(url.pathname).toBe('/api/v1/conversations/sidebar');
+    expect(url.searchParams.getAll('context_types')).toEqual(['web', 'agent_work']);
+    expect(url.searchParams.getAll('agent_ids')).toEqual(['laforge', 'riker']);
+    expect(url.searchParams.get('include_shared')).toBe('true');
+    expect(url.searchParams.get('limit')).toBe('50');
+    expect(url.searchParams.get('status')).toBe('active');
   });
 
   it('serializes sidebar delta cursor timestamps', async () => {
@@ -243,6 +266,9 @@ describe('conversation API client', () => {
       })
     );
     global.fetch = fetchMock;
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      conversations: { items: [], cursor: null, has_more: false }, active_conversation_ids: [],
+    }), { status: 200, headers: jsonHeaders }));
 
     await expect(
       api.conversations.sidebar(null, { contextType: 'web' }, {
@@ -251,9 +277,42 @@ describe('conversation API client', () => {
       })
     ).resolves.toEqual(payload);
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/v1/conversations/sidebar?limit=50&changed_since=2026-01-01T00%3A00%3A00Z&sidebar_revision=900719925474099300001&context_type=web'
-    );
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), 'http://localhost');
+    expect(url.pathname).toBe('/api/v1/conversations/sidebar');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      limit: '50', changed_since: '2026-01-01T00:00:00Z',
+      sidebar_revision: '900719925474099300001', include_shared: 'true', context_type: 'web'
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes successful history when a later Waiting page fails', async () => {
+    const payload = {
+      agents: [], agent_direct_chats: [], context_types: ['web'],
+      conversations: { items: [], cursor: null, has_more: false },
+    };
+    global.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes('/conversations/sidebar')) return new Response(JSON.stringify(payload), { status: 200, headers: jsonHeaders });
+      if (url.includes('cursor=')) return new Response(JSON.stringify({ error: { code: 'unavailable', message: 'Waiting offline' } }), { status: 503, headers: jsonHeaders });
+      return new Response(JSON.stringify({
+        conversations: { items: [], cursor: 'waiting-next', has_more: true },
+        active_conversation_ids: [],
+      }), { status: 200, headers: jsonHeaders });
+    });
+    await expect(api.conversations.sidebar()).resolves.toEqual(payload);
+    await expect(api.conversations.waiting()).rejects.toThrow('Waiting offline');
+  });
+
+  it('does not fetch active Waiting in an archived scope', async () => {
+    const payload = {
+      agents: [], agent_direct_chats: [], context_types: ['web'],
+      conversations: { items: [], cursor: null, has_more: false },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200, headers: jsonHeaders }));
+    global.fetch = fetchMock;
+    await expect(api.conversations.sidebar(null, { status: 'archived' })).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('requests backend chat open resolution with ordered candidates', async () => {
@@ -477,7 +536,12 @@ describe('long-running API client endpoints', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/images/generate');
-    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeUndefined();
+    // Long-running calls omit a timeout but retain account-revocation cancellation.
+    const signal = fetchMock.mock.calls[0]?.[1]?.signal;
+    expect(signal).toBe(documentCoordination().capture().signal);
+    expect(signal?.aborted).toBe(false);
+    await auth.clear();
+    expect(signal?.aborted).toBe(true);
   });
 });
 

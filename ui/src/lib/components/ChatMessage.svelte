@@ -2,9 +2,12 @@
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
   import GitFork from 'lucide-svelte/icons/git-fork';
+  import LoaderCircle from 'lucide-svelte/icons/loader-circle';
   import Square from 'lucide-svelte/icons/square';
   import Volume2 from 'lucide-svelte/icons/volume-2';
   import { getContext, onMount } from 'svelte';
+  import { streamReveal } from '$lib/chat-v2/stream-reveal';
+  import { chatArrivalContext, messageArrival, type ChatArrivalRegistry } from '$lib/chat-v2/motion';
   import { api } from '$lib/api/client';
   import type { MessageTimelineItem } from '$lib/timeline-render-model';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -48,6 +51,7 @@
     searchSelected?: boolean;
     live?: boolean;
   }>();
+  const arrivals = getContext<ChatArrivalRegistry | undefined>(chatArrivalContext);
 
   const runtimeAgentName = $derived(
     item.runtime?.agent_display_name
@@ -100,7 +104,7 @@
   function sizeClass(): string {
     if (compact) return 'w-full min-w-0';
     return item.role === 'assistant'
-      ? 'min-w-0 flex-1 xl:max-w-3xl'
+      ? 'min-w-0 flex-1'
       : 'w-full min-w-0 sm:max-w-[88%] xl:max-w-2xl';
   }
 
@@ -115,15 +119,11 @@
   });
 
   function bubbleClass(): string {
-    // Outgoing bubble uses a tonal sky-600 with a subtle border and light
-    // text instead of the previous vivid sky-500 + near-black text. The
-    // result is clearly an outgoing message but reads quietly against the
-    // slate-950 conversation surface, matching the rest of the chat style.
     return item.role === 'user'
-      ? 'ml-auto bg-sky-600/90 text-slate-50 border border-sky-400/30'
+      ? 'chat-message-user ml-auto border'
       : item.role === 'assistant'
-        ? 'bg-slate-900 text-slate-100 border border-slate-800'
-        : 'bg-slate-800/70 text-slate-200 border border-slate-700';
+        ? 'chat-message-assistant border'
+        : 'bg-inset/70 text-foreground border border-control-border';
   }
 
   const agentDefaultChatMode = $derived(
@@ -157,34 +157,32 @@
 
   function modeBadgeClass(): string {
     return explicitChatMode === 'build'
-      ? 'border-amber-300/45 bg-amber-300/10 text-amber-100'
-      : 'border-sky-300/30 bg-sky-300/[0.075] text-sky-100';
+      ? 'border-orange-border bg-orange-subtle text-orange-tone'
+      : 'border-blue-border bg-blue-subtle text-blue-tone';
   }
 
   function modeClass(): string {
-    if (explicitChatMode === 'plan') return 'border-l-4 border-l-sky-300/60 bg-sky-300/[0.025]';
-    if (explicitChatMode === 'build') return 'border-l-4 border-l-amber-300/85 bg-amber-300/[0.055]';
+    if (explicitChatMode === 'plan') return 'border-l-4 border-l-blue-border';
+    if (explicitChatMode === 'build') return 'border-l-4 border-l-orange-border';
     return '';
   }
 
   function deliveryStatusClass(): string {
-    if (deliveryStatusLabel === 'queued') return 'border-sky-200/40 bg-sky-200/10 text-sky-50';
-    if (deliveryStatusLabel === 'failed') return 'border-rose-200/50 bg-rose-300/15 text-rose-50';
-    return 'border-slate-100/30 bg-white/10 text-slate-50';
+    if (deliveryStatusLabel === 'queued') return 'border-info-border bg-info-subtle text-info';
+    if (deliveryStatusLabel === 'failed') return 'border-danger-border bg-danger-subtle text-danger';
+    return 'border-current text-inherit';
   }
 
   function proseClass(): string {
     return item.role === 'user'
-      // Typography defaults use dark ink for headings, tables, and other
-      // semantic Markdown elements. User bubbles have a sky background, so
-      // invert the full typography palette instead of styling only paragraphs.
+      // The bubble owns its foreground pair, independently of action colors.
       ? 'prose-invert prose-user'
-      : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
+      : 'prose-code:text-accent prose-code:before:content-none prose-code:after:content-none';
   }
 
   function searchRingClass(): string {
-    if (searchSelected) return 'ring-2 ring-yellow-300/80 ring-offset-2 ring-offset-slate-950';
-    if (searchActive) return 'ring-1 ring-yellow-300/35 ring-offset-1 ring-offset-slate-950';
+    if (searchSelected) return 'ring-2 ring-warning/80 ring-offset-2 ring-offset-canvas';
+    if (searchActive) return 'ring-1 ring-warning/35 ring-offset-1 ring-offset-canvas';
     return '';
   }
 
@@ -497,13 +495,14 @@
   standard messaging-app conventions on mobile.
 -->
 {#if item.role === 'assistant'}
-  <div class={`flex w-full min-w-0 items-start ${compact ? '' : 'gap-2 sm:gap-3'}`}>
+  <div use:messageArrival={{ id: item.id, eligible: !compact && item.arrivalEligible === true, registry: arrivals }}
+    class={`flex w-full min-w-0 items-start ${compact ? '' : 'gap-2 sm:gap-3'}`}>
     {#if !compact}
       <div class="relative mt-0.5 shrink-0" data-copy-exclude>
         {#if agent}
           <button
             type="button"
-            class="block rounded-2xl transition hover:ring-2 hover:ring-sky-300/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+            class="block rounded-2xl transition hover:ring-2 hover:ring-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             aria-label={`View ${agentName} profile`}
             onclick={() => { showAgentProfile = !showAgentProfile; }}
           >
@@ -517,31 +516,31 @@
         {/if}
       </div>
     {/if}
-    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
-      {#if item.html}
-        <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
+    <article data-message-role={item.role} class={`chat-message-bubble overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
+      {#if item.html !== undefined && item.html !== null}
+        <div class:streaming-markdown={item.streaming} use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} use:streamReveal={{ html: item.html, streaming: Boolean(item.streaming) }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
       {:else}
-        <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+        <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="chat-message-text whitespace-pre-wrap break-words leading-6 [overflow-wrap:anywhere]">{item.content}</p>
       {/if}
 
       {#if item.attachments && item.attachments.length > 0}
         <MessageAttachments attachments={item.attachments} />
       {/if}
 
-      <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3" data-copy-exclude>
+      <div class="chat-message-meta mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3" data-copy-exclude>
         <div class="flex min-w-0 items-center gap-1.5">
           <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-4 w-4 rounded-md text-[9px]" />
           <Popover text={runtimeTooltip} placement="top">
-            <span class="truncate font-medium text-slate-200">{agentName}</span>
+            <span class="truncate font-medium text-foreground">{agentName}</span>
           </Popover>
           {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
             <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
           {/if}
           {#if item.partial && !item.streaming}
-            <span class="rounded-full border border-slate-600 bg-slate-800/80 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-slate-300" title={partialStatusTitle}>{partialStatusLabel}</span>
+            <span class="rounded-full border border-control-border bg-raised/80 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-secondary" title={partialStatusTitle}>{partialStatusLabel}</span>
           {/if}
-          <span class="text-slate-500">·</span>
-          <span class="text-slate-400" title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
+          <span class="legacy-quiet text-quiet">·</span>
+          <span class="text-muted" title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
         </div>
         <div class="flex shrink-0 items-center gap-2">
           {#if item.streaming}
@@ -583,14 +582,19 @@
             </button>
             {#if canFork}
               <button
-                class="copy-icon-button ml-1 border-l border-slate-700"
+                class="copy-icon-button ml-1 border-l border-control-border"
                 onclick={forkMessage}
                 type="button"
-                title="Fork conversation from this message"
-                aria-label="Fork conversation from this message"
+                title={forking ? 'Forking conversation…' : 'Fork conversation from this message'}
+                aria-label={forking ? 'Forking conversation…' : 'Fork conversation from this message'}
+                aria-busy={forking}
                 disabled={forking}
               >
-                <GitFork />
+                {#if forking}
+                  <LoaderCircle class="animate-spin" />
+                {:else}
+                  <GitFork />
+                {/if}
               </button>
             {/if}
           {/if}
@@ -599,11 +603,12 @@
     </article>
   </div>
 {:else}
-  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
+  <article use:messageArrival={{ id: item.id, eligible: !compact && item.arrivalEligible === true, registry: arrivals }}
+    data-message-role={item.role} class={`chat-message-bubble overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
     {#if item.html}
       <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
     {:else}
-      <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+      <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="chat-message-text whitespace-pre-wrap break-words leading-6 [overflow-wrap:anywhere]">{item.content}</p>
     {/if}
 
     {#if item.attachments && item.attachments.length > 0}
@@ -612,7 +617,7 @@
 
     <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5" data-copy-exclude>
       {#if deliveryStatusLabel}
-        <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${deliveryStatusClass()}`}>{deliveryStatusLabel}</span>
+        <span class={`chat-state-handoff rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${deliveryStatusClass()}`}>{deliveryStatusLabel}</span>
       {/if}
       {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
         <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
@@ -635,9 +640,49 @@
 {/if}
 
 <style>
+  .chat-message-assistant {
+    border-radius: var(--chat-assistant-radius, 1.4rem);
+  }
+  @media (min-width: 640px) {
+    .chat-message-assistant { border-radius: var(--chat-assistant-radius, 1.5rem); }
+  }
+  .chat-message-text { font-size: var(--chat-message-font-size); }
+  /* One reading measure for every theme (matches rich deliverables). The
+     font size here makes 70ch resolve at the message size; bubble themes cap
+     the bubble, bubble-less themes let tables and code use the full column. */
+  .chat-message-assistant {
+    font-size: var(--chat-message-font-size);
+    --chat-assistant-measure: 70ch;
+    max-width: var(--chat-assistant-bubble-max-width, calc(var(--chat-assistant-measure) + 2rem));
+  }
+  .chat-message-assistant > .chat-message-text,
+  .chat-message-assistant > .chat-markdown {
+    font-family: var(--chat-prose-font);
+  }
+  .chat-message-assistant > .chat-message-text,
+  .chat-message-assistant > .chat-message-meta,
+  .chat-message-assistant > .chat-markdown > :global(:not(.markdown-table-wrap, .chat-code-wrap, pre)) {
+    max-width: var(--chat-assistant-measure);
+  }
+  .streaming-markdown :global(.stream-reveal) {
+    animation: stream-arrival var(--chat-motion-stream, 320ms) ease-out;
+  }
+
+  @keyframes stream-arrival {
+    from { opacity: 0.45; }
+    to { opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .streaming-markdown :global(.stream-reveal) {
+      animation: none;
+    }
+
+  }
+
   :global(.chat-search-mark) {
     border-radius: 0.25rem;
-    background: rgba(250, 204, 21, 0.45);
+    background: rgb(var(--color-warning) / 0.3);
     color: inherit;
     padding: 0 0.08em;
   }

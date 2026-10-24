@@ -4,6 +4,7 @@
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import Button from '$lib/components/ui/Button.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
+  import { renderMarkdown } from '$lib/markdown';
 
   let { item, onViewSession } = $props<{
     item: DelegationTimelineItem;
@@ -12,10 +13,10 @@
 
   function toneClass(): string {
     return item.status === 'completed'
-      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
+      ? 'border-success-border bg-success-subtle text-success'
       : item.status === 'failed' || item.status === 'cancelled'
-        ? 'border-rose-500/40 bg-rose-500/10 text-rose-100'
-        : 'border-sky-500/30 bg-sky-500/10 text-sky-100';
+        ? 'border-danger-border bg-danger-subtle text-danger'
+        : 'border-info-border bg-info-subtle text-info';
   }
 
   // Task delegations have IDs starting with "task_". Sub-session cards should
@@ -26,6 +27,7 @@
   let agentLabel = $derived(item.usedAgentId ?? item.agentId ?? null);
   let visibleTodos = $derived(activeVisibleTodos(item.todos));
   let showTodos = $derived(visibleTodos.length > 0);
+  const resultHtml = $derived(item.result ? renderMarkdown(item.result) : '');
 </script>
 
 <article class={`rounded-3xl border px-4 py-4 shadow-card ${toneClass()}`}>
@@ -34,7 +36,7 @@
       <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">{cardLabel}</p>
       <h3 class="mt-1 text-base font-semibold">{item.taskLabel}</h3>
       {#if agentLabel}
-        <p class="mt-1 inline-flex max-w-full rounded-full border border-current/20 bg-black/10 px-2 py-0.5 font-mono text-[11px] opacity-85">
+        <p class="mt-1 inline-flex max-w-full rounded-full border border-current/20 bg-inset px-2 py-0.5 font-mono text-[11px] opacity-85">
           <span class="mr-1 opacity-70">agent_id</span>
           <span class="truncate">{agentLabel}</span>
         </p>
@@ -56,7 +58,7 @@
   {#if item.status === 'started' || item.status === 'running'}
     <div class="mt-3 flex items-center gap-2 text-xs opacity-75">
       <span class="h-2 w-2 animate-pulse rounded-full bg-current"></span>
-      <span class="flex-1">{item.result ?? 'Working...'}</span>
+      {#if !item.result}<span class="flex-1">Working...</span>{/if}
     </div>
     {#if item.toolCallCount !== undefined}
       <div class="mt-1.5 flex items-center gap-2 text-xs opacity-60">
@@ -76,8 +78,11 @@
         {/if}
       </div>
     {/if}
-  {:else if item.result}
-    <p class="mt-3 line-clamp-5 whitespace-pre-wrap text-sm leading-6 opacity-90">{item.result}</p>
+  {/if}
+  {#if resultHtml}
+    <div class="chat-markdown prose prose-sm mt-3 max-h-72 max-w-none overflow-auto break-words text-foreground">
+      {@html resultHtml}
+    </div>
   {/if}
 
   <div class="mt-3 flex justify-end">

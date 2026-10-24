@@ -7,6 +7,7 @@ import httpx
 
 from cognis.providers.llm.anthropic_subscription import AnthropicSubscriptionError
 from cognis.providers.llm.errors import (
+    LLMStreamProviderError,
     MidStreamErrorCategory,
     classify_llm_exception,
     classify_response_failure,
@@ -90,6 +91,37 @@ def test_classify_unsupported_model_rejection_is_invalid_request() -> None:
     )
 
     assert classify_llm_exception(exc)["category"] == MidStreamErrorCategory.INVALID_REQUEST.value
+
+
+def test_hidden_tool_validation_rejection_is_invalid_request_even_with_executor_prefix() -> None:
+    exc = RuntimeError(
+        "executor inference via /v1/chat/completions: attempted to call tool bash "
+        "which was not in request.tools"
+    )
+
+    payload = classify_llm_exception(exc)
+
+    assert payload["category"] == MidStreamErrorCategory.INVALID_REQUEST.value
+
+
+def test_normalized_hidden_tool_validation_rejection_is_invalid_request() -> None:
+    exc = LLMStreamProviderError(
+        "provider stream rejected",
+        payload={
+            "category": MidStreamErrorCategory.OTHER.value,
+            "message": (
+                "executor request: attempted to call tool bash which was not in request.tools"
+            ),
+        },
+    )
+
+    assert classify_llm_exception(exc)["category"] == MidStreamErrorCategory.INVALID_REQUEST.value
+
+
+def test_unrelated_tool_error_remains_recoverable() -> None:
+    payload = classify_llm_exception(RuntimeError("tool execution failed"))
+
+    assert payload["category"] == MidStreamErrorCategory.OTHER.value
 
 
 def test_deterministic_status_outranks_server_error_wording() -> None:

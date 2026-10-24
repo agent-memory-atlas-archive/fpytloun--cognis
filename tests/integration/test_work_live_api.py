@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +13,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import AsyncEngine
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cognis.api.app import create_app
 from cognis.api.chat_v2.event_store import (
@@ -34,6 +39,55 @@ from cognis.store.models import (
     WorkSessionProjectionRow,
 )
 from cognis.store.work_live_invalidation import bump_live_work_revision
+
+
+@dataclass
+class _RequestQueries:
+    statements: list[str] = field(default_factory=list)
+    ambient: list[str] = field(default_factory=list)
+    active: bool = True
+
+
+_request_queries: ContextVar[_RequestQueries | None] = ContextVar("request_queries", default=None)
+
+
+@contextmanager
+def _capture_request_queries(engine: AsyncEngine) -> Iterator[_RequestQueries]:
+    """Count the whole TestClient request, including inherited child-task SQL."""
+    capture = _RequestQueries()
+
+    def count_query(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        normalized = " ".join(statement.split())
+        capture.ambient.append(normalized)
+        if _request_queries.get() is capture and capture.active:
+            capture.statements.append(normalized)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count_query)
+    token = _request_queries.set(capture)
+    try:
+        yield capture
+    finally:
+        # Child tasks retain the collector object, not just the ContextVar token.
+        capture.active = False
+        _request_queries.reset(token)
+        event.remove(engine.sync_engine, "before_cursor_execute", count_query)
+
+
+def _assert_query_budget(count: int) -> None:
+    assert count <= 50, count
+
+
+async def _read_query_probe(client: TestClient, count: int) -> None:
+    async with client.app.state.session_factory() as db:
+        for _ in range(count):
+            await db.execute(select(User.email))
 
 
 @pytest.fixture
@@ -67,7 +121,8 @@ def _seed_identity(client: TestClient, email: str = "owner@example.com") -> None
             db.add(Agent(agent_id=f"agent-{email}", owner_email=email, name="Agent"))
             await db.commit()
 
-    asyncio.run(seed())
+    assert client.portal is not None
+    client.portal.call(seed)
 
 
 def _seed_conversation(
@@ -105,7 +160,8 @@ def _seed_conversation(
                     )
             await db.commit()
 
-    asyncio.run(seed())
+    assert client.portal is not None
+    client.portal.call(seed)
 
 
 def test_current_managed_rotation_survives_history_cap(work_api: TestClient) -> None:
@@ -1286,71 +1342,199 @@ def test_rotations_collapse_and_retain_deduped_files_during_partial_recovery(
     assert files_payload["mutations"][0]["file_stats"][0]["preview_available"] is True
 
 
-def test_conversation_work_routes_have_bounded_query_count(work_api: TestClient) -> None:
+def test_conversation_work_routes_have_bounded_query_count(
+    work_api: TestClient, record_property: Callable[[str, object], None]
+) -> None:
     _seed_identity(work_api)
     _seed_conversation(
         work_api,
         conversation_id="budget",
         session_id="budget-session",
     )
-    engine = client_engine = work_api.app.state.engine
-    counts: list[str] = []
-
-    def count_query(
-        _connection: object,
-        _cursor: object,
-        statement: str,
-        _parameters: object,
-        _context: object,
-        _executemany: object,
-    ) -> None:
-        counts.append(statement)
-
-    event.listen(client_engine.sync_engine, "before_cursor_execute", count_query)
-    try:
-        results: dict[str, int] = {}
-        for suffix in ("activity-overview", "work"):
-            counts.clear()
+    engine = work_api.app.state.engine
+    results: dict[str, int] = {}
+    for suffix in ("activity-overview", "work"):
+        with _capture_request_queries(engine) as capture:
             response = work_api.get(
                 f"/api/v1/chat/v2/conversations/budget/{suffix}",
                 headers=_auth_headers(work_api),
             )
-            assert response.status_code == 200, response.text
-            results[suffix] = len(counts)
-        assert results["activity-overview"] <= 50, results
-        assert results["work"] <= 50, results
+        assert response.status_code == 200, response.text
+        assert {node["session_id"] for node in response.json()["workstreams"]} == {"budget-session"}
+        results[suffix] = len(capture.statements)
+    assert results["activity-overview"] <= 50, results
+    assert results["work"] <= 50, results
+    record_property("baseline_queries", results)
 
-        async def add_descendants() -> None:
-            async with work_api.app.state.session_factory() as db:
-                for index in range(12):
-                    await queries.create_session(
-                        db,
-                        session_id=f"budget-child-{index}",
-                        conversation_id="budget",
-                        user_email="owner@example.com",
-                        agent_id="agent-owner@example.com",
-                        intaris_session_id=f"source-budget-child-{index}",
-                        parent_session_id="budget-session",
-                    )
-                await db.commit()
+    async def add_descendants() -> None:
+        async with work_api.app.state.session_factory() as db:
+            for index in range(12):
+                await queries.create_session(
+                    db,
+                    session_id=f"budget-child-{index}",
+                    conversation_id="budget",
+                    user_email="owner@example.com",
+                    agent_id="agent-owner@example.com",
+                    intaris_session_id=f"source-budget-child-{index}",
+                    parent_session_id="budget-session",
+                )
+            excluded = await db.get(Session, "excluded-session")
+            excluded.parent_session_id = "budget-session"
+            await db.commit()
 
-        asyncio.run(add_descendants())
-        scaled: dict[str, int] = {}
-        for suffix in ("activity-overview", "work"):
-            counts.clear()
+    _seed_identity(work_api, email="excluded@example.com")
+    _seed_conversation(
+        work_api,
+        conversation_id="excluded",
+        email="excluded@example.com",
+        session_id="excluded-session",
+    )
+    assert work_api.portal is not None
+    work_api.portal.call(add_descendants)
+    scaled: dict[str, int] = {}
+    for suffix in ("activity-overview", "work"):
+        with _capture_request_queries(engine) as capture:
             response = work_api.get(
                 f"/api/v1/chat/v2/conversations/budget/{suffix}",
                 headers=_auth_headers(work_api),
             )
-            assert response.status_code == 200, response.text
-            scaled[suffix] = len(counts)
-        assert scaled["activity-overview"] <= results["activity-overview"] + 8, (
-            results,
-            scaled,
+        assert response.status_code == 200, response.text
+        assert {node["session_id"] for node in response.json()["workstreams"]} == {
+            "budget-session",
+            *(f"budget-child-{index}" for index in range(12)),
+        }
+        scaled[suffix] = len(capture.statements)
+        _assert_query_budget(scaled[suffix])
+    assert scaled["activity-overview"] <= results["activity-overview"] + 8, (
+        results,
+        scaled,
+    )
+    assert scaled["work"] <= results["work"] + 8, (results, scaled)
+    record_property("scaled_queries", scaled)
+
+    async def make_admin() -> None:
+        async with work_api.app.state.session_factory() as db:
+            owner = await db.get(User, "owner@example.com")
+            owner.role = "admin"
+            await db.commit()
+
+    work_api.portal.call(make_admin)
+    admin_token = work_api.app.state.auth_provider.sign_access_token(
+        "owner@example.com", "Owner", "admin"
+    )
+    for suffix in ("activity-overview", "work"):
+        denied = work_api.get(
+            f"/api/v1/chat/v2/conversations/excluded/{suffix}",
+            headers={"Authorization": f"Bearer {admin_token}"},
         )
-        assert scaled["work"] <= results["work"] + 8, (results, scaled)
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", count_query)
+        assert denied.status_code in {403, 404}, denied.text
+        visible = work_api.get(
+            f"/api/v1/chat/v2/conversations/budget/{suffix}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert visible.status_code == 200, visible.text
+        assert "excluded-session" not in {
+            node["session_id"] for node in visible.json()["workstreams"]
+        }
+
+
+@pytest.mark.parametrize("suffix", ["activity-overview", "work"])
+@pytest.mark.parametrize("extra_queries", [0, 51])
+def test_query_budget_counts_complete_request_not_overlapping_workers(
+    work_api: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    extra_queries: int,
+    record_property: Callable[[str, object], None],
+) -> None:
+    _seed_identity(work_api)
+    _seed_conversation(work_api, conversation_id="probe", session_id="probe-session")
+    engine = work_api.app.state.engine
+    path = f"/api/v1/chat/v2/conversations/probe/{suffix}"
+    headers = _auth_headers(work_api)
+    with _capture_request_queries(engine) as baseline:
+        expected = work_api.get(path, headers=headers)
+    assert expected.status_code == 200, expected.text
+    # Authentication and the graph's independently scheduled build must be counted.
+    assert any("FROM users " in sql for sql in baseline.statements)
+    assert any("FROM managed_conversation_links " in sql for sql in baseline.statements)
+
+    async def barriers() -> tuple[asyncio.Event, asyncio.Event]:
+        return asyncio.Event(), asyncio.Event()
+
+    assert work_api.portal is not None
+    start, done = work_api.portal.call(barriers)
+
+    async def background() -> None:
+        assert _request_queries.get() is None
+        await start.wait()
+        try:
+            await _read_query_probe(work_api, 60)
+        finally:
+            done.set()
+
+    worker = work_api.portal.start_task_soon(background)
+    original: ASGIApp = work_api.app.middleware_stack
+
+    async def overlap(scope: Scope, receive: Receive, send: Send) -> None:
+        # This outer ASGI wrapper surrounds auth, route execution and serialization.
+        await _read_query_probe(work_api, 1)
+        start.set()
+        # A test barrier, not a product dependency on the unrelated worker's data.
+        await done.wait()
+        await asyncio.create_task(_read_query_probe(work_api, 3 + extra_queries))
+        await original(scope, receive, send)
+        await _read_query_probe(work_api, 1)
+
+    monkeypatch.setattr(work_api.app, "middleware_stack", overlap)
+    with _capture_request_queries(engine) as measured:
+        actual = work_api.get(path, headers=headers)
+    worker.result(timeout=5)
+    assert actual.status_code == 200, actual.text
+    assert len(measured.statements) == len(baseline.statements) + 5 + extra_queries
+    assert len(measured.ambient) >= len(measured.statements) + 60
+    record_property("baseline_queries", len(baseline.statements))
+    record_property("request_queries", len(measured.statements))
+    record_property("ambient_queries", len(measured.ambient))
+    with pytest.raises(AssertionError):
+        _assert_query_budget(len(measured.ambient))
+    if extra_queries:
+        with pytest.raises(AssertionError):
+            _assert_query_budget(len(measured.statements))
+    else:
+        _assert_query_budget(len(measured.statements))
+    expected_payload = expected.json()
+    actual_payload = actual.json()
+    expected_payload.pop("server_time")
+    actual_payload.pop("server_time")
+    assert actual_payload == expected_payload
+
+
+def test_expired_query_capture_cannot_leak_into_next_request(work_api: TestClient) -> None:
+    assert work_api.portal is not None
+
+    async def pending() -> tuple[asyncio.Event, asyncio.Task[None]]:
+        release = asyncio.Event()
+
+        async def late_child() -> None:
+            await release.wait()
+            await _read_query_probe(work_api, 1)
+
+        return release, asyncio.create_task(late_child())
+
+    with _capture_request_queries(work_api.app.state.engine) as expired:
+        release, child = work_api.portal.call(pending)
+
+    async def finish() -> None:
+        release.set()
+        await child
+        await _read_query_probe(work_api, 1)
+
+    with _capture_request_queries(work_api.app.state.engine) as current:
+        work_api.portal.call(finish)
+    assert expired.statements == []
+    assert len(current.statements) == 1
+    assert len(current.ambient) >= 2
 
 
 def test_file_history_preserves_exact_source_and_path_identity(

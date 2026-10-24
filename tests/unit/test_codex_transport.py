@@ -6,7 +6,7 @@ import uuid
 import httpx
 import pytest
 
-from cognis.providers.llm.codex import CodexAuth
+from cognis.providers.llm.codex import CODEX_CLIENT_VERSION, CodexAuth
 from cognis.providers.llm.codex_transport import (
     DEFAULT_CODEX_HTTP_TIMEOUT,
     DEFAULT_CODEX_STREAM_HTTP_TIMEOUT,
@@ -34,6 +34,7 @@ def test_codex_headers_merge_auth_extra_headers_and_stream_accept() -> None:
 
     assert headers["Authorization"] == "Bearer token"
     assert headers["ChatGPT-Account-ID"] == "account"
+    assert headers["User-Agent"] == f"codex_cli_rs/{CODEX_CLIENT_VERSION}"
     assert headers["Accept"] == "text/event-stream"
     assert headers["x-session-affinity"] == "session-123"
     assert headers["session_id"] == "session-123"

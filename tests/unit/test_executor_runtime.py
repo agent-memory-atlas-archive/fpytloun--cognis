@@ -49,6 +49,91 @@ def test_fast_path_local_inference_requires_matching_generation_flags_and_endpoi
 
 
 @pytest.mark.asyncio
+async def test_background_mcp_retries_are_bounded_and_cancelled_on_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = AsyncMock()
+    report = (
+        RuntimeCapabilityReport.unknown()
+        .model_copy(update={"observed_tools": ["read", "mcp_hass__status"]})
+        .model_dump(mode="json")
+    )
+    connection.rpc_call.return_value = {
+        "state": "applied",
+        "runtime_state": "degraded",
+        "observed_tools": [{"name": "read"}, {"name": "mcp_hass__status"}],
+        "runtime_metadata": {
+            "observed_capabilities": report,
+            "mcp_servers": [
+                {"server_id": "hass", "name": "hass", "status": "failed", "timed_out": True}
+            ],
+        },
+    }
+    app = _app_with_ws_connection(connection)
+    row = _executor_row(
+        desired_config_version=7,
+        applied_config_version=7,
+        runtime_state="degraded",
+        runtime_metadata=connection.rpc_call.return_value["runtime_metadata"],
+    )
+    monkeypatch.setattr(executor_runtime, "MCP_RETRY_DELAYS_SECONDS", (0, 0, 0))
+    monkeypatch.setattr(executor_runtime, "get_executor_row", AsyncMock(return_value=row))
+    monkeypatch.setattr(
+        executor_runtime,
+        "_build_configure_payload",
+        AsyncMock(return_value=({"mcp_servers": [{"server_id": "hass"}], "secrets": {}}, {})),
+    )
+    persisted = AsyncMock(return_value=row)
+    monkeypatch.setattr(executor_runtime, "_persist_runtime_state", persisted)
+    monkeypatch.setattr(
+        executor_runtime, "_connection_ownership_is_current", AsyncMock(return_value=True)
+    )
+    app.state.providers.executor.websocket.mark_ready = lambda *args, **kwargs: True
+    executor_runtime.schedule_executor_mcp_retries(app, "remote-1", connection, 7)
+    task = app.state.executor_mcp_retry_tasks[("remote-1", connection, 7)]
+    executor_runtime.schedule_executor_mcp_retries(app, "remote-1", connection, 7)
+    assert app.state.executor_mcp_retry_tasks[("remote-1", connection, 7)] is task
+    await task
+    assert connection.rpc_call.await_count == 3
+    assert persisted.call_args.kwargs["runtime_metadata"]["observed_capabilities"] == report
+    assert (
+        persisted.call_args.kwargs["runtime_metadata"]["capabilities"]["tools"]
+        == report["observed_tools"]
+    )
+    assert app.state.executor_mcp_retry_tasks == {}
+    monkeypatch.setattr(executor_runtime, "MCP_RETRY_DELAYS_SECONDS", (60,))
+    executor_runtime.schedule_executor_mcp_retries(app, "remote-1", connection, 7)
+    old_task = app.state.executor_mcp_retry_tasks[("remote-1", connection, 7)]
+    await asyncio.sleep(0)
+    executor_runtime.schedule_executor_mcp_retries(app, "remote-1", connection, 8)
+    new_task = app.state.executor_mcp_retry_tasks[("remote-1", connection, 8)]
+    assert new_task is not old_task
+    await asyncio.gather(old_task, return_exceptions=True)
+    assert old_task.cancelled()
+    assert not new_task.done()
+    await executor_runtime.cancel_executor_mcp_retries(app, "remote-1", connection)
+    assert app.state.executor_mcp_retry_tasks == {}
+
+
+def test_mcp_retries_exclude_auth_faults_and_non_timeout_failures() -> None:
+    assert executor_runtime._retryable_mcp_server_ids(
+        {
+            "mcp_servers": [
+                {"server_id": "hass", "status": "failed", "timed_out": True},
+                {
+                    "server_id": "oauth",
+                    "status": "failed",
+                    "timed_out": True,
+                    "authorization_required": True,
+                },
+                {"server_id": "invalid", "status": "failed", "timed_out": False},
+                {"server_id": "healthy", "status": "ready", "timed_out": True},
+            ]
+        }
+    ) == {"hass"}
+
+
+@pytest.mark.asyncio
 async def test_catalog_validation_runs_off_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     row = _executor_row(owner_email="alice@example.com")
     queue = SimpleNamespace(enqueue_tools=AsyncMock())

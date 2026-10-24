@@ -28,6 +28,7 @@ from cognis.api.chat_v2.schemas import (
     ErrorTimelineItem,
     FileDiffRef,
     FileDiffTimelineItem,
+    HandoffTimelineItem,
     ManagedConversationTimelineItem,
     MessageTimelineItem,
     NoticeTimelineItem,
@@ -47,6 +48,8 @@ from cognis.api.chat_v2.schemas import (
     UserInteractionAnswer,
     UserInteractionTimelineItem,
 )
+from cognis.api.chat_v2.status import normalize_timeline_status
+from cognis.core.command_notices import is_profile_switch_notice
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 
 ThinkingStatus = Literal["running", "complete", "failed"]
@@ -104,8 +107,23 @@ def project_timeline(events: Iterable[NormalizedChatEvent]) -> TimelineProjectio
     evaluations_by_call_id: dict[str, tuple[dict[str, Any], SourceRef]] = {}
     delegation_folds = _DelegationFolds()
     warnings: list[ProjectionWarning] = []
+    pending_profile_notice: str | None = None
+    pending_profile_session: str | None = None
 
     for event in normalized_events:
+        # Replay also folds old UUID-per-click notices. The first card identity
+        # stays stable; every successful update remains in source provenance.
+        if event.source_ref.session_id != pending_profile_session:
+            pending_profile_notice = None
+            pending_profile_session = event.source_ref.session_id
+        if event.kind in {"user_message", "assistant_message"}:
+            pending_profile_notice = None
+        if event.kind == "system_message" and is_profile_switch_notice(event.data):
+            if pending_profile_notice is None:
+                pending_profile_notice = str(event.data.get("notice_id") or _fallback_id(event))
+            event = event.model_copy(
+                update={"data": {**event.data, "notice_id": pending_profile_notice}}
+            )
         later_occurrence = latest_occurrence_by_source.get(event.source_ref.session_id)
         if (
             event.kind == "compaction"
@@ -150,7 +168,25 @@ def project_timeline(events: Iterable[NormalizedChatEvent]) -> TimelineProjectio
                 )
             )
             item = _unknown_notice(event)
-        _upsert_item(items_by_id, cast(TimelineItem, item))
+        projected_item = cast(TimelineItem, item)
+        if is_profile_switch_notice(event.data) or event.data.get("event") == "agent_hook":
+            previous = items_by_id.get(projected_item.id)
+            if previous is not None:
+                if (
+                    isinstance(previous, NoticeTimelineItem)
+                    and isinstance(projected_item, NoticeTimelineItem)
+                    and previous.hook is not None
+                    and projected_item.hook is not None
+                ):
+
+                    def hook_rank(status: str) -> int:
+                        return {"pending": 0, "dispatching": 1, "running": 2}.get(status, 3)
+
+                    if hook_rank(projected_item.hook.status) < hook_rank(previous.hook.status):
+                        continue
+                projected_item.sort_key = previous.sort_key
+                projected_item.created_at = previous.created_at
+        _upsert_item(items_by_id, projected_item)
 
     items = sorted(items_by_id.values(), key=lambda item: item.sort_key)
     return TimelineProjection(
@@ -261,7 +297,13 @@ def _project_event(
     if event.kind == "user_message":
         return _message_item(event, role="user")
     if event.kind == "assistant_message":
-        return _message_item(event, role="assistant")
+        item = _message_item(event, role="assistant")
+        previous = items_by_id.get(item.id)
+        if event.data.get("content_is_delta") is True and isinstance(previous, MessageTimelineItem):
+            item.content = previous.content + item.content
+            item.sort_key = previous.sort_key
+            item.created_at = previous.created_at
+        return item
     if event.kind == "system_message":
         return _message_item(event, role="system")
     if event.kind == "thinking":
@@ -311,6 +353,25 @@ def _project_event(
         return _file_diff_item(event)
     if event.kind == "recap":
         return _recap_item(event)
+    if event.kind == "handoff":
+        return HandoffTimelineItem(
+            id=f"handoff:{event.source_ref.session_id}:{event.data.get('request_id') or event.data.get('handoff_seq') or event.source_ref.seq}",
+            sort_key=_sort_key(event),
+            source_refs=[event.source_ref],
+            created_at=event.timestamp,
+            updated_at=event.timestamp,
+            text=str(event.data.get("text") or ""),
+            focus=str(event.data.get("focus") or ""),
+            source_session_id=str(
+                event.data.get("source_session_id") or event.source_ref.session_id
+            ),
+            source_seq=int(event.data.get("source_seq") or 0),
+            status="complete"
+            if event.data.get("status", "completed") == "completed"
+            else event.data["status"],
+            error=event.data.get("error"),
+            recipient_conversation_id=event.data.get("recipient_conversation_id"),
+        )
     if event.kind == "notice":
         return _notice_item(event)
     if event.kind == "compaction":
@@ -887,6 +948,8 @@ def _assistant_deliverable_item(event: NormalizedChatEvent) -> AssistantDelivera
         updated_at=event.timestamp,
         status="complete",
         deliverable_id=deliverable_id,
+        lineage_id=_str_or_none(data.get("lineage_id")),
+        revision=_int_or_none(data.get("revision")),
         format=str(data.get("format") or "markdown"),
         title=_str_or_none(data.get("title")),
         content=_str_or_none(data.get("content")),
@@ -936,6 +999,40 @@ def _recap_item(event: NormalizedChatEvent) -> RecapTimelineItem:
 
 def _notice_item(event: NormalizedChatEvent) -> NoticeTimelineItem:
     data = event.data
+    if data.get("event") == "agent_hook":
+        from cognis.api.chat_v2.schemas import HookLifecycle
+
+        return NoticeTimelineItem(
+            id=f"hook:{data['hook_run_id']}",
+            sort_key=_sort_key(event),
+            source_refs=[event.source_ref],
+            created_at=event.timestamp,
+            updated_at=event.timestamp,
+            level="warning"
+            if data["status"]
+            in {
+                "failed",
+                "interrupted",
+                "timed_out",
+            }
+            else "info",
+            title=str(data["name"]),
+            hook=HookLifecycle(
+                trigger=data.get("trigger"),
+                run_id=data["hook_run_id"],
+                hook_id=data["hook_id"],
+                status=data["status"],
+                child_conversation_id=data.get("child_conversation_id"),
+                child_session_id=data.get("child_session_id"),
+                task_id=data.get("task_id"),
+                outcome=data.get("outcome"),
+                outcome_partial=bool(data.get("outcome_partial")),
+                outcome_available=data.get("outcome_available"),
+                result_anchors=data.get("result_anchors", []),
+                result_truncated=bool(data.get("result_truncated")),
+                result_original_length=data.get("result_original_length"),
+            ),
+        )
     notice_id = str(data.get("notice_id") or data.get("id") or _fallback_id(event))
     return NoticeTimelineItem(
         id=f"notice:{notice_id}",
@@ -977,6 +1074,7 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
         raw_status if raw_status in {"running", "compacted", "failed", "skipped"} else "compacted",
     )
     turns_compacted = data.get("turns_compacted")
+    events_compacted = data.get("events_compacted")
     return CompactionTimelineItem(
         id=item_id,
         sort_key=_sort_key(event),
@@ -995,6 +1093,9 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
         turns_compacted=turns_compacted
         if isinstance(turns_compacted, int) and turns_compacted >= 0
         else 0,
+        events_compacted=events_compacted
+        if isinstance(events_compacted, int) and events_compacted >= 0
+        else 0,
         trigger=_str_or_none(data.get("trigger")),
         reason=_str_or_none(data.get("fallback_reason")) or _str_or_none(data.get("reason")),
         previous_usage_percentage=_float_or_none(data.get("previous_usage_percentage")),
@@ -1009,6 +1110,7 @@ def _error_item(event: NormalizedChatEvent) -> ErrorTimelineItem:
     error_id = str(data.get("error_id") or data.get("id") or _fallback_id(event))
     return ErrorTimelineItem(
         id=f"error:{error_id}",
+        turn_id=_str_or_none(data.get("turn_id")),
         sort_key=_sort_key(event),
         source_refs=[event.source_ref],
         created_at=event.timestamp,
@@ -1059,7 +1161,7 @@ def _upsert_item(items_by_id: dict[str, TimelineItem], item: TimelineItem) -> No
     if existing is None:
         items_by_id[item.id] = item
         return
-    if existing.kind == "compaction" and item.kind == "compaction":
+    if existing.kind == item.kind and item.kind in {"compaction", "handoff"}:
         if existing.status != "running" and item.status == "running":
             existing.source_refs = _merged_source_refs(existing, *item.source_refs)
             return
@@ -1226,10 +1328,7 @@ def _evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _status(data: dict[str, Any], *, default: TimelineItemStatus) -> TimelineItemStatus:
-    value = data.get("status")
-    if value in {"pending", "running", "waiting", "complete", "failed", "cancelled", "denied"}:
-        return cast(TimelineItemStatus, value)
-    return default
+    return normalize_timeline_status(data.get("status")) or default
 
 
 def _thinking_status(data: dict[str, Any]) -> ThinkingStatus | None:

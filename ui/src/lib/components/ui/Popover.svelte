@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { portal } from '$lib/actions/portal';
+  import { keepInViewport } from '$lib/actions/keep-in-viewport';
 
   /**
    * Tap-or-hover popover. Replaces hover-only tooltips.
@@ -131,19 +132,20 @@
   {#if open}
     <span
       role="tooltip"
-      class="pointer-events-none z-[2147483647] whitespace-pre-line rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-normal leading-relaxed text-slate-200 shadow-2xl ring-1 ring-black/50"
+      class="pointer-events-none z-[2147483647] whitespace-pre-line rounded-xl border border-control-border bg-elevated px-3 py-2 text-xs font-normal leading-relaxed text-foreground shadow-2xl ring-1 ring-separator"
       style={floatingStyle}
       use:portal
+      use:keepInViewport={floatingStyle}
     >
       {text}
       {#if placement === 'top'}
-        <span class="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-slate-700"></span>
+        <span class="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-control-border"></span>
       {:else if placement === 'bottom'}
-        <span class="absolute left-1/2 bottom-full -translate-x-1/2 border-4 border-transparent border-b-slate-700"></span>
+        <span class="absolute left-1/2 bottom-full -translate-x-1/2 border-4 border-transparent border-b-control-border"></span>
       {:else if placement === 'right'}
-        <span class="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-slate-700"></span>
+        <span class="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-control-border"></span>
       {:else}
-        <span class="absolute left-full top-1/2 -translate-y-1/2 border-4 border-transparent border-l-slate-700"></span>
+        <span class="absolute left-full top-1/2 -translate-y-1/2 border-4 border-transparent border-l-control-border"></span>
       {/if}
     </span>
   {/if}

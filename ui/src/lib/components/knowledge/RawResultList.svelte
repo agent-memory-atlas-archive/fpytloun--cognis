@@ -53,17 +53,17 @@
     <li
       id={elementIdForMatch(match.chunk_id)}
       tabindex="-1"
-      class={`rounded-2xl border px-4 py-3 transition ${highlightedChunkId === match.chunk_id ? 'border-sky-500 bg-sky-500/5' : 'border-slate-800/80 bg-slate-900/60'}`}
+      class={`rounded-2xl border px-4 py-3 transition ${highlightedChunkId === match.chunk_id ? 'border-accent bg-accent-subtle' : 'border-separator/80 bg-surface/60'}`}
       data-testid="knowledge-raw-result"
     >
       <div class="flex flex-wrap items-start justify-between gap-2">
         <div class="min-w-0">
-          <p class="truncate text-sm font-medium text-white" title={match.citation.filename ?? match.artifact_id}>
+          <p class="truncate text-sm font-medium text-strong" title={match.citation.filename ?? match.artifact_id}>
             {match.citation.filename ?? match.artifact_id}
           </p>
-          <p class="text-xs text-slate-500">{locatorLabel(match)}</p>
+          <p class="text-xs text-quiet">{locatorLabel(match)}</p>
         </div>
-        <div class="flex shrink-0 items-center gap-2 text-xs text-slate-400">
+        <div class="flex shrink-0 items-center gap-2 text-xs text-muted">
           <span title={JSON.stringify(match.score_breakdown)}>score {match.score.toFixed(3)}</span>
           <Button size="sm" variant="ghost" onclick={() => onOpenDocument(match)}>
             <ExternalLink class="mr-1.5 h-3.5 w-3.5" /> Open
@@ -71,12 +71,12 @@
         </div>
       </div>
 
-      <p class="mt-2 text-sm leading-6 text-slate-300">{match.snippet}</p>
+      <p class="mt-2 text-sm leading-6 text-secondary">{match.snippet}</p>
 
       {#if Object.keys(match.metadata).length > 0}
         <div class="mt-2 flex flex-wrap gap-1.5">
           {#each Object.entries(match.metadata) as [key, value] (key)}
-            <span class="rounded-full border border-slate-700 bg-slate-800/70 px-2 py-0.5 text-xs text-slate-300">
+            <span class="rounded-full border border-control-border bg-raised/70 px-2 py-0.5 text-xs text-secondary">
               {key}: {typeof value === 'object' ? JSON.stringify(value) : String(value)}
             </span>
           {/each}
@@ -85,7 +85,7 @@
 
       <button
         type="button"
-        class="mt-2 flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200"
+        class="mt-2 flex items-center gap-1 text-xs text-accent hover:text-accent-hover"
         onclick={() => toggleContext(match)}
         aria-expanded={expandedChunkId === match.chunk_id}
       >
@@ -94,11 +94,11 @@
       </button>
 
       {#if expandedChunkId === match.chunk_id}
-        <div class="mt-2 rounded-xl border border-slate-800/80 bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
+        <div class="mt-2 rounded-xl border border-separator/80 bg-canvas/60 px-3 py-2 text-sm text-secondary">
           {#if sourceContext[match.chunk_id] === 'loading'}
-            <p class="text-slate-500">Loading context…</p>
+            <p class="text-quiet">Loading context…</p>
           {:else if sourceContext[match.chunk_id] === 'error'}
-            <p class="text-rose-300">Failed to load source context.</p>
+            <p class="text-danger">Failed to load source context.</p>
           {:else if sourceContext[match.chunk_id]}
             <p class="whitespace-pre-wrap">{(sourceContext[match.chunk_id] as KnowledgebaseSourceContextResponse).text}</p>
           {/if}

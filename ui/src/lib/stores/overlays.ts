@@ -6,6 +6,7 @@ interface OverlayEntry {
   id: string;
   kind: OverlayKind;
   blocksChrome: boolean;
+  root?: () => HTMLElement | null;
 }
 
 let entries: OverlayEntry[] = [];
@@ -90,7 +91,7 @@ export const blockingOverlayActive = readable(false, (set) => {
   return () => listeners.delete(listener);
 });
 
-export function registerOverlay(options: { kind: OverlayKind; blocksChrome: boolean }): {
+export function registerOverlay(options: { kind: OverlayKind; blocksChrome: boolean; root?: () => HTMLElement | null }): {
   id: string;
   unregister: () => void;
 } {

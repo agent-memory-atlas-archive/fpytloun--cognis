@@ -59,17 +59,17 @@
 
 {#if deliverableItem || hasMetadata}
   <section
-    class="mt-8 space-y-4 border-t border-slate-800/80 pt-6"
+    class="mt-8 space-y-4 border-t border-separator/80 pt-6"
     data-testid="task-step-outcome"
     data-step-run-id={stepRun.step_run_id}
   >
     <div class="flex flex-wrap items-center justify-between gap-2">
-      <p class="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Task outcome</p>
+      <p class="text-xs font-semibold uppercase tracking-[0.2em] text-quiet">Task outcome</p>
       <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide">
-        <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2.5 py-1 text-slate-300">{stepRun.status}</span>
+        <span class="rounded-full border border-control-border bg-surface/70 px-2.5 py-1 text-secondary">{stepRun.status}</span>
         {#if deliverable}
-          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-sky-200">
-            v{deliverable.version} {deliverable.status}
+          <span class="rounded-full border border-accent/30 bg-accent-subtle px-2.5 py-1 text-accent">
+            Draft {deliverable.version} {deliverable.status}
           </span>
         {/if}
       </div>
@@ -84,36 +84,36 @@
     {/if}
 
     {#if evaluating}
-      <div class="rounded-xl border border-violet-500/25 bg-violet-500/10 px-4 py-3 text-sm text-violet-100">
+      <div class="rounded-xl border border-violet-border bg-violet-subtle px-4 py-3 text-sm text-violet-tone">
         Evaluator is reviewing this attempt…
       </div>
     {/if}
 
     {#if evaluationDecision || evaluationReasoning || evaluationFeedback}
-      <div class="rounded-xl border border-slate-700/80 bg-slate-900/60 px-4 py-3 text-sm text-slate-300">
-        <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
-        {#if evaluationDecision}<p class="mt-2 font-medium text-white">{evaluationDecision}</p>{/if}
+      <div class="rounded-xl border border-control-border/80 bg-surface/60 px-4 py-3 text-sm text-secondary">
+        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Evaluation</p>
+        {#if evaluationDecision}<p class="mt-2 font-medium text-strong">{evaluationDecision}</p>{/if}
         {#if evaluationReasoning}<div class="prose prose-sm prose-invert mt-2 max-w-none">{@html renderMarkdown(evaluationReasoning)}</div>{/if}
-        {#if evaluationFeedback}<p class="mt-2 text-slate-400"><span class="font-medium">Feedback:</span> {evaluationFeedback}</p>{/if}
+        {#if evaluationFeedback}<p class="mt-2 text-muted"><span class="font-medium">Feedback:</span> {evaluationFeedback}</p>{/if}
       </div>
     {/if}
 
-    {#if summary}<div class="prose prose-sm prose-invert max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>{/if}
+    {#if summary}<div class="prose prose-sm prose-invert max-w-none text-secondary">{@html renderMarkdown(summary)}</div>{/if}
     {#if content && content.trim() !== deliverable?.content?.trim()}
-      <div class="prose prose-sm prose-invert max-w-none text-slate-300">{@html renderMarkdown(content)}</div>
+      <div class="prose prose-sm prose-invert max-w-none text-secondary">{@html renderMarkdown(content)}</div>
     {/if}
     {#if outcomeStatus || outcomeReason}
-      <p class="rounded-xl border border-slate-700/80 bg-slate-900/50 px-4 py-3 text-sm text-slate-300">
+      <p class="rounded-xl border border-control-border/80 bg-surface/50 px-4 py-3 text-sm text-secondary">
         {outcomeStatus || 'Outcome'}{#if outcomeReason}: {outcomeReason}{/if}
       </p>
     {/if}
     {#if claims.length > 0}
-      <ul class="space-y-1 text-sm text-slate-400">
+      <ul class="space-y-1 text-sm text-muted">
         {#each claims as claim}<li>• {claim}</li>{/each}
       </ul>
     {/if}
     {#if error}
-      <pre class="whitespace-pre-wrap rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">{error}</pre>
+      <pre class="whitespace-pre-wrap rounded-xl border border-danger-border bg-danger-subtle px-4 py-3 text-xs text-danger">{error}</pre>
     {/if}
   </section>
 {/if}

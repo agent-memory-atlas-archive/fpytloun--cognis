@@ -79,11 +79,11 @@ class TestDefinitions:
         assert len(defs) >= 11
         names = {d.name for d in defs}
         assert "patch" not in names
+        assert "skill_asset_materialize" not in names
         assert {
             "read",
             "write",
             "artifact_save",
-            "skill_asset_materialize",
             "edit",
             "apply_patch",
             "multiedit",
@@ -111,7 +111,6 @@ class TestDefinitions:
         write_tools = {
             "write",
             "artifact_save",
-            "skill_asset_materialize",
             "edit",
             "apply_patch",
             "multiedit",
@@ -2919,6 +2918,10 @@ class TestBashTool:
                 },
                 "turn_id": "turn-1",
                 "tool_call_id": "call-1",
+                "executor_admission": {
+                    "call_id": "approved-spawn-audit",
+                    "session_id": "sess-1",
+                },
             },
             shared_runtime_metadata=shared_runtime_metadata,
         )
@@ -2944,6 +2947,8 @@ class TestBashTool:
         assert status["executor_type"] == "in_process"
         assert status["user_email"] == "user@example.com"
         assert status["conversation_id"] == "conv-1"
+        assert status["admission_call_id"] == "approved-spawn-audit"
+        assert status["admission_session_id"] == "sess-1"
         assert isinstance(status["pid"], int)
 
         stopped = await handle_bash_kill({"shell_id": shell_id}, ctx)

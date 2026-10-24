@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -149,9 +150,11 @@ async def test_task_control_direct_turn_admits_and_executes_with_injected_sessio
         created_by="user@example.com",
         control_conversation_id="conv-control",
         session_policy={"executor_id": "executor-1"},
+        interaction_mode_override="explicit_gates",
     )
     runtime = SimpleNamespace(
         tool_registry=SimpleNamespace(),
+        rebuild_tool_registry=None,
         executor_connection=SimpleNamespace(),
         executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
         executor_pool=None,
@@ -193,6 +196,7 @@ async def test_task_control_direct_turn_admits_and_executes_with_injected_sessio
     access_context = resolve_runtime.await_args.kwargs["access_context"]
     assert access_context.task_id == "task-1"
     assert access_context.control_surface == "task_control"
+    assert access_context.interaction_mode_override == "explicit_gates"
     assert access_context.session_policy == {"executor_id": "executor-1"}
     run_step.assert_awaited_once()
     step_context = run_step.await_args.args[0]
@@ -735,6 +739,8 @@ async def test_handle_gate_step_reuses_existing_pause_id(monkeypatch: pytest.Mon
         notification_id="gate_existing",
         status="pending",
         resolution=None,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        payload={},
     )
 
     task = TaskModel(
@@ -791,6 +797,7 @@ async def test_handle_gate_step_reuses_existing_pause_id(monkeypatch: pytest.Mon
         engine._pause_waiter.resolve("gate_existing", PauseResolution(decision="continue"))
 
     asyncio.create_task(_resolve_soon())
+    workflow.steps = [step_def]
     result = await engine._handle_gate_step(task, step_def, state, workflow)
 
     assert result == "continue"
@@ -832,7 +839,11 @@ async def test_handle_gate_step_timeout_defaults_to_fail(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
     monkeypatch.setattr(engine._pause_waiter, "wait", _timeout)
+    notifications.wait_for_resolution = AsyncMock(
+        side_effect=[TimeoutError(), PauseResolution(decision="fail", data={"reason": "timeout"})]
+    )
 
+    workflow.steps = [step_def]
     result = await engine._handle_gate_step(task, step_def, state, workflow)
 
     assert result == "fail"
@@ -842,7 +853,7 @@ async def test_handle_gate_step_timeout_defaults_to_fail(monkeypatch: pytest.Mon
             notifications.created[0]["notification_id"],
             "fail",
             {"reason": "timeout"},
-            "user@example.com",
+            None,
         )
     ]
 
@@ -872,6 +883,7 @@ async def test_handle_gate_step_recreates_missing_notification(
             "pause_id": "gate_missing",
             "task_id": "task-1",
             "step_name": "review",
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         },
     )
     step_def = StepDefinition(
@@ -894,6 +906,7 @@ async def test_handle_gate_step_recreates_missing_notification(
     monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
     asyncio.create_task(_resolve_soon())
 
+    workflow.steps = [step_def]
     result = await engine._handle_gate_step(task, step_def, state, workflow)
 
     assert result == "continue"
@@ -954,7 +967,8 @@ async def test_handle_gate_step_uses_resolved_notification_after_restart(
     assert notifications.created == []
     assert state.pending_pause_type is None
     assert state.last_operator_instruction == "Use the approved version."
-    assert persisted == [None]
+    # Consumption is committed with the caller's destination transition, not here.
+    assert persisted == []
 
 
 @pytest.mark.asyncio
@@ -1969,6 +1983,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
         del args, kwargs
         return SimpleNamespace(
             tool_registry=None,
+            rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=None,
             runtime_info=None,
@@ -2015,8 +2030,14 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("require_deliverable", "original_error"),
+    [(False, None), (True, None), (True, "Provider stream failed")],
+)
 async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
     monkeypatch: pytest.MonkeyPatch,
+    require_deliverable: bool,
+    original_error: str | None,
 ) -> None:
     engine = _build_engine()
     task = TaskModel(
@@ -2030,7 +2051,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         name="execute",
         type="run",
         prompt="Do work",
-        require_deliverable=False,
+        require_deliverable=require_deliverable,
     )
     workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
     conversation = SimpleNamespace(conversation_id="conv-1")
@@ -2067,6 +2088,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         del args, kwargs
         return SimpleNamespace(
             tool_registry=None,
+            rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user/src/cognis"),
             runtime_info=None,
@@ -2082,7 +2104,10 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         return SimpleNamespace()
 
     async def _update_step_run(*args: object, **kwargs: object) -> bool:
-        del args, kwargs
+        del args
+        if kwargs.get("completed_at") is not None:
+            observed["persisted_status"] = kwargs.get("status")
+            observed["persisted_output"] = kwargs.get("output")
         return True
 
     async def _run_step(ctx: StepContext, **kwargs: object) -> StepOutput:
@@ -2090,7 +2115,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         observed["orchestration_mode"] = ctx.orchestration_mode.value
         observed["has_boundary_consumer"] = ctx.consume_boundary_batch is not None
         observed["has_cooperative_wait_input"] = ctx.wait_for_boundary_input is not None
-        return StepOutput(summary="done", content="done")
+        return StepOutput(summary="done", content="done", error=original_error)
 
     async def _refresh(_session: object) -> None:
         del _session
@@ -2112,7 +2137,18 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         task, step_def, task.workflow_state or WorkflowState(), workflow
     )
 
-    assert output is not None
+    expected_error = original_error
+    if require_deliverable and expected_error is None:
+        expected_error = "Step 'execute' requires a deliverable, but the step finished without one."
+    if expected_error:
+        assert output is None
+    else:
+        assert output is not None
+        assert output.error is None
+    assert observed.pop("persisted_status") == ("failed" if expected_error else "evaluating")
+    persisted_output = observed.pop("persisted_output")
+    assert isinstance(persisted_output, dict)
+    assert persisted_output["error"] == expected_error
     assert refreshed == [("/home/user/src/cognis", "/home/user/src/cognis")]
     assert observed == {
         "orchestration_mode": "task_primary",
@@ -2178,6 +2214,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         del args, kwargs
         return SimpleNamespace(
             tool_registry=None,
+            rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
             runtime_info=None,
@@ -2398,7 +2435,7 @@ async def test_evaluate_step_includes_actual_session_tool_events(
     output = StepOutput(
         summary="Updated weekly notes",
         content="Read current notes and wrote the weekly file.",
-        execution_evidence={"files_written": ["Lumilens/Weekly/2026-W24.md"]},
+        execution_evidence={"files_written": ["Sample/Weekly/2026-W24.md"]},
         intaris_session_id="intaris-session-1",
     )
 
@@ -2412,7 +2449,7 @@ async def test_evaluate_step_includes_actual_session_tool_events(
                     "data": {
                         "call_id": "call-read",
                         "name": "read",
-                        "arguments": {"file_path": "Lumilens/Weekly/2026-W24.md"},
+                        "arguments": {"file_path": "Sample/Weekly/2026-W24.md"},
                     },
                 },
                 {
@@ -2448,7 +2485,7 @@ async def test_evaluate_step_includes_actual_session_tool_events(
     assert result.decision == "approved"
     evidence = captured["execution_evidence"]
     assert isinstance(evidence, dict)
-    assert evidence["files_written"] == ["Lumilens/Weekly/2026-W24.md"]
+    assert evidence["files_written"] == ["Sample/Weekly/2026-W24.md"]
     session_events = evidence["session_events"]
     assert session_events["session_id"] == "intaris-session-1"
     assert session_events["tool_call_count"] == 2

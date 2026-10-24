@@ -5,6 +5,8 @@
   import { onMount, tick, untrack } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import { isConnectivityError } from '$lib/connectivity';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import AttentionPanel from '$lib/components/task-cockpit/AttentionPanel.svelte';
   import TaskControlChat from '$lib/components/task-cockpit/TaskControlChat.svelte';
@@ -32,6 +34,8 @@
   let chat = $state<TaskControlChatResponse | null>(null);
   let chatLoading = $state(false);
   let chatError = $state<string | null>(null);
+  // Hidden while the global connection banner applies; reopen on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(chatError), retry: () => ensureChat() });
   let conversation = $state<Conversation | null>(null);
   let backgroundWork = $state<BackgroundWorkItem[]>([]);
   let runtimeActive = $state<boolean | null>(null);
@@ -136,7 +140,7 @@
     } catch (error) {
       if (current === generation) {
         chatError = asApiError(error).message || 'Could not open the task agent.';
-        addToast(chatError, 'error');
+        if (!isConnectivityError(error)) addToast(chatError, 'error');
       }
     } finally {
       if (current === generation) chatLoading = false;
@@ -480,7 +484,7 @@
   <button
     bind:this={launcher}
     type="button"
-    class={`task-agent-fab fixed z-[60] flex h-[52px] w-[52px] items-center justify-center rounded-2xl border bg-slate-900 shadow-2xl transition hover:-translate-y-0.5 motion-reduce:transition-none motion-reduce:hover:translate-y-0 ${effectiveAvatarState.attention || effectiveAvatarState.unread || effectiveAvatarState.error ? 'border-amber-400 ring-2 ring-amber-400/20' : 'border-slate-700'}`}
+    class={`task-agent-fab fixed z-[60] flex h-[52px] w-[52px] items-center justify-center rounded-2xl border bg-surface shadow-2xl transition hover:-translate-y-0.5 motion-reduce:transition-none motion-reduce:hover:translate-y-0 ${effectiveAvatarState.attention || effectiveAvatarState.unread || effectiveAvatarState.error ? 'border-warning-border ring-2 ring-warning/20' : 'border-control-border'}`}
     aria-label={`Open ${agentName} for task ${task.title}. ${effectiveAvatarState.label}`}
     aria-haspopup="dialog"
     data-testid="task-agent-dock-launcher"
@@ -497,7 +501,7 @@
 
 {#if !otherBlockingOverlay && taskAgentDock.state !== 'minimized'}
   {#if modal}
-    <button class="fixed inset-0 z-[89] bg-slate-950/75 backdrop-blur-sm" data-task-agent-modal type="button" aria-label="Minimize task agent" onclick={minimize}></button>
+    <button class="fixed inset-0 z-[89] bg-scrim/75 backdrop-blur-sm" data-task-agent-modal type="button" aria-label="Minimize task agent" onclick={minimize}></button>
   {/if}
   <div
     bind:this={panel}
@@ -506,11 +510,11 @@
     aria-modal={modal}
     aria-label={`Agent — ${task.title}`}
     class:task-agent-fullscreen={taskAgentDock.state === 'fullscreen'}
-    class="task-agent-panel fixed z-[90] flex flex-col overflow-hidden border border-slate-700 bg-slate-950 shadow-2xl outline-none"
+    class="task-agent-panel fixed z-[90] flex flex-col overflow-hidden border border-control-border bg-elevated shadow-overlay outline-none"
     data-testid="task-agent-dock"
     onkeydown={handlePanelKeydown}
   >
-    <header class="task-agent-header flex shrink-0 items-center justify-between gap-3 border-b border-slate-800 px-3 py-3">
+    <header class="task-agent-header flex shrink-0 items-center justify-between gap-3 border-b border-separator px-3 py-3">
       <div class="flex min-w-0 items-center gap-3">
         <ActivityAvatar
           name={agentName}
@@ -518,7 +522,7 @@
           state={effectiveAvatarState}
           class="h-9 w-9 rounded-xl"
         />
-        <div class="min-w-0"><p class="truncate text-sm font-semibold text-white">{agentName}</p><p class="truncate text-xs text-slate-400">Scoped to: {task.title}</p></div>
+        <div class="min-w-0"><p class="truncate text-sm font-semibold text-strong">{agentName}</p><p class="truncate text-xs text-muted">Scoped to: {task.title}</p></div>
       </div>
       <div class="flex shrink-0 gap-1">
         {#if taskAgentDock.state === 'open'}<Button size="sm" variant="ghost" aria-label="Expand agent to full screen" onclick={() => taskAgentDock.expand()}><Maximize2 class="h-4 w-4" /></Button>{/if}
@@ -529,7 +533,7 @@
       </div>
     </header>
 
-    <div class="flex shrink-0 border-b border-slate-800 p-1" role="tablist" aria-label="Agent Dock views">
+    <div class="flex shrink-0 border-b border-separator p-1" role="tablist" aria-label="Agent Dock views">
       {#each tabs as item, index}
         <button
           bind:this={tabButtons[index]}
@@ -539,7 +543,7 @@
           aria-selected={taskAgentDock.tab === item.id}
           aria-controls={`task-agent-panel-${item.id}`}
           tabindex={taskAgentDock.tab === item.id ? 0 : -1}
-          class={`min-h-11 flex-1 rounded-lg px-3 text-sm ${taskAgentDock.tab === item.id ? 'bg-sky-500/10 text-sky-100' : 'text-slate-400 hover:text-white'}`}
+          class={`min-h-11 flex-1 rounded-lg px-3 text-sm ${taskAgentDock.tab === item.id ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-strong'}`}
           onclick={() => selectTab(item.id)}
           onkeydown={(event) => handleTabKeydown(event, index)}
         >{item.label}</button>
@@ -547,7 +551,7 @@
     </div>
 
     {#if task.pending_pause && task.status === 'paused'}
-      <div class="max-h-[45%] shrink-0 overflow-y-auto border-b border-slate-800 p-3">
+      <div class="max-h-[45%] shrink-0 overflow-y-auto border-b border-separator p-3">
         <AttentionPanel pause={task.pending_pause} compact busy={decisionBusy} onGate={respondToGate} onQuestion={respondToQuestion} />
       </div>
     {/if}
@@ -558,10 +562,10 @@
       aria-labelledby={`task-agent-tab-${taskAgentDock.tab}`}
       class="min-h-0 flex-1"
     >
-      {#if chatLoading}
-        <p class="p-4 text-sm text-slate-400">Loading the task agent…</p>
+      {#if chatLoading || (chatError && net.hideErrors)}
+        <p class="p-4 text-sm text-muted">Loading the task agent…</p>
       {:else if chatError}
-        <div class="m-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" role="alert">
+        <div class="m-4 rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" role="alert">
           <p>{chatError}</p>
           <Button class="mt-3" size="sm" variant="secondary" onclick={() => void ensureChat()}>Try again</Button>
         </div>

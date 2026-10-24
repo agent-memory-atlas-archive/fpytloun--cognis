@@ -7,7 +7,7 @@ import socket
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy import select
@@ -20,6 +20,7 @@ from cognis.core.tool_router import (
     _extract_output_anchor_names,
     caller_assignable_tools,
 )
+from cognis.executor.tool_definitions_runtime import BASH_TOOL
 from cognis.mcp_runtime import MCPClientError
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord
@@ -30,6 +31,7 @@ from cognis.models.tool import (
 from cognis.models.tool import (
     Permission,
     ToolCall,
+    ToolCapability,
     ToolResult,
     ToolSource,
     sanitize_mcp_tool_name,
@@ -39,9 +41,69 @@ from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
 from cognis.tools.builtin.mcp_management import MANAGE_MCP_TOOL
 from cognis.tools.builtin.schedule import MANAGE_SCHEDULES_TOOL
 from cognis.tools.builtin.skill_management import SKILL_PATCH_TOOL
+from cognis.tools.builtin.system_management import system_management_tools
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 pytest_plugins = ("tests.unit.test_task_continuation_tools",)
+
+
+@pytest.fixture(autouse=True)
+def artifact_policy_boundary_for_router_fakes(monkeypatch):
+    """Routing-only fakes lack a DB; real-session ACL tests retain the real resolver.
+
+    Agent/KB/lineage policy is exercised with real SQL sessions in
+    test_artifact_agent_access and test_artifact_virtual_deliverable_refs.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from cognis.core import artifact_access
+
+    real_check = artifact_access.artifact_authorized_for_conversation
+    real_predicate = artifact_access.content_read_predicate
+
+    async def check(db, **kwargs):
+        if isinstance(db, AsyncSession):
+            return await real_check(db, **kwargs)
+        row = kwargs["artifact"]
+        expires = getattr(row, "expires_at", None)
+        return (
+            row is not None
+            and getattr(row, "status", "attached") != "deleted"
+            and getattr(row, "deleted_at", None) is None
+            and row.owner_email == kwargs["owner_email"]
+            and (
+                expires is None or expires.replace(tzinfo=expires.tzinfo or UTC) > datetime.now(UTC)
+            )
+        )
+
+    async def predicate(db, **kwargs):
+        return await real_predicate(db, **kwargs) if isinstance(db, AsyncSession) else sa.true()
+
+    monkeypatch.setattr(artifact_access, "artifact_authorized_for_conversation", check)
+    monkeypatch.setattr(artifact_access, "content_read_predicate", predicate)
+
+    from cognis.core import content_projects
+    from cognis.tools.builtin import artifact_tools
+
+    real_project_ids = content_projects.content_project_ids
+    real_discover = artifact_tools.discover_task_deliverables
+    real_revision_facts = artifact_tools._artifact_revision_facts
+
+    async def project_ids(db, **kwargs):
+        return await real_project_ids(db, **kwargs) if isinstance(db, AsyncSession) else []
+
+    async def discover(db, **kwargs):
+        return await real_discover(db, **kwargs) if isinstance(db, AsyncSession) else []
+
+    async def revision_facts(db, row, **kwargs):
+        if isinstance(db, AsyncSession):
+            return await real_revision_facts(db, row, **kwargs)
+        return {}
+
+    monkeypatch.setattr(content_projects, "content_project_ids", project_ids)
+    monkeypatch.setattr(artifact_tools, "discover_task_deliverables", discover)
+    monkeypatch.setattr(artifact_tools, "_artifact_revision_facts", revision_facts)
 
 
 def test_caller_assignable_tools_excludes_permission_denied_registry_tools() -> None:
@@ -130,6 +192,61 @@ class _Executor:
 
     async def cancel_call(self, call_id: str) -> None:
         self.cancelled.append(call_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["approve", "deny", "escalate"])
+async def test_shell_kill_gets_owned_target_before_policy_without_bypassing_it(outcome):
+    from tests.unit.test_shell_target_evidence import row
+
+    session = _session()
+    executor = _Executor()
+    executor.executor_id = "executor_monitor"
+    executor.background_shell_status = AsyncMock(
+        return_value={
+            "shells": [
+                row(user_email=session.user_email, conversation_id=session.conversation_id),
+            ]
+        }
+    )
+    guardrails = _Guardrails()
+    guardrails.evaluate = AsyncMock(
+        return_value=SimpleNamespace(
+            decision=outcome,
+            reasoning="Normal policy decision",
+            risk="medium",
+            call_id="eval_shell_target",
+            path=None,
+            latency_ms=0,
+        )
+    )
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash_kill",
+                description="Stop a background shell",
+                source=ToolSource(type="executor"),
+                parameters={
+                    "type": "object",
+                    "properties": {"shell_id": {"type": "string"}},
+                    "required": ["shell_id"],
+                },
+            )
+        )
+    )
+    call = ToolCall(
+        call_id="stop_owned_monitor",
+        name="bash_kill",
+        arguments={"shell_id": "shell_monitor"},
+        runtime_metadata={"shell_target": {"command": "forged target"}},
+    )
+    await router.execute(call, session, _agent({"*": Permission.EVALUATE}), registry, executor)
+    context = guardrails.evaluate.call_args.kwargs["context"]
+    assert context["shell_target"]["target"]["description"] == "Release verification tunnel"
+    assert "forged" not in str(context["shell_target"])
+    assert executor.calls == (1 if outcome == "approve" else 0)
 
 
 class _SlowExecutor(_Executor):
@@ -1281,12 +1398,185 @@ def test_plan_hidden_tool_policy_blocks_writes_but_not_unknown_or_readonly() -> 
     assert is_plan_hidden_tool(ambiguous) is False
 
 
+def test_plan_mode_exposes_native_bash_without_claiming_it_is_read_only() -> None:
+    assert is_plan_hidden_tool(BASH_TOOL) is False
+    assert BASH_TOOL.read_only is False
+    assert is_plan_mutating_tool_call(BASH_TOOL, {"command": "git log -1"}) is False
+    assert is_plan_mutating_tool_call(BASH_TOOL, {"command": "git commit -m change"}) is False
+    for source, category, name in [
+        ("builtin", "shell", "bash"),
+        ("executor", "filesystem", "bash"),
+        ("executor", "shell", "bash_kill"),
+    ]:
+        definition = ToolDefinition(
+            name=name,
+            description="Mutating tool",
+            source=ToolSource(type=source),
+            category=category,
+            capabilities=[ToolCapability.PRIVILEGED],
+        )
+        assert is_plan_hidden_tool(definition) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["git log -1", "git status --short", "kubectl logs cognis-0"])
+@pytest.mark.parametrize("approval_mode", ["ask", "unattended"])
+async def test_plan_mode_bash_reaches_guard_before_executor(command, approval_mode) -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    # Even a bypassable declaration and an agent ALLOW cannot skip assessment.
+    registry.register(
+        RegisteredTool(definition=BASH_TOOL.model_copy(update={"non_bypassable": False}))
+    )
+    executor = _Executor()
+    agent = _agent()
+    agent.capabilities.approval_mode = approval_mode
+    agent.capabilities.maximum_outcome = "approve"
+    call = ToolCall(
+        call_id="plan-bash",
+        name="bash",
+        arguments={"command": command},
+        runtime_metadata={
+            "read_only_required": True,
+            "chat_mode": "plan",
+            "chat_mode_source": "one_shot",
+        },
+    )
+    result = await router.execute(call, _session(), agent, registry, executor)
+    assert result.is_error is False
+    assert executor.calls == 1
+    assert guardrails.evaluate_calls == 1
+    context = guardrails.last_evaluate_call[3]
+    assert context["read_only_required"] is True
+    assert context["chat_mode"] == "plan"
+    assert context["chat_mode_source"] == "one_shot"
+    assert context["tool"]["read_only"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard_outcome", ["deny", "failure", "disabled"])
+async def test_plan_mode_bash_cannot_execute_without_guard_approval(guard_outcome) -> None:
+    guardrails = _Guardrails()
+    if guard_outcome == "failure":
+        guardrails.evaluate = AsyncMock(side_effect=RuntimeError("evaluation unavailable"))
+    else:
+        guardrails.evaluate = AsyncMock(
+            return_value=SimpleNamespace(
+                decision="deny",
+                reasoning="Plan mode mutation denied",
+                risk=None,
+                path=None,
+                latency_ms=0,
+                call_id="plan-denial",
+            )
+        )
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=BASH_TOOL))
+    executor = _Executor()
+    agent = _agent()
+    if guard_outcome == "disabled":
+        agent.capabilities.guardrails_backend = "none"
+    else:
+        agent.capabilities.maximum_outcome = "approve"
+    call = ToolCall(
+        call_id="plan-mutating-bash",
+        name="bash",
+        arguments={"command": "git commit -m change"},
+        runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
+    )
+    if guard_outcome == "failure":
+        with pytest.raises(RuntimeError, match="evaluation unavailable"):
+            await router.execute(call, _session(), agent, registry, executor)
+    else:
+        result = await router.execute(call, _session(), agent, registry, executor)
+        assert result.is_error is True
+        assert result.metadata["evaluation"]["decision"] == "deny"
+        if guard_outcome == "disabled":
+            assert "contextual assessment" in result.output
+            guardrails.evaluate.assert_not_awaited()
+    assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["default", "plan", "build"])
+@pytest.mark.parametrize("outcome", ["approve", "escalate", "deny"])
+async def test_chat_mode_alone_preserves_guardrails_decision(mode, outcome) -> None:
+    guardrails = _Guardrails()
+    guardrails.evaluate = AsyncMock(
+        return_value=SimpleNamespace(
+            decision=outcome,
+            reasoning="Policy and Judge decision",
+            risk="low",
+            path=None,
+            latency_ms=0,
+            call_id="planning-policy-decision",
+        )
+    )
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=BASH_TOOL))
+    call = ToolCall(
+        call_id="planning-policy-call",
+        name="bash",
+        arguments={"command": "printf outline > /tmp/plan.md"},
+        runtime_metadata={"chat_mode": mode, "chat_mode_source": "one_shot"},
+    )
+    decision = await router._evaluate_tool_call(call, _agent(), _session(), registry)
+    assert decision.decision == outcome
+    assert decision.source == "guardrails"
+    guardrails.evaluate.assert_awaited_once()
+    assert "read_only_required" not in guardrails.evaluate.call_args.kwargs["context"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["write", "edit", "multiedit", "apply_patch"])
+async def test_plan_mode_file_mutation_stays_denied_before_guard(name) -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name=name,
+                description="File mutation",
+                source=ToolSource(type="executor"),
+                category="filesystem",
+            )
+        )
+    )
+    executor = _Executor()
+    result = await router.execute(
+        ToolCall(
+            call_id="plan-file-mutation",
+            name=name,
+            arguments={},
+            runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+    assert result.is_error is True
+    assert result.metadata["code"] == "plan_mode_mutation_denied"
+    assert guardrails.evaluate_calls == 0
+    assert executor.calls == 0
+
+
 @pytest.mark.parametrize(
     ("definition", "read_action", "write_action"),
     [
         (MANAGE_AGENTS_TOOL, "get", "update"),
         (MANAGE_MCP_TOOL, "servers_get", "servers_update"),
         (MANAGE_SCHEDULES_TOOL, "get", "update"),
+        *[
+            (tool, "named_list", "named_update")
+            if tool.name == "manage_routes"
+            else (tool, "list", "update")
+            for tool in system_management_tools()
+        ],
     ],
 )
 def test_plan_mode_uses_native_operation_mutation_kind_for_mixed_tools(
@@ -1306,6 +1596,12 @@ def test_plan_mode_uses_native_operation_mutation_kind_for_mixed_tools(
         (MANAGE_AGENTS_TOOL, "get", "update"),
         (MANAGE_MCP_TOOL, "servers_get", "servers_update"),
         (MANAGE_SCHEDULES_TOOL, "get", "update"),
+        *[
+            (tool, "named_list", "named_update")
+            if tool.name == "manage_routes"
+            else (tool, "list", "update")
+            for tool in system_management_tools()
+        ],
     ],
 )
 def test_plan_mode_execution_gate_allows_reads_and_denies_writes_for_mixed_tools(
@@ -1432,7 +1728,7 @@ async def test_plan_mode_denies_routed_schedule_write_before_execution() -> None
     )
 
     assert result.is_error is True
-    assert "Plan mode is active" in result.output
+    assert "explicit read-only restriction" in result.output
     assert result.metadata and result.metadata["code"] == "plan_mode_mutation_denied"
 
 
@@ -1914,14 +2210,14 @@ async def test_evaluation_context_infers_executor_home_from_workspace_root() -> 
             name="read",
             arguments={"file_path": "~/src/cognis/README.md"},
             runtime_metadata={
-                "workspace_root": "/home/riker/src/cognis",
-                "working_directory": "/home/riker/src/cognis",
+                "workspace_root": "/home/developer/src/cognis",
+                "working_directory": "/home/developer/src/cognis",
                 "executor_environment": {"executor_id": "exec-1", "home": None},
             },
         )
     )
 
-    assert context["executor_environment"]["home"] == "/home/riker"
+    assert context["executor_environment"]["home"] == "/home/developer"
 
 
 def test_decision_cache_key_separates_writes_by_arguments() -> None:
@@ -1972,14 +2268,14 @@ async def test_tool_router_passes_executor_runtime_to_guardrails() -> None:
         ToolCall(
             call_id="r1",
             name="artifact_publish",
-            arguments={"path": "/home/riker/image.png"},
+            arguments={"path": "/home/developer/image.png"},
             runtime_metadata={
-                "working_directory": "/home/riker",
+                "working_directory": "/home/developer",
                 "executor_environment": {
-                    "executor_id": "riker-laptop",
+                    "executor_id": "developer-laptop",
                     "executor_type": "websocket",
-                    "cwd": "/home/riker",
-                    "home": "/home/riker",
+                    "cwd": "/home/developer",
+                    "home": "/home/developer",
                 },
             },
         ),
@@ -1990,8 +2286,8 @@ async def test_tool_router_passes_executor_runtime_to_guardrails() -> None:
 
     assert guardrails.last_evaluate_call is not None
     _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
-    assert context["working_directory"] == "/home/riker"
-    assert context["executor_environment"]["cwd"] == "/home/riker"
+    assert context["working_directory"] == "/home/developer"
+    assert context["executor_environment"]["cwd"] == "/home/developer"
     assert "hostname" not in context["executor_environment"]
     assert context["tool"]["description"] == "memory search"
     assert context["tool"]["read_only"] is True
@@ -2054,9 +2350,9 @@ async def test_tool_router_passes_skill_load_metadata_to_guardrails(monkeypatch)
         del db, owner_email
         return SimpleNamespace(
             skill_id=skill_id,
-            name="lumilens-loki-query",
-            description="Safe procedure for querying Lumilens production Loki.",
-            tags=["lumilens"],
+            name="sample-loki-query",
+            description="Query a fictional service's Loki logs.",
+            tags=["observability"],
         )
 
     import cognis.store.queries as queries
@@ -2073,7 +2369,7 @@ async def test_tool_router_passes_skill_load_metadata_to_guardrails(monkeypatch)
         ToolCall(
             call_id="skill-1",
             name="skill_load",
-            arguments={"skill_id": "skill_bbff42a5255b"},
+            arguments={"skill_id": "skill_111111111111"},
         ),
         _agent({"*": Permission.EVALUATE}),
         _session(),
@@ -2084,8 +2380,8 @@ async def test_tool_router_passes_skill_load_metadata_to_guardrails(monkeypatch)
     _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
     assert context["tool"]["description"] == "Load a skill by ID"
     assert context["tool"]["read_only"] is True
-    assert context["skill"]["skill_id"] == "skill_bbff42a5255b"
-    assert context["skill"]["name"] == "lumilens-loki-query"
+    assert context["skill"]["skill_id"] == "skill_111111111111"
+    assert context["skill"]["name"] == "sample-loki-query"
     assert "Loki" in context["skill"]["description"]
 
 
@@ -2221,6 +2517,58 @@ async def test_tool_router_enforces_non_bypassable_guardrails() -> None:
     )
 
     assert guardrails.evaluate_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("definition", system_management_tools(), ids=lambda tool: tool.name)
+@pytest.mark.parametrize("decision", ["approve", "deny", "unavailable"])
+async def test_system_management_routes_require_opt_in_and_evaluation(
+    monkeypatch,
+    definition,
+    decision,
+) -> None:
+    handler = AsyncMock(return_value=ToolResult(output="managed"))
+    monkeypatch.setattr("cognis.core.system_management.handle_system_management_tool", handler)
+    guardrails = _Guardrails()
+    guardrails.evaluate = AsyncMock(
+        return_value=SimpleNamespace(
+            decision=decision,
+            reasoning="Policy decision",
+            risk="medium",
+            call_id="eval-management",
+            path=None,
+            latency_ms=0,
+        )
+    )
+    if decision == "unavailable":
+        guardrails.evaluate.side_effect = RuntimeError("evaluation unavailable")
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[], session_factory=Mock())
+    router.system_management = SimpleNamespace()
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=definition))
+    agent = _agent({"*": Permission.ALLOW})
+    action = "named_list" if definition.name == "manage_routes" else "list"
+    call = ToolCall(call_id="management-read", name=definition.name, arguments={"action": action})
+    executor = _Executor()
+    denied = await router.execute(call, _session(), agent, registry, executor)
+    assert denied.is_error
+    handler.assert_not_awaited()
+    agent.tools["opt_in_builtin_tools"] = [definition.name]
+    if decision == "unavailable":
+        with pytest.raises(RuntimeError, match="evaluation unavailable"):
+            await router.execute(call, _session(), agent, registry, executor)
+        handler.assert_not_awaited()
+        assert executor.calls == 0
+        return
+    result = await router.execute(call, _session(), agent, registry, executor)
+    guardrails.evaluate.assert_awaited_once()
+    if decision == "approve":
+        handler.assert_awaited_once()
+        assert not result.is_error
+    else:
+        handler.assert_not_awaited()
+        assert result.is_error
+    assert executor.calls == 0
 
 
 @pytest.mark.asyncio
@@ -2366,9 +2714,9 @@ async def test_tool_router_accepts_multiline_local_tool_arguments() -> None:
         )
     )
     command = (
-        'gh pr create --title "feat(blr-lab): configure rclone bisync" '
-        '--body "Mirrors the HA bisync model.\n\n'
-        'AWS secret JSON: {\\"username\\":\\"bisync\\",\\"password\\":\\"...\\"}"'
+        'gh pr create --title "feat(catalog): add exhibit descriptions" '
+        '--body "Adds a fictional museum exhibit index.\n\n'
+        'Sample JSON: {\\"category\\":\\"sculpture\\",\\"caption\\":\\"Study in blue\\"}"'
     )
 
     result = await router.execute(
@@ -2377,7 +2725,7 @@ async def test_tool_router_accepts_multiline_local_tool_arguments() -> None:
             name="bash",
             arguments={
                 "command": command,
-                "workdir": "/Users/fpytloun/src/lumilens/beskar",
+                "workdir": "/Users/developer/src/museum/catalog",
             },
         ),
         _session(),
@@ -2878,7 +3226,7 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
         "expected_namespace",
     ),
     [
-        ("artifact_publish", None, None, "art_1", "artifacts"),
+        ("artifact_publish", "conv-a", "session-a", "art_1", "artifacts"),
         ("document_generate", "conv-a", "session-a", "doc_1", "documents"),
     ],
 )
@@ -3379,7 +3727,11 @@ async def test_artifact_read_materializes_tool_artifact_ref(
     )
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools.find_tool_output_artifact_record",
-        AsyncMock(return_value=SimpleNamespace(conversation_id="conv-a")),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                conversation_id="conv-a", owner_email="user@example.com", status="attached"
+            )
+        ),
     )
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools._fetch_remote_artifact_candidate",
@@ -3557,7 +3909,11 @@ async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachme
     )
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools.find_tool_output_artifact_record",
-        AsyncMock(return_value=SimpleNamespace(conversation_id="conv-a")),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                conversation_id="conv-a", owner_email="user@example.com", status="attached"
+            )
+        ),
     )
 
     result = await handle_artifact_tool(
@@ -3794,7 +4150,7 @@ async def test_artifact_read_uses_effective_owner_for_attachment_analysis_route(
         ),
     )
     monkeypatch.setattr(
-        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        "cognis.core.attachment_analysis.get_model_routing",
         fake_get_model_routing,
     )
 
@@ -3884,7 +4240,7 @@ async def test_artifact_read_returns_native_attachment_for_capable_current_model
         ),
     )
     monkeypatch.setattr(
-        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        "cognis.core.attachment_analysis.get_model_routing",
         fake_get_model_routing,
     )
 
@@ -4145,7 +4501,7 @@ async def test_tool_router_retries_artifact_read_with_attachment_route_after_nat
         ),
     )
     monkeypatch.setattr(
-        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        "cognis.core.attachment_analysis.get_model_routing",
         fake_get_model_routing,
     )
 
@@ -4253,7 +4609,7 @@ async def test_tool_router_retries_image_url_payload_inline_before_route(
         ),
     )
     monkeypatch.setattr(
-        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        "cognis.core.attachment_analysis.get_model_routing",
         AsyncMock(return_value=SimpleNamespace(model="vision-route", provider_id="route-provider")),
     )
 
@@ -4755,7 +5111,7 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
         ),
     )
     monkeypatch.setattr(
-        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        "cognis.core.attachment_analysis.get_model_routing",
         AsyncMock(return_value=SimpleNamespace(model="vision-route", provider_id="route-provider")),
     )
 
@@ -5266,7 +5622,13 @@ async def test_tool_router_resolves_deliverable_artifact_save_content_for_execut
             name="artifact_save",
             arguments={"file_path": "/tmp/report.md", "source_artifact_id": "dlv_owner"},
         ),
-        _session().model_copy(update={"user_email": "owner@example.com"}),
+        _session().model_copy(
+            update={
+                "user_email": "owner@example.com",
+                "agent_id": "agent-owner",
+                "conversation_id": "conv-owner",
+            }
+        ),
         _agent({"*": Permission.EVALUATE}),
         registry,
         executor,
@@ -5538,7 +5900,13 @@ async def test_tool_router_resolves_deliverable_browser_upload_guardrails_and_pa
                 "source_artifact_ids": ["dlv_owner"],
             },
         ),
-        _session().model_copy(update={"user_email": "owner@example.com"}),
+        _session().model_copy(
+            update={
+                "user_email": "owner@example.com",
+                "agent_id": "agent-owner",
+                "conversation_id": "conv-owner",
+            }
+        ),
         _agent({"*": Permission.EVALUATE}),
         registry,
         executor,

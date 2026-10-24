@@ -20,6 +20,8 @@ import {
   invalidateWorkFromSocket,
   invalidateWorkScope,
 } from '$lib/work/workViewState';
+// Lazily imported by the component under test; load it during collection.
+import '$lib/components/rich/RichDeliverable.svelte';
 
 afterEach(cleanup);
 beforeEach(() => {

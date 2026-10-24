@@ -444,6 +444,7 @@ MEMORY_LIST_ARTIFACTS_TOOL = ToolDefinition(
 
 MEMORY_DELETE_ARTIFACT_TOOL = ToolDefinition(
     name="memory_delete_artifact",
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
     description="Delete an artifact from a memory.",
     parameters={
         "type": "object",

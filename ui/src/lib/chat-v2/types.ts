@@ -1,6 +1,19 @@
 import type { AttachmentRef, ContextUsage, GenerationPerformanceSnapshot } from '$lib/types/api';
 
 export type ChatV2SchemaVersion = 2;
+
+export interface RetryProviderOption {
+  provider_id: string;
+  display_name: string;
+  model: string;
+}
+
+export interface RetryProviderOptionsResponse {
+  turn_id: string | null;
+  provider_id: string | null;
+  model: string | null;
+  options: RetryProviderOption[];
+}
 export type ChatMode = 'default' | 'plan' | 'build';
 export type TimelineItemStatus =
   | 'pending'
@@ -142,6 +155,8 @@ export interface WorkstreamRef {
 
 export interface WorkDeliverable {
   deliverable_id: string;
+  lineage_id?: string | null;
+  revision?: number | null;
   sort_key?: string;
   format: string;
   title?: string | null;
@@ -435,6 +450,7 @@ export interface MessageTimelineItem extends TimelineItemBase {
   follow_up_session_id?: string | null;
   attachments: AttachmentRef[];
   partial: boolean;
+  text_streaming?: boolean | null;
   chat_mode?: ChatMode | null;
   chat_mode_source?: string | null;
 }
@@ -598,6 +614,17 @@ export interface FileDiffTimelineItem extends TimelineItemBase {
   title?: string | null;
 }
 
+export interface HandoffTimelineItem extends TimelineItemBase {
+  kind: 'handoff';
+  text: string;
+  focus: string;
+  source_session_id: string;
+  source_seq: number;
+  status?: 'running' | 'complete' | 'failed';
+  error?: string | null;
+  recipient_conversation_id?: string | null;
+}
+
 export interface RecapTimelineItem extends TimelineItemBase {
   kind: 'recap';
   text: string;
@@ -615,6 +642,8 @@ export interface RecapTimelineItem extends TimelineItemBase {
 export interface AssistantDeliverableTimelineItem extends TimelineItemBase {
   kind: 'assistant_deliverable';
   deliverable_id: string;
+  lineage_id?: string | null;
+  revision?: number | null;
   format: string;
   title?: string | null;
   content?: string | null;
@@ -626,6 +655,21 @@ export interface NoticeTimelineItem extends TimelineItemBase {
   kind: 'notice';
   level: 'info' | 'warning';
   title: string;
+  hook?: {
+    run_id: string;
+    hook_id: string;
+    status: string;
+    child_conversation_id?: string | null;
+    trigger?: string | null;
+    child_session_id?: string | null;
+    task_id?: string | null;
+    outcome?: string | null;
+    outcome_partial?: boolean;
+    outcome_available?: boolean | null;
+    result_anchors?: Record<string, unknown>[];
+    result_truncated?: boolean;
+    result_original_length?: number | null;
+  } | null;
   message?: string | null;
 }
 
@@ -638,6 +682,7 @@ export interface CompactionTimelineItem extends TimelineItemBase {
   summary?: string | null;
   method: string;
   turns_compacted: number;
+  events_compacted?: number;
   trigger?: string | null;
   reason?: string | null;
   previous_usage_percentage?: number | null;
@@ -648,6 +693,7 @@ export interface CompactionTimelineItem extends TimelineItemBase {
 
 export interface ErrorTimelineItem extends TimelineItemBase {
   kind: 'error';
+  turn_id?: string | null;
   level: 'error';
   title: string;
   message?: string | null;
@@ -672,6 +718,7 @@ export type TimelineItem =
   | AssistantDeliverableTimelineItem
   | FileDiffTimelineItem
   | RecapTimelineItem
+  | HandoffTimelineItem
   | NoticeTimelineItem
   | CompactionTimelineItem
   | ErrorTimelineItem;
@@ -762,6 +809,7 @@ export interface QueueMessage {
   updated_at?: string | null;
   status?: 'queued' | 'recoverable' | 'committing';
   cancel_requested?: boolean;
+  can_edit?: boolean;
 }
 
 export interface QueueState {
@@ -883,6 +931,14 @@ export interface CancelTurnV2Response {
   client_txn_id: string;
   status: 'cancelled' | 'idle' | 'duplicate';
   runtime?: RuntimeOverlaySnapshot | null;
+  server_time: string;
+}
+
+export interface BackgroundToolCallV2Response {
+  conversation_id: string;
+  call_id: string;
+  tool_name: string;
+  status: 'requested' | 'already_requested';
   server_time: string;
 }
 

@@ -30,6 +30,7 @@
   let creating = $state(false);
   let error = $state('');
   let agents = $state<Agent[]>([]);
+  let agentsLoaded = $state(false);
   let workflows = $state<Workflow[]>([]);
   let filterWorkflows = $state<Workflow[]>([]);
   let projects = $state<Project[]>([]);
@@ -359,20 +360,9 @@
       }
     }, TASK_BOARD_LOAD_TIMEOUT_MS);
     try {
-      const [nextBoard, nextAgents, nextWorkflows, nextProjects, nextSkills] = await Promise.all([
-        api.tasks.board(boardQueryParams()),
-        api.agents.listAll(),
-        api.workflows.listAll(),
-        api.projects.list(),
-        api.skills.list()
-      ]);
+      const nextBoard = await api.tasks.board(boardQueryParams());
       if (requestId !== boardReplaceRequestId || requestFilterKey !== boardFilterKey()) return;
       applyBoardResponse(nextBoard.columns);
-      agents = nextAgents;
-      workflows = nextWorkflows;
-      filterWorkflows = nextWorkflows;
-      projects = nextProjects;
-      skills = nextSkills;
     } catch (caughtError) {
       if (requestId !== boardReplaceRequestId) return;
       error = asApiError(caughtError).message;
@@ -387,10 +377,19 @@
     }
   }
 
+  let workflowChoicesPromise: Promise<Workflow[]> | null = null;
+
+  function loadWorkflowChoices(): Promise<Workflow[]> {
+    return workflowChoicesPromise ??= api.workflows.listAll().catch((error) => {
+      workflowChoicesPromise = null;
+      throw error;
+    });
+  }
+
   async function loadWorkflowFilterOptions(projectId: string): Promise<void> {
     const key = ++workflowFilterLoadKey;
     try {
-      const next = await api.workflows.listAll({ project_id: projectId || null });
+      const next = await (projectId ? api.workflows.listAll({ project_id: projectId }) : loadWorkflowChoices());
       if (key !== workflowFilterLoadKey) return;
       filterWorkflows = next;
       if (filters.workflowId && !next.some((workflow) => workflow.workflow_id === filters.workflowId)) {
@@ -786,6 +785,10 @@
   // ---------------------------------------------------------------------------
 
   onMount(() => {
+    void api.agents.listAll().then((items) => { agents = items; agentsLoaded = true; }).catch((e) => addToast(asApiError(e).message, 'error'));
+    void loadWorkflowChoices().then((items) => { workflows = items; }).catch((e) => addToast(asApiError(e).message, 'error'));
+    void api.projects.list().then((items) => { projects = items; }).catch((e) => addToast(asApiError(e).message, 'error'));
+    void api.skills.list().then((items) => { skills = items; }).catch((e) => addToast(asApiError(e).message, 'error'));
     visibilityHandler = () => {
       if (document.hidden) stopPolling();
       else { void refreshTasksOnly(); startPolling(); }
@@ -833,9 +836,9 @@
   {#if loadingTimedOut}
     <Card class="mx-auto max-w-3xl p-6 sm:p-8">
       <div class="space-y-4 text-center">
-        <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Task board</p>
-        <h1 class="text-xl font-semibold text-white">Still loading task board</h1>
-        <p class="text-sm leading-6 text-slate-400">
+        <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Task board</p>
+        <h1 class="text-xl font-semibold text-strong">Still loading task board</h1>
+        <p class="text-sm leading-6 text-muted">
           Fetching tasks is taking longer than expected. You can retry now or open diagnostics to check provider health.
         </p>
         <div class="flex flex-wrap justify-center gap-3">
@@ -849,18 +852,18 @@
   {/if}
 {:else}
   <section class={`min-w-0 space-y-5 ${selectedCount > 0 ? 'pb-[calc(var(--app-shell-bottom-offset,0px)+5.5rem)]' : ''}`}>
-    {#if agents.length === 0}
+    {#if agentsLoaded && agents.length === 0}
       <Card class="p-5">
-        <p class="text-sm font-medium text-white">Create an agent before using the task board.</p>
-        <p class="mt-2 text-sm leading-6 text-slate-400">Tasks need an execution agent and workflow before they can be queued.</p>
+        <p class="text-sm font-medium text-strong">Create an agent before using the task board.</p>
+        <p class="mt-2 text-sm leading-6 text-muted">Tasks need an execution agent and workflow before they can be queued.</p>
         <div class="mt-4">
           <Button onclick={() => goto('/agents/new')}>Create agent</Button>
         </div>
       </Card>
     {:else if isLlmUnavailableForSetup()}
       <Card class="p-5">
-        <p class="text-sm font-medium text-white">Configure an LLM provider before submitting tasks.</p>
-        <p class="mt-2 text-sm leading-6 text-slate-400">Background workflows need a configured provider to execute.</p>
+        <p class="text-sm font-medium text-strong">Configure an LLM provider before submitting tasks.</p>
+        <p class="mt-2 text-sm leading-6 text-muted">Background workflows need a configured provider to execute.</p>
         <div class="mt-4">
           <Button onclick={() => goto('/settings?tab=providers')}>Open providers</Button>
         </div>
@@ -869,23 +872,23 @@
 
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow queue</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">Task board</h1>
+        <p class="text-sm uppercase tracking-[0.25em] text-muted">Workflow queue</p>
+        <h1 class="mt-1 text-2xl font-semibold text-strong">Task board</h1>
       </div>
       <Button onclick={() => void openCreateTaskModal()}>Create task</Button>
     </div>
 
     {#if error}
-      <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
+      <p class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">{error}</p>
     {/if}
 
     <Card class="p-4 sm:p-5">
       <div class="grid gap-4 md:grid-cols-5">
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Search</span>
-          <Input bind:value={filters.search} placeholder="title or description" />
+          <Input find bind:value={filters.search} placeholder="title or description" />
         </label>
-        <div class="space-y-2 text-sm font-medium text-slate-200">
+        <div class="space-y-2 text-sm font-medium text-foreground">
           <span>Agent</span>
           <AgentSelect
             agents={agents}
@@ -896,27 +899,27 @@
             allLabel="All"
           />
         </div>
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Workflow</span>
-          <select bind:value={filters.workflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select bind:value={filters.workflowId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">All</option>
             {#each filterWorkflows as workflow}
               <option value={workflow.workflow_id}>{workflow.name}</option>
             {/each}
           </select>
         </label>
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Project</span>
-          <select bind:value={filters.projectId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select bind:value={filters.projectId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">All</option>
             {#each projects as project}
               <option value={project.project_id}>{project.name}</option>
             {/each}
           </select>
         </label>
-        <label class="space-y-2 text-sm font-medium text-slate-200">
+        <label class="space-y-2 text-sm font-medium text-foreground">
           <span>Status</span>
-          <select bind:value={filters.status} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select bind:value={filters.status} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">All</option>
             <option value="draft">draft</option>
             <option value="queued">queued</option>
@@ -930,7 +933,7 @@
         </label>
       </div>
       {#if filtersActive}
-        <p class="mt-3 text-sm text-sky-200">Priority drag reordering is disabled while filters are active.</p>
+        <p class="mt-3 text-sm text-accent">Priority drag reordering is disabled while filters are active.</p>
       {/if}
     </Card>
 
@@ -944,10 +947,10 @@
             role="tab"
             aria-selected={mobileActiveColumn === column.id}
             onclick={() => (mobileActiveColumn = column.id)}
-            class={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${mobileActiveColumn === column.id ? 'border-sky-400 bg-sky-500/15 text-white' : 'border-slate-800 bg-slate-900/60 text-slate-300'}`}
+            class={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${mobileActiveColumn === column.id ? 'border-accent bg-accent-subtle text-strong' : 'border-separator bg-surface/60 text-secondary'}`}
           >
             {column.label}
-            <span class="ml-1.5 rounded-full bg-slate-950/60 px-2 py-0.5 text-xs text-slate-400">{count}</span>
+            <span class="ml-1.5 rounded-full bg-canvas/60 px-2 py-0.5 text-xs text-muted">{count}</span>
           </button>
         {/each}
       </div>
@@ -961,13 +964,13 @@
                   {@const history = doneGroupHistories[group.key] ?? emptyDoneGroupHistoryState()}
                   {@const expanded = expandedDoneGroups.has(group.key)}
                   {@const olderExecutions = history.items.filter((task) => task.task_id !== group.latest.task_id)}
-                  <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
+                  <article class="rounded-2xl border border-separator bg-canvas/70 p-3">
                     <div class="flex items-start gap-3">
                       <div class="flex h-8 w-8 shrink-0 items-start justify-center">
                         {#if group.task_count > 1}
                           <button
                             type="button"
-                            class="mt-1 rounded-full border border-slate-700 bg-slate-900 p-1 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-300"
+                            class="mt-1 rounded-full border border-control-border bg-surface p-1 text-muted transition hover:border-accent/60 hover:text-accent-hover"
                             aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.title} executions`}
                             aria-expanded={expanded}
                             onclick={() => toggleDoneGroup(group)}
@@ -978,9 +981,9 @@
                       </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
-                          <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
+                          <span class="text-xs uppercase tracking-[0.2em] text-quiet">{group.title}</span>
                           {#if group.task_count > 1}
-                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.task_count}</span>
+                            <span class="rounded-full border border-control-border bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-secondary">{group.task_count}</span>
                           {/if}
                         </div>
                         <TaskCard
@@ -990,16 +993,16 @@
                           onclick={(event) => handleCardClick(event, group.latest.task_id, column.id)}
                         />
                         {#if taskActivityLabel(group.latest)}
-                          <p class="px-1 text-[11px] text-slate-500" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
+                          <p class="px-1 text-[11px] text-quiet" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
                             Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
                           </p>
                         {/if}
                         {#if expanded}
-                          <div class="space-y-2 border-l border-slate-800 pl-3">
+                          <div class="space-y-2 border-l border-separator pl-3">
                             {#if history.loading && !history.loaded}
-                              <p class="px-1 text-xs text-slate-500">Loading executions…</p>
+                              <p class="px-1 text-xs text-quiet">Loading executions…</p>
                             {:else if olderExecutions.length === 0}
-                              <p class="px-1 text-xs text-slate-500">No earlier executions loaded.</p>
+                              <p class="px-1 text-xs text-quiet">No earlier executions loaded.</p>
                             {:else}
                               {#each olderExecutions as task (task.task_id)}
                                 <TaskCard
@@ -1039,7 +1042,7 @@
                 {/each}
               {/if}
               {#if (column.id === 'done' ? doneTaskGroups.length : tasksForColumn(column.id).length) === 0}
-                <p class="py-6 text-center text-sm text-slate-500">No tasks.</p>
+                <p class="py-6 text-center text-sm text-quiet">No tasks.</p>
               {/if}
               {#if boardColumns[column.id].hasMore}
                 <div use:columnInfiniteScroll={column.id} class="py-2 text-center">
@@ -1057,9 +1060,9 @@
     <!-- Desktop kanban board (lg+) -->
     <div class="hidden lg:block">
       <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <p class="text-sm text-slate-400">Empty columns collapse to keep active work in view.</p>
-        <label class="inline-flex items-center gap-2 rounded-full border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm text-slate-300">
-          <input type="checkbox" bind:checked={showEmptyDesktopColumns} class="h-4 w-4 rounded border-slate-700 bg-slate-950 text-sky-500 focus:ring-sky-500" />
+        <p class="text-sm text-muted">Empty columns collapse to keep active work in view.</p>
+        <label class="inline-flex items-center gap-2 rounded-full border border-separator bg-surface/70 px-3 py-2 text-sm text-secondary">
+          <input type="checkbox" bind:checked={showEmptyDesktopColumns} class="h-4 w-4 rounded border-control-border bg-canvas text-accent focus:ring-accent" />
           Show empty columns
         </label>
       </div>
@@ -1070,7 +1073,7 @@
           {@const columnCollapsed = isDesktopColumnCollapsed(column.id)}
           {#if columnCollapsed}
             <section
-              class="flex min-h-[600px] rounded-3xl border border-slate-800/80 bg-slate-900/60 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : ''}"
+              class="flex min-h-[600px] rounded-3xl border border-separator/80 bg-surface/60 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-accent/50 bg-accent-subtle' : ''}"
               ondragover={(event: DragEvent) => {
                 if (dragState && isDragTransitionValid(dragState.column, column.id)) {
                   event.preventDefault();
@@ -1088,18 +1091,18 @@
             >
               <button
                 type="button"
-                class="flex h-full w-full flex-col items-center gap-3 px-2 py-4 text-slate-400 transition hover:text-white"
+                class="flex h-full w-full flex-col items-center gap-3 px-2 py-4 text-muted transition hover:text-strong"
                 onclick={() => expandDesktopColumn(column.id)}
                 aria-label={`Expand ${column.label} column`}
                 aria-expanded="false"
               >
-                <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-1 text-xs font-semibold text-slate-300">{columnTaskCount}</span>
+                <span class="rounded-full border border-control-border bg-canvas/70 px-2 py-1 text-xs font-semibold text-secondary">{columnTaskCount}</span>
                 <span class="[writing-mode:vertical-rl] rotate-180 text-sm font-semibold tracking-wide">{column.label}</span>
               </button>
             </section>
           {:else}
           <section
-            class="flex h-[min(72vh,900px)] min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+            class="flex h-[min(72vh,900px)] min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-accent/50 bg-accent-subtle' : 'border-separator/80 bg-surface/70'}"
             ondragover={(event: DragEvent) => {
               if (dragState && isDragTransitionValid(dragState.column, column.id)) {
                 event.preventDefault();
@@ -1120,16 +1123,16 @@
                 {#if columnTaskCount === 0}
                   <button
                     type="button"
-                    class="text-left text-sm font-semibold text-white transition hover:text-sky-300"
+                    class="text-left text-sm font-semibold text-strong transition hover:text-accent-hover"
                     onclick={() => collapseDesktopColumn(column.id)}
                     aria-label={`Collapse ${column.label} column`}
                   >
                     {column.label}
                   </button>
                 {:else}
-                  <p class="text-sm font-semibold text-white">{column.label}</p>
+                  <p class="text-sm font-semibold text-strong">{column.label}</p>
                 {/if}
-                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{columnTaskCount} items</p>
+                <p class="text-xs uppercase tracking-[0.2em] text-quiet">{columnTaskCount} items</p>
               </div>
             </div>
 
@@ -1139,13 +1142,13 @@
                   {@const history = doneGroupHistories[group.key] ?? emptyDoneGroupHistoryState()}
                   {@const expanded = expandedDoneGroups.has(group.key)}
                   {@const olderExecutions = history.items.filter((task) => task.task_id !== group.latest.task_id)}
-                  <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
+                  <article class="rounded-2xl border border-separator bg-canvas/70 p-3">
                     <div class="flex items-start gap-3">
                       <div class="flex h-8 w-8 shrink-0 items-start justify-center">
                         {#if group.task_count > 1}
                           <button
                             type="button"
-                            class="mt-1 rounded-full border border-slate-700 bg-slate-900 p-1 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-300"
+                            class="mt-1 rounded-full border border-control-border bg-surface p-1 text-muted transition hover:border-accent/60 hover:text-accent-hover"
                             aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.title} executions`}
                             aria-expanded={expanded}
                             onclick={() => toggleDoneGroup(group)}
@@ -1156,9 +1159,9 @@
                       </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
-                          <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
+                          <span class="text-xs uppercase tracking-[0.2em] text-quiet">{group.title}</span>
                           {#if group.task_count > 1}
-                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.task_count}</span>
+                            <span class="rounded-full border border-control-border bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-secondary">{group.task_count}</span>
                           {/if}
                         </div>
                         <TaskCard
@@ -1168,16 +1171,16 @@
                           onclick={(event) => handleCardClick(event, group.latest.task_id, column.id)}
                         />
                         {#if taskActivityLabel(group.latest)}
-                          <p class="px-1 text-[11px] text-slate-500" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
+                          <p class="px-1 text-[11px] text-quiet" title={formatAbsoluteTime(taskActivityLabel(group.latest)!)}>
                             Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
                           </p>
                         {/if}
                         {#if expanded}
-                          <div class="space-y-2 border-l border-slate-800 pl-3">
+                          <div class="space-y-2 border-l border-separator pl-3">
                             {#if history.loading && !history.loaded}
-                              <p class="px-1 text-xs text-slate-500">Loading executions…</p>
+                              <p class="px-1 text-xs text-quiet">Loading executions…</p>
                             {:else if olderExecutions.length === 0}
-                              <p class="px-1 text-xs text-slate-500">No earlier executions loaded.</p>
+                              <p class="px-1 text-xs text-quiet">No earlier executions loaded.</p>
                             {:else}
                               {#each olderExecutions as task (task.task_id)}
                                 <TaskCard
@@ -1248,9 +1251,9 @@
       class="fixed inset-x-2 z-40 flex justify-center lg:inset-x-0 lg:bottom-6"
       style="bottom: calc(var(--app-shell-bottom-offset, 0px) + 0.5rem);"
     >
-      <div class="flex w-full max-w-2xl flex-wrap items-center justify-center gap-2 rounded-2xl border border-slate-700 bg-slate-900/95 px-3 py-2.5 shadow-2xl backdrop-blur-sm sm:gap-3 sm:px-5 sm:py-3">
-        <span class="text-sm font-medium text-slate-200">{selectedCount} selected</span>
-        <div class="hidden h-5 w-px bg-slate-700 sm:block"></div>
+      <div class="flex w-full max-w-2xl flex-wrap items-center justify-center gap-2 rounded-2xl border border-control-border bg-surface/95 px-3 py-2.5 shadow-2xl backdrop-blur-sm sm:gap-3 sm:px-5 sm:py-3">
+        <span class="text-sm font-medium text-foreground">{selectedCount} selected</span>
+        <div class="hidden h-5 w-px bg-inset sm:block"></div>
         {#if submitCount > 0}
           <Button size="sm" onclick={bulkSubmit}>Submit ({submitCount})</Button>
         {/if}

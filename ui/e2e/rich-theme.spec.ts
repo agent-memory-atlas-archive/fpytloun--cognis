@@ -1,0 +1,47 @@
+import { expect, test } from '@playwright/test';
+
+test('embedded defaults follow app, while explicit system and standalone follow OS', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.addInitScript(() => localStorage.removeItem('cognis-rich-viewer-theme'));
+  await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&surface=embedded&capture=viewer');
+  const viewer = page.getByTestId('rich-deliverable');
+  await expect(viewer).toBeVisible();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
+  await page.screenshot({ path: '/tmp/cognis-rich-app-light.png', fullPage: true });
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'dark'));
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
+  await page.screenshot({ path: '/tmp/cognis-rich-app-dark.png', fullPage: true });
+  await viewer.getByRole('button', { name: 'Open full view' }).click();
+  const full = page.getByTestId('rich-deliverable-full-view');
+  await expect(full).toHaveAttribute('data-viewer-theme', 'dark');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await full.getByRole('button', { name: 'Open table of contents' }).click();
+  const drawer = page.locator('.rich-toc-drawer-root');
+  await expect(drawer).toHaveAttribute('data-viewer-theme', 'dark');
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await expect(full).toHaveAttribute('data-viewer-theme', 'light');
+  await expect(drawer).toHaveAttribute('data-viewer-theme', 'light');
+  await page.keyboard.press('Escape');
+  await full.getByRole('button', { name: 'Theme: app.', exact: false }).click();
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
+  await full.getByRole('button', { name: 'Theme: light.', exact: false }).click();
+  await full.getByRole('button', { name: 'Theme: dark.', exact: false }).click();
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await expect(full).toHaveAttribute('data-viewer-theme', 'dark');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await expect(full).toHaveAttribute('data-viewer-theme', 'light');
+});
+
+test('saved app mode falls back to OS in standalone without rewriting storage', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.addInitScript(() => localStorage.setItem('cognis-rich-viewer-theme', 'app'));
+  await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&surface=standalone&capture=viewer');
+  const viewer = page.getByTestId('rich-deliverable');
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
+  await expect(viewer.locator('[data-theme-mode]')).toHaveAttribute('data-theme-mode', 'system');
+  expect(await page.evaluate(() => localStorage.getItem('cognis-rich-viewer-theme'))).toBe('app');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
+});

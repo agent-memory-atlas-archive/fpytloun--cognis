@@ -93,6 +93,8 @@ class Scheduler:
         self._task_queue = task_queue
         self._event_bus = event_bus
         self._wake_event = asyncio.Event()
+        self._wake_generation = 0
+        self._pass_generation = 0
         self._stop_event = asyncio.Event()
         self._timer_task: asyncio.Task[None] | None = None
         self._running = False
@@ -156,6 +158,7 @@ class Scheduler:
 
     def wake(self) -> None:
         """Signal the timer loop to re-evaluate immediately."""
+        self._wake_generation += 1
         self._wake_event.set()
 
     # ------------------------------------------------------------------
@@ -165,6 +168,7 @@ class Scheduler:
     async def _timer_loop(self) -> None:
         """Main loop: sleep until next due schedule, fire, repeat."""
         while not self._stop_event.is_set():
+            self._pass_generation = self._wake_generation
             try:
                 await self._tick()
             except Exception:
@@ -218,6 +222,8 @@ class Scheduler:
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep for *seconds*, but wake early if signalled or stopped."""
+        if self._stop_event.is_set() or self._wake_generation != self._pass_generation:
+            return
         self._wake_event.clear()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._wake_event.wait(), timeout=seconds)
@@ -607,6 +613,7 @@ class Scheduler:
             return await self._task_queue.submit(
                 task_id=task_id,
                 created_by=sched.created_by,
+                creation_origin=getattr(sched, "creation_origin", None),
                 agent_id=sched.agent_id,
                 agent_profile_id=getattr(sched, "agent_profile_id", None),
                 title=str(title),
@@ -747,6 +754,7 @@ class Scheduler:
 
             task = await self._task_queue.submit(
                 created_by=sched.created_by,
+                creation_origin=getattr(sched, "creation_origin", None),
                 agent_id=sched.agent_id,
                 agent_profile_id=getattr(sched, "agent_profile_id", None),
                 title=str(title),

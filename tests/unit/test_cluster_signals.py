@@ -139,6 +139,39 @@ def _record_events(target: list[Event]) -> Any:
 
 
 @pytest.mark.asyncio
+async def test_only_account_sidebar_reconciliation_is_marked_metadata_only() -> None:
+    bus = EventBus()
+    received: list[Event] = []
+    bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, _record_events(received))
+    service = ClusterSignalService(
+        database_url="sqlite://",
+        controller_id="controller-a",
+        session_factory=_unused_session_factory,
+        event_bus=bus,
+        scope_provider=lambda: [],
+        owner_token_secret="shared-secret",
+    )
+    service._scope_provider = lambda: [  # noqa: SLF001
+        {
+            "owner_token": service.owner_token("owner@example.com"),
+            "user_email": "owner@example.com",
+        },
+        {"session_id": "session-1", "user_email": "owner@example.com"},
+    ]
+    service._scope_watermark = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        side_effect=["initial", "initial", "changed", "changed"]
+    )
+    await service.reconcile_once()
+    await service.reconcile_once()
+    assert len(received) == 4  # Initial snapshots and their subsequent changes.
+    account = [event for event in received if event.data["scope"].get("owner_token")]
+    session = [event for event in received if event.data["scope"].get("session_id")]
+    assert len(account) == len(session) == 2
+    assert all(event.data["metadata_only"] is True for event in account)
+    assert all("metadata_only" not in event.data for event in session)
+
+
+@pytest.mark.asyncio
 async def test_work_reconciliation_watermark_reads_durable_revision(
     tmp_path: Path,
 ) -> None:
@@ -339,6 +372,183 @@ async def test_event_store_invalidation_signal_is_identity_free() -> None:
     }
     assert "@" not in received[0].model_dump_json()
     await service.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "sqlite+aiosqlite:///:memory:",
+        "postgresql+asyncpg://localhost/cognis",
+    ],
+)
+async def test_canonical_append_wakes_origin_controller_without_remote_echo(
+    database_url: str,
+) -> None:
+    bus = EventBus()
+    received: list[Event] = []
+    bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, _record_events(received))
+    service = ClusterSignalService(
+        database_url=database_url,
+        controller_id="controller-a",
+        session_factory=_unused_session_factory,
+        event_bus=bus,
+        scope_provider=lambda: [],
+        transport=_FakeTransport([]),
+        owner_token_secret="shared-secret",
+    )
+    await service.publish_event_store_invalidation(
+        store_id=ClusterEventStoreId.INTARIS,
+        session_token="a" * 64,
+        revision=7,
+    )
+    assert len(received) == 1
+    assert received[0].data["kind"] == "event_store_session_invalidated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_append_publication_keeps_local_delivery_when_remote_fails(failure: bool) -> None:
+    local_bus = EventBus()
+    remote_bus = EventBus()
+    local_events: list[Event] = []
+    remote_events: list[Event] = []
+    local_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, _record_events(local_events))
+    remote_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, _record_events(remote_events))
+    callbacks: list[Any] = []
+
+    class Transport(_FakeTransport):
+        async def publish(self, channel: str, payload: str) -> None:
+            assert len(local_events) == 1  # Local delivery precedes transport.
+            if failure:
+                raise RuntimeError("synthetic transport failure")
+            await super().publish(channel, payload)
+
+    local = ClusterSignalService(
+        database_url="postgresql+asyncpg://localhost/cognis",
+        controller_id="controller-local",
+        session_factory=_unused_session_factory,
+        event_bus=local_bus,
+        scope_provider=lambda: [],
+        transport=Transport(callbacks),
+        owner_token_secret="shared-secret",
+    )
+    remote = ClusterSignalService(
+        database_url="postgresql+asyncpg://localhost/cognis",
+        controller_id="controller-remote",
+        session_factory=_unused_session_factory,
+        event_bus=remote_bus,
+        scope_provider=lambda: [],
+        transport=_FakeTransport(callbacks),
+        owner_token_secret="shared-secret",
+    )
+    await local.start()
+    await remote.start()
+    await asyncio.sleep(0)
+    try:
+        result = await local.publish_event_store_invalidation(
+            store_id=ClusterEventStoreId.INTARIS,
+            session_token="b" * 64,
+            revision=8,
+        )
+        await asyncio.wait_for(local._pending.join(), timeout=1)  # noqa: SLF001
+        await asyncio.wait_for(remote._pending.join(), timeout=1)  # noqa: SLF001
+        assert result is (not failure)
+        assert len(local_events) == 1  # Own echo must not recurse or redeliver.
+        assert len(remote_events) == (0 if failure else 1)
+        if not failure:
+            assert remote_events[0].data == local_events[0].data
+    finally:
+        await local.stop()
+        await remote.stop()
+
+
+@pytest.mark.asyncio
+async def test_append_listener_dispatches_post_commit_read_after_early_hint() -> None:
+    from cognis.api.chat_v2.append_listener import EventAppendListenerFastPath
+    from cognis.api.chat_v2.cached_event_store import AppendInvalidation
+    from cognis.core.event_append_invalidation import EventAppendInvalidationDispatcher
+    from cognis.models.session import SessionEvent
+    from cognis.providers.guardrails.events import EventAppendNotification, EventStoreAuthority
+
+    committed: list[SessionEvent] = []
+    reads: list[list[str]] = []
+    observed = asyncio.Event()
+    token = "c" * 64
+
+    class Store:
+        def invalidate_append_local(self, notification):
+            assert committed == list(notification.events)
+            return AppendInvalidation(token, "authority", 1, True, 1)
+
+        async def process_append_invalidation(self, work):
+            assert committed and work.last_seq == 1
+            return True
+
+    async def recipient_read(_event):
+        reads.append([event.data["client_message_id"] for event in committed])
+        observed.set()
+
+    bus = EventBus()
+    bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, recipient_read)
+    service = ClusterSignalService(
+        database_url="sqlite+aiosqlite:///:memory:",
+        controller_id="controller-origin",
+        session_factory=_unused_session_factory,
+        event_bus=bus,
+        scope_provider=lambda: [],
+        owner_token_secret="shared-secret",
+    )
+
+    async def publish(session_token, revision):
+        return await service.publish_event_store_invalidation(
+            store_id=ClusterEventStoreId.INTARIS,
+            session_token=session_token,
+            revision=revision,
+        )
+
+    dispatcher = EventAppendInvalidationDispatcher(
+        event_store=Store(), publish_invalidation=publish
+    )
+    listener = EventAppendListenerFastPath(
+        event_store=Store(),
+        invalidation_dispatcher=dispatcher,
+        work_materializer=SimpleNamespace(enqueue_append=lambda _: True),
+    )
+    await dispatcher.start()
+    try:
+        # Early admission returns an unchanged canonical read. Sender HTTP ACK
+        # is irrelevant: only the real post-append listener can wake this reader.
+        await recipient_read(None)
+        assert reads == [[]]
+        observed.clear()
+        committed.append(
+            SessionEvent(
+                type="user_message",
+                data={
+                    "client_message_id": "absorbed-admission",
+                    "content": "Synthetic absorbed input",
+                },
+            )
+        )
+        await listener(
+            EventAppendNotification(
+                authority=EventStoreAuthority(
+                    user_email="recipient@example.com",
+                    agent_id="agent-1",
+                    agent_owner_email="recipient@example.com",
+                ),
+                session_id="session-1",
+                first_seq=1,
+                last_seq=1,
+                event_count=1,
+                events=tuple(committed),
+            )
+        )
+        await asyncio.wait_for(observed.wait(), timeout=1)
+        assert reads == [[], ["absorbed-admission"]]
+    finally:
+        await dispatcher.stop()
 
 
 @pytest.mark.asyncio

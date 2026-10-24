@@ -170,8 +170,10 @@ export const viewportMetrics = readable<ViewportMetrics>(
   if (typeof window === 'undefined') return;
   const vv = window.visualViewport;
   const scheduledTimers = new Set<number>();
+  let active = true;
   let layoutViewportBaseline = window.innerHeight;
   const update = () => {
+    if (!active) return;
     const focusedTextInput = hasFocusedTextInput();
     if (!focusedTextInput) {
       layoutViewportBaseline = window.innerHeight;
@@ -181,7 +183,9 @@ export const viewportMetrics = readable<ViewportMetrics>(
     set(metrics);
   };
   const scheduleUpdate = () => {
-    update();
+    // Removing a focused modal emits focusout synchronously during Svelte's
+    // render teardown. Publish after that render, still before the next paint.
+    queueMicrotask(update);
     window.requestAnimationFrame(update);
     const timer = window.setTimeout(() => {
       scheduledTimers.delete(timer);
@@ -217,6 +221,7 @@ export const viewportMetrics = readable<ViewportMetrics>(
   scheduledTimers.add(firstTimer);
   scheduledTimers.add(secondTimer);
   return () => {
+    active = false;
     for (const timer of scheduledTimers) {
       window.clearTimeout(timer);
     }

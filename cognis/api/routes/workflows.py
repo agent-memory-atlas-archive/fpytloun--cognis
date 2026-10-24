@@ -89,7 +89,7 @@ async def workflow_list(
         if project is None or project.status != "active":
             raise api_exception(404, "not_found", "Project not found")
         await check_project_access(request, project, required="use")
-    workflows = await request.app.state.workflow_registry.list_all(
+    workflows = await request.app.state.workflow_registry.list_for_management(
         owner_email=user.email,
         include_disabled=include_disabled,
         include_ephemeral=include_ephemeral,
@@ -124,7 +124,7 @@ async def workflow_create(request: Request, payload: WorkflowRequest) -> Workflo
 @router.get("/{workflow_id}", response_model=WorkflowResponse)
 async def workflow_detail(request: Request, workflow_id: str) -> WorkflowResponse:
     user = require_current_user(request)
-    workflow = await request.app.state.workflow_registry.get(
+    workflow = await request.app.state.workflow_registry.get_for_management(
         workflow_id, owner_email=user.email, include_disabled=True
     )
     if workflow is None:

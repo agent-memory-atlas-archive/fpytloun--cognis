@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
+import { selectViewerTheme } from './viewer-theme';
 
 test.use({ viewport: { width: 1230, height: 1133 }, deviceScaleFactor: 2, contextOptions: { reducedMotion: 'reduce' } });
 
@@ -13,7 +14,7 @@ for (const theme of ['dark', 'light'] as const) {
     await page.evaluate(() => document.fonts.ready);
     await expect(viewer.locator('aside.rich-toc')).toBeVisible();
     const icons = await viewer.locator('[aria-label="Viewer controls"] [data-viewer-icon]').evaluateAll(nodes => nodes.map(n => n.getAttribute('data-viewer-icon')));
-    expect(icons).toEqual(['light', 'dark', 'system', 'download', 'copy']);
+    expect(icons).toEqual([theme === 'dark' ? 'system' : 'light', 'download', 'copy']);
     const geometry = await viewer.evaluate(el => {
       const rect = (selector: string) => {
         const node = el.querySelector(selector)!;
@@ -48,7 +49,7 @@ test('full view keeps focus inside after collapsing default sidebar', async ({ p
   await page.screenshot({ path: '/tmp/rich-parity-embedded.png' });
   await viewer.getByRole('button', { name: 'Open full view' }).click();
   const full = page.getByTestId('rich-deliverable-full-view');
-  await full.getByRole('button', { name: 'Dark theme' }).click();
+  await selectViewerTheme(full, 'dark');
   await expect(full.locator('aside.rich-toc')).toBeVisible();
   await page.screenshot({ path: '/tmp/rich-parity-full.png' });
   await full.getByRole('button', { name: 'Close table of contents' }).click();
@@ -61,7 +62,7 @@ test('390px drawer, local overflow, clipboard failure and live system theme', as
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&surface=standalone&capture=viewer');
   const viewer = page.getByTestId('rich-deliverable');
-  await viewer.getByRole('button', { name: 'Follow system theme' }).click();
+  await selectViewerTheme(viewer, 'system');
   await page.emulateMedia({ colorScheme: 'dark' });
   await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
   await page.evaluate(() => document.fonts.ready);

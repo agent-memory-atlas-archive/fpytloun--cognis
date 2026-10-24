@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import subprocess
 import sys
 import sysconfig
+import tarfile
+import tomllib
 import zipfile
 from functools import partial
 from pathlib import Path
@@ -13,6 +16,13 @@ from pathlib import Path
 import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_VERSION = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())["project"][
+    "version"
+]
+RUNTIME_VERSION_ASSERTION = (
+    "from importlib.metadata import version; "
+    f"assert cognis.__version__ == version('cognis-common') == {EXPECTED_VERSION!r}; "
+)
 
 
 @pytest.fixture(scope="module")
@@ -47,6 +57,51 @@ def test_workspace_wheels_have_exclusive_ownership(
         check=True,
         capture_output=True,
     )
+
+
+def test_workspace_wheels_name_the_existing_license(
+    built_wheels: tuple[Path, Path, Path],
+) -> None:
+    for wheel in built_wheels:
+        with zipfile.ZipFile(wheel) as archive:
+            name = next(item for item in archive.namelist() if item.endswith(".dist-info/METADATA"))
+            metadata = archive.read(name).decode("utf-8")
+        assert "License: BUSL-1.1\n" in metadata
+
+
+def test_controller_source_archive_preserves_distribution_exclusions(tmp_path: Path) -> None:
+    subprocess.run(
+        [
+            "uv",
+            "build",
+            "--package",
+            "cognis-controller",
+            "--sdist",
+            "--out-dir",
+            str(tmp_path),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "COGNIS_SKIP_UI_BUILD": "1"},
+        check=True,
+        capture_output=True,
+    )
+    source = next(tmp_path.glob("cognis_controller-*.tar.gz"))
+    with tarfile.open(source) as archive:
+        members = {name.split("/", 1)[1] for name in archive.getnames() if "/" in name}
+    assert {
+        "LICENSE",
+        "README.md",
+        "CHANGELOG.md",
+        "pyproject.toml",
+        "cognis/main.py",
+    } <= members
+    config = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    exclusions = config["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
+    assert exclusions
+    assert not any(
+        fnmatch.fnmatch(f"/{name}", pattern) for name in members for pattern in exclusions
+    )
+    assert not any(name.startswith(".gitea/") for name in members)
 
 
 def test_executor_wheel_imports_without_controller_tree(
@@ -155,8 +210,8 @@ def test_editable_workspace_exposes_both_trees_and_one_version(tmp_path: Path) -
             "-c",
             (
                 "import cognis; import cognis.main; import cognis.executor.runner; "
-                "assert cognis.__version__ == '0.17.1'; "
-                "assert len(cognis.__path__) == 3"
+                + RUNTIME_VERSION_ASSERTION
+                + "assert len(cognis.__path__) == 3"
             ),
         ],
         cwd=REPOSITORY_ROOT,
@@ -187,8 +242,9 @@ def test_workspace_console_scripts_start(command: str) -> None:
         (
             ("common",),
             (
-                "import importlib.util, cognis; assert cognis.__version__ == '0.17.1'; "
-                "import cognis.core.tool_arguments; import cognis.tools.introspection; "
+                "import importlib.util, cognis; "
+                + RUNTIME_VERSION_ASSERTION
+                + "import cognis.core.tool_arguments; import cognis.tools.introspection; "
                 "import cognis.mcp_runtime; "
                 "from cognis.channels.factory import create_adapter; "
                 "assert create_adapter('matrix').channel_type == 'matrix'; "
@@ -287,8 +343,9 @@ def test_isolated_minimal_full_and_uninstall_acceptance(
             "-c",
             (
                 "import sys; from pathlib import Path; import cognis; "
-                "import cognis.executor.runner; assert cognis.__version__ == '0.17.1'; "
-                "assert Path(cognis.__file__).resolve().is_relative_to("
+                "import cognis.executor.runner; "
+                + RUNTIME_VERSION_ASSERTION
+                + "assert Path(cognis.__file__).resolve().is_relative_to("
                 "Path(sys.prefix).resolve())"
             ),
         ],

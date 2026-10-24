@@ -157,20 +157,20 @@
 
 <div class="flex flex-col gap-8">
   {#if !canEdit}
-    <p class="rounded-xl border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-200">
+    <p class="rounded-xl border border-warning-border bg-warning-subtle px-3 py-2 text-sm text-warning">
       Archived knowledgebases are read-only. Reactivate this knowledgebase to change its profile, schema, chunking, access, or documents.
     </p>
   {/if}
   <section class="flex flex-col gap-3">
-    <h2 class="text-base font-semibold text-white">Profile</h2>
-    <label class="flex flex-col gap-1.5 text-sm text-slate-300">
+    <h2 class="text-base font-semibold text-strong">Profile</h2>
+    <label class="flex flex-col gap-1.5 text-sm text-secondary">
       Name
       <Input bind:value={name} maxlength={200} disabled={!canEdit} data-testid="knowledge-settings-name" />
     </label>
-    <label class="flex flex-col gap-1.5 text-sm text-slate-300">
+    <label class="flex flex-col gap-1.5 text-sm text-secondary">
       Description
       <textarea
-        class="min-h-[80px] rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2.5 text-sm text-slate-100"
+        class="min-h-[80px] rounded-xl border border-control-border bg-canvas/80 px-3 py-2.5 text-sm text-foreground"
         bind:value={description}
         disabled={!canEdit}
       ></textarea>
@@ -181,34 +181,34 @@
   </section>
 
   <section class="flex flex-col gap-3">
-    <h2 class="text-base font-semibold text-white">Metadata schema</h2>
-    <p class="text-sm text-slate-400">
+    <h2 class="text-base font-semibold text-strong">Metadata schema</h2>
+    <p class="text-sm text-muted">
       Defines fields available to ingestion and retrieval. Only fields with <code>filterable: true</code> appear in Search/Ask.
       Example: <code>&#123;"fields": &#123;"category": &#123;"type": "keyword", "filterable": true&#125;&#125;&#125;</code>
     </p>
     <textarea
-      class="min-h-[140px] rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2.5 font-mono text-xs text-slate-100"
+      class="min-h-[140px] rounded-xl border border-control-border bg-canvas/80 px-3 py-2.5 font-mono text-xs text-foreground"
       bind:value={metadataSchemaText}
       disabled={!canEdit}
       data-testid="knowledge-settings-schema"
     ></textarea>
-    {#if schemaError}<p class="text-sm text-rose-300">{schemaError}</p>{/if}
+    {#if schemaError}<p class="text-sm text-danger">{schemaError}</p>{/if}
     <Button class="self-start" variant="secondary" disabled={!canEdit || savingSchema} onclick={saveSchema}>
       {savingSchema ? 'Saving…' : 'Save schema'}
     </Button>
   </section>
 
   <section class="flex flex-col gap-3">
-    <h2 class="text-base font-semibold text-white">Chunk settings</h2>
-    <p class="text-sm text-slate-400">Backend-defined chunking and embedding options for this knowledgebase.</p>
+    <h2 class="text-base font-semibold text-strong">Chunk settings</h2>
+    <p class="text-sm text-muted">Backend-defined chunking and embedding options for this knowledgebase.</p>
     <textarea
-      class="min-h-[100px] rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2.5 font-mono text-xs text-slate-100"
+      class="min-h-[100px] rounded-xl border border-control-border bg-canvas/80 px-3 py-2.5 font-mono text-xs text-foreground"
       bind:value={chunkSettingsText}
       disabled={!canEdit}
     ></textarea>
-    {#if chunkingError}<p class="text-sm text-rose-300">{chunkingError}</p>{/if}
+    {#if chunkingError}<p class="text-sm text-danger">{chunkingError}</p>{/if}
     {#if staleCount > 0}
-      <p class="rounded-xl border border-amber-800/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-200">
+      <p class="rounded-xl border border-warning-border bg-warning-subtle px-3 py-2 text-sm text-warning">
         {staleCount} document{staleCount === 1 ? '' : 's'} need reindexing to reflect current chunk settings.
       </p>
     {/if}
@@ -224,16 +224,16 @@
 
   {#if diagnostics}
     <section class="flex flex-col gap-3">
-      <h2 class="text-base font-semibold text-white">Diagnostics</h2>
+      <h2 class="text-base font-semibold text-strong">Diagnostics</h2>
       <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {#each Object.entries(diagnostics.artifact_counts) as [status, count] (status)}
-          <div class="rounded-xl border border-slate-800/80 bg-slate-900/60 px-3 py-2 text-center">
-            <p class="text-lg font-semibold text-white">{count}</p>
+          <div class="rounded-xl border border-separator/80 bg-surface/60 px-3 py-2 text-center">
+            <p class="text-lg font-semibold text-strong">{count}</p>
             <p class={`mt-0.5 inline-block rounded-full border px-2 py-0.5 text-xs capitalize ${statusToneClass('neutral')}`}>{status}</p>
           </div>
         {/each}
       </div>
-      <p class="text-sm text-slate-400">
+      <p class="text-sm text-muted">
         {diagnostics.chunk_count} chunk{diagnostics.chunk_count === 1 ? '' : 's'} indexed ·
         backend {diagnostics.enabled ? 'enabled' : 'disabled'}
       </p>
@@ -241,8 +241,8 @@
   {/if}
 
   {#if canManageLifecycle}
-  <section class="flex flex-col gap-3 border-t border-slate-800/80 pt-6">
-    <h2 class="text-base font-semibold text-rose-300">Danger zone</h2>
+  <section class="flex flex-col gap-3 border-t border-separator/80 pt-6">
+    <h2 class="text-base font-semibold text-danger">Danger zone</h2>
     <div class="flex flex-wrap gap-3">
       <Button variant="secondary" onclick={toggleArchive}>
         {kb.status === 'archived' ? 'Reactivate knowledgebase' : 'Archive knowledgebase'}

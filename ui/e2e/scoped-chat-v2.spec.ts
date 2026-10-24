@@ -1,4 +1,6 @@
 import { test, expect } from '@playwright/test';
+import type { ScopedFixtureController } from '../src/lib/chat-v2/scoped-fixture';
+import type { ChatRealtimeFrame, MessageTimelineItem } from '../src/lib/chat-v2/types';
 
 test.describe('ScopedChatV2Timeline', () => {
   test.use({ serviceWorkers: 'block' });
@@ -6,6 +8,61 @@ test.describe('ScopedChatV2Timeline', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/scoped-chat-v2-fixture');
     await expect(page.getByTestId('scoped-timeline-shell')).toBeVisible();
+  });
+
+  test('does not blink from recent history to an old tail when runtime hydration arrives later', async ({ page }) => {
+    const shell = page.getByTestId('scoped-timeline-shell');
+    const message = (id: string, cycle: number, phase: number, content: string): MessageTimelineItem => ({
+      id, message_id: id, kind: 'message', role: 'assistant', content,
+      status: 'complete', partial: false, stable: true, attachments: [],
+      source_refs: [{ store: 'intaris', session_id: 'fixture-parent', seq: 1140, event_type: 'assistant_message' }],
+      turn_id: 'hydrated-turn', turn_cycle_index: cycle, assistant_phase_index: phase,
+      sort_key: '0900:000000000001140:000030:02:000000000',
+    });
+    const latest = message('message:hydrated-latest', 40, 30, 'Latest canonical progress');
+    const earlier = {
+      ...message('message:hydrated-earlier', 2, 1, 'Earlier progress must not trail'),
+      stable: false, source_refs: [], sort_key: '9998:999999999999999:000001:02:000000000',
+    };
+    const current: MessageTimelineItem = {
+      ...message('message:hydrated-current', 41, 31, 'Current live progress'),
+      stable: false, source_refs: [], status: 'running', partial: true,
+      sort_key: '9998:999999999999999:000031:02:000000000',
+    };
+    const emit = async (runtime: ChatRealtimeFrame['runtime'], items: MessageTimelineItem[]) => {
+      await page.evaluate(({ runtime, items }) => {
+        const controller = (window as typeof window & {
+          __scopedFixtureController?: ScopedFixtureController;
+        }).__scopedFixtureController;
+        if (!controller) throw new Error('Missing scoped fixture controller');
+        const cursor = document.querySelector('[data-testid="scoped-timeline-shell"] [data-scope-key]')?.getAttribute('data-cursor');
+        if (!cursor) throw new Error('Missing canonical cursor');
+        controller.realtime.emitFrame({
+          type: 'chat_v2_frame', schema_version: 2, projection_version: 'fixture-projection-v1',
+          scope: { key: 'conversation:fixture-conversation', kind: 'conversation', conversation_id: 'fixture-conversation' },
+          conversation_id: 'fixture-conversation', cursor_before: cursor,
+          cursor_after: items.length ? `${cursor}:hydrated` : cursor,
+          ops: items.map(item => ({ op: 'upsert_item' as const, item })), runtime,
+          server_time: '2026-01-01T00:00:01Z',
+        });
+      }, { runtime, items });
+    };
+    await emit(null, [latest]);
+    await expect(shell.getByText(latest.content, { exact: true })).toBeVisible();
+    await emit({
+      runtime_epoch: 'hydrated-epoch', runtime_revision: 1, generated_at: '2026-01-01T00:00:01Z',
+      has_active_turn: true,
+      active_turn: { turn_id: 'hydrated-turn', session_id: 'fixture-parent', status: 'running' },
+      authority: {
+        protocol: 'runtime_authority_v1', direct_request_id: 'hydrated-request',
+        turn_id: 'hydrated-turn', fencing_token: 1, lifecycle: 'active',
+        source_epoch: 'hydrated-source', source_revision: 1,
+      },
+      volatile_items_complete: false, volatile_items: [earlier, current],
+    }, []);
+    await expect(shell.getByText(current.content, { exact: true })).toBeVisible();
+    await expect(shell.getByText(latest.content, { exact: true })).toBeVisible();
+    await expect(shell.getByText(earlier.content, { exact: true })).toHaveCount(0);
   });
 
   test('renders a task-step scope through the production timeline', async ({ page }) => {

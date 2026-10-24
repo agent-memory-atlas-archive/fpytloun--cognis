@@ -1,205 +1,170 @@
 # Getting Started
 
-This guide walks through the shortest path to a working Cognis system with the web UI, one LLM provider, one agent, and your first conversation.
+The shortest path is **deploy → account → models → executor → XO → first chat**.
+The XO can then operate Cognis and create other agents. Credentials,
+permissions, and consequential actions can still need human approval.
 
-## Prerequisites
+## 1. Deploy the components
 
-- Python 3.12+
-- One LLM option:
-  - OpenAI API key
-  - Anthropic API key
-  - local Ollama instance
+Use [Deployment](deployment.md) for production or [Local Compose](local-compose.md)
+for Cognis, Mnemory, Intaris, Qdrant, and an executor. The controller includes the
+UI but cannot execute host tools.
 
-## 1. Start Cognis once to generate local state
-
-```bash
-uvx cognis-controller
-```
-
-On first start, Cognis creates `~/.cognis/` with:
-
-- JWT signing keys
-- an encryption key for stored secrets
-- a local SQLite database unless you configure another database
-
-When bundled UI assets are available, Cognis serves the workspace on `http://localhost:8080` and prints a one-time setup URL if no users exist yet.
-
-If you already know which model backend you want to use, you can also start Cognis with that credential in place, but it is not required just to bootstrap the installation.
-
-## 2. Start the companion services
-
-```bash
-uvx mnemory
-uvx intaris
-```
-
-- **Mnemory** stores long-term memory and recall context.
-- **Intaris** evaluates tool calls and stores session content.
-
-Point both services at Cognis's public key for JWT validation:
-
-```bash
-MNEMORY_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx mnemory
-INTARIS_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx intaris
-```
-
-If Mnemory or Intaris were already running before Cognis generated the key, restart them with the JWT public key configured.
-
-## 3. Create the first admin user
-
-Open the printed `/setup?token=...` URL and create the first admin account.
-
-If the token has expired, either restart Cognis or create the first user locally:
-
-```bash
-cognis-controller admin create-user admin@example.com --name "Admin"
-```
-
-## 4. Confirm readiness
-
-After login, open the onboarding guide or the system tab and confirm:
-
-- Mnemory is reachable
-- Intaris is reachable
-- an LLM provider is configured
-- executor tools are configured
-- at least one agent exists
-
-The `Getting started` flow in the UI is the fastest way to see what is still missing.
-
-## 5. Configure an LLM provider
-
-Open `Settings` and add a provider using one of the guided presets:
-
-- OpenAI
-- OpenAI Compatible
-- Anthropic
-- Ollama
-- LiteLLM Proxy
-- Custom
-
-Use the provider test action to verify credentials, model resolution, and basic connectivity before moving on.
-
-## 6. Create your first agent
-
-Open `Agents` and create an agent with:
-
-- a name and description
-- personality and system prompt guidance
-- a provider or model override if needed
-- an executor/tool configuration that matches what the agent should be allowed to do
-
-For a first setup, keep the agent simple and enable only the tools you expect to use.
-
-## 7. Start a conversation
-
-Open `Chat`, create a new conversation, choose your agent, and send a first message.
-The conversation appears immediately, but the active session is created lazily from that first user message.
-
-The chat view will show streaming responses, tool activity, and any approval prompts that need human input.
-
-## 8. Explore the rest of the workspace
-
-Once basic chat is working, the next useful areas are:
-
-- `Tasks` for background or multi-step work
-- `Schedules` for recurring task creation
-- `Workflows` for reusable execution templates
-- `Channels` for external messaging integrations
-- `Docs` for embedded user guidance inside the app
-
-## Docker Quick Start
-
-Cognis publishes two container images:
-
-- `ghcr.io/fpytloun/cognis` for the remote-only controller and bundled web UI
-- `ghcr.io/fpytloun/cognis-executor` for a remote WebSocket executor with browser, coding, shell, search, and LSP tooling
-
-The controller image cannot execute host tools. It must connect the executor
-image as an external or sidecar process. Persisted local executor rows remain
-unavailable until an executor package/process is installed and connected.
-
-Run the controller with a persistent data volume:
-
-```bash
-docker run -d \
-  --name cognis \
-  --add-host=host.docker.internal:host-gateway \
-  -p 8080:8080 \
-  -v cognis-data:/data \
-  -e COGNIS_DATA_DIR=/data \
-  -e COGNIS_MNEMORY_URL=http://host.docker.internal:8050 \
-  -e COGNIS_INTARIS_URL=http://host.docker.internal:8060 \
-  -e OPENAI_API_KEY=sk-... \
-  ghcr.io/fpytloun/cognis:latest
-```
-
-`host.docker.internal` works by default on Docker Desktop. On Linux, the `--add-host=host.docker.internal:host-gateway` flag maps it to the Docker host so a containerized controller can reach Mnemory and Intaris running on the host.
-
-Open the printed setup URL from the controller logs:
-
-```bash
-docker logs cognis
-```
-
-Create a WebSocket executor in `Settings -> Executors`, generate a token, then run the executor image. For a local non-TLS controller, use host networking so the executor URL is `ws://localhost:8080/...`, which the executor accepts as a local-only insecure connection:
-
-```bash
-docker run -d \
-  --name cognis-executor \
-  --network host \
-  -v cognis-executor-home:/home/cognis \
-  -e COGNIS_CONTROLLER_URL=ws://localhost:8080/api/executor/ws \
-  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
-  ghcr.io/fpytloun/cognis-executor:latest
-```
-
-For remote controllers, always use TLS:
-
-```bash
-docker run -d \
-  --name cognis-executor \
-  -v cognis-executor-home:/home/cognis \
-  -e COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws \
-  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
-  ghcr.io/fpytloun/cognis-executor:latest
-```
-
-The executor image runs as the non-root `cognis` user by default. Its home directory is designed to be mounted as a persistent volume so browser profiles, LSP caches, shell history, and workspace files survive restarts.
-
-## Local Compose deployment
-
-For a complete single-instance local deployment, use
-[`compose.local.yml`](../../compose.local.yml) instead of starting each service
-manually. It runs Cognis, Mnemory, Intaris, Qdrant, and a WebSocket executor,
-then seeds a local admin user, provider, model routing, executor record, agent,
-and sample conversation.
+From the repository, start a fresh interactive local installation:
 
 ```bash
 cp .env.local.example .env.local
-# Fill COGNIS_LOCAL_LLM_BASE_URL and COGNIS_LOCAL_LLM_API_KEY.
-set -a
-source .env.local
-set +a
-make local-compose-build
-make local-compose-up
-make local-compose-wait
-make local-compose-seed
-make local-compose-executor-up
+docker compose --env-file .env.local -f compose.local.yml up -d --build --wait cognis mnemory intaris qdrant
+docker compose --env-file .env.local -f compose.local.yml logs cognis
 ```
 
-Open `http://localhost:8080` and log in with the configured local admin
-credentials. See [Local Compose Deployment](local-compose.md) for the full env
-contract, reset workflow, and the host-executor alternative.
+Open the one-time setup URL from the logs and create the first admin account.
+Leave both `COGNIS_LOCAL_ADMIN_EMAIL` and `COGNIS_LOCAL_ADMIN_PASSWORD` blank.
+Do not run the `seed` service for this path. That separate development/demo
+shortcut requires a populated provider API key and pre-creates the account,
+provider, agent, executor record, and conversation.
 
-## Common setup problems
+Compose configures companion authentication, inference-token volumes, and
+storage. Use compatible managed-inference releases. Companions obtain inference
+from Cognis and do not need upstream provider keys. For manual Python or
+separate-host deployments, follow [Inference API](inference-api.md) and
+[Deployment](deployment.md), including JWT/public-key configuration.
 
-- **Mnemory or Intaris unreachable**
-  - Check the configured URLs in the system view.
-  - Confirm both services are running and use Cognis's public key.
-- **Provider test fails**
-  - Verify the API key or base URL.
-  - Confirm the model exists and is available to the selected provider.
-- **No setup link is available**
-  - A user may already exist, or the token may have expired.
-  - Use the CLI admin command if you need local bootstrap access.
+## 2. Open setup
+
+The dashboard offers setup while incomplete. You can also use **Settings →
+System → Setup guide**. **Documentation** in the menu always opens docs home.
+
+Finishing or permanently closing setup is stored per user on the server,
+across devices. It never returns automatically after that, even if configuration
+later degrades. Explicitly revisiting it from Settings does not reset dismissal.
+
+## 3. Configure LLM provider
+
+Setup has three screens: **Configure LLM provider → Setup executor → Create agent**.
+Only the current screen is shown. Advanced options stay collapsed.
+
+Choose **OpenRouter**, paste an API key and click **Connect and continue**. Cognis discovers
+the models, runs a small provider test, and saves the recommended routing
+automatically. The test and subsequent usage can incur provider charges.
+The key is global so companions can work independently of an agent.
+
+**Image generation is optional but recommended:** leave it enabled to generate
+an avatar in the last screen. You can skip it and enable it later.
+
+You do not need to choose models or routes. To inspect or customize them, open
+**Advanced options**. The default selections are:
+
+| Role | Recommended upstream model |
+|---|---|
+| Agent default and companion Smart | `openai/gpt-oss-120b` |
+| Classifier and companion Lite | `openai/gpt-oss-20b` |
+| Mnemory extraction and retrieval | `openai/gpt-oss-120b` |
+| Intaris judge/analysis and Mnemory consolidation/maintenance | Inherit Smart |
+| Intaris evaluation | `typesafe/jev-1.13`, or `openai/gpt-oss-20b` |
+| Companion embeddings | `openai/text-embedding-3-small` |
+| Image generation | A discovered image-capable Gemini or other model |
+
+Automatic defaults use discovered IDs and capabilities, preserve explicit
+routes, and do not invent unavailable choices. Existing embedding routes are
+never changed automatically. The provider test checks chat access, not every
+embedding, evaluation, or image model.
+
+**Jev is a typed-decision evaluator, not a chat model.** Select it only for
+`intaris_evaluation`. Intaris must support managed System One inference and use
+`EVALUATOR_BACKEND=auto` (`INTARIS_EVALUATOR_BACKEND=auto` in the Compose env),
+the local stack's default. For older releases use GPT-OSS-20B until upgrading.
+
+**Embeddings are separate from chat.** Dimensions must match both stores.
+The local defaults are 1536, matching the recommended embedding model.
+Changing a populated store's model/dimensions requires the migration described
+in [Inference API](inference-api.md).
+
+### Custom providers and Codex
+
+Choose **Custom (advanced)** for manual global provider and system-model setup.
+The optional **Agent providers** section always remains visible, with shortcuts
+for Codex (ChatGPT sign-in), OpenAI, and Anthropic (API keys). Connected accounts
+have a checkmark. These accounts are private to you and do not replace the global
+models required by Cognis. You can skip these shortcuts and use OpenRouter for
+the agent too.
+
+Settings → Providers supports Groq, Codex/ChatGPT subscription authentication,
+Anthropic, Ollama, and others. Groq IDs are `openai/gpt-oss-20b` and
+`openai/gpt-oss-120b`; a Groq chat provider does not supply embeddings or images.
+Agent inference can use a private provider, including Codex. Companion routes
+must use global providers. See [Configuring Providers](configuring-providers.md).
+
+## 4. Connect an executor before creating the agent
+
+Choose macOS, Docker, or Kubernetes, then click **Get setup command**. Cognis
+creates a private executor and connection code for you. Copy the command into
+your terminal and paste the code when asked. Tokens stay separate from the
+script so they are not embedded in shell history.
+
+- **macOS:** native Homebrew path: `brew tap fpytloun/tap`,
+  `brew install cognis-executor`, interactive `cognis-executor configure`,
+  `doctor --test-connection`, and `brew services start cognis-executor`.
+  Install Homebrew first if needed; run without sudo. Configuration persists.
+  Grant macOS filesystem/browser permissions only as required.
+- **Docker:** public `ghcr.io/fpytloun/cognis-executor` image, restart policy,
+  and persistent home/workspace. Local HTTP uses host networking with localhost:
+  Linux, or Docker Desktop with host networking enabled. Otherwise use HTTPS.
+- **Kubernetes:** generated namespace, connection Secret, workspace PVC, and
+  single-replica Deployment. Requires kubectl access, a default StorageClass,
+  trusted HTTPS, and controller connectivity from pods. No Kubernetes API
+  token is mounted.
+
+Run the commands on the target platform and paste the connection token at the
+prompt. Regenerating a token invalidates the previous one. Never publish tokens
+or disable TLS verification. Pin compatible image versions for production.
+Docker/Kubernetes tools access their container and mounted workspace, not your
+whole laptop. No Docker socket or cluster-management access is granted.
+
+The screen checks the connection automatically. When your computer is connected,
+click **Continue**. Computer name, existing executors, controller URL, token
+replacement, and troubleshooting are under **Advanced options**.
+See [macOS Executor](macos-executor.md) and [Executors](executors.md) for
+permissions, browser installation, persistence, and troubleshooting.
+
+## 5. Create agent
+
+Name your assistant, review the visible **Provider** and **Model** pickers,
+optionally choose **Generate avatar**, then click **Start conversation**.
+Defaults are selected for you. Cognis uses the XO template and your connected
+executor. Your agent can control this instance, create agents, set up tools
+and integrations, and manage tasks and workflows. No profile or tool configuration
+is required. The page explains the access granted before you create the agent.
+Safety checks and approvals stay enabled.
+
+**Advanced options** contains the template, executor, management access,
+instructions, and profiles. Templates are also available later in Agents.
+
+**XO** provides coordination, memory, Intaris guardrails, approvals, workflows,
+and explicit owner-only management. **Coding agent** provides implementation and
+review profiles without agent-management tools.
+
+Templates are independently copied. They never copy deployment-specific model,
+executor, or credential references. Missing optional system skills are not
+invented. Templates remain available later under Agents → New agent.
+
+## After setup
+
+Open the XO's owner chat and ask it to inspect its tools, run a harmless tool,
+remember/recall a preference, and create a coding specialist. Review the
+specialist's model, executor, prompt, permissions, and approval requests.
+External or delegated conversations do not gain owner-root management authority.
+
+Readiness checks prove configuration only: they do not run inference or tools.
+Actual tests are needed for memory, embeddings, evaluation, and images.
+Agent creation finishes setup and opens the assistant's owner chat. If the
+handoff fails, retry **Start chatting** without creating a duplicate agent.
+
+## Troubleshooting
+
+- Companions unreachable: check URLs, JWT/public key, releases, and service logs.
+- Missing models: refresh discovery and verify exact IDs, account access, and credits.
+- Jev mismatch: use compatible Intaris with `auto`, or choose GPT-OSS-20B.
+- Embedding mismatch: match dimensions; migrate existing collections before changing models.
+- Executor unavailable: check logs, token, TLS, runtime state, and applied config.
+- Expired account setup URL: restart Cognis or use local `cognis-controller admin create-user`.

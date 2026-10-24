@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import postcss from 'postcss';
 import { describe, expect, it } from 'vitest';
 
 function productionSources(directory: string): string[] {
@@ -78,20 +79,44 @@ describe('Apple safe-area contract', () => {
     const layout = readFileSync('src/routes/(app)/+layout.svelte', 'utf8');
     const styles = readFileSync('src/app.css', 'utf8');
 
-    expect(layout).toContain('bg-slate-950 px-3 py-1');
+    expect(layout).toContain('bg-chrome px-3 py-1');
     expect(layout).toContain('class="h-10 w-10 lg:hidden');
     expect(layout).not.toContain('0.625rem+env(safe-area-inset-top)');
     expect(layout).not.toContain('chat-workspace-surface');
-    expect(layout).toContain('app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-slate-950');
+    expect(layout).toContain('app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-chrome');
     expect(styles).toContain('.chat-header-shell,\n.app-keyboard-stable-header {');
     expect(styles).toContain('background: var(--app-chrome-bg)');
     expect(styles).not.toContain('.chat-header-shell {\n  background: transparent;');
     const manifest = JSON.parse(readFileSync('static/manifest.webmanifest', 'utf8'));
     const color = manifest.theme_color.toLowerCase();
     expect(manifest.background_color.toLowerCase()).toBe(color);
-    expect(readFileSync('src/app.html', 'utf8').toLowerCase()).toContain(`name="theme-color" content="${color}"`);
-    expect(styles).toContain(`--app-chrome-bg: ${color}`);
-    expect(styles).toContain('linear-gradient(180deg, var(--app-chrome-bg) 0px, var(--app-chrome-bg) 64px');
+    const classic = postcss.parse(readFileSync('src/lib/theme/classic.css', 'utf8'));
+    const chromeColors = ['light', 'dark'].map((mode) => {
+      const values: Record<string, string> = {};
+      for (const darkMedia of mode === 'dark' ? [false, true] : [false]) {
+        let matched = false;
+        classic.walkRules((rule) => {
+          if (!rule.selectors.includes(':root:not([data-theme-family])')) return;
+          if (darkMedia) {
+            if (rule.parent?.type !== 'atrule' || rule.parent.name !== 'media' ||
+                rule.parent.params !== '(prefers-color-scheme: dark)') return;
+          } else if (rule.parent?.type !== 'root') return;
+          matched = true;
+          rule.walkDecls((decl) => { values[decl.prop] = decl.value; });
+        });
+        expect(matched, `Canonical Classic OS fallback (dark media=${darkMedia})`).toBe(true);
+      }
+      const resolve = (value: string): string => value.replace(/var\((--[\w-]+)\)/g, (_, role) => resolve(values[role]));
+      const chrome = resolve(values['--app-chrome-bg']).toLowerCase();
+      expect(chrome).toMatch(/^#[0-9a-f]{6}$/);
+      return chrome;
+    });
+    expect(color).toBe(chromeColors[0]);
+    const html = readFileSync('src/app.html', 'utf8').toLowerCase();
+    expect(html).toContain(`name="theme-color" content="${chromeColors[0]}"`);
+    expect(html).toContain(`dark ? '${chromeColors[1]}' : '${chromeColors[0]}'`);
+    expect(styles).toContain('background-color: var(--app-chrome-bg)');
+    expect(styles).toContain('linear-gradient(180deg, var(--app-chrome-bg), rgb(var(--color-canvas)) 54%)');
     expect(styles).toContain('.app-chat-mobile-safe-top {\n    padding-top: 0;');
   });
 

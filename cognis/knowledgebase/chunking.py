@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.knowledgebase.extraction import ExtractedDocument, SourceSpan
+from cognis.logging import get_logger
+from cognis.offline_runtime import configure_offline_runtime
+
+logger = get_logger(__name__)
 
 DEFAULT_TARGET_TOKENS = 800
 DEFAULT_OVERLAP_TOKENS = 100
@@ -88,17 +94,59 @@ def _merge_locators(
     ]
     if heading_stacks:
         merged["heading_stack"] = heading_stacks[-1]
+    image_analysis = next(
+        (locator["image_analysis"] for locator in locators if "image_analysis" in locator), None
+    )
+    if image_analysis is not None:
+        merged["image_analysis"] = image_analysis
+        merged["image_uncertainties"] = next(
+            (
+                locator["image_uncertainties"]
+                for locator in locators
+                if "image_uncertainties" in locator
+            ),
+            "",
+        )
     return merged
+
+
+_FALLBACK_WARN_INTERVAL_SECONDS = 60.0
+_fallback_warn_lock = threading.Lock()
+_fallback_warn_state: dict[str, float | int | None] = {"last": None, "suppressed": 0}
+
+
+def _warn_token_count_fallback(error: BaseException) -> None:
+    now = time.monotonic()
+    with _fallback_warn_lock:
+        last = _fallback_warn_state["last"]
+        if isinstance(last, float) and now - last < _FALLBACK_WARN_INTERVAL_SECONDS:
+            _fallback_warn_state["suppressed"] = int(_fallback_warn_state["suppressed"] or 0) + 1
+            return
+        suppressed = int(_fallback_warn_state["suppressed"] or 0)
+        _fallback_warn_state["last"] = now
+        _fallback_warn_state["suppressed"] = 0
+    logger.warning(
+        "knowledgebase: token counting fell back to character estimate",
+        extra={
+            "extra_data": {
+                "failed_backend": "tiktoken_cl100k_base",
+                "fallback_backend": "chars_div_4",
+                "error_type": type(error).__name__,
+                "error": str(error)[:300],
+                "suppressed_since_last_warning": suppressed,
+            }
+        },
+    )
 
 
 def _default_token_count(text: str) -> int:
     try:
+        configure_offline_runtime()
         import tiktoken
-    except ImportError:
-        return max(1, (len(text) + FALLBACK_CHARS_PER_TOKEN - 1) // FALLBACK_CHARS_PER_TOKEN)
-    try:
+
         encoding = tiktoken.get_encoding("cl100k_base")
-    except Exception:
+    except Exception as exc:
+        _warn_token_count_fallback(exc)
         return max(1, (len(text) + FALLBACK_CHARS_PER_TOKEN - 1) // FALLBACK_CHARS_PER_TOKEN)
     return max(1, len(encoding.encode(text)))
 
@@ -192,13 +240,15 @@ def _prepare_spans(
             if heading_stack:
                 locator["heading_stack"] = list(heading_stack)
         contextual_text = _with_heading_context(text, heading_stack) if is_markdown else text
-        prepared.extend(
-            _split_long_text(
-                SourceSpan(text=contextual_text, locator=locator),
-                target_tokens=target_tokens,
-                count_tokens=count_tokens,
-            )
+        parts = _split_long_text(
+            SourceSpan(text=contextual_text, locator=locator),
+            target_tokens=target_tokens,
+            count_tokens=count_tokens,
         )
+        if "image_analysis" in locator:
+            for part in parts:
+                part.text = _with_heading_context(part.text, locator.get("heading_stack", []))
+        prepared.extend(parts)
     return prepared
 
 

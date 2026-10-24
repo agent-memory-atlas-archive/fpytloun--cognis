@@ -121,33 +121,33 @@
 >
   <div class="mx-auto max-w-2xl space-y-4">
     <div>
-      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-amber-300">Action required</p>
-      <h2 class="mt-1 text-lg font-semibold text-white">{action.title}</h2>
-      {#if action.display.message}<p class="mt-2 text-sm leading-6 text-slate-300">{action.display.message}</p>{/if}
+      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-warning">Action required</p>
+      <h2 class="mt-1 text-lg font-semibold text-strong">{action.title}</h2>
+      {#if action.display.message}<p class="request-prose mt-2 leading-6 text-secondary">{action.display.message}</p>{/if}
     </div>
 
     {#if action.kind === 'escalation'}
-      <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 p-4">
-        <p class="font-medium text-sky-100">{action.display.tool_name ?? 'Tool request'}</p>
+      <div class="rounded-2xl border border-accent/30 bg-accent-subtle p-4">
+        <p class="font-medium text-accent">{action.display.tool_name ?? 'Tool request'}</p>
         {#if action.display.arguments_display}
-          <pre class="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950/70 p-3 text-xs text-slate-200">{JSON.stringify(action.display.arguments_display, null, 2)}</pre>
+          <pre class="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-canvas/70 p-3 text-xs text-foreground">{JSON.stringify(action.display.arguments_display, null, 2)}</pre>
         {/if}
-        {#if action.display.reasoning}<p class="mt-3 text-sm text-slate-300">{action.display.reasoning}</p>{/if}
-        {#if action.display.risk}<p class="mt-2 text-sm text-amber-200">Risk: {action.display.risk}</p>{/if}
-        <label class="mt-3 block text-sm text-slate-200">Optional note
-          <textarea bind:value={note} maxlength="500" disabled={busy} class="mt-1 min-h-20 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"></textarea>
+        {#if action.display.reasoning}<p class="mt-3 text-sm text-secondary">{action.display.reasoning}</p>{/if}
+        {#if action.display.risk}<p class="mt-2 text-sm text-warning">Risk: {action.display.risk}</p>{/if}
+        <label class="mt-3 block text-sm text-foreground">Optional note
+          <textarea bind:value={note} maxlength="500" disabled={busy} class="mt-1 min-h-20 w-full rounded-xl border border-control-border bg-canvas px-3 py-2"></textarea>
         </label>
       </div>
     {:else if action.kind === 'gate'}
-      <label class="block text-sm text-slate-200">Optional instruction
-        <textarea bind:value={feedback} maxlength="4000" disabled={busy} class="mt-1 min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"></textarea>
+      <label class="block text-sm text-foreground">Optional instruction
+        <textarea bind:value={feedback} maxlength="4000" disabled={busy} class="mt-1 min-h-24 w-full rounded-xl border border-control-border bg-canvas px-3 py-2"></textarea>
       </label>
     {:else if action.kind === 'step_question'}
       {#each action.display.questions as question (question.id)}
-        <fieldset class="space-y-2 rounded-2xl border border-slate-700 p-4">
-          <legend class="px-1 text-sm font-medium text-white">{question.question}</legend>
+        <fieldset class="min-w-0 space-y-2 border-0 p-0">
+          <legend class="request-prose mb-3 block w-full whitespace-normal font-medium leading-6 text-strong">{question.question}</legend>
           {#each question.options as option (option.id)}
-            <label class="flex min-h-11 items-start gap-3 rounded-xl border border-slate-700 px-3 py-2 text-sm">
+            <label class="flex min-h-11 items-start gap-3 rounded-xl border border-separator bg-inset px-3 py-2 text-sm">
               <input
                 type={question.multiple ? 'checkbox' : 'radio'}
                 name={`${action.action_id}-${question.id}`}
@@ -155,14 +155,14 @@
                 disabled={busy}
                 onchange={() => toggle(question, option.id)}
               />
-              <span>{option.label}{#if option.description}<small class="block text-slate-400">{option.description}</small>{/if}</span>
+              <span>{option.label}{#if option.description}<small class="block text-muted">{option.description}</small>{/if}</span>
             </label>
           {/each}
           {#if question.allow_custom}
             <textarea
               value={answers[question.id]?.custom ?? ''}
               disabled={busy}
-              class="min-h-20 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
+              class="min-h-20 w-full rounded-xl border border-control-border bg-canvas px-3 py-2 text-sm"
               placeholder="Custom answer"
               oninput={(event) => setCustom(question.id, event.currentTarget.value)}
             ></textarea>
@@ -172,38 +172,38 @@
     {:else if action.kind === 'credential_request' || action.kind === 'auth_challenge'}
       <div class="grid gap-3 sm:grid-cols-2">
         {#each action.display.required_fields as field (field)}
-          <label class="text-sm text-slate-200"><span>{fieldLabel(field)}</span>
+          <label class="text-sm text-foreground"><span>{fieldLabel(field)}</span>
             <input
               type={inputType(field)}
               autocomplete="off"
               disabled={busy}
               value={fields[field] ?? ''}
-              class="mt-1 w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+              class="mt-1 w-full rounded-xl border border-control-border bg-canvas px-3 py-2"
               oninput={(event) => fields = { ...fields, [field]: event.currentTarget.value }}
             />
           </label>
         {/each}
       </div>
       {#if action.kind === 'credential_request'}
-        <p class="text-xs text-slate-400">Values go directly to encrypted credential storage and are not shown to the model.</p>
+        <p class="text-xs text-muted">Values go directly to encrypted credential storage and are not shown to the model.</p>
       {/if}
     {:else if action.kind === 'oauth_authorization'}
       {#if action.display.authorization_url}
         <a
-          class="inline-flex min-h-11 items-center rounded-xl bg-amber-300 px-4 py-2 font-medium text-slate-950"
+          class="inline-flex min-h-11 items-center rounded-xl bg-warning px-4 py-2 font-medium text-on-accent"
           href={action.display.authorization_url}
           target="_blank"
           rel="noreferrer"
           onpointerdown={(event) => event.stopPropagation()}
         >Open authorization</a>
       {/if}
-      {#if action.display.user_code}<p class="rounded-xl border border-amber-400/30 p-3">Code: <code>{action.display.user_code}</code></p>{/if}
+      {#if action.display.user_code}<p class="rounded-xl border border-warning-border p-3">Code: <code>{action.display.user_code}</code></p>{/if}
     {:else}
-      <p class="rounded-xl border border-slate-700 bg-slate-900 p-3 text-sm text-slate-300">This action is unavailable.</p>
+      <p class="rounded-xl border border-control-border bg-surface p-3 text-sm text-secondary">This action is unavailable.</p>
     {/if}
 
-    {#if error}<p class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100" role="alert">{error}</p>{/if}
-    {#if busy}<p class="text-sm text-sky-200" role="status" aria-live="polite">Resolving…</p>{/if}
+    {#if error}<p class="rounded-xl border border-danger-border bg-danger-subtle p-3 text-sm text-danger" role="alert">{error}</p>{/if}
+    {#if busy}<p class="text-sm text-accent" role="status" aria-live="polite">Resolving…</p>{/if}
 
     <div class="flex flex-wrap gap-2">
       {#each actionable ? action.allowed_actions : [] as choice (`${choice.action}-${choice.input}`)}
@@ -212,10 +212,10 @@
           disabled={busy || !valid(choice)}
           class={`min-h-11 rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50 ${
             choice.intent === 'danger'
-              ? 'border border-rose-400/40 text-rose-200'
+              ? 'border border-danger-border text-danger'
               : choice.intent === 'primary'
-                ? 'bg-sky-400 text-slate-950'
-                : 'border border-slate-600 text-slate-200'
+                ? 'bg-accent text-on-accent'
+                : 'border border-control-border text-foreground'
            }`}
            onclick={() => void submit(choice)}
            onpointerdown={(event) => event.stopPropagation()}
@@ -224,7 +224,7 @@
       {#if !actionable && onDismiss}
         <button
           type="button"
-          class="min-h-11 rounded-xl border border-slate-600 px-4 py-2 text-sm font-medium text-slate-200"
+          class="min-h-11 rounded-xl border border-control-border px-4 py-2 text-sm font-medium text-foreground"
           onclick={onDismiss}
         >Close</button>
       {/if}

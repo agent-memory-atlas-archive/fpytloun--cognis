@@ -4,21 +4,30 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DashboardIssuesResponse } from '$lib/types/api';
 import IssuesStrip from './IssuesStrip.svelte';
 
-const { dismissScheduleIssue, goto } = vi.hoisted(() => ({
+const { dismissScheduleIssue, goto, getExecutor, reconfigure } = vi.hoisted(() => ({
   dismissScheduleIssue: vi.fn(),
   goto: vi.fn(),
+  getExecutor: vi.fn(),
+  reconfigure: vi.fn(),
 }));
 
 vi.mock('$app/navigation', () => ({ goto }));
 vi.mock('$lib/api/client', () => ({
-  api: { dashboard: { dismissScheduleIssue } },
+  api: { dashboard: { dismissScheduleIssue }, executor: { get: getExecutor, reconfigure } },
   asApiError: (error: unknown) => error instanceof Error ? error : new Error(String(error)),
 }));
+vi.mock('$lib/stores/auth', async () => {
+  const { writable, get } = await import('svelte/store');
+  const store = writable({ user: { email: 'user@example.com', role: 'user' } });
+  return { auth: { ...store, getSnapshot: () => get(store) } };
+});
 
 describe('IssuesStrip', () => {
   beforeEach(() => {
     goto.mockReset();
     dismissScheduleIssue.mockReset();
+    getExecutor.mockReset();
+    reconfigure.mockReset();
   });
 
   it('uses the backend action URL for issue actions', async () => {
@@ -55,6 +64,54 @@ describe('IssuesStrip', () => {
 
     expect(screen.queryByTestId('dashboard-issues-strip')).not.toBeInTheDocument();
     expect(screen.queryByText('All systems healthy')).not.toBeInTheDocument();
+  });
+
+  it('expands exact MCP diagnostics and supports retry followed by status refresh', async () => {
+    const executor = {
+      executor_id: 'exec-1', executor_type: 'websocket', status: 'active', available: true,
+      shared: false, owner_email: 'user@example.com', runtime_state: 'degraded',
+      desired_config_version: 1, applied_config_version: 1,
+      runtime_metadata: {
+        mcp_servers: [{ name: 'hass', status: 'failed', phase: 'initialize',
+          error_class: 'timeout', timed_out: true, message: 'MCP initialize timed out after 15s',
+          stderr_summary: 'Waiting for startup dependencies' }]
+      }
+    };
+    getExecutor.mockResolvedValue(executor);
+    reconfigure.mockResolvedValue({ ...executor, desired_config_version: 2, runtime_state: 'reconfiguring' });
+    const onRetry = vi.fn();
+    render(IssuesStrip, { onRetry, issues: {
+      generated_at: '2026-08-22T00:00:00Z',
+      summary: { total: 1, warning: 1, critical: 0, info: 0, truncated: false },
+      issues: [{ id: 'exec-1', severity: 'warning', kind: 'executor_degraded',
+        title: 'Executor is degraded', detail: 'Degraded runtime', observed_at: null,
+        resource: { type: 'executor', id: 'exec-1', label: 'Executor' }, action_url: '/settings' }]
+    } });
+    expect(getExecutor).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Show details' }));
+    expect(await screen.findByText(/hass: initialize.*MCP initialize timed out after 15s/)).toBeVisible();
+    expect(screen.getByText(/Waiting for startup dependencies/)).toBeVisible();
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry configuration' }));
+    await waitFor(() => expect(reconfigure).toHaveBeenCalledWith('exec-1'));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledOnce());
+    expect(screen.getByRole('button', { name: 'Retry configuration' })).toBeDisabled();
+    getExecutor.mockResolvedValue({ ...executor, runtime_state: 'active', runtime_metadata: {} });
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    expect(await screen.findByText('No detailed runtime failures reported.')).toBeVisible();
+  });
+
+  it('keeps refresh available after a diagnostics fetch failure', async () => {
+    getExecutor.mockRejectedValue(new Error('Executor status unavailable'));
+    render(IssuesStrip, { issues: {
+      generated_at: '2026-08-22T00:00:00Z',
+      summary: { total: 1, warning: 1, critical: 0, info: 0, truncated: false },
+      issues: [{ id: 'exec-1', severity: 'warning', kind: 'executor_degraded',
+        title: 'Executor is degraded', detail: 'Degraded runtime', observed_at: null,
+        resource: { type: 'executor', id: 'exec-1', label: 'Executor' }, action_url: '/settings' }]
+    } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Show details' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Executor status unavailable');
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled();
   });
 
   it('retains regular warning and information notifications while showing a refresh error', () => {

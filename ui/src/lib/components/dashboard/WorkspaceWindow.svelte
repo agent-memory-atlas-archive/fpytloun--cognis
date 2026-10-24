@@ -6,9 +6,10 @@
   import PanelRightClose from 'lucide-svelte/icons/panel-right-close';
   import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
   import X from 'lucide-svelte/icons/x';
+  import { keepInViewport } from '$lib/actions/keep-in-viewport';
 
   import {
-    workspaceSnapTarget,
+    type WorkspaceInteraction,
     type WorkspaceManager,
     type WorkspacePreset,
     type WorkspaceSnapTarget,
@@ -35,18 +36,17 @@
     children: Snippet;
   }>();
 
-  let interaction = $state<{
-    kind: 'move' | 'resize';
+  let interaction = $state.raw<{
+    token: WorkspaceInteraction;
+    owner: WorkspaceManager;
     pointerId: number;
-    startX: number;
-    startY: number;
-    rect: WorkspaceWindowState['rect'];
     captureTarget: HTMLElement;
-    pointerRatioX: number;
-    titleOffsetY: number;
-    detached: boolean;
-    snapTarget: WorkspaceSnapTarget | null;
   } | null>(null);
+  let previewRect = $state<WorkspaceWindowState['rect'] | null>(null);
+  let pendingPointer: { x: number; y: number } | null = null;
+  let lastPointer: { x: number; y: number } | null = null;
+  let interactionFrame: number | null = null;
+  let lastSnapTarget: WorkspaceSnapTarget | null = null;
   let menuElement = $state<HTMLDetailsElement | null>(null);
   let panelElement = $state<HTMLDivElement | null>(null);
   let inspectorToggleElement = $state<HTMLButtonElement | null>(null);
@@ -71,6 +71,7 @@
     && manager.focusedTopVisibleKey() === current.key,
   );
   const interacting = $derived(interaction !== null);
+  const displayedRect = $derived(previewRect ?? current.rect);
   let seenFocusRevision = $state(0);
 
   $effect(() => {
@@ -106,8 +107,25 @@
   });
 
   onDestroy(() => {
+    finishInteraction(false, true);
     if (openingTimer) clearTimeout(openingTimer);
     if (restoreTimer) clearTimeout(restoreTimer);
+  });
+
+  $effect(() => {
+    // Observe canonical publications without treating metadata object identity as
+    // a geometry revision. The manager decides whether the session is obsolete.
+    $manager;
+    if (interaction && (interaction.owner !== manager
+        || interaction.token.key !== window.key
+        || !manager.isInteractionActive(interaction.token))) {
+      finishInteraction(false, true);
+    } else if (interaction && lastPointer) {
+      // Safe-area updates are reconciled by the manager without abandoning an
+      // otherwise valid gesture, even if no new pointer sample arrives.
+      pendingPointer = lastPointer;
+      if (interactionFrame === null) interactionFrame = requestAnimationFrame(() => flushPreview());
+    }
   });
 
   function minimize(): void {
@@ -122,7 +140,7 @@
   }
 
   function startInteraction(event: PointerEvent, kind: 'move' | 'resize'): void {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || interaction) return;
     if (
       kind === 'move'
       && event.target instanceof Element
@@ -130,72 +148,72 @@
     ) return;
     event.preventDefault();
     event.stopPropagation();
-    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
     manager.raise(current.key);
+    const token = manager.beginInteraction(current.key, kind, event.clientX, event.clientY);
+    if (!token) return;
+    const captureTarget = event.currentTarget as HTMLElement;
+    try {
+      captureTarget.setPointerCapture(event.pointerId);
+    } catch {
+      manager.abandonInteraction(token);
+      return;
+    }
     interaction = {
-      kind,
+      token,
+      owner: manager,
       pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      rect: { ...current.rect },
-      captureTarget: event.currentTarget as HTMLElement,
-      pointerRatioX: Math.max(0, Math.min(1, (event.clientX - current.rect.x) / current.rect.width)),
-      titleOffsetY: Math.max(0, event.clientY - current.rect.y),
-      detached: current.restoreRect === null,
-      snapTarget: null,
+      captureTarget,
     };
+  }
+
+  function flushPreview(notify = true): void {
+    interactionFrame = null;
+    const point = pendingPointer;
+    pendingPointer = null;
+    if (!interaction || !point) return;
+    const preview = interaction.owner.previewInteraction(interaction.token, point.x, point.y);
+    if (!preview) return;
+    previewRect = preview.rect;
+    if (preview.snapTarget !== lastSnapTarget) {
+      lastSnapTarget = preview.snapTarget;
+      if (notify) onSnapPreview?.(lastSnapTarget);
+    }
   }
 
   function moveInteraction(event: PointerEvent): void {
     if (!interaction || interaction.pointerId !== event.pointerId) return;
     event.preventDefault();
-    let dx = event.clientX - interaction.startX;
-    let dy = event.clientY - interaction.startY;
-    if (interaction.kind === 'move') {
-      if (!interaction.detached && Math.hypot(dx, dy) < 16) return;
-      if (!interaction.detached) {
-        const restored = manager.restoreForDrag(
-          current.key,
-          event.clientX,
-          event.clientY,
-          interaction.pointerRatioX,
-          interaction.titleOffsetY,
-        );
-        if (restored) {
-          interaction = {
-            ...interaction,
-            startX: event.clientX,
-            startY: event.clientY,
-            rect: restored,
-            detached: true,
-          };
-          dx = 0;
-          dy = 0;
-        }
-      }
-      const snapTarget = workspaceSnapTarget(
-        event.clientX,
-        event.clientY,
-        manager.getSafeRect(),
-      );
-      interaction = { ...interaction, snapTarget };
-      onSnapPreview?.(snapTarget);
-      manager.move(current.key, interaction.rect.x + dx, interaction.rect.y + dy);
-    } else {
-      manager.resize(current.key, interaction.rect.width + dx, interaction.rect.height + dy);
-    }
+    // Preserve the exact threshold-crossing anchor even when several pointer
+    // samples arrive before the next visual frame. This does no publication.
+    interaction.owner.previewInteraction(interaction.token, event.clientX, event.clientY);
+    pendingPointer = { x: event.clientX, y: event.clientY };
+    lastPointer = pendingPointer;
+    if (interactionFrame === null) interactionFrame = requestAnimationFrame(() => flushPreview());
   }
 
   function endInteraction(event: PointerEvent, cancelled = false): void {
     if (!interaction || interaction.pointerId !== event.pointerId) return;
+    finishInteraction(cancelled);
+  }
+
+  function finishInteraction(cancelled: boolean, abandon = false): void {
+    if (!interaction) return;
+    if (interactionFrame !== null) cancelAnimationFrame(interactionFrame);
+    interactionFrame = null;
+    if (!abandon) flushPreview(false);
     const finished = interaction;
-    if (interaction.captureTarget.hasPointerCapture?.(event.pointerId)) {
-      interaction.captureTarget.releasePointerCapture(event.pointerId);
-    }
+    // Clear ownership before release/callbacks: lostpointercapture can reenter.
     interaction = null;
-    const snap = finished.kind === 'move' && !cancelled ? finished.snapTarget : null;
+    pendingPointer = null;
+    lastPointer = null;
+    previewRect = null;
+    lastSnapTarget = null;
+    if (abandon) finished.owner.abandonInteraction(finished.token);
+    else finished.owner.finishInteraction(finished.token, cancelled);
+    if (finished.captureTarget.hasPointerCapture?.(finished.pointerId)) {
+      finished.captureTarget.releasePointerCapture(finished.pointerId);
+    }
     onSnapPreview?.(null);
-    if (snap) manager.applyPreset(current.key, snap);
   }
 
   function applyPreset(preset: WorkspacePreset): void {
@@ -208,13 +226,14 @@
   onpointermove={moveInteraction}
   onpointerup={endInteraction}
   onpointercancel={(event) => endInteraction(event, true)}
+  onblur={() => finishInteraction(true)}
 />
 
 <div
   bind:this={panelElement}
   aria-label={current.title}
   aria-modal="false"
-  class={`workspace-window pointer-events-auto fixed flex flex-col overflow-hidden rounded-2xl border bg-slate-950 ${focused ? 'border-sky-400/70 shadow-[0_24px_70px_rgba(0,0,0,0.65),0_0_0_1px_rgba(56,189,248,0.18)]' : 'border-slate-700/90 shadow-2xl'}`}
+  class={`workspace-window pointer-events-auto fixed flex flex-col overflow-hidden rounded-2xl border bg-elevated ${focused ? 'border-control-border/60 shadow-card' : 'border-separator/60 shadow-card'}`}
   data-focused={focused}
   data-interacting={interacting}
   data-testid={`workspace-window-${current.key}`}
@@ -223,7 +242,7 @@
   data-opening={opening}
   data-restoring={restoring}
   role="dialog"
-  style={`left:${current.rect.x}px;top:${current.rect.y}px;width:${current.rect.width}px;height:${current.rect.height}px;z-index:${70 + current.zOrder};pointer-events:${current.minimized ? 'none' : 'auto'};`}
+  style={`left:${displayedRect.x}px;top:${displayedRect.y}px;width:${displayedRect.width}px;height:${displayedRect.height}px;z-index:${70 + current.zOrder};pointer-events:${current.minimized ? 'none' : 'auto'};`}
   tabindex="-1"
   onpointerdown={() => manager.raise(current.key)}
   onanimationend={(event) => {
@@ -233,16 +252,17 @@
 >
   <header
     role="presentation"
-    class="app-keyboard-stable-header relative z-20 flex min-h-[40px] shrink-0 select-none items-center gap-1.5 border-b border-slate-800 bg-slate-900/95 px-2.5"
+    class="app-keyboard-stable-header relative z-20 flex min-h-[40px] shrink-0 select-none items-center gap-1.5 border-b border-separator bg-chrome/95 material-chrome px-2.5"
     data-testid={`workspace-window-drag-${current.key}`}
     style="touch-action:none"
     onpointerdown={(event) => startInteraction(event, 'move')}
     onpointerup={endInteraction}
     onpointercancel={(event) => endInteraction(event, true)}
+    onlostpointercapture={(event) => endInteraction(event, true)}
   >
     <div class="min-w-0 flex-1">
-      <h2 class="truncate text-sm font-semibold text-white">{current.title}</h2>
-      {#if current.status}<p class="truncate text-[10px] uppercase tracking-wide text-slate-400">{current.status}</p>{/if}
+      <h2 class="truncate text-sm font-semibold text-strong">{current.title}</h2>
+      {#if current.status}<p class="truncate text-[10px] uppercase tracking-wide text-muted">{current.status}</p>{/if}
     </div>
     {#if onToggleInspector}
       <button
@@ -250,7 +270,7 @@
         aria-label={inspectorExpanded ? 'Close conversation inspector' : 'Open conversation inspector'}
         aria-expanded={inspectorExpanded}
         aria-controls={inspectorControlsId}
-        class={`workspace-control grid place-items-center rounded-lg text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/70 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
+        class={`workspace-control grid place-items-center rounded-lg text-secondary hover:bg-raised hover:text-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
         data-testid={`workspace-window-inspector-${current.key}`}
         type="button"
         title={inspectorExpanded ? 'Close conversation inspector' : 'Open conversation inspector'}
@@ -261,7 +281,7 @@
     {/if}
     <a
       aria-label="Open full page"
-      class={`grid place-items-center rounded-lg text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/70 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
+      class={`grid place-items-center rounded-lg text-secondary hover:bg-raised hover:text-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
       data-testid={`workspace-window-external-${current.key}`}
       href={current.canonicalHref}
       title="Open full page"
@@ -269,16 +289,16 @@
     <details bind:this={menuElement} class="relative" onpointerdown={(event) => event.stopPropagation()}>
       <summary
         aria-label="Window layout"
-        class={`workspace-control workspace-control-layout grid cursor-pointer list-none place-items-center rounded-lg border border-emerald-400/20 bg-emerald-400/5 text-emerald-300/80 hover:border-emerald-300/50 hover:bg-emerald-400/15 hover:text-emerald-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
+        class={`workspace-control workspace-control-layout grid cursor-pointer list-none place-items-center rounded-lg border border-success-border bg-success-subtle text-success/80 hover:border-success-border hover:bg-success-subtle hover:text-success focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-success/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
         data-testid={`workspace-window-menu-${current.key}`}
         title="Window layout"
       >
         <LayoutGrid class="h-3.5 w-3.5" />
       </summary>
-      <div class="absolute right-0 top-full z-10 mt-1 w-40 rounded-xl border border-slate-700 bg-slate-900 p-1 shadow-xl" role="menu">
+      <div class="absolute right-0 top-full z-10 mt-1 w-40 rounded-xl border border-control-border bg-surface p-1 shadow-xl" role="menu" use:keepInViewport>
         {#each presets as item}
           <button
-            class="block w-full rounded-lg px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+            class="block w-full rounded-lg px-3 py-2 text-left text-sm text-foreground hover:bg-raised"
             role="menuitem"
             type="button"
             onclick={() => applyPreset(item[0])}
@@ -288,7 +308,7 @@
     </details>
     <button
       aria-label="Minimize"
-      class={`workspace-control grid place-items-center rounded-lg border border-amber-400/20 bg-amber-400/5 text-amber-300/80 hover:border-amber-300/50 hover:bg-amber-400/15 hover:text-amber-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
+      class={`workspace-control grid place-items-center rounded-lg border border-warning-border bg-warning-subtle text-warning/80 hover:border-warning-border hover:bg-warning-subtle hover:text-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-warning/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
       data-testid={`workspace-window-minimize-${current.key}`}
       type="button"
       title="Minimize"
@@ -296,7 +316,7 @@
     ><Minus class="h-4 w-4" /></button>
     <button
       aria-label="Close"
-      class={`workspace-control grid place-items-center rounded-lg border border-rose-400/20 bg-rose-400/5 text-rose-300/80 hover:border-rose-300/50 hover:bg-rose-400/15 hover:text-rose-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-300/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
+      class={`workspace-control grid place-items-center rounded-lg border border-danger-border bg-danger-subtle text-danger/80 hover:border-danger-border hover:bg-danger-subtle hover:text-danger focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger/60 ${largeControls ? 'h-[40px] w-[40px]' : 'h-8 w-8'}`}
       data-testid={`workspace-window-close-${current.key}`}
       type="button"
       title="Close"
@@ -310,13 +330,14 @@
 
   <button
     aria-label="Resize window"
-    class="touch-corner-resize absolute bottom-0 right-0 z-30 h-3 w-3 cursor-nwse-resize text-slate-500 hover:text-slate-200 focus-visible:bg-sky-400/30"
+    class="touch-corner-resize absolute bottom-0 right-0 z-30 h-3 w-3 cursor-nwse-resize text-quiet hover:text-foreground focus-visible:bg-accent-subtle"
     data-testid={`workspace-window-resize-${current.key}`}
     style="touch-action:none;width:12px;height:12px"
     type="button"
     onpointerdown={(event) => startInteraction(event, 'resize')}
     onpointerup={endInteraction}
     onpointercancel={(event) => endInteraction(event, true)}
+    onlostpointercapture={(event) => endInteraction(event, true)}
   >
     <svg
       aria-hidden="true"

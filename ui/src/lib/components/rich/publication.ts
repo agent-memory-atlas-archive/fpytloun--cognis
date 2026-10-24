@@ -164,11 +164,11 @@ function nestedMarkdownLevel(
   blockLevel: 2 | 3 | 4,
   firstSourceLevel: number,
   explicitTitle: boolean,
-): 3 | 4 {
+): 2 | 3 | 4 {
   const relative = explicitTitle
     ? heading.sourceLevel
-    : Math.max(1, heading.sourceLevel - firstSourceLevel);
-  return Math.min(4, blockLevel + relative) as 3 | 4;
+    : Math.max(0, heading.sourceLevel - firstSourceLevel);
+  return Math.min(4, blockLevel + relative) as 2 | 3 | 4;
 }
 
 export function buildTocItems(blocks: RichBlock[], depth: 2 | 3 | 4 = 2): TocItem[] {
@@ -182,7 +182,7 @@ export function buildTocItems(blocks: RichBlock[], depth: 2 | 3 | 4 = 2): TocIte
         const requestedAnchor = slugBase(String(block.id ?? block.anchor ?? title));
         const anchor = allocateId(requestedAnchor);
         items.push({ anchor, requestedAnchor, label: title, level, block });
-        if (type === 'markdown' && depth > level) {
+        if (type === 'markdown') {
           const headings = markdownHeadings(block);
           const start = blockTitle(block) ? 0 : 1;
           const firstSourceLevel = headings[0]?.sourceLevel ?? 1;

@@ -1,0 +1,17 @@
+[
+  {
+    "value": {},
+    "canonical_json": "{}",
+    "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  {
+    "value": {"z": null, "a": [true, false, 1, 1.0, "domeček"]},
+    "canonical_json": "{\"a\":[true,false,1,1.0,\"domeček\"],\"z\":null}",
+    "sha256": "cd3d318f80ec84af995a8e47876a2a5ac4fed4eee762014d5b0057d29885ac14"
+  },
+  {
+    "value": {"command": "printf %s café", "target_executor": "maitrea_riker"},
+    "canonical_json": "{\"command\":\"printf %s café\",\"target_executor\":\"maitrea_riker\"}",
+    "sha256": "911b26ea581564511620d726b35ee48a97a26d0b7aba2010c944802e251c07e3"
+  }
+]

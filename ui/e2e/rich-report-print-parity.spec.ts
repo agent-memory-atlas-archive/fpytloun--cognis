@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test';
 
 const build = resolve('standalone-build');
 const entry = JSON.parse(readFileSync(resolve(build, '.vite/manifest.json'), 'utf8'))['src/standalone.ts'];
+// Synthetic incident details exercise wrapping, alignment, and escaped arrows.
 const payload = {
   title: 'Saturation report',
   content: '',
@@ -14,19 +15,19 @@ const payload = {
       { type: 'key_value', variant: 'summary', items: Array.from({ length: 6 }, (_, i) => ({ label: `Metric ${i}`, value: `${i * 100}` })) },
       { type: 'markdown', content: 'A long paragraph about a measurable saturation event and its causes. '.repeat(20) },
       { type: 'timeline', title: 'How it got here', items: [
-        { time: '22 Sep', title: 'Started', description: 'The first event.' },
-        { time: '23–24 Sep', title: 'Continued', description: 'The second event.' },
-        { time: '24 Sep ~18:00', title: 'Exceeded threshold', description: 'The third event.' },
+        { time: 'Day 1', title: 'Started', description: 'The first event.' },
+        { time: 'Days 2–3', title: 'Continued', description: 'The second event.' },
+        { time: 'Day 3 ~17:00', title: 'Exceeded threshold', description: 'The third event.' },
       ] },
       { type: 'mermaid', title: 'Request flow', source: 'flowchart LR\n A["Source"] --&gt; B["Destination"]' },
-      { type: 'mermaid', title: 'The same job, two traversal modes', source: 'flowchart LR\n  subgraph NOW["TODAY: --no-traverse"]\n    A1["816,593 source files"] --&gt; A2["1 HEAD request\\nper file"]\n    A2 --&gt; A3["~786,000 S3 requests\\nper 10-min cycle"]\n  end\n  subgraph FIX["PROPOSED: listing"]\n    B1["816,593 source files"] --&gt; B2["paged LIST\\n1,000 keys per request"]\n    B2 --&gt; B3["~786 S3 requests\\nper 10-min cycle"]\n  end\n  A3 --&gt; R["1000x fewer requests"]\n  B3 --&gt; R' },
+      { type: 'mermaid', title: 'Example catalog, two lookup modes', source: 'flowchart LR\n  subgraph NOW["EXAMPLE: per-file lookup"]\n    A1["240,000 sample files"] --&gt; A2["1 HEAD request\\nper file"]\n    A2 --&gt; A3["240,000 requests\\nper 20-min cycle"]\n  end\n  subgraph FIX["EXAMPLE: batch listing"]\n    B1["240,000 sample files"] --&gt; B2["paged LIST\\n1,000 keys per request"]\n    B2 --&gt; B3["240 requests\\nper 20-min cycle"]\n  end\n  A3 --&gt; R["1000x fewer requests"]\n  B3 --&gt; R' },
       { type: 'incident_timeline', title: 'How it got here', items: [
-        { time: '22 Sep', title: 'logs-actalign deployed', description: 'Cycles complete in 83–142 s.' },
-        { time: '23–24 Sep', title: 'Backfill completes' },
-        { time: '24 Sep ~18:00', title: 'Threshold crossed' },
-        { time: '24 Sep ~20:00', title: 'Load steps 28 → 395' },
-        { time: '25 Sep 10:26', title: 'actalign cleanup armed' },
-        { time: '25 Sep 13:00', title: 'Still saturated' },
+        { time: 'Day 1', title: 'Sample indexer deployed', description: 'Example cycles complete in 60–90 s.' },
+        { time: 'Days 2–3', title: 'Sample import completes' },
+        { time: 'Day 3 ~17:00', title: 'Threshold crossed' },
+        { time: 'Day 3 ~19:00', title: 'Load steps 18 → 260' },
+        { time: 'Day 4 09:30', title: 'Sample cleanup queued' },
+        { time: 'Day 4 12:00', title: 'Load recovering' },
       ] },
       { type: 'steps', title: 'Remediation', items: [
         { title: '1. Reduce workers', description: 'Measure the result.' },
@@ -81,5 +82,9 @@ for (const width of [390, 1440]) {
       for (const { date, title } of incidentPositions) expect(title!.y).toBeGreaterThan(date!.y);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    await page.emulateMedia({ media: 'print' });
+    await expect(page.locator('.rich-mermaid svg')).toHaveCount(2);
+    await expect(page.getByRole('heading', { name: 'Saturation report', exact: true })).toBeVisible();
+    await expect(page.locator('.theme-control')).toBeHidden();
   });
 }

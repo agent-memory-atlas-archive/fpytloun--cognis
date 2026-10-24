@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { findTarget } from '$lib/find';
   import { goto } from '$app/navigation';
   import Download from 'lucide-svelte/icons/download';
   import ExternalLink from 'lucide-svelte/icons/external-link';
@@ -16,6 +17,7 @@
   import X from 'lucide-svelte/icons/x';
 
   import { api } from '$lib/api/client';
+  import { keepInViewport } from '$lib/actions/keep-in-viewport';
   import {
     clearSkillWorkflowDraft,
     createEmptyKeyValueEntry,
@@ -43,7 +45,7 @@
   type SkillSheetMode = 'view' | 'edit' | 'create';
   type SkillExportFormat = 'skill_md' | 'cognis_yaml' | 'cognis_package';
   const tooltipButtonClass =
-    'inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5';
+    'inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5';
 
   let {
     open,
@@ -583,20 +585,21 @@
   onClose={() => void handleSheetClose()}
   label={activeMode === 'create' ? 'Create skill' : skill ? `${skill.name} skill details` : 'Skill details'}
   titleId="skill-detail-title"
+  backdropDismissible={!((activeMode === 'edit' || activeMode === 'create') && isDirty)}
   panelClass="max-w-6xl"
 >
   {#snippet header()}
     <div class="flex flex-col gap-3">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p class="text-sm font-semibold text-slate-100" id="skill-detail-title">
+          <p class="text-sm font-semibold text-foreground" id="skill-detail-title">
             {#if activeMode === 'create'}
               New Skill
             {:else}
               {skill?.name ?? 'Skill'}
             {/if}
           </p>
-          <p class="mt-1 text-xs text-slate-400">
+          <p class="mt-1 text-xs text-muted">
             {#if activeMode === 'create'}
               Create a reusable skill with instructions, optional tool recipes, assets, and workflow material.
             {:else if activeMode === 'edit'}
@@ -611,16 +614,16 @@
             <div class="flex flex-wrap items-center justify-end gap-2">
               <Badge>{skill.source}</Badge>
               {#if skill.is_system}
-                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">system</Badge>
+                <Badge class="border-accent/30 bg-accent-subtle text-accent">system</Badge>
               {/if}
               {#if skill.attach_to_all_agents ?? skill.auto_load}
-                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">attached to all agents</Badge>
+                <Badge class="border-accent/30 bg-accent-subtle text-accent">attached to all agents</Badge>
               {/if}
               {#if savedSteps.length > 0}
-                <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>
+                <Badge class="border-success-border bg-success-subtle text-success">workflow</Badge>
               {/if}
               {#if currentVersion?.decomposition_stale}
-                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">decomposition stale</Badge>
+                <Badge class="border-accent/30 bg-accent-subtle text-accent">decomposition stale</Badge>
               {/if}
             </div>
           {/if}
@@ -644,14 +647,14 @@
                 <Download class="mr-1 h-4 w-4" /> Export
               </Button>
               {#if exportMenuOpen}
-                <div class="absolute right-0 top-full z-10 mt-2 w-48 rounded-2xl border border-slate-800 bg-slate-950 p-1 shadow-card">
-                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-900" onclick={() => void downloadExport('skill_md')}>
+                <div class="absolute right-0 top-full z-10 mt-2 w-48 rounded-2xl border border-separator bg-canvas p-1 shadow-card" use:keepInViewport>
+                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-foreground hover:bg-surface" onclick={() => void downloadExport('skill_md')}>
                     SKILL.md
                   </button>
-                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-900" onclick={() => void downloadExport('cognis_yaml')}>
+                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-foreground hover:bg-surface" onclick={() => void downloadExport('cognis_yaml')}>
                     Cognis YAML
                   </button>
-                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-900" onclick={() => void downloadExport('cognis_package')}>
+                  <button class="flex w-full items-center rounded-xl px-3 py-2 text-left text-sm text-foreground hover:bg-surface" onclick={() => void downloadExport('cognis_package')}>
                     Full package
                   </button>
                 </div>
@@ -678,18 +681,18 @@
   {#snippet children()}
   <div class="space-y-5 text-sm">
     {#if activeMode === 'view' && skill}
-      <section class="space-y-2 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-        <div class="flex items-center gap-2 text-slate-200">
-          <FileText class="h-4 w-4 text-slate-400" />
+      <section class="space-y-2 rounded-2xl border border-separator bg-canvas/70 p-4">
+        <div class="flex items-center gap-2 text-foreground">
+          <FileText class="h-4 w-4 text-muted" />
           <h3 class="font-medium">Instructions</h3>
         </div>
-        <pre class="overflow-x-auto whitespace-pre-wrap rounded-xl bg-slate-900 p-3 text-xs text-slate-200">{currentVersion?.instructions ?? skill.instructions}</pre>
+        <pre class="overflow-x-auto whitespace-pre-wrap rounded-xl bg-surface p-3 text-xs text-foreground">{currentVersion?.instructions ?? skill.instructions}</pre>
       </section>
 
       <section class="grid gap-4 lg:grid-cols-2">
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div class="flex items-center gap-2 text-slate-200">
-            <Wrench class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+          <div class="flex items-center gap-2 text-foreground">
+            <Wrench class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Tools</h3>
             <Tooltip placement="bottom" text="Optional executable tools bundled with this skill. Most skills only need instructions. Add tools when a skill should expose reusable commands on the executor.">
               <button aria-label="Tools help" class={tooltipButtonClass} title="Tools help" type="button"><Info class="h-4 w-4" /></button>
@@ -698,24 +701,24 @@
           {#if currentVersion?.tools && currentVersion.tools.length > 0}
             <div class="space-y-2">
               {#each currentVersion.tools as tool}
-                <div class="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+                <div class="rounded-xl border border-separator bg-surface/80 p-3">
                   <div class="flex flex-wrap items-center gap-2">
-                    <p class="font-medium text-slate-100">{String(tool.name ?? 'Unnamed tool')}</p>
+                    <p class="font-medium text-foreground">{String(tool.name ?? 'Unnamed tool')}</p>
                     {#if tool.read_only}
                       <Badge>read-only</Badge>
                     {/if}
                     {#if tool.recipe && typeof tool.recipe === 'object' && tool.recipe !== null}
-                      <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{String((tool.recipe as Record<string, unknown>).mode ?? 'recipe')}</Badge>
+                      <Badge class="border-accent/30 bg-accent-subtle text-accent">{String((tool.recipe as Record<string, unknown>).mode ?? 'recipe')}</Badge>
                     {/if}
                   </div>
-                  <p class="mt-1 text-xs text-slate-400">{String(tool.description ?? '')}</p>
+                  <p class="mt-1 text-xs text-muted">{String(tool.description ?? '')}</p>
                   {#if tool.parameters && typeof tool.parameters === 'object' && tool.parameters !== null && Object.keys((tool.parameters as Record<string, unknown>).properties ?? {}).length > 0}
                     <div class="mt-3 flex flex-wrap gap-2 text-xs">
                       {#each Object.entries(((tool.parameters as Record<string, unknown>).properties ?? {}) as Record<string, unknown>) as [parameterName, parameter]}
-                        <span class="rounded-full border border-slate-700 bg-slate-950 px-2 py-1 text-slate-300">
+                        <span class="rounded-full border border-control-border bg-canvas px-2 py-1 text-secondary">
                           {parameterName}
                           {#if typeof (parameter as Record<string, unknown>).type === 'string'}
-                            <span class="text-slate-500"> · {(parameter as Record<string, unknown>).type}</span>
+                            <span class="text-quiet"> · {(parameter as Record<string, unknown>).type}</span>
                           {/if}
                         </span>
                       {/each}
@@ -725,13 +728,13 @@
               {/each}
             </div>
           {:else}
-            <p class="text-xs text-slate-500">No executable tools bundled with this skill.</p>
+            <p class="text-xs text-quiet">No executable tools bundled with this skill.</p>
           {/if}
         </div>
 
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div class="flex items-center gap-2 text-slate-200">
-            <Wrench class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+          <div class="flex items-center gap-2 text-foreground">
+            <Wrench class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Linked Runtime Tools</h3>
             <Tooltip placement="bottom" text="Existing registry tools that this skill should expose when it is attached or loaded. These are not bundled with the skill package itself.">
               <button aria-label="Linked tools help" class={tooltipButtonClass} title="Linked tools help" type="button"><Info class="h-4 w-4" /></button>
@@ -744,19 +747,19 @@
               {/each}
             </div>
           {:else}
-            <p class="text-xs text-slate-500">No linked runtime tools configured.</p>
+            <p class="text-xs text-quiet">No linked runtime tools configured.</p>
           {/if}
         </div>
 
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div class="flex items-center gap-2 text-slate-200">
-            <Layers class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+          <div class="flex items-center gap-2 text-foreground">
+            <Layers class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Templates And Secrets</h3>
           </div>
 
           <div>
             <div class="flex items-center gap-2">
-              <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Prompt templates</p>
+              <p class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Prompt templates</p>
               <Tooltip placement="bottom" text="Named text snippets stored on the skill. These help with reusable prompts or sub-prompts without cluttering the main instructions.">
                 <button aria-label="Prompt templates help" class={tooltipButtonClass} title="Prompt templates help" type="button"><Info class="h-4 w-4" /></button>
               </Tooltip>
@@ -764,20 +767,20 @@
             {#if currentVersion?.prompt_templates && Object.keys(currentVersion.prompt_templates).length > 0}
               <div class="mt-2 space-y-2">
                 {#each Object.entries(currentVersion.prompt_templates) as [key, value]}
-                  <div class="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-                    <p class="font-medium text-slate-100">{key}</p>
-                    <pre class="mt-2 whitespace-pre-wrap text-xs text-slate-300">{String(value)}</pre>
+                  <div class="rounded-xl border border-separator bg-surface/80 p-3">
+                    <p class="font-medium text-foreground">{key}</p>
+                    <pre class="mt-2 whitespace-pre-wrap text-xs text-secondary">{String(value)}</pre>
                   </div>
                 {/each}
               </div>
             {:else}
-              <p class="mt-2 text-xs text-slate-500">No prompt templates saved.</p>
+              <p class="mt-2 text-xs text-quiet">No prompt templates saved.</p>
             {/if}
           </div>
 
           <div>
             <div class="flex items-center gap-2">
-              <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Secret placeholders</p>
+              <p class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Secret placeholders</p>
               <Tooltip placement="bottom" text="Names of secrets that the executor may inject as environment variables when this skill's tool recipes run. These are placeholders only, never the secret values themselves.">
                 <button aria-label="Secret placeholders help" class={tooltipButtonClass} title="Secret placeholders help" type="button"><Info class="h-4 w-4" /></button>
               </Tooltip>
@@ -789,116 +792,116 @@
                 {/each}
               </div>
             {:else}
-              <p class="mt-2 text-xs text-slate-500">No secret placeholders declared.</p>
+              <p class="mt-2 text-xs text-quiet">No secret placeholders declared.</p>
             {/if}
           </div>
         </div>
       </section>
     {:else}
-      <section class="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <section class="space-y-4 rounded-2xl border border-separator bg-canvas/70 p-4">
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="space-y-2 text-sm text-slate-200">
+          <label class="space-y-2 text-sm text-foreground">
             <span>Name</span>
-            <input bind:value={form.name} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="e.g. git-release" type="text" />
+            <input bind:value={form.name} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="e.g. git-release" type="text" />
           </label>
-          <label class="space-y-2 text-sm text-slate-200">
+          <label class="space-y-2 text-sm text-foreground">
             <span>Tags</span>
-            <input bind:value={form.tagsText} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="release, automation" type="text" />
+            <input bind:value={form.tagsText} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="release, automation" type="text" />
           </label>
         </div>
 
-        <label class="space-y-2 text-sm text-slate-200">
+        <label class="space-y-2 text-sm text-foreground">
           <span>Description</span>
-          <input bind:value={form.description} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="What this skill is for" type="text" />
+          <input bind:value={form.description} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="What this skill is for" type="text" />
         </label>
 
-        <label class="space-y-2 text-sm text-slate-200">
+        <label class="space-y-2 text-sm text-foreground">
           <span>Instructions</span>
-          <textarea bind:value={form.instructions} rows="10" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="# Skill instructions"></textarea>
+          <textarea bind:value={form.instructions} rows="10" class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="# Skill instructions"></textarea>
         </label>
 
-        <label class="space-y-1 text-sm text-slate-300">
+        <label class="space-y-1 text-sm text-secondary">
           <span class="flex items-center gap-2">
-            <input bind:checked={form.attachToAllAgents} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
+            <input bind:checked={form.attachToAllAgents} class="rounded border-control-border bg-canvas" type="checkbox" />
             Globally attach to every agent
           </span>
-          <span class="block pl-6 text-xs text-slate-500">
+          <span class="block pl-6 text-xs text-quiet">
             Use rarely for universal platform skills only. This does not preload the skill's full instructions.
           </span>
         </label>
       </section>
 
       <section class="grid gap-4 xl:grid-cols-2">
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 xl:col-span-2">
-          <div class="flex items-center gap-2 text-slate-200">
-            <Wrench class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4 xl:col-span-2">
+          <div class="flex items-center gap-2 text-foreground">
+            <Wrench class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Linked Runtime Tools</h3>
             <Tooltip placement="bottom" text="Select existing builtin or MCP tools that should become available when this skill is attached or loaded. This is separate from bundled executable tools below.">
               <button aria-label="Linked runtime tools help" class={tooltipButtonClass} title="Linked runtime tools help" type="button"><Info class="h-4 w-4" /></button>
             </Tooltip>
           </div>
-          <input bind:value={linkedToolSearch} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Search existing tools by name, source, category, or id" type="text" />
+          <input use:findTarget bind:value={linkedToolSearch} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Search existing tools by name, source, category, or id" type="text" />
           {#if form.linkedToolIds.length > 0}
             <div class="flex flex-wrap gap-2">
               {#each form.linkedToolIds as toolId}
-                <span class="inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+                <span class="inline-flex items-center gap-1 rounded-full border border-control-border bg-surface px-2 py-1 text-xs text-foreground">
                   {linkedToolDisplay(toolId)}
-                  <button class="text-slate-500 hover:text-rose-300" onclick={() => toggleLinkedTool(toolId)} type="button"><X class="h-3.5 w-3.5" /></button>
+                  <button class="text-quiet hover:text-danger" onclick={() => toggleLinkedTool(toolId)} type="button"><X class="h-3.5 w-3.5" /></button>
                 </span>
               {/each}
             </div>
           {:else}
-            <p class="text-xs text-slate-500">No linked runtime tools selected yet.</p>
+            <p class="text-xs text-quiet">No linked runtime tools selected yet.</p>
           {/if}
-          <div class="max-h-72 space-y-2 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40 p-2">
+          <div class="max-h-72 space-y-2 overflow-y-auto rounded-xl border border-separator bg-canvas/40 p-2">
             {#if filteredLinkedTools.length > 0}
               {#each filteredLinkedTools as tool}
-                <label class="flex cursor-pointer items-start justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3 text-sm text-slate-200">
+                <label class="flex cursor-pointer items-start justify-between gap-3 rounded-xl border border-separator bg-surface/80 p-3 text-sm text-foreground">
                   <div class="min-w-0 space-y-1">
                     <div class="flex flex-wrap items-center gap-2">
-                      <span class="font-medium text-slate-100">{tool.name}</span>
+                      <span class="font-medium text-foreground">{tool.name}</span>
                       <Badge>{tool.category}</Badge>
                       {#if tool.profile_group}<Badge>{tool.profile_group}</Badge>{/if}
                       <Badge>{tool.source?.server_name || tool.source?.type || 'tool'}</Badge>
                     </div>
-                    <p class="text-xs text-slate-400">{tool.description}</p>
-                    {#if tool.tool_id}<p class="font-mono text-[11px] text-slate-500">{tool.tool_id}</p>{/if}
+                    <p class="text-xs text-muted">{tool.description}</p>
+                    {#if tool.tool_id}<p class="font-mono text-[11px] text-quiet">{tool.tool_id}</p>{/if}
                   </div>
-                  <input checked={Boolean(tool.tool_id && form.linkedToolIds.includes(tool.tool_id))} class="mt-1 rounded border-slate-600 bg-slate-950" disabled={!tool.tool_id} onchange={() => tool.tool_id && toggleLinkedTool(tool.tool_id)} type="checkbox" />
+                  <input checked={Boolean(tool.tool_id && form.linkedToolIds.includes(tool.tool_id))} class="mt-1 rounded border-control-border bg-canvas" disabled={!tool.tool_id} onchange={() => tool.tool_id && toggleLinkedTool(tool.tool_id)} type="checkbox" />
                 </label>
               {/each}
             {:else}
-              <p class="px-2 py-1 text-xs text-slate-500">No matching existing tools.</p>
+              <p class="px-2 py-1 text-xs text-quiet">No matching existing tools.</p>
             {/if}
           </div>
         </div>
 
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div class="flex items-center gap-2 text-slate-200">
-            <Layers class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+          <div class="flex items-center gap-2 text-foreground">
+            <Layers class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Prompt Templates</h3>
             <Tooltip placement="bottom" text="Optional named snippets stored with the skill. Useful for reusable prompts or canned sub-prompts.">
               <button aria-label="Prompt templates help" class={tooltipButtonClass} title="Prompt templates help" type="button"><Info class="h-4 w-4" /></button>
             </Tooltip>
           </div>
           {#if form.promptTemplates.length === 0}
-            <p class="text-xs text-slate-500">No prompt templates yet.</p>
+            <p class="text-xs text-quiet">No prompt templates yet.</p>
           {/if}
           {#each form.promptTemplates as template}
-            <div class="space-y-2 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+            <div class="space-y-2 rounded-xl border border-separator bg-surface/80 p-3">
               <div class="flex items-center gap-2">
-                <input bind:value={template.key} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Template name" type="text" />
-                <button class="text-slate-500 hover:text-rose-300" onclick={() => removePromptTemplate(template.id)} type="button"><X class="h-4 w-4" /></button>
+                <input bind:value={template.key} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Template name" type="text" />
+                <button class="text-quiet hover:text-danger" onclick={() => removePromptTemplate(template.id)} type="button"><X class="h-4 w-4" /></button>
               </div>
-              <textarea bind:value={template.value} rows="4" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Template text"></textarea>
+              <textarea bind:value={template.value} rows="4" class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Template text"></textarea>
             </div>
           {/each}
           <Button size="sm" variant="secondary" onclick={addPromptTemplate}><Plus class="mr-1 h-4 w-4" /> Add template</Button>
         </div>
 
-        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-          <div class="flex items-center gap-2 text-slate-200">
-            <FileText class="h-4 w-4 text-slate-400" />
+        <div class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+          <div class="flex items-center gap-2 text-foreground">
+            <FileText class="h-4 w-4 text-muted" />
             <h3 class="font-medium">Secret Placeholders</h3>
             <Tooltip placement="bottom" text="Names of secrets that the executor can inject as environment variables when the skill's tool recipes run. Put names like GITHUB_TOKEN here, never actual values.">
               <button aria-label="Secret placeholders help" class={tooltipButtonClass} title="Secret placeholders help" type="button"><Info class="h-4 w-4" /></button>
@@ -907,7 +910,7 @@
           <div class="flex gap-2">
             <input
               bind:value={secretDraft}
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
               onkeydown={(event) => {
                 if (event.key === 'Enter' || event.key === ',') {
                   event.preventDefault();
@@ -922,81 +925,81 @@
           {#if form.secretPlaceholders.length > 0}
             <div class="flex flex-wrap gap-2">
               {#each form.secretPlaceholders as placeholder}
-                <span class="inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+                <span class="inline-flex items-center gap-1 rounded-full border border-control-border bg-surface px-2 py-1 text-xs text-foreground">
                   {placeholder}
-                  <button class="text-slate-500 hover:text-rose-300" onclick={() => removeSecretPlaceholder(placeholder)} type="button"><X class="h-3.5 w-3.5" /></button>
+                  <button class="text-quiet hover:text-danger" onclick={() => removeSecretPlaceholder(placeholder)} type="button"><X class="h-3.5 w-3.5" /></button>
                 </span>
               {/each}
             </div>
           {:else}
-            <p class="text-xs text-slate-500">No placeholders declared yet.</p>
+            <p class="text-xs text-quiet">No placeholders declared yet.</p>
           {/if}
         </div>
       </section>
 
-      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-        <div class="flex items-center gap-2 text-slate-200">
-          <Wrench class="h-4 w-4 text-slate-400" />
+      <section class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+        <div class="flex items-center gap-2 text-foreground">
+          <Wrench class="h-4 w-4 text-muted" />
           <h3 class="font-medium">Skill Tools</h3>
           <Tooltip placement="bottom" text="Use skill tools only when the skill should expose reusable executor-side commands. This editor covers the common skill tool shape without making you write raw JSON.">
             <button aria-label="Skill tools help" class={tooltipButtonClass} title="Skill tools help" type="button"><Info class="h-4 w-4" /></button>
           </Tooltip>
         </div>
         {#if editableToolCards().length === 0}
-          <p class="text-xs text-slate-500">No tools yet. Many skills work fine with instructions only.</p>
+          <p class="text-xs text-quiet">No tools yet. Many skills work fine with instructions only.</p>
         {/if}
         {#each editableToolCards() as tool}
-          <div class="space-y-4 rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
+          <div class="space-y-4 rounded-2xl border border-separator bg-surface/80 p-4">
             <div class="flex items-center justify-between gap-3">
-              <p class="font-medium text-slate-100">{tool.name || 'New tool'}</p>
-              <button class="text-slate-500 hover:text-rose-300" onclick={() => removeTool(tool.id)} type="button"><Trash2 class="h-4 w-4" /></button>
+              <p class="font-medium text-foreground">{tool.name || 'New tool'}</p>
+              <button class="text-quiet hover:text-danger" onclick={() => removeTool(tool.id)} type="button"><Trash2 class="h-4 w-4" /></button>
             </div>
 
             <div class="grid gap-4 md:grid-cols-2">
-              <label class="space-y-2 text-sm text-slate-200">
+              <label class="space-y-2 text-sm text-foreground">
                 <span>Tool name</span>
-                <input bind:value={tool.name} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="publish_release" type="text" />
+                <input bind:value={tool.name} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="publish_release" type="text" />
               </label>
-              <label class="space-y-2 text-sm text-slate-200">
+              <label class="space-y-2 text-sm text-foreground">
                 <span>Description</span>
-                <input bind:value={tool.description} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="What the tool does" type="text" />
+                <input bind:value={tool.description} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="What the tool does" type="text" />
               </label>
             </div>
 
             <div class="grid gap-4 md:grid-cols-4">
-              <label class="space-y-2 text-sm text-slate-200">
+              <label class="space-y-2 text-sm text-foreground">
                 <span>Timeout (s)</span>
-                <input bind:value={tool.timeoutSeconds} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" min="1" type="number" />
+                <input bind:value={tool.timeoutSeconds} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" min="1" type="number" />
               </label>
-              <label class="space-y-2 text-sm text-slate-200">
+              <label class="space-y-2 text-sm text-foreground">
                 <span>Max result size</span>
-                <input bind:value={tool.maxResultSize} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" min="1" type="number" />
+                <input bind:value={tool.maxResultSize} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" min="1" type="number" />
               </label>
-              <label class="flex items-center gap-2 text-sm text-slate-300 md:self-end">
-                <input bind:checked={tool.readOnly} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
+              <label class="flex items-center gap-2 text-sm text-secondary md:self-end">
+                <input bind:checked={tool.readOnly} class="rounded border-control-border bg-canvas" type="checkbox" />
                 Read-only
               </label>
-              <label class="flex items-center gap-2 text-sm text-slate-300 md:self-end">
-                <input bind:checked={tool.nonBypassable} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
+              <label class="flex items-center gap-2 text-sm text-secondary md:self-end">
+                <input bind:checked={tool.nonBypassable} class="rounded border-control-border bg-canvas" type="checkbox" />
                 Always guardrail-check
               </label>
             </div>
 
-            <div class="space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+            <div class="space-y-3 rounded-xl border border-separator bg-canvas/60 p-3">
               <div class="flex items-center justify-between gap-2">
                 <div>
-                  <p class="text-sm font-medium text-slate-100">Parameters</p>
-                  <p class="text-xs text-slate-500">Common object-style tool inputs.</p>
+                  <p class="text-sm font-medium text-foreground">Parameters</p>
+                  <p class="text-xs text-quiet">Common object-style tool inputs.</p>
                 </div>
                 <Button size="sm" variant="secondary" onclick={() => addToolParameter(tool.id)}><Plus class="mr-1 h-4 w-4" /> Add parameter</Button>
               </div>
               {#if tool.parameters.length === 0}
-                <p class="text-xs text-slate-500">No parameters yet.</p>
+                <p class="text-xs text-quiet">No parameters yet.</p>
               {/if}
               {#each tool.parameters as parameter}
-                <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3 md:grid-cols-[1.2fr,0.8fr,1.6fr,auto]">
-                  <input bind:value={parameter.name} class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Parameter name" type="text" />
-                  <select bind:value={parameter.type} class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <div class="grid gap-3 rounded-xl border border-separator bg-surface/80 p-3 md:grid-cols-[1.2fr,0.8fr,1.6fr,auto]">
+                  <input bind:value={parameter.name} class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Parameter name" type="text" />
+                  <select bind:value={parameter.type} class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
                     <option value="string">string</option>
                     <option value="number">number</option>
                     <option value="integer">integer</option>
@@ -1005,82 +1008,82 @@
                     <option value="object">object</option>
                   </select>
                   <div class="space-y-2">
-                    <input bind:value={parameter.description} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Description" type="text" />
-                    <input bind:value={parameter.enumText} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Enum values (comma-separated, optional)" type="text" />
+                    <input bind:value={parameter.description} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Description" type="text" />
+                    <input bind:value={parameter.enumText} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="Enum values (comma-separated, optional)" type="text" />
                   </div>
                   <div class="flex items-center justify-between gap-2 md:flex-col md:items-end">
-                    <label class="flex items-center gap-2 text-xs text-slate-300">
-                      <input bind:checked={parameter.required} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
+                    <label class="flex items-center gap-2 text-xs text-secondary">
+                      <input bind:checked={parameter.required} class="rounded border-control-border bg-canvas" type="checkbox" />
                       Required
                     </label>
-                    <button class="text-slate-500 hover:text-rose-300" onclick={() => removeToolParameter(tool.id, parameter.id)} type="button"><X class="h-4 w-4" /></button>
+                    <button class="text-quiet hover:text-danger" onclick={() => removeToolParameter(tool.id, parameter.id)} type="button"><X class="h-4 w-4" /></button>
                   </div>
                 </div>
               {/each}
             </div>
 
-            <div class="space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+            <div class="space-y-3 rounded-xl border border-separator bg-canvas/60 p-3">
               <div class="flex items-center gap-2">
-                <p class="text-sm font-medium text-slate-100">Execution recipe</p>
+                <p class="text-sm font-medium text-foreground">Execution recipe</p>
                 <Tooltip placement="bottom" text="Recipes tell the executor how to run this tool. Leave this off if you are only drafting a tool shape for later.">
                   <button aria-label="Execution recipe help" class={tooltipButtonClass} title="Execution recipe help" type="button"><Info class="h-4 w-4" /></button>
                 </Tooltip>
               </div>
 
               <div class="grid gap-4 md:grid-cols-2">
-                <label class="space-y-2 text-sm text-slate-200">
+                <label class="space-y-2 text-sm text-foreground">
                   <span>Recipe mode</span>
-                  <select bind:value={tool.recipeMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <select bind:value={tool.recipeMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
                     <option value="none">No recipe</option>
                     <option value="script">Script</option>
                     <option value="command">Command</option>
                   </select>
                 </label>
-                <label class="space-y-2 text-sm text-slate-200">
+                <label class="space-y-2 text-sm text-foreground">
                   <span>{tool.recipeMode === 'script' ? 'Entry script path' : 'Entry command'}</span>
-                  <input bind:value={tool.entry} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder={tool.recipeMode === 'script' ? 'scripts/release.sh' : 'git'} type="text" />
+                  <input bind:value={tool.entry} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder={tool.recipeMode === 'script' ? 'scripts/release.sh' : 'git'} type="text" />
                 </label>
               </div>
 
               {#if tool.recipeMode !== 'none'}
                 <div class="grid gap-4 md:grid-cols-2">
-                  <label class="space-y-2 text-sm text-slate-200">
+                  <label class="space-y-2 text-sm text-foreground">
                     <span>Arguments</span>
-                    <textarea bind:value={tool.argsText} rows="3" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="One per line"></textarea>
+                    <textarea bind:value={tool.argsText} rows="3" class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="One per line"></textarea>
                   </label>
-                  <label class="space-y-2 text-sm text-slate-200">
+                  <label class="space-y-2 text-sm text-foreground">
                     <span>Working directory</span>
-                    <input bind:value={tool.workingDir} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="scripts" type="text" />
+                    <input bind:value={tool.workingDir} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="scripts" type="text" />
                   </label>
                 </div>
 
                 <div class="grid gap-4 md:grid-cols-2">
-                  <label class="space-y-2 text-sm text-slate-200">
+                  <label class="space-y-2 text-sm text-foreground">
                     <span>Required assets</span>
-                    <textarea bind:value={tool.requiredAssetsText} rows="3" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="One relative path per line"></textarea>
+                    <textarea bind:value={tool.requiredAssetsText} rows="3" class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="One relative path per line"></textarea>
                   </label>
-                  <label class="space-y-2 text-sm text-slate-200">
+                  <label class="space-y-2 text-sm text-foreground">
                     <span>Recipe secret placeholders</span>
-                    <textarea bind:value={tool.secretPlaceholdersText} rows="3" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="One secret name per line"></textarea>
+                    <textarea bind:value={tool.secretPlaceholdersText} rows="3" class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="One secret name per line"></textarea>
                   </label>
                 </div>
 
                 <div class="space-y-3">
                   <div class="flex items-center justify-between gap-2">
                     <div>
-                      <p class="text-sm font-medium text-slate-100">Recipe environment variables</p>
-                      <p class="text-xs text-slate-500">Extra static environment values passed to the command.</p>
+                      <p class="text-sm font-medium text-foreground">Recipe environment variables</p>
+                      <p class="text-xs text-quiet">Extra static environment values passed to the command.</p>
                     </div>
                     <Button size="sm" variant="secondary" onclick={() => addToolEnvEntry(tool.id)}><Plus class="mr-1 h-4 w-4" /> Add env</Button>
                   </div>
                   {#if tool.env.length === 0}
-                    <p class="text-xs text-slate-500">No static env entries yet.</p>
+                    <p class="text-xs text-quiet">No static env entries yet.</p>
                   {/if}
                   {#each tool.env as entry}
-                    <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3 md:grid-cols-[1fr,1fr,auto]">
-                      <input bind:value={entry.key} class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="KEY" type="text" />
-                      <input bind:value={entry.value} class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="value" type="text" />
-                      <button class="text-slate-500 hover:text-rose-300" onclick={() => removeToolEnvEntry(tool.id, entry.id)} type="button"><X class="h-4 w-4" /></button>
+                    <div class="grid gap-3 rounded-xl border border-separator bg-surface/80 p-3 md:grid-cols-[1fr,1fr,auto]">
+                      <input bind:value={entry.key} class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="KEY" type="text" />
+                      <input bind:value={entry.value} class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" placeholder="value" type="text" />
+                      <button class="text-quiet hover:text-danger" onclick={() => removeToolEnvEntry(tool.id, entry.id)} type="button"><X class="h-4 w-4" /></button>
                     </div>
                   {/each}
                 </div>
@@ -1091,13 +1094,13 @@
         <Button size="sm" variant="secondary" onclick={addTool}><Plus class="mr-1 h-4 w-4" /> Add tool</Button>
       </section>
 
-      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <section class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
         <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <p class="text-sm font-medium text-slate-100">Assets</p>
-            <p class="text-xs text-slate-500">Upload files once. Cognis versions them and stages them onto executors only when needed.</p>
+            <p class="text-sm font-medium text-foreground">Assets</p>
+            <p class="text-xs text-quiet">Upload files once. Cognis versions them and stages them onto executors only when needed.</p>
           </div>
-          <label class="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-600">
+          <label class="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-control-border px-3 py-2 text-sm text-foreground hover:border-control-border">
             <Upload class="h-4 w-4" /> Add files
             <input type="file" multiple class="hidden" onchange={uploadSkillAssets} />
           </label>
@@ -1105,33 +1108,33 @@
         {#if form.assets.length > 0}
           <div class="space-y-2">
             {#each form.assets as asset}
-              <div class="flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-900/80 p-3 md:flex-row md:items-center md:justify-between">
+              <div class="flex flex-col gap-2 rounded-xl border border-separator bg-surface/80 p-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <p class="font-mono text-xs text-slate-100">{asset.filename}</p>
-                  <p class="mt-1 text-xs text-slate-500">{asset.content_type || 'application/octet-stream'}{#if asset.size_bytes} · {asset.size_bytes} bytes{/if}</p>
+                  <p class="font-mono text-xs text-foreground">{asset.filename}</p>
+                  <p class="mt-1 text-xs text-quiet">{asset.content_type || 'application/octet-stream'}{#if asset.size_bytes} · {asset.size_bytes} bytes{/if}</p>
                 </div>
-                <button class="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-rose-300" type="button" onclick={() => removeSkillAsset(asset.filename)}>
+                <button class="inline-flex items-center gap-1 text-xs text-muted hover:text-danger" type="button" onclick={() => removeSkillAsset(asset.filename)}>
                   <X class="h-3.5 w-3.5" /> Remove
                 </button>
               </div>
             {/each}
           </div>
         {:else}
-          <p class="text-xs text-slate-500">No assets attached.</p>
+          <p class="text-xs text-quiet">No assets attached.</p>
         {/if}
       </section>
     {/if}
 
     {#if skill}
-      <section bind:this={decompositionSectionEl} class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-        <div class="flex flex-wrap items-center gap-2 text-slate-200">
-          <GitBranch class="h-4 w-4 text-slate-400" />
+      <section bind:this={decompositionSectionEl} class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+        <div class="flex flex-wrap items-center gap-2 text-foreground">
+          <GitBranch class="h-4 w-4 text-muted" />
           <h3 class="font-medium">Workflow Decomposition</h3>
           <Tooltip placement="bottom" text="Saved decomposition turns this skill into workflow material. The workflow composer can reuse these steps instead of guessing structure from the instructions each time.">
             <button aria-label="Workflow decomposition help" class={tooltipButtonClass} title="Workflow decomposition help" type="button"><Info class="h-4 w-4" /></button>
           </Tooltip>
           {#if currentVersion?.decomposition_stale}
-            <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">stale</Badge>
+            <Badge class="border-accent/30 bg-accent-subtle text-accent">stale</Badge>
           {/if}
         </div>
 
@@ -1161,79 +1164,79 @@
         <div class="grid gap-4 lg:grid-cols-2">
           <div class="space-y-2">
             <div class="flex items-center justify-between gap-2">
-              <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Saved on skill</p>
+              <p class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Saved on skill</p>
               {#if currentVersion?.decomposition_stale}
-                <p class="text-xs text-sky-300">Refresh suggested steps before relying on them.</p>
+                <p class="text-xs text-accent">Refresh suggested steps before relying on them.</p>
               {/if}
             </div>
             {#if savedSteps.length > 0}
               <div class="space-y-2">
                 {#each savedSteps as step, index}
-                  <div class="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+                  <div class="rounded-xl border border-separator bg-surface/80 p-3">
                     <div class="flex flex-wrap items-center gap-2">
-                      <p class="font-medium text-slate-100">{index + 1}. {stepName(step, index)}</p>
+                      <p class="font-medium text-foreground">{index + 1}. {stepName(step, index)}</p>
                       <Badge>{formatRelativeStepType(step)}</Badge>
                       {#if stepRequiresDeliverable(step)}
-                        <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">deliverable</Badge>
+                        <Badge class="border-success-border bg-success-subtle text-success">deliverable</Badge>
                       {/if}
                     </div>
                     {#if stepPrompt(step)}
-                      <p class="mt-2 text-xs text-slate-400">{stepPrompt(step)}</p>
+                      <p class="mt-2 text-xs text-muted">{stepPrompt(step)}</p>
                     {/if}
                   </div>
                 {/each}
               </div>
             {:else}
-              <p class="text-xs text-slate-500">No decomposition saved yet.</p>
+              <p class="text-xs text-quiet">No decomposition saved yet.</p>
             {/if}
           </div>
 
           <div class="space-y-2">
-            <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Latest suggestion</p>
+            <p class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Latest suggestion</p>
             {#if decompositionPreview && decompositionPreview.length > 0}
-              <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-3 text-xs text-slate-200">
+              <div class="rounded-2xl border border-accent/20 bg-accent-subtle p-3 text-xs text-foreground">
                 {#if decompositionRationale}
-                  <p class="text-slate-300">{decompositionRationale}</p>
+                  <p class="text-secondary">{decompositionRationale}</p>
                 {/if}
                 <div class="mt-3 space-y-2">
                   {#each decompositionPreview as step, index}
-                    <div class="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+                    <div class="rounded-xl border border-separator bg-surface/80 p-3">
                       <div class="flex flex-wrap items-center gap-2">
-                        <p class="font-medium text-slate-100">{index + 1}. {stepName(step, index)}</p>
+                        <p class="font-medium text-foreground">{index + 1}. {stepName(step, index)}</p>
                         <Badge>{formatRelativeStepType(step)}</Badge>
                         {#if stepRequiresDeliverable(step)}
-                          <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">deliverable</Badge>
+                          <Badge class="border-success-border bg-success-subtle text-success">deliverable</Badge>
                         {/if}
                       </div>
                       {#if stepPrompt(step)}
-                        <p class="mt-2 text-xs text-slate-400">{stepPrompt(step)}</p>
+                        <p class="mt-2 text-xs text-muted">{stepPrompt(step)}</p>
                       {/if}
                     </div>
                   {/each}
                 </div>
               </div>
             {:else}
-              <p class="text-xs text-slate-500">Generate a suggestion to review candidate workflow steps here.</p>
+              <p class="text-xs text-quiet">Generate a suggestion to review candidate workflow steps here.</p>
             {/if}
           </div>
         </div>
       </section>
 
-      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-        <div class="flex items-center gap-2 text-slate-200">
-          <Download class="h-4 w-4 text-slate-400" />
+      <section class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+        <div class="flex items-center gap-2 text-foreground">
+          <Download class="h-4 w-4 text-muted" />
           <h3 class="font-medium">Assets</h3>
         </div>
         {#if currentVersion?.asset_manifest && currentVersion.asset_manifest.length > 0}
           <div class="space-y-2">
             {#each currentVersion.asset_manifest as asset}
-              <div class="flex flex-col gap-2 rounded-xl border border-slate-800 bg-slate-900/80 p-3 md:flex-row md:items-center md:justify-between">
+              <div class="flex flex-col gap-2 rounded-xl border border-separator bg-surface/80 p-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <p class="font-mono text-xs text-slate-100">{asset.filename}</p>
-                  <p class="mt-1 text-xs text-slate-500">{asset.content_type} · {asset.size_bytes} bytes · {asset.content_hash.slice(0, 8)}</p>
+                  <p class="font-mono text-xs text-foreground">{asset.filename}</p>
+                  <p class="mt-1 text-xs text-quiet">{asset.content_type} · {asset.size_bytes} bytes · {asset.content_hash.slice(0, 8)}</p>
                 </div>
                 {#if asset.url}
-                  <a class="inline-flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200" href={asset.url} rel="noopener noreferrer" target="_blank">
+                  <a class="inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover" href={asset.url} rel="noopener noreferrer" target="_blank">
                     <Download class="h-3.5 w-3.5" /> Download
                   </a>
                 {/if}
@@ -1241,35 +1244,35 @@
             {/each}
           </div>
         {:else}
-          <p class="text-xs text-slate-500">No assets attached.</p>
+          <p class="text-xs text-quiet">No assets attached.</p>
         {/if}
       </section>
 
-      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-        <div class="flex items-center gap-2 text-slate-200">
-          <RotateCcw class="h-4 w-4 text-slate-400" />
+      <section class="space-y-3 rounded-2xl border border-separator bg-canvas/70 p-4">
+        <div class="flex items-center gap-2 text-foreground">
+          <RotateCcw class="h-4 w-4 text-muted" />
           <h3 class="font-medium">Version History</h3>
         </div>
         {#if loadingVersions}
-          <p class="text-xs text-slate-500">Loading versions…</p>
+          <p class="text-xs text-quiet">Loading versions…</p>
         {:else if versions.length === 0}
-          <p class="text-xs text-slate-500">No versions available.</p>
+          <p class="text-xs text-quiet">No versions available.</p>
         {:else}
           <div class="space-y-2">
             {#each versions as version}
-              <div class="rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+              <div class="rounded-xl border border-separator bg-surface/80 p-3">
                 <div class="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <div class="flex flex-wrap items-center gap-2">
-                      <p class="text-sm font-medium text-slate-100">{versionLabel(version)}</p>
+                      <p class="text-sm font-medium text-foreground">{versionLabel(version)}</p>
                       {#if version.version_id === skill.current_version_id}
-                        <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">current</Badge>
+                        <Badge class="border-success-border bg-success-subtle text-success">current</Badge>
                       {/if}
                       {#if version.version_id === latestVersionId}
-                        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">latest</Badge>
+                        <Badge class="border-accent/30 bg-accent-subtle text-accent">latest</Badge>
                       {/if}
                     </div>
-                    <p class="mt-1 text-xs text-slate-500">{formatTimestamp(version.created_at)} · {version.version_id} · {version.content_hash.slice(0, 8)}</p>
+                    <p class="mt-1 text-xs text-quiet">{formatTimestamp(version.created_at)} · {version.version_id} · {version.content_hash.slice(0, 8)}</p>
                   </div>
                   {#if canRestoreVersions && version.version_id !== skill.current_version_id}
                     <Button size="sm" variant="secondary" disabled={restoringVersionId === version.version_id} onclick={() => void restoreVersion(version)}>
@@ -1278,10 +1281,10 @@
                   {/if}
                 </div>
                 {#if version.source_url}
-                  <p class="mt-2 text-xs text-slate-400">Imported from <span class="break-all text-slate-300">{version.source_url}</span></p>
+                  <p class="mt-2 text-xs text-muted">Imported from <span class="break-all text-secondary">{version.source_url}</span></p>
                 {/if}
                 {#if version.asset_manifest && version.asset_manifest.length > 0}
-                  <p class="mt-1 text-xs text-slate-500">{version.asset_manifest.length} asset(s)</p>
+                  <p class="mt-1 text-xs text-quiet">{version.asset_manifest.length} asset(s)</p>
                 {/if}
               </div>
             {/each}

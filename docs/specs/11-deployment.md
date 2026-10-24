@@ -256,30 +256,32 @@ browser, and other executor tools.
 
 ## Kubernetes
 
-### Single-Replica Production
+### Fictional Single-Replica Example
 
-Cognis runs as a single replica alongside Mnemory and Intaris in a shared
-namespace. The bundled image serves both the API and the UI on `:8080`.
+This illustrative installation uses separate application and storage namespaces.
+Names, domains, storage class, and sizes below are invented, not an operational
+inventory. Choose values appropriate to your cluster. The bundled image serves
+both the API and the UI on `:8080`.
 
 ```
-Namespace: openwebui (shared with Mnemory, Intaris)
+Namespace: assistant-demo
   Deployment: cognis (replicas: 1, strategy: RollingUpdate)
   Service: cognis (ClusterIP, port 8080)
-  Ingress: cognis.fpy.cz (TLS via cert-manager)
-  Certificate: cognis.fpy.cz (letsencrypt-prod)
-  Secret: cognis-secret (JWT keys, secrets key, DB URL, MinIO creds)
-  PVC: cognis-data (1Gi, local-path, for COGNIS_DATA_DIR)
+  Ingress: assistant.example.test (TLS via cert-manager)
+  Certificate: assistant.example.test (configured ACME issuer)
+  Secret: assistant-keys (JWT keys, secrets key, DB URL, object-store credentials)
+  PVC: assistant-data (4Gi, configured storage class, for COGNIS_DATA_DIR)
 ```
 
 #### Dependencies
 
 | Dependency | Service URL | Purpose |
 |------------|-------------|---------|
-| PostgreSQL | `postgresql.postgresql.svc.cluster.local:5432` | Cognis metadata DB |
-| Redis (optional) | `redis.redis.svc.cluster.local:6379` | L2 session cache |
-| MinIO | `http://minio.minio.svc.cluster.local:9000` | Artifacts + tool outputs |
-| Mnemory | `http://mnemory.openwebui.svc.cluster.local:8050` | Memory provider |
-| Intaris | `http://intaris.openwebui.svc.cluster.local:8060` | Guardrails provider |
+| PostgreSQL | `metadata-db.storage-demo.svc.cluster.local:5432` | Cognis metadata DB |
+| Redis (optional) | `session-cache.storage-demo.svc.cluster.local:6379` | L2 session cache |
+| MinIO | `http://object-store.storage-demo.svc.cluster.local:9000` | Artifacts + tool outputs |
+| Mnemory | `http://mnemory.assistant-demo.svc.cluster.local:8050` | Memory provider |
+| Intaris | `http://intaris.assistant-demo.svc.cluster.local:8060` | Guardrails provider |
 
 #### JWT/JWKS Integration
 
@@ -287,10 +289,10 @@ Cognis issues ES256 JWTs. Mnemory and Intaris validate them via JWKS:
 
 ```bash
 # Mnemory
-MNEMORY_JWKS_URL=http://cognis.openwebui.svc.cluster.local:8080/.well-known/jwks.json
+MNEMORY_JWKS_URL=http://cognis.assistant-demo.svc.cluster.local:8080/.well-known/jwks.json
 
 # Intaris
-INTARIS_JWKS_URL=http://cognis.openwebui.svc.cluster.local:8080/.well-known/jwks.json
+INTARIS_JWKS_URL=http://cognis.assistant-demo.svc.cluster.local:8080/.well-known/jwks.json
 ```
 
 Existing API key auth on Mnemory/Intaris is preserved for standalone
@@ -339,15 +341,19 @@ profiles, shell history, caches, and workspace files stable across restarts.
 
 Use `enableServiceLinks: false` on the pod. Kubernetes service-link
 environment variables can collide with Cognis env names such as
-`COGNIS_PORT` and inject values like `tcp://10.103.145.251:8080`, which
+`COGNIS_PORT` and inject values like `tcp://192.0.2.10:8080`, which
 break executor startup paths that parse those variables as integers.
+
+The following manifest uses fictional resource and node names and a
+documentation-only controller address. Replace the namespace, node name,
+controller address, and token with your deployment's values before applying it.
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: cognis-executor-romana-secret
-  namespace: openwebui
+  name: cognis-executor-browser-secret
+  namespace: cognis
 type: Opaque
 stringData:
   token: "<executor-jwt-token>"
@@ -355,8 +361,8 @@ stringData:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: cognis-executor-romana-home
-  namespace: openwebui
+  name: cognis-executor-browser-home
+  namespace: cognis
 spec:
   accessModes:
     - ReadWriteOnce
@@ -368,22 +374,22 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: cognis-executor-romana
-  namespace: openwebui
+  name: cognis-executor-browser
+  namespace: cognis
 spec:
-  serviceName: cognis-executor-romana
+  serviceName: cognis-executor-browser
   replicas: 1
   selector:
     matchLabels:
-      app: cognis-executor-romana
+      app: cognis-executor-browser
   template:
     metadata:
       labels:
-        app: cognis-executor-romana
+        app: cognis-executor-browser
     spec:
       enableServiceLinks: false
       nodeSelector:
-        kubernetes.io/hostname: hades
+        kubernetes.io/hostname: worker-node-1
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -391,8 +397,8 @@ spec:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
       containers:
-        - name: cognis-executor-romana
-          image: genunix/cognis-executor:latest
+        - name: cognis-executor-browser
+          image: ghcr.io/fpytloun/cognis-executor:latest
           imagePullPolicy: Always
           env:
             - name: COGNIS_PORT
@@ -402,7 +408,7 @@ spec:
             - name: COGNIS_EXECUTOR_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: cognis-executor-romana-secret
+                  name: cognis-executor-browser-secret
                   key: token
             - name: COGNIS_DATA_DIR
               value: "/home/cognis/.cognis"
@@ -416,7 +422,7 @@ spec:
       volumes:
         - name: home
           persistentVolumeClaim:
-            claimName: cognis-executor-romana-home
+            claimName: cognis-executor-browser-home
 ```
 
 This one-replica example uses a pre-created PVC. Executor pools must not scale

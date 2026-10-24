@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
-from cognis.models.tool import ToolSource
+from cognis.models.tool import ToolCapability, ToolSource
 
 _SOURCE = ToolSource(type="executor")
 
@@ -187,6 +187,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_eval",
+            capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
             description=(
                 "Evaluate arbitrary JSON-returning JavaScript in the current page context. "
                 "This is a powerful debug/control tool and can mutate page state. "
@@ -692,6 +693,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_save_auth_state",
+            capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
             description="Persist the current browser auth state as an encrypted credential record.",
             parameters={
                 "type": "object",

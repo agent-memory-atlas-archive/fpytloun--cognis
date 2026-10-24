@@ -371,3 +371,217 @@ describe('ws client heartbeat', () => {
     wsClient.disconnect();
   });
 });
+
+describe('ws client mobile reconnect policy', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket);
+    FakeWebSocket.instances = [];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  function authenticate(socket: FakeWebSocket): void {
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+  }
+
+  it('applies bounded full jitter to reconnect delays', async () => {
+    const { reconnectDelayMs, WS_RECONNECT_MAX_MS } = await import('./ws/client');
+    expect(reconnectDelayMs(0, () => 0)).toBe(500);
+    expect(reconnectDelayMs(0, () => 1)).toBe(1000);
+    expect(reconnectDelayMs(3, () => 0.5)).toBe(6000);
+    expect(reconnectDelayMs(20, () => 1)).toBe(WS_RECONNECT_MAX_MS);
+    expect(reconnectDelayMs(20, () => 0)).toBe(WS_RECONNECT_MAX_MS / 2);
+  });
+
+  it('abandons a handshake that never authenticates', async () => {
+    const { wsClient, getWebSocketState, WS_CONNECT_TIMEOUT_MS } = await import('./ws/client');
+    wsClient.connect();
+    await Promise.resolve();
+    const first = FakeWebSocket.instances[0];
+    first.readyState = FakeWebSocket.CONNECTING;
+
+    vi.advanceTimersByTime(WS_CONNECT_TIMEOUT_MS);
+    expect(first.closed).toBe(true);
+    expect(getWebSocketState().status).toBe('reconnecting');
+
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    wsClient.disconnect();
+  });
+
+  it('reconnects after a missed pong even when the dead socket never fires onclose', async () => {
+    const { wsClient, WS_HEARTBEAT_INTERVAL_MS, WS_PONG_TIMEOUT_MS } = await import('./ws/client');
+    wsClient.connect();
+    await Promise.resolve();
+    const first = FakeWebSocket.instances[0];
+    authenticate(first);
+    // Half-open TCP: close() never reports back.
+    first.close = () => { first.closed = true; };
+
+    vi.advanceTimersByTime(WS_HEARTBEAT_INTERVAL_MS + WS_PONG_TIMEOUT_MS);
+    expect(first.closed).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    wsClient.disconnect();
+  });
+
+  it('emits a client resync signal only after a re-authentication', async () => {
+    const { wsClient } = await import('./ws/client');
+    const events: Array<{ type: string; client_resync?: boolean }> = [];
+    const unsubscribe = wsClient.subscribe((event) => events.push(event as { type: string }));
+
+    wsClient.connect();
+    await Promise.resolve();
+    const first = FakeWebSocket.instances[0];
+    authenticate(first);
+    expect(events.filter((event) => event.type === 'reconnected')).toHaveLength(0);
+
+    first.onclose?.({ code: 1006 } as CloseEvent);
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    authenticate(FakeWebSocket.instances[1]);
+
+    expect(events.filter((event) => event.type === 'reconnected')).toEqual([
+      { type: 'reconnected', missed_events_count: 0, client_resync: true }
+    ]);
+    unsubscribe();
+    wsClient.disconnect();
+  });
+
+  it('waits for the network while offline and reconnects immediately on online', async () => {
+    const { wsClient, getWebSocketState } = await import('./ws/client');
+    wsClient.connect();
+    await Promise.resolve();
+    const first = FakeWebSocket.instances[0];
+    authenticate(first);
+
+    const onLine = vi.spyOn(window.navigator, 'onLine', 'get').mockReturnValue(false);
+    window.dispatchEvent(new Event('offline'));
+    first.onclose?.({ code: 1006 } as CloseEvent);
+    expect(getWebSocketState()).toMatchObject({ status: 'reconnecting', offline: true });
+
+    vi.advanceTimersByTime(30_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    onLine.mockReturnValue(true);
+    window.dispatchEvent(new Event('online'));
+    await Promise.resolve();
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(getWebSocketState().attempts).toBe(0);
+    onLine.mockRestore();
+    wsClient.disconnect();
+  });
+
+  it('keeps retrying in the background after the stall threshold', async () => {
+    const { wsClient, getWebSocketState, WS_STALL_AFTER_ATTEMPTS, WS_STALLED_RETRY_MS } = await import('./ws/client');
+    wsClient.connect();
+    await Promise.resolve();
+    for (let attempt = 0; attempt < WS_STALL_AFTER_ATTEMPTS; attempt += 1) {
+      const socket = FakeWebSocket.instances.at(-1)!;
+      socket.onclose?.({ code: 1006 } as CloseEvent);
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+    }
+    const last = FakeWebSocket.instances.at(-1)!;
+    const count = FakeWebSocket.instances.length;
+    last.onclose?.({ code: 1006 } as CloseEvent);
+    expect(getWebSocketState().status).toBe('stalled');
+    vi.advanceTimersByTime(WS_STALLED_RETRY_MS);
+    await Promise.resolve();
+    expect(FakeWebSocket.instances.length).toBe(count + 1);
+    wsClient.disconnect();
+  });
+});
+
+describe('ws client reconnect catch-up', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket);
+    FakeWebSocket.instances = [];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  function authenticate(socket: FakeWebSocket): void {
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+  }
+
+  async function reconnected() {
+    const { wsClient } = await import('./ws/client');
+    wsClient.connect();
+    await Promise.resolve();
+    authenticate(FakeWebSocket.instances[0]);
+    wsClient.acquireChatV2('conv-1', 'cursor-1');
+    FakeWebSocket.instances[0].onclose?.({ code: 1006 } as CloseEvent);
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[1];
+    authenticate(socket);
+    return { wsClient, socket };
+  }
+
+  it('requests catch-up on resubscribe and hands the pushed delta to the matching cursor', async () => {
+    const { wsClient, socket } = await reconnected();
+    const subscribe = socket.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === 'chat_v2_subscribe');
+    expect(subscribe).toMatchObject({ cursor: 'cursor-1', catch_up: true });
+
+    expect(wsClient.consumeCatchUp('conversation:conv-1', 'other-cursor')).toBeNull();
+    const pending = wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1');
+    expect(pending).not.toBeNull();
+    const sync = { cursor_before: 'cursor-1', cursor_after: 'cursor-2', ops: [], reset_required: false };
+    socket.onmessage?.({
+      data: JSON.stringify({ type: 'chat_v2_catch_up', scope_key: 'conversation:conv-1', sync }),
+    } as MessageEvent<string>);
+    await expect(pending).resolves.toMatchObject({ cursor_after: 'cursor-2' });
+    expect(wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1')).toBeNull();
+    wsClient.disconnect();
+  });
+
+  it('falls back (null) on a server error marker', async () => {
+    const { wsClient, socket } = await reconnected();
+    const pending = wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1')!;
+    socket.onmessage?.({
+      data: JSON.stringify({ type: 'chat_v2_catch_up', scope_key: 'conversation:conv-1', error: 'catch_up_failed' }),
+    } as MessageEvent<string>);
+    await expect(pending).resolves.toBeNull();
+    wsClient.disconnect();
+  });
+
+  it('falls back (null) when no catch-up frame arrives in time', async () => {
+    const { wsClient } = await reconnected();
+    const timedOut = wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1')!;
+    vi.advanceTimersByTime(5_000);
+    await expect(timedOut).resolves.toBeNull();
+    wsClient.disconnect();
+  });
+
+  it('settles pending catch-ups when the socket drops and ignores late frames', async () => {
+    const { wsClient, socket } = await reconnected();
+    const pending = wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1')!;
+    socket.onclose?.({ code: 1006 } as CloseEvent);
+    await expect(pending).resolves.toBeNull();
+    // A late frame from the dead socket must not surface to a later consumer.
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'chat_v2_catch_up',
+        scope_key: 'conversation:conv-1',
+        sync: { cursor_before: 'cursor-1', cursor_after: 'x', ops: [] },
+      }),
+    } as MessageEvent<string>);
+    expect(wsClient.consumeCatchUp('conversation:conv-1', 'cursor-1')).toBeNull();
+    wsClient.disconnect();
+  });
+});

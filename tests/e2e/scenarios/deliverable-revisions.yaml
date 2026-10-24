@@ -1,0 +1,54 @@
+id: deliverable-revisions
+description: |
+  Writes a direct-chat deliverable, then revises it in the next user turn with
+  write_deliverable(supersedes=...). The revision targets the server-generated
+  dlv_ ID through a tool_result placeholder.
+trigger: "scenario:deliverable-revisions"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_write_plan_v1
+        name: write_deliverable
+        arguments:
+          title: "Launch plan"
+          content: |
+            # Launch plan
+
+            ## Goals
+            - Ship the beta to 50 design partners.
+            - Collect feedback for two weeks.
+
+            ## Timeline
+            Week 1: invite partners. Week 2: first feedback review.
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["The ", "first ", "draft ", "is ", "ready."]
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_write_plan_v2
+        name: write_deliverable
+        arguments:
+          supersedes: "{{tool_result:call_write_plan_v1:deliverable_id}}"
+          content: |
+            # Launch plan
+
+            ## Goals
+            - Ship the beta to 20 design partners with weekly check-ins.
+            - Collect structured feedback for three weeks.
+
+            ## Timeline
+            Week 1: invite partners. Week 2: onboarding calls. Week 3: feedback review.
+
+            ## Risks
+            - Partner onboarding capacity.
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["I ", "revised ", "the ", "launch ", "plan."]
+        delay_ms: 20

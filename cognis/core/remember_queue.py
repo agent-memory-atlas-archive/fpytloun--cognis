@@ -1726,6 +1726,17 @@ class RememberRetryQueue:
         assert item.item_id is not None
         payload = item.payload
         async with self._session_factory() as session, session.begin():
+            # Match TODO persistence's conversation -> session order, including
+            # the session KEY SHARE lock taken by the session_todos foreign key.
+            conversation = (
+                await session.execute(
+                    sa.select(Conversation)
+                    .where(
+                        Conversation.conversation_id == str(payload.get("conversation_id") or "")
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             cognis_session = (
                 await session.execute(
                     sa.select(Session)
@@ -1733,17 +1744,6 @@ class RememberRetryQueue:
                     .with_for_update()
                 )
             ).scalar_one_or_none()
-            conversation = (
-                (
-                    await session.execute(
-                        sa.select(Conversation)
-                        .where(Conversation.conversation_id == cognis_session.conversation_id)
-                        .with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if cognis_session is not None
-                else None
-            )
             agent = (
                 (
                     await session.execute(

@@ -144,7 +144,10 @@ export function richDensity(metadata: Record<string, unknown>, blocks: RichBlock
 export function safeUrl(value: unknown): string {
   if (typeof value !== 'string') return '';
   try {
-    const base = typeof window !== 'undefined' ? window.location.origin : 'https://cognis.local';
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'https://cognis.local';
+    // A downloaded file has an opaque origin ("null"), not a valid URL base.
+    // Absolute links remain usable; relative links must not resolve to local files.
+    const base = origin === 'null' ? undefined : origin;
     const url = new URL(value, base);
     return ['http:', 'https:', 'mailto:'].includes(url.protocol) ? url.href : '';
   } catch {

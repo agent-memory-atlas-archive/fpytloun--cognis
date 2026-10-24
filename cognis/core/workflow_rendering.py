@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dateutil.relativedelta import relativedelta
 from jinja2 import StrictUndefined, nodes
 from jinja2.exceptions import SecurityError, TemplateError
+from jinja2.filters import do_default
 from jinja2.sandbox import SandboxedEnvironment
 
 from cognis import json_codec as json
@@ -163,6 +164,17 @@ class _WorkflowSandbox(SandboxedEnvironment):
         return obj in _HELPERS.values()
 
 
+def _bounded_join(values: list[Any], separator: str = "") -> str:
+    if not isinstance(values, list) or not isinstance(separator, str):
+        raise WorkflowRenderError("join requires a JSON array and string separator")
+    parts = [str(value) for value in values]
+    size = sum(len(part.encode("utf-8")) for part in parts)
+    size += max(0, len(parts) - 1) * len(separator.encode("utf-8"))
+    if size > MAX_RENDER_OUTPUT_BYTES:
+        raise WorkflowRenderError("workflow rendered output exceeds size limit")
+    return separator.join(parts)
+
+
 class WorkflowRenderer:
     """Render workflow templates against an immutable JSON-like context."""
 
@@ -174,8 +186,30 @@ class WorkflowRenderer:
         )
         self._environment.filters.clear()
         self._environment.filters["length"] = len
+        # Bounded JSON-like contexts make these pure formatting filters safe for
+        # conditions and evidence-bearing prompts as well as workflow templates.
+        from jinja2.filters import do_lower, do_tojson, do_trim, do_upper
+
+        self._environment.filters.update(
+            {
+                "lower": do_lower,
+                "upper": do_upper,
+                "trim": do_trim,
+                "tojson": do_tojson,
+            }
+        )
+        self._environment.filters["join"] = _bounded_join
+        self._environment.filters["default"] = do_default
         self._environment.globals.clear()
         self._environment.globals.update(_HELPERS)
+
+    def validate_template(self, source: str) -> None:
+        """Validate template syntax and sandbox limits without requiring runtime values."""
+        self._prepare(source, {})
+        try:
+            self._environment.from_string(source)
+        except TemplateError as exc:
+            raise WorkflowRenderError("invalid workflow template") from exc
 
     def _prepare(self, source: str, context: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(source, str):
@@ -299,6 +333,9 @@ def build_render_audit_record(
     """Build a bounded redacted audit summary without retaining raw context."""
 
     explicit = {key.lower() for key in (redact_keys or set())}
+    from cognis.core.workflow_step_scope import canonical_digest
+
+    rendered_args_digest = canonical_digest(rendered)
 
     def redact(value: Any) -> Any:
         if isinstance(value, dict):
@@ -315,6 +352,7 @@ def build_render_audit_record(
         return value
 
     record = {
+        "rendered_args_digest": rendered_args_digest,
         "template_digest": hashlib.sha256(
             json.dumps(template, sort_keys=True, default=str).encode()
         ).hexdigest(),
@@ -324,6 +362,7 @@ def build_render_audit_record(
     if len(encoded.encode()) <= MAX_AUDIT_BYTES:
         return record
     return {
+        "rendered_args_digest": rendered_args_digest,
         "template_digest": record["template_digest"],
         "rendered_digest": hashlib.sha256(encoded.encode()).hexdigest(),
         "truncated": True,

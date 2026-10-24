@@ -47,13 +47,21 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_healthy(url: str, *, timeout: float = 120.0, interval: float = 1.0) -> None:
+def _wait_healthy(
+    url: str,
+    *,
+    timeout: float = 120.0,
+    interval: float = 1.0,
+    headers: dict[str, str] | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            httpx.get(f"{url}/health", timeout=5.0)
-            return
+            response = httpx.get(f"{url}/health", timeout=5.0, headers=headers)
+            if response.status_code == 200:
+                return
+            last_error = RuntimeError(f"Health returned HTTP {response.status_code}")
         except httpx.ConnectError as exc:
             last_error = exc
         except Exception as exc:
@@ -90,7 +98,18 @@ def _start_proc(
     base.update(env)
     log_path = log_dir / f"{label}.log"
     log_handle = open(log_path, "w")  # noqa: SIM115
-    proc = subprocess.Popen(command, env=base, stdout=log_handle, stderr=subprocess.STDOUT)
+    # Opt-in compatibility qualification can run an immutable older controller
+    # with its own locked workspace while all companion fixtures stay isolated.
+    controller_project = (
+        os.environ.get("COGNIS_E2E_CONTROLLER_PROJECT") if label == "cognis" else None
+    )
+    proc = subprocess.Popen(
+        command,
+        env=base,
+        cwd=controller_project,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
     proc._log_handle = log_handle  # type: ignore[attr-defined]
     return proc
 
@@ -134,6 +153,7 @@ class E2EStack:
     e2e_agent_id: str
     e2e_conversation_id: str | None
     http: httpx.Client
+    append_proxy: Any = None
 
     def admin_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.admin_token}"}
@@ -153,7 +173,10 @@ class E2EStack:
 
 
 @pytest.fixture(scope="session")
-def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
+def e2e_stack(
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[E2EStack]:
     """Start the full e2e stack: Cognis + Mnemory + Intaris + mock-llm."""
     dict(os.environ)
     base_dir = tmp_path_factory.mktemp("e2e")
@@ -169,6 +192,9 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     cognis_url = f"http://127.0.0.1:{cognis_port}"
     mnemory_url = f"http://127.0.0.1:{mnemory_port}"
     intaris_url = f"http://127.0.0.1:{intaris_port}"
+    from tests.e2e.append_barrier import AppendProxyServer
+
+    append_proxy = AppendProxyServer(intaris_url)
     mock_llm_url = f"http://127.0.0.1:{mock_llm_port}"
     ws_url = f"ws://127.0.0.1:{cognis_port}/api/ws"
 
@@ -183,6 +209,9 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     # Bootstrap Cognis keys before starting anything
     cognis_dir = base_dir / "cognis"
     cognis_dir.mkdir()
+    database_url = os.environ.get(
+        "COGNIS_E2E_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}"
+    )
     from dataclasses import replace
 
     bootstrap_config = replace(
@@ -191,8 +220,8 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
         host="127.0.0.1",
         port=cognis_port,
         mnemory_url=mnemory_url,
-        intaris_url=intaris_url,
-        database_url=f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}",
+        intaris_url=append_proxy.url,
+        database_url=database_url,
         jwt_private_key_path=cognis_dir / "keys" / "private.pem",
         jwt_public_key_path=cognis_dir / "keys" / "public.pem",
         secrets_key_path=cognis_dir / "secrets.key",
@@ -211,6 +240,18 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     public_key_path = str(cognis_dir / "keys" / "public.pem")
 
     procs: list[tuple[str, subprocess.Popen]] = []
+    clients: list[httpx.Client] = []
+
+    def cleanup() -> None:
+        try:
+            append_proxy.close()
+        finally:
+            for client in clients:
+                client.close()
+            for label, proc in reversed(procs):
+                _stop_proc(proc, label)
+
+    request.addfinalizer(cleanup)
 
     try:
         # Start mock-llm
@@ -282,18 +323,39 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
 
         # Wait for mock-llm, mnemory, intaris
         _wait_healthy(mock_llm_url, timeout=30)
-        _wait_healthy(mnemory_url, timeout=120)
+        # Mnemory's main-port health is authenticated; other startup health
+        # routes are public. Never attach this audience-specific JWT elsewhere.
+        from cognis.providers.auth.jwt import JWTAuthProvider
+
+        health_signer = JWTAuthProvider(
+            bootstrap_config.jwt_private_key_path,
+            bootstrap_config.jwt_public_key_path,
+        )
+        _wait_healthy(
+            mnemory_url,
+            timeout=120,
+            headers={
+                "Authorization": "Bearer "
+                + health_signer.sign_service_jwt(
+                    subject=admin_email,
+                    agent_id=E2E_AGENT_ID,
+                    audience=["mnemory"],
+                )
+            },
+        )
         _wait_healthy(intaris_url, timeout=120)
+        append_proxy.start()
 
         # Start Cognis
         cognis_proc = _start_proc(
             [uv_path, "run", "cognis-controller", "serve"],
             {
                 "COGNIS_DATA_DIR": str(cognis_dir),
+                "DATABASE_URL": database_url,
                 "COGNIS_HOST": "127.0.0.1",
                 "COGNIS_PORT": str(cognis_port),
                 "COGNIS_MNEMORY_URL": mnemory_url,
-                "COGNIS_INTARIS_URL": intaris_url,
+                "COGNIS_INTARIS_URL": append_proxy.url,
                 "COGNIS_INITIAL_ADMIN_EMAIL": admin_email,
                 "COGNIS_INITIAL_ADMIN_PASSWORD": admin_password,
                 "COGNIS_LOG_FORMAT": "text",
@@ -314,11 +376,11 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     except Exception:
         for label, proc in procs:
             _dump_log(label, proc, log_dir)
-            _stop_proc(proc, label)
         raise
 
     # Login and get admin token
     http = httpx.Client(timeout=30.0)
+    clients.append(http)
     login_resp = http.post(
         f"{cognis_url}/api/auth/login",
         json={"email": admin_email, "password": admin_password, "mode": "native"},
@@ -327,7 +389,14 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     admin_token = login_resp.json()["token"]
 
     # Seed e2e resources
-    e2e_conversation_id = _seed_e2e_resources(cognis_url, admin_token, mock_llm_url, http)
+    e2e_conversation_id = _seed_e2e_resources(
+        cognis_url,
+        admin_token,
+        mock_llm_url,
+        http,
+        admin_email=admin_email,
+        log_dir=log_dir,
+    )
 
     stack = E2EStack(
         cognis_url=cognis_url,
@@ -339,14 +408,10 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
         e2e_agent_id=E2E_AGENT_ID,
         e2e_conversation_id=e2e_conversation_id,
         http=http,
+        append_proxy=append_proxy,
     )
 
     yield stack
-
-    # Teardown
-    http.close()
-    for label, proc in reversed(procs):
-        _stop_proc(proc, label)
 
 
 def _seed_e2e_resources(
@@ -354,6 +419,9 @@ def _seed_e2e_resources(
     admin_token: str,
     mock_llm_url: str,
     http: httpx.Client,
+    *,
+    admin_email: str,
+    log_dir: Path,
 ) -> str | None:
     """Seed e2e provider, agent, and a test conversation."""
     headers = {"Authorization": f"Bearer {admin_token}"}
@@ -389,6 +457,22 @@ def _seed_e2e_resources(
     )
     if provider_resp.status_code not in (200, 409):
         raise RuntimeError(f"Failed to create e2e provider: {provider_resp.text}")
+    default_resp = http.post(
+        f"{cognis_url}/api/v1/llm-providers/{E2E_PROVIDER_ID}/set-default",
+        headers=headers,
+    )
+    assert default_resp.status_code == 200, default_resp.status_code
+    assert default_resp.json()["ok"] is True
+    provider_read = http.get(
+        f"{cognis_url}/api/v1/llm-providers/{E2E_PROVIDER_ID}", headers=headers
+    )
+    assert provider_read.status_code == 200
+    assert provider_read.json()["is_default"] is True
+    # The existing fixture intentionally creates an admin-authorized system
+    # provider. Health resolves the system default; the agent remains admin-owned.
+    from cognis.ownership import SYSTEM_USER_EMAIL
+
+    assert provider_read.json()["owner_email"] == SYSTEM_USER_EMAIL
 
     # Create an in-process executor for the e2e agent
     E2E_EXECUTOR_ID = "e2e-inprocess-executor"
@@ -447,7 +531,39 @@ def _seed_e2e_resources(
         raise RuntimeError(f"Failed to create e2e agent: {agent_resp.text}")
 
     # Activate agent
-    http.post(f"{cognis_url}/api/v1/agents/{E2E_AGENT_ID}/activate", headers=headers)
+    activation = http.post(f"{cognis_url}/api/v1/agents/{E2E_AGENT_ID}/activate", headers=headers)
+    assert activation.status_code == 200, activation.status_code
+    agent_read = http.get(f"{cognis_url}/api/v1/agents/{E2E_AGENT_ID}", headers=headers)
+    assert agent_read.status_code == 200
+    assert agent_read.json()["owner_email"] == admin_email
+    assert agent_read.json()["llm_config"]["provider_id"] == E2E_PROVIDER_ID
+    assert agent_read.json()["llm_config"]["model"] == "mock-model"
+    health = http.get(f"{cognis_url}/api/health", headers=headers)
+    assert health.status_code == 200
+    diagnostics = http.get(f"{cognis_url}/api/v1/system/diagnostics", headers=headers)
+    assert diagnostics.status_code == 200
+    # Capture only public readiness flags, not diagnostic credentials/config.
+    # Companion/Mnemory readiness is broader than the UI send gate.
+    (log_dir / "public-readiness.json").write_text(
+        json.dumps(
+            {
+                "agent_owner_matches": agent_read.json()["owner_email"] == admin_email,
+                "provider_is_fixture_system_default": provider_read.json()["owner_email"]
+                == SYSTEM_USER_EMAIL,
+                "providers": {
+                    category: health.json()["providers"][category]["status"]
+                    for category in ("llm", "guardrails")
+                },
+                "readiness": diagnostics.json()["readiness"],
+            },
+            indent=2,
+        )
+    )
+
+    for category in ("llm", "guardrails"):
+        assert health.json()["providers"][category]["status"] == "healthy", (
+            f"Public UI readiness failed: {category}; see public-readiness.json"
+        )
 
     # Create a test conversation
     conv_resp = http.post(

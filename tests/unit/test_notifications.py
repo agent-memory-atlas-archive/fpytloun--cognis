@@ -304,6 +304,7 @@ def test_canonical_pending_question_exposes_question_set_and_context() -> None:
 class _FakeSession:
     def __init__(self, row: Any) -> None:
         self._row = row
+        self.bind = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
 
     async def __aenter__(self) -> _FakeSession:
         return self

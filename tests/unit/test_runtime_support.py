@@ -56,6 +56,71 @@ async def _executor_pin_lifecycle_settings(_session_factory: object) -> dict[str
     return {"retry_seconds": 0, "retry_interval_seconds": 0}
 
 
+@pytest.mark.asyncio
+async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    observed = ToolDefinition(
+        name="read",
+        description="Read a file.",
+        parameters={"type": "object"},
+        source=ToolSource(type="executor"),
+        read_only=True,
+        category="filesystem",
+    )
+    resolve_config = AsyncMock(
+        return_value={
+            "executor_id": "alice_exec",
+            "executor_type": "websocket",
+            "config": {},
+            "executor_owner_email": "alice@example.com",
+            "owner_email": "alice@example.com",
+            "selection_source": "explicit",
+            "runtime_state": "active",
+            "observed_tools": [observed.model_dump(mode="json")],
+        }
+    )
+    monkeypatch.setattr(
+        runtime_support, "load_executor_policy", AsyncMock(return_value=ExecutorPolicy())
+    )
+    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", resolve_config)
+    monkeypatch.setattr(
+        runtime_support,
+        "_resolve_web_config",
+        AsyncMock(return_value={"web_available_backends": ["direct"], "web_backend": "direct"}),
+    )
+    monkeypatch.setattr(
+        runtime_support, "resolve_skills_for_agent", AsyncMock(return_value=ResolvedSkillSet())
+    )
+    dispatcher = SimpleNamespace(dispatch_pending=AsyncMock())
+    executor = SimpleNamespace(
+        spawn=AsyncMock(),
+        websocket=SimpleNamespace(
+            get_connection=AsyncMock(),
+            list_tools=AsyncMock(),
+        ),
+    )
+    providers = _runtime_providers_with_executor(executor)
+    providers.executor_pin_notice_dispatcher = dispatcher
+    factory = runtime_support.build_step_runtime_factory(
+        providers=providers,
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=_runtime_session_factory,
+    )
+    agent = _agent()
+    agent.owner_email = "alice@example.com"
+    runtime = await factory(agent, agent.owner_email, prepare_only=True)
+    assert runtime.tool_registry.get("read") is not None
+    assert resolve_config.call_args.kwargs["read_only"] is True
+    assert runtime.executor_connection is None
+    dispatcher.dispatch_pending.assert_not_awaited()
+    executor.spawn.assert_not_awaited()
+    executor.websocket.get_connection.assert_not_awaited()
+    executor.websocket.list_tools.assert_not_awaited()
+    await runtime.cleanup()
+
+
 def test_mcp_degraded_notice_exposes_only_authorization_failures() -> None:
     notice = _mcp_degraded_notice(
         {
@@ -1015,6 +1080,119 @@ class _ReadyWebSocketConnection:
         return []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reader_email", "scope_task_id", "expected"),
+    [
+        ("owner@example.com", "task-rich", True),
+        ("other@example.com", "task-rich", False),
+        ("owner@example.com", "task-owner", False),
+    ],
+)
+async def test_remote_factory_rebuild_and_scoped_reader(
+    monkeypatch, task_continuation_db, reader_email, scope_task_id, expected
+) -> None:
+    """Exercise real remote composition, inventory filters and controller hydration."""
+    import json
+    from unittest.mock import AsyncMock
+
+    async def policy(_):
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
+
+    async def config(*_, **__):
+        return {
+            "executor_id": "alice_exec",
+            "executor_type": "websocket",
+            "config": {},
+            "runtime_state": "active",
+            "desired_config_version": 1,
+            "applied_config_version": 1,
+        }
+
+    async def web(*_, **__):
+        return {"web_available_backends": ["direct"], "web_backend": "direct"}
+
+    async def skills(*_, **__):
+        return ResolvedSkillSet()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", policy)
+    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", config)
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", web)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", skills)
+    ws = _ReadyWebSocketProvider("alice_exec")
+
+    def advertised(name, server):
+        return ToolDefinition(
+            name=name,
+            description=name,
+            parameters={"type": "object"},
+            source=ToolSource(type="local_mcp", server_name=server),
+            category="mcp",
+            read_only=True,
+        ).model_dump(mode="json")
+
+    ws.connection.list_tools = AsyncMock(return_value=[advertised("calendar_search", "calendar")])
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers_with_ws(ws),
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=task_continuation_db,
+        artifact_store=task_continuation_db.artifact_store,
+    )
+    runtime = await factory(
+        agent=AgentDefinition(
+            agent_id="agent-owner",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={"executor_id": "alice_exec"},
+            tools={"disabled_mcp_servers": ["local_mcp:blocked"]},
+        ),
+        user_email="owner@example.com",
+    )
+    replacement_conn = SimpleNamespace(
+        list_tools=AsyncMock(
+            return_value=[
+                advertised("gmail_search", "gmail"),
+                advertised("blocked_search", "blocked"),
+            ]
+        )
+    )
+    # A websocket connection contains no store; only the controller handler closure does.
+    router = ToolRouter.__new__(ToolRouter)
+    result = await router._execute_local_handler(
+        ToolCall(
+            call_id="read-scoped-packet",
+            name="read_task_deliverable",
+            arguments={"deliverable_id": "dlv_rich"},
+            runtime_metadata={
+                "user_email": reader_email,
+                "conversation_context": {
+                    "platform_data": {
+                        "forked_from": "task",
+                        "task_id": scope_task_id,
+                    }
+                },
+            },
+        ),
+        registered_tool=runtime.tool_registry.get("read_task_deliverable"),
+        executor=replacement_conn,
+    )
+    payload = json.loads(result.output)
+    assert payload["ok"] is expected
+    if expected:
+        assert payload["content"] == "Rich fallback"
+        assert payload["rich_payload"]["blocks"][0]["title"] == "Finding"
+    else:
+        assert payload["error"] == "not_found"
+    assert not hasattr(replacement_conn, "artifact_store")
+    assert runtime.rebuild_tool_registry is not None
+    replacement = await runtime.rebuild_tool_registry(replacement_conn)
+    assert replacement.get("gmail_search") is not None
+    assert replacement.get("calendar_search") is None
+    assert replacement.get("blocked_search") is None
+    assert runtime.tool_registry.get("calendar_search") is not None
+
+
 class _ReadyWebSocketProvider:
     def __init__(self, executor_id: str) -> None:
         self.executor_id = executor_id
@@ -1031,6 +1209,330 @@ class _ReadyWebSocketProvider:
 class _SecretsProvider:
     async def resolve_for_execution(self, *_: object, **__: object) -> dict[str, str]:
         return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "outcome"),
+    [
+        ("physical", "ready"),
+        ("forwarded", "ready"),
+        ("timeout", "ready"),
+        ("forwarded", "deadline"),
+        ("forwarded", "cancel"),
+        ("rpc", "permanent"),
+        ("forwarded_rpc", "permanent"),
+        ("forwarded_protocol", "permanent"),
+        ("malformed", "permanent"),
+    ],
+)
+async def test_inventory_discovery_uses_runtime_admission_recovery(
+    monkeypatch: pytest.MonkeyPatch, failure_kind: str, outcome: str
+) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from cognis.core.executor_recovery import ExecutorRecoveryTimeout, ExecutorRecoveryWindow
+    from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
+    from cognis.providers.executor.forwarding import ForwardedDeliveryError
+    from cognis.providers.executor.websocket import ExecutorRPCError
+
+    errors = {
+        "physical": ExecutorDeliveryError(
+            "Executor did not reconnect for replay-safe retry",
+            DeliveryState.TERMINAL,
+            code="executor_recovery_timeout",
+        ),
+        "forwarded": ForwardedDeliveryError(
+            "Executor did not reconnect for replay-safe retry",
+            DeliveryState.TERMINAL,
+            code="executor_recovery_timeout",
+        ),
+        "timeout": TimeoutError("Inventory request timed out"),
+        "rpc": ExecutorRPCError(-32601, "Unknown method"),
+        "forwarded_rpc": ForwardedDeliveryError(
+            "Unknown method", DeliveryState.TERMINAL, code="-32601"
+        ),
+        "forwarded_protocol": ForwardedDeliveryError(
+            "Forwarded result chunk assembly timed out", DeliveryState.TERMINAL
+        ),
+        "malformed": ValueError("Invalid tool inventory"),
+    }
+    failure = errors[failure_kind]
+    executor_id = "alice_exec"
+    ws = _ReadyWebSocketProvider(executor_id)
+    failed_connection = ws.connection
+    failed_connection.list_tools = AsyncMock(side_effect=failure)
+    replacement = _ReadyWebSocketConnection()
+    replacement.list_tools = AsyncMock(return_value=[])
+    cancel_event = asyncio.Event()
+
+    async def wait_for_connection(selected_id: str, **kwargs: object) -> object | None:
+        assert selected_id == executor_id
+        assert kwargs["cancel_event"] is cancel_event
+        if outcome == "deadline":
+            return None
+        if outcome == "cancel":
+            cancel_event.set()
+            raise asyncio.CancelledError
+        ws.connection = replacement
+        return replacement
+
+    waiter = AsyncMock(side_effect=wait_for_connection)
+    monkeypatch.setattr(ws, "wait_for_connection", waiter, raising=False)
+    monkeypatch.setattr(
+        runtime_support, "load_executor_policy", AsyncMock(return_value=ExecutorPolicy())
+    )
+    monkeypatch.setattr(
+        runtime_support,
+        "_resolve_eligible_executor_config",
+        AsyncMock(
+            return_value={
+                "executor_id": executor_id,
+                "executor_type": "websocket",
+                "config": {},
+                "runtime_state": "active",
+                "desired_config_version": 1,
+                "applied_config_version": 1,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_support,
+        "_resolve_web_config",
+        AsyncMock(return_value={"web_available_backends": ["direct"], "web_backend": "direct"}),
+    )
+    monkeypatch.setattr(
+        runtime_support, "resolve_skills_for_agent", AsyncMock(return_value=ResolvedSkillSet())
+    )
+    monkeypatch.setattr(store_queries, "get_conversation", AsyncMock(return_value=None))
+    now = datetime.now(UTC)
+    recovery = AsyncMock(
+        return_value=ExecutorRecoveryWindow(
+            executor_id=executor_id,
+            unavailable_since=now,
+            deadline=now + timedelta(seconds=900),
+            database_remaining_seconds=900,
+        )
+    )
+    monkeypatch.setattr(runtime_support, "begin_executor_recovery", recovery)
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers_with_ws(ws),
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=_runtime_session_factory,
+    )
+    admission = factory(
+        AgentDefinition(
+            agent_id="agent-owner",
+            name="Agent",
+            owner_email="owner@example.com",
+            execution={"executor_id": executor_id},
+        ),
+        "owner@example.com",
+        conversation_id="conv-inventory-recovery",
+        cancel_event=cancel_event,
+    )
+    if outcome == "ready":
+        runtime = await asyncio.wait_for(admission, timeout=2)
+        assert runtime.executor_connection is replacement
+        assert runtime.active_executor_id == executor_id
+        replacement.list_tools.assert_awaited_once()
+    else:
+        error_type = (
+            ExecutorRecoveryTimeout
+            if outcome == "deadline"
+            else asyncio.CancelledError
+            if outcome == "cancel"
+            else type(failure)
+        )
+        with pytest.raises(error_type):
+            await asyncio.wait_for(admission, timeout=2)
+        replacement.list_tools.assert_not_awaited()
+    failed_connection.list_tools.assert_awaited_once()
+    if outcome == "permanent":
+        recovery.assert_not_awaited()
+        waiter.assert_not_awaited()
+    else:
+        recovery.assert_awaited_once_with(
+            _runtime_session_factory,
+            conversation_id="conv-inventory-recovery",
+            task_id=None,
+            executor_id=executor_id,
+            notice_dispatcher=None,
+        )
+        waiter.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["conversation", "task"])
+@pytest.mark.parametrize("mode", ["ready", "restart", "deadline"])
+async def test_inventory_recovery_preserves_durable_deadline_until_admission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scope: str, mode: str
+) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from cognis.core.executor_recovery import ExecutorRecoveryTimeout, begin_executor_recovery
+    from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
+
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/inventory-recovery.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = create_session_factory(engine)
+    user_email = "inventory-owner@example.com"
+    executor_id = "inventory-executor"
+    conversation_id = "inventory-conversation"
+    task_id = "inventory-task" if scope == "task" else None
+    database_time = datetime.now(UTC)
+    original_observation = database_time - timedelta(seconds=899 if mode == "deadline" else 60)
+    original_deadline = original_observation + timedelta(seconds=900)
+    try:
+        async with sessions() as session:
+            session.add(User(email=user_email, name="U", role="user"))
+            await session.flush()
+            session.add(Agent(agent_id="inventory-agent", owner_email=user_email, name="A"))
+            await session.flush()
+            pin = {
+                "active_executor_id": executor_id,
+                "active_executor_source": "explicit_primary",
+                "active_executor_generation": 2,
+                "active_executor_unavailable_since": original_observation,
+            }
+            session.add(
+                Conversation(
+                    conversation_id=conversation_id,
+                    user_email=user_email,
+                    agent_id="inventory-agent",
+                    context_type="chat",
+                    **pin,
+                )
+            )
+            if task_id:
+                session.add(
+                    Task(
+                        task_id=task_id,
+                        title="Inventory recovery",
+                        created_by=user_email,
+                        agent_id="inventory-agent",
+                        **pin,
+                    )
+                )
+            await session.commit()
+
+        async def database_now(_session):
+            return database_time
+
+        monkeypatch.setattr("cognis.store.coordination.database_now", database_now)
+        monkeypatch.setattr(
+            store_queries,
+            "list_executors",
+            AsyncMock(return_value=[_executor_row(executor_id, owner_email=user_email)]),
+        )
+        monkeypatch.setattr(
+            runtime_support, "load_executor_policy", AsyncMock(return_value=ExecutorPolicy())
+        )
+        monkeypatch.setattr(
+            runtime_support,
+            "load_executor_pin_lifecycle_settings",
+            _executor_pin_lifecycle_settings,
+        )
+        monkeypatch.setattr(
+            runtime_support,
+            "_resolve_web_config",
+            AsyncMock(return_value={"web_available_backends": ["direct"], "web_backend": "direct"}),
+        )
+        monkeypatch.setattr(
+            runtime_support, "resolve_skills_for_agent", AsyncMock(return_value=ResolvedSkillSet())
+        )
+        recovery = AsyncMock(wraps=begin_executor_recovery)
+        monkeypatch.setattr(runtime_support, "begin_executor_recovery", recovery)
+        ws = _ReadyWebSocketProvider(executor_id)
+        ws.get_ready_connection = ws.get_connection
+        attempts = 0
+
+        async def list_tools():
+            nonlocal attempts
+            attempts += 1
+            async with sessions() as session:
+                conversation = await store_queries.get_conversation(session, conversation_id)
+                assert (
+                    conversation.active_executor_unavailable_since.replace(tzinfo=UTC)
+                    == original_observation
+                )
+                if task_id:
+                    task = await store_queries.get_task(session, task_id)
+                    assert (
+                        task.active_executor_unavailable_since.replace(tzinfo=UTC)
+                        == original_observation
+                    )
+            if attempts <= 2:
+                raise ExecutorDeliveryError(
+                    "Short reconnect retry expired",
+                    DeliveryState.TERMINAL,
+                    code="executor_recovery_timeout",
+                )
+            return []
+
+        ws.connection.list_tools = AsyncMock(side_effect=list_tools)
+        waits = 0
+
+        async def wait_for_connection(selected_id, **kwargs):
+            nonlocal waits, database_time
+            waits += 1
+            assert selected_id == executor_id
+            if mode == "restart" and waits == 1:
+                raise asyncio.CancelledError
+            if mode == "deadline":
+                database_time += timedelta(seconds=2)
+            return ws.connection
+
+        ws.wait_for_connection = AsyncMock(side_effect=wait_for_connection)
+        providers = SimpleNamespace(
+            _session_factory=sessions,
+            executor=SimpleNamespace(websocket=ws, status_provider=None),
+        )
+
+        def factory():
+            return runtime_support.build_step_runtime_factory(
+                providers=providers,
+                shared_registry=ToolRegistry(),
+                shared_connection=None,
+                session_factory=sessions,
+            )
+
+        agent = AgentDefinition(
+            agent_id="inventory-agent",
+            name="A",
+            owner_email=user_email,
+            execution={"executor_id": executor_id},
+        )
+        kwargs = {"conversation_id": conversation_id, "task_id": task_id}
+        if mode == "restart":
+            with pytest.raises(asyncio.CancelledError):
+                await factory()(agent, user_email, **kwargs)
+        if mode == "deadline":
+            with pytest.raises(ExecutorRecoveryTimeout) as error:
+                await factory()(agent, user_email, **kwargs)
+            assert error.value.window.deadline == original_deadline
+            assert error.value.phase == "runtime_admission"
+            assert attempts == 2
+        else:
+            runtime = await factory()(agent, user_email, **kwargs)
+            assert runtime.executor_connection is ws.connection
+            assert attempts == 3
+        assert recovery.await_count == 2
+        async with sessions() as session:
+            conversation = await store_queries.get_conversation(session, conversation_id)
+            marker = conversation.active_executor_unavailable_since
+            assert (marker.replace(tzinfo=UTC) if marker else None) == (
+                original_observation if mode == "deadline" else None
+            )
+            if task_id:
+                task = await store_queries.get_task(session, task_id)
+                assert task.active_executor_unavailable_since == marker
+    finally:
+        await engine.dispose()
 
 
 class _InProcessExecutorProvider:
@@ -1246,7 +1748,17 @@ async def test_runtime_factory_refuses_missing_explicit_executor_configuration(
         session_factory=_runtime_session_factory,
     )
 
-    with pytest.raises(RuntimeError, match="explicitly configure executor_id or executor_selector"):
+    from cognis.core.runtime import ExecutorConfigurationError
+    from cognis.core.turn_scheduler import (
+        _durable_turn_error_detail,
+        _durable_turn_error_message,
+        classify_turn_error,
+    )
+
+    providers = _runtime_providers()
+    with pytest.raises(
+        ExecutorConfigurationError, match="explicitly configure executor_id or executor_selector"
+    ) as failure:
         await factory(
             agent=AgentDefinition(
                 agent_id="agent-1",
@@ -1255,6 +1767,14 @@ async def test_runtime_factory_refuses_missing_explicit_executor_configuration(
             ),
             user_email="alice@example.com",
         )
+
+    classified = await classify_turn_error(providers, failure.value)
+    assert classified.code == "executor_configuration_invalid"
+    assert classified.recoverable is False
+    assert classified.transient is False
+    assert "agent page" in classified.message
+    assert "agent page" in _durable_turn_error_message(classified)
+    assert _durable_turn_error_detail(classified) == str(failure.value)
 
 
 @pytest.mark.asyncio
@@ -1281,7 +1801,11 @@ async def test_runtime_factory_refuses_empty_executor_selector(
         session_factory=_runtime_session_factory,
     )
 
-    with pytest.raises(RuntimeError, match="executor_selector must be a non-empty object"):
+    from cognis.core.runtime import ExecutorConfigurationError
+
+    with pytest.raises(
+        ExecutorConfigurationError, match="executor_selector must be a non-empty object"
+    ):
         await factory(
             agent=AgentDefinition(
                 agent_id="agent-1",
@@ -1502,6 +2026,8 @@ async def test_runtime_factory_refuses_explicit_websocket_fallback(
 async def test_runtime_factory_returns_runtime_diagnostics_for_selected_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from unittest.mock import AsyncMock
+
     async def _policy(_: object) -> ExecutorPolicy:
         return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
 
@@ -1533,8 +2059,13 @@ async def test_runtime_factory_returns_runtime_diagnostics_for_selected_executor
     monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
     monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
 
+    providers = _runtime_providers_with_ws(_ReadyWebSocketProvider("alice_exec"))
+    providers.image_generation = SimpleNamespace(
+        resolve_model_target=AsyncMock(return_value=("gpt-image-1", "openai")),
+        list_models=AsyncMock(return_value=[{"provider_id": "openai", "model_id": "gpt-image-1"}]),
+    )
     factory = runtime_support.build_step_runtime_factory(
-        providers=_runtime_providers_with_ws(_ReadyWebSocketProvider("alice_exec")),
+        providers=providers,
         shared_registry=ToolRegistry(),
         shared_connection=_shared_in_process_connection(),
         session_factory=_runtime_session_factory,
@@ -1555,6 +2086,41 @@ async def test_runtime_factory_returns_runtime_diagnostics_for_selected_executor
     assert runtime.runtime_info["fallback_used"] is False
     assert runtime.runtime_info["executor_id"] == "alice_exec"
     assert runtime.runtime_info["environment"]["cwd"] == "/workspace"
+
+    first_image = runtime.tool_registry.get("image_generate").definition
+    assert first_image.parameters["properties"]["model"]["enum"] == ["openai/gpt-image-1"]
+    providers.image_generation.resolve_model_target.return_value = (
+        "gemini-nano-banana-2.1",
+        "gemini",
+    )
+    providers.image_generation.list_models.return_value = [
+        {
+            "provider_id": "gemini",
+            "model_id": "gemini-nano-banana-2.1",
+            "supports_image_generation": True,
+        }
+    ]
+    refreshed = await factory(
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_id": "alice_exec"},
+        ),
+        user_email="alice@example.com",
+    )
+    refreshed_image = refreshed.tool_registry.get("image_generate").definition
+    assert refreshed_image.parameters["properties"]["model"]["enum"] == [
+        "gemini/gemini-nano-banana-2.1"
+    ]
+    assert (
+        "Default: gemini/gemini-nano-banana-2.1."
+        in (refreshed_image.parameters["properties"]["model"]["description"])
+    )
+    providers.image_generation.list_models.assert_awaited_with(
+        acting_user_email="alice@example.com"
+    )
+    assert first_image.parameters["properties"]["model"]["enum"] == ["openai/gpt-image-1"]
 
 
 @pytest.mark.asyncio
@@ -2290,8 +2856,9 @@ async def test_legacy_missing_selector_reconnect_preserves_pin_on_sqlite(
         task = await store_queries.get_task(session, "runtime-missing-task")
         conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
         assert task is not None and conversation is not None
-        assert task.active_executor_unavailable_since is None
-        assert conversation.active_executor_unavailable_since is None
+        # Resolving the pin is not successful inventory admission.
+        assert task.active_executor_unavailable_since == observed_at
+        assert conversation.active_executor_unavailable_since == observed_at
         old_observation = datetime.now(UTC) - timedelta(seconds=30)
         task.active_executor_unavailable_since = old_observation
         conversation.active_executor_unavailable_since = old_observation

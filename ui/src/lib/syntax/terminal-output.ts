@@ -10,31 +10,39 @@ const BARE_URL_PATTERN = /https?:\/\/[^\s<>'")\]]+/g;
 const ESC = '\x1b';
 const BEL = '\x07';
 
+// Theme named ANSI foregrounds on the default surface, including aliases 0–15.
+// Explicit RGB and the remaining indexed cube/grayscale values retain terminal fidelity.
 const BASIC_COLORS = [
-  '#111827',
-  '#ef4444',
-  '#22c55e',
-  '#eab308',
-  '#3b82f6',
-  '#d946ef',
-  '#06b6d4',
-  '#e5e7eb',
+  'rgb(var(--color-foreground, 229 231 235))',
+  'rgb(var(--color-danger, 239 68 68))',
+  'rgb(var(--color-success, 34 197 94))',
+  'rgb(var(--color-warning, 234 179 8))',
+  'rgb(var(--color-blue-tone, 59 130 246))',
+  'rgb(var(--color-fuchsia-tone, 217 70 239))',
+  'rgb(var(--color-cyan-tone, 6 182 212))',
+  'rgb(var(--color-foreground, 229 231 235))',
 ];
 
 const BRIGHT_COLORS = [
-  '#6b7280',
-  '#f87171',
-  '#4ade80',
-  '#facc15',
-  '#60a5fa',
-  '#e879f9',
-  '#22d3ee',
-  '#f9fafb',
+  'rgb(var(--color-secondary, 107 114 128))',
+  'rgb(var(--color-danger, 248 113 113))',
+  'rgb(var(--color-success, 74 222 128))',
+  'rgb(var(--color-warning, 250 204 21))',
+  'rgb(var(--color-blue-tone, 96 165 250))',
+  'rgb(var(--color-fuchsia-tone, 232 121 249))',
+  'rgb(var(--color-cyan-tone, 34 211 238))',
+  'rgb(var(--color-foreground, 249 250 251))',
 ];
 
+const ANSI_COLORS = [
+  '#111827', '#ef4444', '#22c55e', '#eab308', '#3b82f6', '#d946ef', '#06b6d4', '#e5e7eb',
+  '#6b7280', '#f87171', '#4ade80', '#facc15', '#60a5fa', '#e879f9', '#22d3ee', '#f9fafb',
+];
+
+type TerminalColor = string | number;
 type TerminalStyle = {
-  fg?: string;
-  bg?: string;
+  fg?: TerminalColor;
+  bg?: TerminalColor;
   bold: boolean;
   faint: boolean;
   italic: boolean;
@@ -75,6 +83,8 @@ type EscSequence =
 
 function defaultStyle(): TerminalStyle {
   return {
+    fg: undefined,
+    bg: undefined,
     bold: false,
     faint: false,
     italic: false,
@@ -131,10 +141,9 @@ function linkifyEscapedText(text: string): string {
   return html;
 }
 
-function xterm256Color(index: number): string | undefined {
+function xterm256Color(index: number): TerminalColor | undefined {
   if (!Number.isInteger(index) || index < 0 || index > 255) return undefined;
-  if (index < 8) return BASIC_COLORS[index];
-  if (index < 16) return BRIGHT_COLORS[index - 8];
+  if (index < 16) return index;
   if (index < 232) {
     const value = index - 16;
     const r = Math.floor(value / 36);
@@ -156,7 +165,7 @@ function applyExtendedColor(codes: number[], index: number, target: 'fg' | 'bg',
   const mode = codes[index + 1];
   if (mode === 5) {
     const color = xterm256Color(codes[index + 2]);
-    if (color) style[target] = color;
+    if (color !== undefined) style[target] = color;
     return index + 2;
   }
   if (mode === 2) {
@@ -188,10 +197,10 @@ function applySgrCodes(params: string, style: TerminalStyle): TerminalStyle {
     else if (code === 27) next.inverse = false;
     else if (code === 39) delete next.fg;
     else if (code === 49) delete next.bg;
-    else if (code >= 30 && code <= 37) next.fg = BASIC_COLORS[code - 30];
-    else if (code >= 40 && code <= 47) next.bg = BASIC_COLORS[code - 40];
-    else if (code >= 90 && code <= 97) next.fg = BRIGHT_COLORS[code - 90];
-    else if (code >= 100 && code <= 107) next.bg = BRIGHT_COLORS[code - 100];
+    else if (code >= 30 && code <= 37) next.fg = code - 30;
+    else if (code >= 40 && code <= 47) next.bg = code - 40;
+    else if (code >= 90 && code <= 97) next.fg = code - 90 + 8;
+    else if (code >= 100 && code <= 107) next.bg = code - 100 + 8;
     else if (code === 38) index = applyExtendedColor(codes, index, 'fg', next);
     else if (code === 48) index = applyExtendedColor(codes, index, 'bg', next);
   }
@@ -414,8 +423,22 @@ function readOscSequence(text: string, index: number): EscSequence | null {
 
 function cssForStyle(style: TerminalStyle): string {
   const declarations: string[] = [];
-  const fg = style.inverse ? style.bg : style.fg;
-  const bg = style.inverse ? style.fg : style.bg;
+  // Named foregrounds adapt to the default app surface. Explicit backgrounds
+  // instead use the terminal palette, so black/white pairs stay distinct.
+  const paletteColor = (color: TerminalColor): string =>
+    typeof color === 'number' ? ANSI_COLORS[color] : color;
+  const foreground = style.bg === undefined
+    ? typeof style.fg === 'number'
+      ? style.fg < 8 ? BASIC_COLORS[style.fg] : BRIGHT_COLORS[style.fg - 8]
+      : style.fg
+    : style.fg !== undefined
+      ? paletteColor(style.fg)
+      : typeof style.bg === 'number'
+        ? [3, 6, 7, 10, 11, 12, 13, 14, 15].includes(style.bg) ? ANSI_COLORS[0] : ANSI_COLORS[15]
+        : undefined;
+  const background = style.bg !== undefined ? paletteColor(style.bg) : undefined;
+  const fg = style.inverse ? background ?? 'rgb(var(--color-inset, 15 23 42))' : foreground;
+  const bg = style.inverse ? foreground ?? 'rgb(var(--color-foreground, 229 231 235))' : background;
   if (fg) declarations.push(`color: ${fg}`);
   if (bg) declarations.push(`background-color: ${bg}`);
   if (style.bold) declarations.push('font-weight: 700');

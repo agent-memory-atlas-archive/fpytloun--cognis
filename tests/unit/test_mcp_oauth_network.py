@@ -17,9 +17,9 @@ from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService, _safe_url
 from cognis.core.mcp_oauth_network import OAuthDestinationTransport, resolve_oauth_destination
 
 ENV = "COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS"
-HOST = "mcp-gws.fpy.cz"
+HOST = "oauth-gateway.example.test"
 URL = f"https://{HOST}/mcp"
-IP = "192.168.33.208"
+IP = "10.73.5.19"
 
 
 @pytest.fixture(autouse=True)
@@ -49,18 +49,18 @@ def dns(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> None:
         "[]",
         "true",
         "{",
-        '{"mcp-gws.fpy.cz:443":["192.168.33.208/32"],"mcp-gws.fpy.cz:443":["10.0.0.1/32"]}',
-        '{"*.fpy.cz:443":["192.168.33.208/32"]}',
-        '{"https://mcp-gws.fpy.cz:443":["192.168.33.208/32"]}',
-        '{"mcp-gws.fpy.cz":["192.168.33.208/32"]}',
-        '{"mcp-gws.fpy.cz:0":["192.168.33.208/32"]}',
-        '{"MCP-GWS.fpy.cz:443":["192.168.33.208/32"]}',
-        '{"mcp-gws.fpy.cz.:443":["192.168.33.208/32"]}',
-        '{"192.168.33.208:443":["192.168.33.208/32"]}',
-        '{"mcp-gws.fpy.cz:443/path":["192.168.33.208/32"]}',
-        '{"user@mcp-gws.fpy.cz:443":["192.168.33.208/32"]}',
-        '{"mcp-gws.fpy.cz:443":[]}',
-        '{"mcp-gws.fpy.cz:443":"192.168.33.208/32"}',
+        '{"oauth-gateway.example.test:443":["10.73.5.19/32"],"oauth-gateway.example.test:443":["10.73.5.20/32"]}',
+        '{"*.example.test:443":["10.73.5.19/32"]}',
+        '{"https://oauth-gateway.example.test:443":["10.73.5.19/32"]}',
+        '{"oauth-gateway.example.test":["10.73.5.19/32"]}',
+        '{"oauth-gateway.example.test:0":["10.73.5.19/32"]}',
+        '{"OAUTH-GATEWAY.example.test:443":["10.73.5.19/32"]}',
+        '{"oauth-gateway.example.test.:443":["10.73.5.19/32"]}',
+        '{"10.73.5.19:443":["10.73.5.19/32"]}',
+        '{"oauth-gateway.example.test:443/path":["10.73.5.19/32"]}',
+        '{"user@oauth-gateway.example.test:443":["10.73.5.19/32"]}',
+        '{"oauth-gateway.example.test:443":[]}',
+        '{"oauth-gateway.example.test:443":"10.73.5.19/32"}',
     ],
 )
 def test_invalid_settings_fail_closed(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
@@ -75,7 +75,7 @@ def test_invalid_settings_fail_closed(monkeypatch: pytest.MonkeyPatch, raw: str)
         "0.0.0.0/0",
         "192.168.0.0/16",
         "10.0.0.0/8",
-        "192.168.33.208/24",
+        "10.73.5.19/24",
         "169.254.169.254/32",
         "127.0.0.1/32",
         "224.0.0.1/32",
@@ -84,8 +84,8 @@ def test_invalid_settings_fail_closed(monkeypatch: pytest.MonkeyPatch, raw: str)
         "fd00::/64",
         "fe80::1/128",
         "::1/128",
-        "::ffff:192.168.33.208/128",
-        "192.168.33.208",
+        "::ffff:10.73.5.19/128",
+        "10.73.5.19",
         None,
     ],
 )
@@ -117,7 +117,7 @@ def test_default_deny_and_exact_allow(monkeypatch: pytest.MonkeyPatch) -> None:
         f"https://{HOST}:0/mcp",
         f"http://{HOST}/mcp",
         f"https://sub.{HOST}/mcp",
-        "https://other.fpy.cz/mcp",
+        "https://other.example.test/mcp",
         f"https://{HOST}./mcp",
         f"https://user@{HOST}/mcp",
         f"https://{HOST}/mcp#fragment",
@@ -131,7 +131,7 @@ def test_exception_requires_exact_origin(monkeypatch: pytest.MonkeyPatch, url: s
         resolve_oauth_destination(url)
 
 
-@pytest.mark.parametrize("address", ["192.168.33.209", "169.254.169.254", "127.0.0.1", "8.8.8.8"])
+@pytest.mark.parametrize("address", ["10.73.5.20", "169.254.169.254", "127.0.0.1", "8.8.8.8"])
 def test_all_dns_answers_must_match(monkeypatch: pytest.MonkeyPatch, address: str) -> None:
     trust(monkeypatch)
     dns(monkeypatch, IP, address)
@@ -149,7 +149,7 @@ def test_nondefault_port_and_ipv6(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_public_default_and_loopback_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
     dns(monkeypatch, "8.8.8.8")
-    assert resolve_oauth_destination("https://public.fpy.cz/") == "8.8.8.8"
+    assert resolve_oauth_destination("https://public.example.test/") == "8.8.8.8"
     assert resolve_oauth_destination("http://127.0.0.1:8080/") == "127.0.0.1"
     dns(monkeypatch, "127.0.0.1")
     with pytest.raises(ValueError, match="loopback aliases"):
@@ -228,7 +228,7 @@ async def test_rebinding_between_preflight_and_connect_is_denied(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("location", ["/metadata", "https://other.fpy.cz/metadata"])
+@pytest.mark.parametrize("location", ["/metadata", "https://other.example.test/metadata"])
 async def test_metadata_redirects_use_guard(
     monkeypatch: pytest.MonkeyPatch,
     location: str,
@@ -347,7 +347,7 @@ async def test_credential_redirects_never_follow(
 
     async def handle(self, request):
         seen.append(request)
-        return httpx.Response(307, headers={"Location": "https://other.fpy.cz/token"})
+        return httpx.Response(307, headers={"Location": "https://other.example.test/token"})
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     with pytest.raises(MCPOAuthError):
@@ -370,13 +370,13 @@ async def test_rebinding_after_first_request_cannot_reuse_pool(
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     async with httpx.AsyncClient(transport=OAuthDestinationTransport(), trust_env=False) as client:
         await client.get(URL)
-        dns(monkeypatch, "192.168.33.209")
+        dns(monkeypatch, "10.73.5.20")
         with pytest.raises(httpx.ConnectError, match="outside"):
             await client.get(URL)
     assert len(seen) == 1
 
 
-@pytest.mark.parametrize("addresses", [[], ["8.8.8.8", "192.168.33.208"]])
+@pytest.mark.parametrize("addresses", [[], ["8.8.8.8", "10.73.5.19"]])
 def test_default_empty_or_mixed_dns_is_denied(
     monkeypatch: pytest.MonkeyPatch,
     addresses: list[str],

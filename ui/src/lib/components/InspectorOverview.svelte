@@ -122,18 +122,18 @@
 </script>
 <div class="space-y-4" data-testid="inspector-overview">
   {#if focusedSession}
-    <section class="focused-session-card rounded-xl border border-slate-800 bg-slate-950/30 p-3" data-testid="focused-session-card">
-      <p class="text-[10px] uppercase tracking-wider text-slate-500">Focused session</p>
-      <p class="scrollbar-hidden-x mt-1 text-sm font-medium text-slate-100">{focusedSession.title}</p>
+    <section class="focused-session-card rounded-xl border border-separator bg-inset/30 p-3" data-testid="focused-session-card">
+      <p class="text-[10px] uppercase tracking-wider text-quiet">Focused session</p>
+      <p class="scrollbar-hidden-x mt-1 text-sm font-medium text-foreground">{focusedSession.title}</p>
       <div class="mt-1 flex min-w-0 items-center gap-1">
-        <p class="scrollbar-hidden-x min-w-0 font-mono text-[10px] text-slate-500">{focusedSession.session_id}</p>
-        <button type="button" class="shrink-0 rounded p-1 text-slate-600 transition hover:bg-slate-800 hover:text-sky-300" aria-label={copiedSessionId === focusedSession.session_id ? 'Session ID copied' : 'Copy session ID'} title={copiedSessionId === focusedSession.session_id ? 'Copied' : 'Copy session ID'} onclick={() => void copySessionId(focusedSession.session_id)}>
+        <p class="scrollbar-hidden-x min-w-0 font-mono text-[10px] text-quiet">{focusedSession.session_id}</p>
+        <button type="button" class="shrink-0 rounded p-1 text-quiet transition hover:bg-surface-hover hover:text-accent" aria-label={copiedSessionId === focusedSession.session_id ? 'Session ID copied' : 'Copy session ID'} title={copiedSessionId === focusedSession.session_id ? 'Copied' : 'Copy session ID'} onclick={() => void copySessionId(focusedSession.session_id)}>
           {#if copiedSessionId === focusedSession.session_id}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
         </button>
       </div>
-      <div class="focused-session-metadata mt-2 flex min-w-0 items-center gap-2 text-xs text-slate-400">
+      <div class="focused-session-metadata mt-2 flex min-w-0 items-center gap-2 text-xs text-muted">
         <ActivityAvatar name={focusedAgentName} avatarUrl={focusedAvatarUrl} turnInProgress={sessionStatus() === 'Running'} class="h-7 w-7" />
-        <span class="scrollbar-hidden-x min-w-0 text-slate-200">{focusedAgentName}</span>
+        <span class="scrollbar-hidden-x min-w-0 text-foreground">{focusedAgentName}</span>
         <span>{sessionStatus()}</span>
         <span class="scrollbar-hidden-x min-w-0">{displayedProfile}</span>
         <span class="scrollbar-hidden-x min-w-0">{displayedModel ?? (executionIdentityCurrent ? 'Model unavailable' : 'Model resolving…')}</span>
@@ -141,12 +141,12 @@
       </div>
     </section>
   {:else if focusedSessionId}
-    <section class="rounded-xl border border-slate-800 bg-slate-950/30 p-3" data-testid="focused-session-loading"><p class="text-[10px] uppercase tracking-wider text-slate-500">Focused session</p><p class="mt-1 text-sm text-slate-300">Loading session details…</p><div class="mt-1 flex min-w-0 items-center gap-1"><p class="min-w-0 truncate font-mono text-[10px] text-slate-500">{focusedSessionId}</p><button type="button" class="shrink-0 rounded p-1 text-slate-600 transition hover:bg-slate-800 hover:text-sky-300" aria-label={copiedSessionId === focusedSessionId ? 'Session ID copied' : 'Copy session ID'} title={copiedSessionId === focusedSessionId ? 'Copied' : 'Copy session ID'} onclick={() => void copySessionId(focusedSessionId)}>{#if copiedSessionId === focusedSessionId}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}</button></div><p class="mt-2 text-xs text-slate-500">The conversation tree remains available while this session loads.</p></section>
+    <section class="rounded-xl border border-separator bg-inset/30 p-3" data-testid="focused-session-loading"><p class="text-[10px] uppercase tracking-wider text-quiet">Focused session</p><p class="mt-1 text-sm text-secondary">Loading session details…</p><div class="mt-1 flex min-w-0 items-center gap-1"><p class="min-w-0 truncate font-mono text-[10px] text-quiet">{focusedSessionId}</p><button type="button" class="shrink-0 rounded p-1 text-quiet transition hover:bg-surface-hover hover:text-accent" aria-label={copiedSessionId === focusedSessionId ? 'Session ID copied' : 'Copy session ID'} title={copiedSessionId === focusedSessionId ? 'Copied' : 'Copy session ID'} onclick={() => void copySessionId(focusedSessionId)}>{#if copiedSessionId === focusedSessionId}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}</button></div><p class="mt-2 text-xs text-quiet">The conversation tree remains available while this session loads.</p></section>
   {/if}
-  <section class="rounded-xl border border-slate-800 bg-slate-950/30 p-3" data-testid="overview-context-window">
-    <div class="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-500"><span>Context window</span><span>{contextLabel}</span></div>
-    <div class="h-2 overflow-hidden rounded-full bg-slate-800"><div class="h-full rounded-full bg-sky-400 transition-[width]" style:width={contextWidth}></div></div>
-    <p class="mt-2 text-[10px] text-slate-500" data-testid="overview-context-freshness">
+  <section class="rounded-xl border border-separator bg-inset/30 p-3" data-testid="overview-context-window">
+    <div class="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-quiet"><span>Context window</span><span>{contextLabel}</span></div>
+    <div class="h-2 overflow-hidden rounded-full bg-raised"><div class="h-full rounded-full bg-info transition-[width]" style:width={contextWidth}></div></div>
+    <p class="mt-2 text-[10px] text-quiet" data-testid="overview-context-freshness">
       {contextStatus}
       {#if contextUsage?.measured_at} · Measured {new Date(contextUsage.measured_at).toLocaleTimeString()}{/if}
     </p>
@@ -154,20 +154,20 @@
   <ActivityLifecycleStatus materialization={overview.materialization} onRetry={onRefresh} />
   {#if !presentation.hasContent}
     {#if !overview.materialization || overview.materialization.state === 'live'}
-      <p class="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-400" data-testid="activity-overview-empty">No activity yet.</p>
+      <p class="rounded-xl border border-dashed border-control-border p-8 text-center text-sm text-muted" data-testid="activity-overview-empty">No activity yet.</p>
     {/if}
   {:else}
-    <p class="text-[10px] uppercase tracking-wide text-slate-500" data-testid="overview-stats-scope">Aggregate for this activity graph</p>
+    <p class="text-[10px] uppercase tracking-wide text-quiet" data-testid="overview-stats-scope">Aggregate for this activity graph</p>
     <ActivitySummaryStrip {metrics} onSelect={openMetric} />
     {#if overview.workstreams.length}
-      <section><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Execution sessions</h3><ActivityTree nodes={overview.workstreams} {agents} focusedSessionId={focusedSessionId ?? focusedSession?.session_id ?? null} {runtimeActiveSessionIds} {onViewSession} onViewWork={openTreeWork} /></section>
+      <section><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">Execution sessions</h3><ActivityTree nodes={overview.workstreams} {agents} focusedSessionId={focusedSessionId ?? focusedSession?.session_id ?? null} {runtimeActiveSessionIds} {onViewSession} onViewWork={openTreeWork} /></section>
     {/if}
     <section>
       <div class="mb-2 flex items-center justify-between gap-2">
-        <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-400">Recent activity</h3>
+        <h3 class="text-xs font-semibold uppercase tracking-wide text-muted">Recent activity</h3>
         <div class="flex items-center gap-3">
-          {#if onRefresh}<button type="button" class="text-xs text-slate-400 hover:text-slate-200" onclick={onRefresh}>Refresh</button>{/if}
-          <button type="button" class="text-xs text-sky-300" onclick={() => onOpenWork?.('files', focusedSession?.session_id)}>Open Work</button>
+          {#if onRefresh}<button type="button" class="text-xs text-muted hover:text-foreground" onclick={onRefresh}>Refresh</button>{/if}
+          <button type="button" class="text-xs text-accent hover:text-accent-hover" onclick={() => onOpenWork?.('files', focusedSession?.session_id)}>Open Work</button>
         </div>
       </div>
       {#if overview.recent_work}

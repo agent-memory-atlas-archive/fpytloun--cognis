@@ -15,7 +15,13 @@ from cognis.core.project_context import (
     project_context_event_data,
 )
 from cognis.core.redis_service import RedisService
-from cognis.core.session_cache import CanonicalHistoryUnavailable, SessionCache
+from cognis.core.session_cache import (
+    CachedEvent,
+    CanonicalHistoryUnavailable,
+    SessionCache,
+    _deserialize_entry,
+    _serialize_entry,
+)
 from cognis.models.session import (
     EventAppendResult,
     EventPaginationError,
@@ -23,6 +29,119 @@ from cognis.models.session import (
     SessionEvent,
     SessionModel,
 )
+
+
+@pytest.mark.asyncio
+async def test_projection_decisions_rebuild_from_lifecycle_events_and_survive_cache_encoding() -> (
+    None
+):
+    cache = SessionCache(_Guardrails())
+    session = _session()
+    await cache.refresh(session)
+    entry = cache.get_entry(session.session_id)
+    assert entry is not None
+
+    cache._apply_cached_event(
+        entry,
+        CachedEvent(
+            seq=4,
+            type="lifecycle",
+            data={
+                "event": "context_projection",
+                "decisions": [
+                    {
+                        "call_id": "call-1",
+                        "operation": "compact_result",
+                        "rendering_policy_version": 1,
+                        "parameters": {},
+                    },
+                    {
+                        "event_seq": 23,
+                        "operation": "omit_event",
+                        "rendering_policy_version": 1,
+                        "parameters": {},
+                    },
+                    {
+                        "call_id": "call-invalid-operation",
+                        "operation": [],
+                        "rendering_policy_version": 1,
+                        "parameters": {},
+                    },
+                    {
+                        "call_id": "call-missing-parameter",
+                        "operation": "clear_arguments",
+                        "rendering_policy_version": 1,
+                        "parameters": {},
+                    },
+                ],
+            },
+        ),
+    )
+
+    assert cache.get_projection_decisions(session.session_id) == {
+        "call-1": [
+            {
+                "operation": "compact_result",
+                "rendering_policy_version": 1,
+                "parameters": {},
+            }
+        ],
+        "event:23": [
+            {
+                "operation": "omit_event",
+                "rendering_policy_version": 1,
+                "parameters": {"event_seq": 23},
+            }
+        ],
+    }
+    assert (
+        _deserialize_entry(_serialize_entry(entry)).projection_decisions
+        == entry.projection_decisions
+    )
+    assert "call-invalid-operation" not in entry.projection_decisions
+    assert "call-missing-parameter" not in entry.projection_decisions
+
+
+@pytest.mark.asyncio
+async def test_cold_cache_rebuilds_projection_decisions_from_intaris_events() -> None:
+    class Guardrails(_Guardrails):
+        async def read_events(self, *args: object, **kwargs: object) -> EventReadResult:
+            del args, kwargs
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 9,
+                        "type": "lifecycle",
+                        "data": {
+                            "event": "context_projection",
+                            "decisions": [
+                                {
+                                    "call_id": "call-cold",
+                                    "operation": "compact_result",
+                                    "rendering_policy_version": 1,
+                                    "parameters": {},
+                                }
+                            ],
+                        },
+                    }
+                ],
+                last_seq=9,
+                has_more=False,
+            )
+
+    cache = SessionCache(Guardrails())
+    session = _session("session-cold-projection")
+
+    await cache.refresh(session)
+    assert cache.get_projection_decisions(session.session_id) == {
+        "call-cold": [
+            {
+                "operation": "compact_result",
+                "rendering_policy_version": 1,
+                "parameters": {},
+            }
+        ]
+    }
 
 
 @pytest.mark.asyncio
@@ -1002,6 +1121,97 @@ async def test_legacy_daily_brief_loaded_skill_event_preserves_v12_contract() ->
 
 
 @pytest.mark.asyncio
+async def test_loaded_skill_credential_description_is_redacted_in_live_and_replayed_snapshot() -> (
+    None
+):
+    secret = "AbCd9" * 8
+    description = "x " * 100 + "AWS_SECRET_ACCESS_KEY=" + secret
+    cache = SessionCache(_Guardrails())
+    session = _session("loaded-credential-session")
+    await cache.refresh(session)
+    cache.store_loaded_skill_snapshot(session.session_id, "loaded", {"description": description})
+    assert (
+        secret[:8]
+        not in cache.get_loaded_skill_snapshots(session.session_id)["loaded"]["description"]
+    )
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="lifecycle",
+                data={
+                    "event": "loaded_skill_snapshot",
+                    "skill_id": "loaded",
+                    "description": description,
+                    "name": "Runbook",
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+    assert (
+        secret[:8]
+        not in cache.get_loaded_skill_snapshots(session.session_id)["loaded"]["description"]
+    )
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loaded_skill_summary_survives_record_reload_and_cold_rotation() -> None:
+    from cognis.core.guardrails_context import loaded_skills_context
+
+    events = [
+        {
+            "seq": version,
+            "type": "lifecycle",
+            "data": {
+                "event": "loaded_skill_snapshot",
+                "skill_id": "loaded",
+                "name": "Runbook",
+                "description": description,
+                "version_number": version,
+                "version_id": f"version-{version}",
+                "content_hash": f"hash-{version}",
+            },
+        }
+        for version, description in ((1, "Original summary"), (2, "Reloaded summary"))
+    ]
+    guardrails = _Guardrails()
+    session = _session("loaded-session")
+    cache = SessionCache(guardrails)
+    for row in events:
+        await cache.append_recorded_events(
+            session,
+            [SessionEvent(type=row["type"], data=row["data"])],
+            EventAppendResult(ok=True, count=1, first_seq=row["seq"], last_seq=row["seq"]),
+        )
+        skill = loaded_skills_context(cache.get_loaded_skill_snapshots(session.session_id))[
+            "skills"
+        ][0]
+        assert skill["summary"] == row["data"]["description"]
+        assert skill["summary_missing"] is False
+    await cache.evict_local(session.session_id)
+
+    async def replay(session_id, **kwargs):
+        rows = events if session_id == session.session_id else []
+        return SimpleNamespace(events=rows, last_seq=len(rows), has_more=False)
+
+    guardrails.read_events = replay
+    await cache.refresh(session)
+    rebuilt = loaded_skills_context(cache.get_loaded_skill_snapshots(session.session_id))["skills"][
+        0
+    ]
+    assert rebuilt["summary"] == "Reloaded summary"
+    assert rebuilt["content_hash"] == "hash-2"
+    rotated = _session("rotated-session")
+    await cache.refresh(rotated)
+    assert (
+        loaded_skills_context(cache.get_loaded_skill_snapshots(rotated.session_id))["skills"] == []
+    )
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_events() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session("session-discovery")
@@ -1055,6 +1265,58 @@ async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_event
     )
 
     assert "mcp:googleworkspace:get_events" in cache.get_discovered_tool_ids(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_tool_discovery_replays_to_equivalent_warm_and_cold_cache() -> None:
+    handle = {
+        "tool_id": "mcp:googleworkspace:get_events",
+        "name": "mcp_googleworkspace__get_events",
+        "callable_name": "mcp_googleworkspace__get_events",
+        "scope": "session",
+        "category": "mcp",
+        "profile_group": "office",
+        "source": {
+            "type": "intaris_mcp",
+            "server_name": "googleworkspace",
+            "raw_tool_name": "get_events",
+        },
+        "capabilities": ["read"],
+        "read_only": True,
+        "permission_scope": "current_session_effective_inventory",
+        "confidence": 12.5,
+        "discovered_at": "2026-10-21T10:00:00+00:00",
+    }
+    discovery = {
+        "seq": 1,
+        "type": "lifecycle",
+        "data": {
+            "event": "tool_discovery",
+            "source_tool": "provider_tool_rejection_recovery",
+            "reason": "provider_rejected_hidden_authorized_tool",
+            "handles": [handle],
+        },
+    }
+
+    warm = SessionCache(_Guardrails(), max_entries=10)
+    warm_session = _session("warm-tool-discovery")
+    await warm.append_recorded_events(
+        warm_session,
+        [SessionEvent(type="lifecycle", data=discovery["data"])],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+
+    cold_guardrails = _Guardrails()
+    cold_guardrails.read_events = AsyncMock(
+        return_value=EventReadResult(events=[discovery], last_seq=1, has_more=False)
+    )
+    cold = SessionCache(cold_guardrails, max_entries=10)
+    cold_session = _session("cold-tool-discovery")
+    await cold.refresh(cold_session)
+
+    assert warm.get_discovered_tool_handles(
+        warm_session.session_id
+    ) == cold.get_discovered_tool_handles(cold_session.session_id)
 
 
 @pytest.mark.asyncio

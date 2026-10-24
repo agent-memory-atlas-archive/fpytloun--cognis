@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
@@ -9,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 
 from cognis.core.executor_pin_lifecycle import ensure_active_executor_pin
 from cognis.core.executor_pool import ExecutorAvailability, ExecutorPool, ResolvedExecutorTarget
+from cognis.core.executor_recovery import begin_executor_recovery
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import (
     Agent,
@@ -427,7 +430,10 @@ async def test_mark_and_switch_keep_task_and_conversation_in_sync(tmp_path: obje
 
 
 @pytest.mark.asyncio
-async def test_mark_projection_failure_rolls_back_authoritative_task(tmp_path: object) -> None:
+@pytest.mark.parametrize("through_recovery_service", [False, True])
+async def test_mark_projection_failure_rolls_back_authoritative_task(
+    tmp_path: object, through_recovery_service: bool
+) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/pin-mark-rollback.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -459,17 +465,32 @@ async def test_mark_projection_failure_rolls_back_authoritative_task(tmp_path: o
         )
         await session.commit()
 
-    async with factory() as session:
-        marked, _ = await mark_executor_unavailable(
-            session,
+    if through_recovery_service:
+        dispatcher = SimpleNamespace(
+            queue_recovery_notice=AsyncMock(), flush_recovery_notices=AsyncMock()
+        )
+        window = await begin_executor_recovery(
+            factory,
             conversation_id="conv",
             task_id="task",
-            expected_executor_id="old",
-            expected_generation=1,
-            observed_at=datetime.now(UTC),
+            executor_id="old",
+            notice_dispatcher=dispatcher,
         )
-        assert not marked
-        await session.commit()
+        assert window.executor_id == "old"
+        dispatcher.queue_recovery_notice.assert_awaited_once()
+        dispatcher.flush_recovery_notices.assert_awaited_once()
+    else:
+        async with factory() as session:
+            marked, _ = await mark_executor_unavailable(
+                session,
+                conversation_id="conv",
+                task_id="task",
+                expected_executor_id="old",
+                expected_generation=1,
+                observed_at=datetime.now(UTC),
+            )
+            assert not marked
+            await session.commit()
 
     async with factory() as session:
         task = await session.scalar(select(Task).where(Task.task_id == "task"))

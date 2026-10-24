@@ -3,6 +3,32 @@ import { describe, expect, it } from 'vitest';
 import { TimelineViewportStateStore } from './timeline-viewport-state';
 
 describe('TimelineViewportStateStore', () => {
+  it('does not treat an unconstructed first-boot window as retained history', () => {
+    const store = new TimelineViewportStateStore();
+    expect(store.establishWindow('conversation:a', 1)).toBe(false);
+    store.begin('conversation:a', 1);
+    expect(store.hasRetainedWindow('conversation:a', 1)).toBe(false);
+    expect(store.establishWindow('conversation:a', 1)).toBe(true);
+    expect(store.hasRetainedWindow('conversation:a', 1)).toBe(true);
+  });
+
+  it('retains the logical window after DOM settlement until a genuine load reset', () => {
+    const store = new TimelineViewportStateStore();
+    store.begin('conversation:a', 1);
+    store.establishWindow('conversation:a', 1);
+    store.settle('conversation:a', 1);
+    expect(store.hasRetainedWindow('conversation:a', 1)).toBe(true);
+    store.begin('conversation:b', 2);
+    expect(store.hasRetainedWindow('conversation:a', 1)).toBe(false);
+    expect(store.establishWindow('conversation:a', 1)).toBe(false);
+    expect(store.settle('conversation:a', 1)).toBe(false);
+    expect(store.hasRetainedWindow('conversation:b', 2)).toBe(false);
+    store.establishWindow('conversation:b', 2);
+    store.invalidate();
+    expect(store.hasRetainedWindow('conversation:b', 2)).toBe(false);
+    expect(store.establishWindow('conversation:b', 2)).toBe(false);
+  });
+
   it('defaults an unvisited scope to following the tail', () => {
     const store = new TimelineViewportStateStore();
 

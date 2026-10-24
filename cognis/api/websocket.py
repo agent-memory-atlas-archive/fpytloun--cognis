@@ -63,6 +63,7 @@ from cognis.api.models import (
     WebSocketError,
     WebSocketPong,
 )
+from cognis.api.notification_preview import notification_preview
 from cognis.api.proxy import trusted_request_scheme
 from cognis.api.serializers import conversation_to_response
 from cognis.api.timeline_visibility import (
@@ -415,6 +416,7 @@ class AuthenticatedWebSocket:
     recovery_notified: set[str] = field(default_factory=set)
     chat_v2_cursors: dict[str, str] = field(default_factory=dict)
     chat_v2_scopes: dict[str, TimelineScope] = field(default_factory=dict)
+    executor_monitoring: bool = False
     chat_v2_session_ids: dict[str, frozenset[str]] = field(default_factory=dict)
     chat_v2_rejected_session_ids: dict[str, set[str]] = field(default_factory=dict)
     # Voice mode (conversation overlay). Populated by `enable_tts`/
@@ -456,7 +458,7 @@ class AuthenticatedWebSocket:
         await asyncio.sleep(0)
 
     def send_scope_invalidation_nowait(self, data: dict[str, Any]) -> bool:
-        """Coalesce and enqueue a droppable scope wakeup without blocking."""
+        """Coalesce wakeups without blocking; retain required reconciliation hints."""
         if not self._can_enqueue():
             return False
         conversation_id = data.get("conversation_id")
@@ -480,22 +482,31 @@ class AuthenticatedWebSocket:
             msg_type=str(data.get("type") or "scope_invalidated"),
             message_id=scope_key,
             conversation_id=str(conversation_id or ""),
-            droppable=True,
+            # Stream pressure must not silently evict the only hint that repairs
+            # a sidebar/work view after a committed change.
+            droppable=data.get("type") not in {"work_invalidated", "scope_invalidated"},
             payload=data,
         )
         self._ensure_writer()
-        return self._put_frame_nowait(frame)
+        queued = self._put_frame_nowait(frame)
+        if not queued and not frame.droppable:
+            self._schedule_overflow_abort()
+        return queued
 
     @staticmethod
     def _scope_invalidation_key(data: dict[str, Any]) -> str:
+        if data.get("type") == "executor_monitor_update":
+            return f"executor:{data.get('executor_id')}"
         if data.get("type") == "work_invalidated":
             return f"work:{data.get('work_scope_key') or ''}"
         conversation_id = data.get("conversation_id")
-        return (
+        key = (
             f"{data.get('reason')}:{conversation_id}"
             if isinstance(conversation_id, str)
             else (f"{data.get('reason')}:{data.get('task_id') or data.get('step_run_id') or ''}")
         )
+        # Never let a routine refresh coalesce away a pending access invalidation.
+        return f"{key}:metadata" if data.get("metadata_only") is True else key
 
     async def send_text(
         self,
@@ -1285,7 +1296,6 @@ class WebSocketTurnObserver:
             if result.managed_continuation_pending
             else None,
         )
-
         # Notify clients if the conversation title changed
         if result.title_changed and result.new_title:
             await self._manager.send_to_conversation(
@@ -1325,7 +1335,8 @@ class WebSocketTurnObserver:
             conversation_id,
             volatile_items=[],
             has_active_turn=False,
-            lifecycle="recoverable" if error.recoverable else "terminal",
+            # Manual retry eligibility does not keep this execution alive.
+            lifecycle="recoverable" if error.transient else "terminal",
         )
 
     async def on_thinking(
@@ -1468,6 +1479,7 @@ class WebSocketTurnObserver:
     async def on_queued_messages(
         self, conversation_id: str, messages: list[dict[str, Any]]
     ) -> None:
+        await self._manager.invalidate_chat_v2_admission(conversation_id)
         await self._manager.send_to_conversation(
             conversation_id,
             {
@@ -2087,6 +2099,40 @@ class WebSocketConnectionManager:
             if not conns:
                 del self._by_conversation[conversation_id]
         self._remove_turn_observer_if_unused(conversation_id)
+
+    async def invalidate_chat_v2_admission(
+        self, conversation_id: str, *, session_id: str | None = None
+    ) -> None:
+        """Wake canonical readers without broadcasting legacy message content."""
+        for cid in list(self._by_chat_v2_conversation.get(conversation_id, ())):
+            connection = self._connections.get(cid)
+            if connection is None:
+                continue
+            for scope in list(connection.chat_v2_scopes.values()):
+                if scope.conversation_id != conversation_id or scope.missing_stream:
+                    continue
+                # Pending queue state belongs to the conversation, not a child scope.
+                if scope.kind != "conversation" and (
+                    session_id is None
+                    or not await self._accepts_chat_v2_runtime(
+                        connection,
+                        scope,
+                        conversation_id=conversation_id,
+                        active_session_id=session_id,
+                    )
+                ):
+                    continue
+                if connection.chat_v2_scopes.get(scope.key) is not scope:
+                    continue
+                await connection.send_json(
+                    {
+                        "type": "scope_invalidated",
+                        "reason": "chat_scope_changed",
+                        "conversation_id": conversation_id,
+                        "scope_key": scope.key,
+                        "revision": server_time_iso(),
+                    }
+                )
 
     async def send_to_conversation(
         self,
@@ -2720,6 +2766,9 @@ class WebSocketConnectionManager:
 
         payload = await self._enrich_conversation_updated_payload(conversation_id, payload)
         session_cache = getattr(self.app.state, "session_cache", None)
+        if payload.get("type") == "sidebar_conversation_upsert":
+            # Explicit null distinguishes metadata refreshes from exact replies.
+            payload = {**payload, "completed_reply": payload.get("completed_reply")}
         owner_email = (
             session_cache.get_conversation_owner(conversation_id)
             if session_cache is not None and hasattr(session_cache, "get_conversation_owner")
@@ -3008,6 +3057,11 @@ class WebSocketConnectionManager:
         if event.type == EventType.CLUSTER_SCOPE_INVALIDATED:
             await self._handle_cluster_scope_invalidated(event)
             return
+        if event.type == EventType.INBOX_CHANGED:
+            user_email = event.data.get("user_email")
+            if isinstance(user_email, str):
+                await self.send_to_user(user_email, {"type": "inbox_changed"})
+            return
         # FOLLOW_UP_TURN_REQUESTED is handled by TurnScheduler
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
             return
@@ -3018,6 +3072,12 @@ class WebSocketConnectionManager:
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
             return
+
+        if event.type == EventType.USER_MESSAGE:
+            await self.invalidate_chat_v2_admission(
+                conversation_id,
+                session_id=event.data.get("session_id"),
+            )
 
         delegation_runtime_item = _chat_v2_delegation_runtime_item(event)
         if delegation_runtime_item is not None:
@@ -3153,6 +3213,26 @@ class WebSocketConnectionManager:
                 {
                     "type": "sidebar_conversation_upsert",
                     "conversation_id": conversation_id,
+                    # Never fetch a later "latest" reply during row hydration.
+                    "completed_reply": (
+                        {
+                            "message_id": event.data["message_id"],
+                            "preview": notification_preview(event.data["final_content"]),
+                        }
+                        if event.type == EventType.TURN_COMPLETED
+                        and isinstance(event.data.get("message_id"), str)
+                        and isinstance(event.data.get("final_content"), str)
+                        and not any(
+                            event.data.get(key)
+                            for key in (
+                                "partial",
+                                "delegated",
+                                "task_id",
+                                "managed_continuation_pending",
+                            )
+                        )
+                        else None
+                    ),
                     "revision": (
                         event.timestamp.isoformat()
                         if event.timestamp
@@ -3302,6 +3382,23 @@ class WebSocketConnectionManager:
         kind = event.data.get("kind")
         if not isinstance(raw_scope, dict) or not isinstance(revision, str):
             return
+        if kind == "executor_monitor_changed":
+            from cognis.api.executor_monitor import send_executor_monitor_update
+
+            executor_id = raw_scope.get("executor_id")
+            if isinstance(executor_id, str):
+                await send_executor_monitor_update(
+                    self.app, list(self._connections.values()), executor_id
+                )
+            return
+        if kind == "inbox_changed":
+            token = raw_scope.get("owner_token")
+            signals = getattr(self.app.state, "cluster_signals", None)
+            if isinstance(token, str) and signals is not None:
+                for email in list(self._by_user):
+                    if signals.owner_token_matches(email, token):
+                        await self.send_to_user(email, {"type": "inbox_changed"})
+            return
         event_session_token = raw_scope.get("event_session_token")
         if kind == "event_store_session_invalidated" and isinstance(event_session_token, str):
             cached_event_store = getattr(self.app.state, "cached_event_store", None)
@@ -3406,7 +3503,7 @@ class WebSocketConnectionManager:
         ):
             connection_ids.update(self._by_user.get(owner_email, set()))
 
-        payload = {
+        scope_payload: dict[str, Any] = {
             "type": (
                 "work_invalidated"
                 if kind == "work_invalidated"
@@ -3416,6 +3513,22 @@ class WebSocketConnectionManager:
             ),
             "reason": str(kind),
             "revision": revision,
+            # Chat-state pointers sent only to the current durable owner cannot
+            # revoke that owner's conversation/task access. Membership removals
+            # have their own scope invalidation and never carry this marker.
+            **(
+                {"metadata_only": True}
+                if event.data.get("metadata_only") is True
+                or (
+                    kind == "chat_scope_changed"
+                    and owner_email is not None
+                    and any(
+                        isinstance(value, str)
+                        for value in (conversation_id, session_id, task_id, step_run_id)
+                    )
+                )
+                else {}
+            ),
             **{
                 key: value
                 for key, value in raw_scope.items()
@@ -3439,7 +3552,7 @@ class WebSocketConnectionManager:
             # Owner-wide sidebar invalidations are additionally constrained here.
             if owner_email is not None and connection.user_email != owner_email:
                 continue
-            connection.send_scope_invalidation_nowait(payload)
+            connection.send_scope_invalidation_nowait(scope_payload)
 
     async def _chat_v2_connection_ids_for_event_session_token(
         self,
@@ -4356,6 +4469,10 @@ async def handle_websocket(websocket: WebSocket) -> None:
                 await connection.send_json(WebSocketPong().model_dump())
                 continue
 
+            if message_type in {"executor_monitor_subscribe", "executor_monitor_unsubscribe"}:
+                connection.executor_monitoring = message_type == "executor_monitor_subscribe"
+                continue
+
             if message_type == "chat_v2_subscribe":
                 await _handle_chat_v2_subscribe(websocket.app, manager, connection, message)
                 continue
@@ -4496,6 +4613,85 @@ async def _handle_chat_v2_subscribe(
         }
     )
     await manager.send_chat_v2_scope_runtime_snapshot(connection, scope)
+    if message.get("catch_up") is True:
+        await _send_chat_v2_catch_up(app, connection, scope, cursor)
+
+
+async def _send_chat_v2_catch_up(
+    app: Any,
+    connection: AuthenticatedWebSocket,
+    scope: TimelineScope,
+    cursor: str,
+) -> None:
+    """Send the canonical sync delta missed while a client was disconnected.
+
+    Saves reconnecting clients the follow-up REST ``/sync`` round trip. It is
+    produced by the same builder as REST sync (same cursor validation, reset
+    rules, and limits) and is sent after the subscription is registered, so
+    realtime frames arriving meanwhile are covered by normal cursor checks.
+    Any failure answers with an error marker so the client falls back to REST
+    immediately instead of waiting.
+    """
+
+    frame: dict[str, Any] = {"type": "chat_v2_catch_up", "scope_key": scope.key}
+    if scope.kind != "conversation" or not scope.conversation_id:
+        frame["error"] = "unsupported_scope"
+        await connection.send_json(frame)
+        return
+    try:
+        from cognis.api.chat_v2.event_store import SessionEventStore
+        from cognis.api.chat_v2.snapshot_coordinator import load_conversation_snapshot_context
+        from cognis.api.chat_v2.sync import build_chat_sync_response
+        from cognis.core.project_access import can_read_conversation
+
+        # Same history-read authority as REST /sync: authors read as
+        # themselves; project readers read as the author after an explicit
+        # conversation read grant. Anything else gets no history.
+        caller_email = connection.user_email
+        async with app.state.session_factory() as db_session:
+            row = await get_conversation(db_session, scope.conversation_id)
+            allowed = (
+                row is not None
+                and getattr(row, "status", None) != "deleted"
+                and (
+                    row.user_email == caller_email
+                    or await can_read_conversation(db_session, row, caller_email)
+                )
+            )
+        if not allowed or row is None:
+            frame["error"] = "not_found"
+            await connection.send_json(frame)
+            return
+        owner_email = str(row.user_email)
+        context = await load_conversation_snapshot_context(
+            app,
+            user_email=owner_email,
+            conversation_id=scope.conversation_id,
+            shared_reader=owner_email != caller_email,
+        )
+        response = await build_chat_sync_response(
+            cursor=cursor,
+            scope=context.scope,
+            conversation=context.conversation,
+            session_refs=context.session_refs,
+            # Readers live on session_refs; the field is unused (as in REST).
+            event_store=cast(SessionEventStore, context.event_store),
+            cursor_secret=context.cursor_secret,
+            queue=context.queue,
+            state=context.state,
+            runtime_input=context.runtime_input,
+            event_post_processor=context.event_post_processor,
+            session_cache=context.session_cache,
+        )
+        frame["sync"] = response.model_dump(mode="json")
+    except Exception as exc:  # noqa: BLE001 - client falls back to REST sync
+        logger.info(
+            "chat_v2 websocket catch-up unavailable",
+            extra={"extra_data": {"scope_key": scope.key, "error": type(exc).__name__}},
+        )
+        frame.pop("sync", None)
+        frame["error"] = "catch_up_failed"
+    await connection.send_json(frame)
 
 
 async def _handle_chat_v2_unsubscribe(
@@ -4922,12 +5118,20 @@ async def _handle_resolve_escalation(
     )
 
     svc = app.state.notification_service
-    resolved = await svc.resolve(
-        call_id,
-        decision,
-        {"note": note if isinstance(note, str) else ""},
-        user_email=connection.user_email,
-    )
+    from cognis.providers.guardrails.resolution_errors import ResolutionRejected
+
+    try:
+        resolved = await svc.resolve(
+            call_id,
+            decision,
+            {"note": note if isinstance(note, str) else ""},
+            user_email=connection.user_email,
+        )
+    except ResolutionRejected as exc:
+        await manager.send_error(
+            connection, code=exc.code, message=exc.message, recoverable=not exc.resolved_locally
+        )
+        return
     if not resolved:
         notification = await svc.get(call_id)
         resolution = notification.resolution if notification is not None else None
@@ -4943,6 +5147,14 @@ async def _handle_resolve_escalation(
                 connection,
                 code="expired",
                 message="Escalation expired before it could be resolved",
+                recoverable=True,
+            )
+            return
+        elif notification is not None and notification.status in {"pending", "resolving"}:
+            await manager.send_error(
+                connection,
+                code="upstream_unavailable",
+                message="Unable to confirm the approval with Intaris. Please try again.",
                 recoverable=True,
             )
             return
@@ -5165,6 +5377,7 @@ async def _handle_step_response(
             "continue",
             reply,
             user_email=notification.user_email,
+            human_answer=True,
         )
         if not resolved:
             await manager.send_error(
@@ -5203,6 +5416,8 @@ async def _handle_step_response(
             notif.notification_id,
             "continue",
             reply,
+            user_email=connection.user_email,
+            human_answer=True,
         )
         if not resolved:
             await manager.send_error(
@@ -5315,6 +5530,11 @@ async def _render_command_result(
         await manager.send_to_conversation(
             conversation_id,
             {"type": "recap_available", "conversation_id": conversation_id},
+        )
+    elif result.type == "handoff":
+        await manager.send_to_conversation(
+            conversation_id,
+            {"type": "handoff_available", "conversation_id": conversation_id},
         )
     elif result.type == "error":
         await manager.send_to_conversation(
@@ -5699,6 +5919,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "decision": event.data.get("decision"),
             "reason": event.data.get("reason"),
         }
+    if event.type == EventType.CONVERSATION_HANDOFF_UPDATED:
+        return {"type": "handoff_available", "conversation_id": conversation_id}
     if event.type == EventType.SESSION_COMPACTION_STARTED:
         return {
             "type": "session_compaction_started",
@@ -5746,6 +5968,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "summary_preview": event.data.get("summary_preview"),
             "method": event.data.get("method"),
             "turns_compacted": event.data.get("turns_compacted"),
+            "events_compacted": event.data.get("events_compacted"),
             "trigger": event.data.get("trigger"),
             "reason": event.data.get("reason"),
             "tokens_before": event.data.get("tokens_before"),

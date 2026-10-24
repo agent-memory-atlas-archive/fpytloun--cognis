@@ -13,6 +13,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,9 @@ async def chat_completions(request: Request) -> Response:
 
     # Determine which turn of the multi-turn conversation this is.
     turn_index = _conversation_turn_index(messages)
+    gate = getattr(request.app.state, "release_barrier", None)
+    if gate is not None and (scenario_id, turn_index) == gate[:2]:
+        await gate[2].hold()
 
     _catalog.record_request(
         {
@@ -153,7 +157,11 @@ async def chat_completions(request: Request) -> Response:
 
     if stream:
         chunks = render_chat_completion_stream(
-            scenario, model=model, request_id=request_id, turn_index=turn_index
+            scenario,
+            model=model,
+            request_id=request_id,
+            turn_index=turn_index,
+            messages=messages,
         )
         delays = get_step_delays(scenario, turn_index=turn_index)
 
@@ -341,6 +349,44 @@ async def health(request: Request) -> Response:
     return JSONResponse({"status": "ok", "scenarios": len(_catalog.list_scenarios())})
 
 
+async def mock_barrier(request: Request) -> Response:
+    """Fixture-only single scenario/turn gate. Never expose controls off loopback."""
+    from cognis.testing.barrier import RequestBarrier
+
+    if request.client is None or request.client.host != "127.0.0.1":
+        return Response(status_code=403)
+    gate = getattr(request.app.state, "release_barrier", None)
+    if request.method == "POST":
+        if gate is not None:
+            return Response(status_code=409)
+        body = await request.json()
+        if (
+            not isinstance(body.get("scenario_id"), str)
+            or not isinstance(body.get("turn_index"), int)
+            or body["turn_index"] < 0
+        ):
+            return Response(status_code=400)
+        request.app.state.release_barrier = (
+            body["scenario_id"],
+            body["turn_index"],
+            RequestBarrier(),
+        )
+        return Response(status_code=201)
+    if gate is None:
+        return Response(status_code=404)
+    if request.method == "GET":
+        # Long-poll the entered event, not a timer-based readiness guess.
+        async with asyncio.timeout(30):
+            await gate[2].entered.wait()
+        return Response(status_code=204)
+    if request.method == "PUT":
+        gate[2].release()
+    else:
+        gate[2].cancel()
+        request.app.state.release_barrier = None
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -378,8 +424,20 @@ def create_app(scenarios_dir: Path | None = None) -> Starlette:
         Route("/__mock/scenarios", mock_list_scenarios, methods=["GET"]),
         Route("/__mock/history", mock_get_history, methods=["GET"]),
         Route("/__mock/history", mock_clear_history, methods=["DELETE"]),
+        Route("/__mock/barrier", mock_barrier, methods=["POST", "GET", "PUT", "DELETE"]),
     ]
 
-    app = Starlette(routes=routes)
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            gate = getattr(app.state, "release_barrier", None)
+            if gate is not None:
+                gate[2].cancel()
+
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.state.catalog = _catalog
     return app

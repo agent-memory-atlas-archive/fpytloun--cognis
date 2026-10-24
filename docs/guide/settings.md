@@ -30,6 +30,64 @@ a specific tab:
 - `/settings/account`
 
 These all land on the main settings page with the matching tab selected.
+Only the selected section's data is loaded; unrelated diagnostics and registries
+do not delay it. Navigation warnings apply to unsaved edits in that section,
+not to values initialized when its form opens.
+
+## Agent-operated instance management
+
+QuickStart enables full instance-management tool access for the first agent by
+default, independent of the selected agent template. Its available management
+skills are attached and auto-loaded. Advanced options allow explicit opt-out.
+Existing agents are not silently upgraded: enable individual tools in the agent
+editor and attach the corresponding skills.
+
+| Tool | Scope | Skill |
+| --- | --- | --- |
+| `manage_agents` | User-owned agents, profiles, sharing and bindings | `cognis-agent-manager` |
+| `manage_mcp` | MCP servers, assignments and runtime capability refresh | `cognis-mcp-manager` |
+| `manage_providers` | LLM provider CRUD, discovery, defaults, health and OAuth | `cognis-provider-manager` |
+| `manage_routes` | Custom named inference routes and system task bindings | `cognis-route-manager` |
+| `manage_settings` | Typed settings, web settings and workflow step profiles | `cognis-settings-manager` |
+| `manage_executors` | Executor CRUD, defaults and reconfiguration | `cognis-executor-manager` |
+
+Management is an explicit agent opt-in, not an authorization bypass. Tools execute
+only in the owner's root primary chat, not tasks, delegates, participant chats, or
+project-scoped contexts. Administrator operations still require an administrator.
+Another user's private providers and executors remain private even to an
+administrator. Intaris, approval controls, and plan-mode restrictions remain active.
+
+Use `search_tools` to discover a domain tool and `describe_tool` with the exact
+operation name for its action-specific schema. Configuration mutations support
+`preview=true`; previews validate without persisting or triggering runtime effects.
+Read before writing and provide the returned `expected_updated_at` for providers,
+executors, and settings, or `expected_revision` for named routes, bindings, and
+workflow profiles. Conflicts require a fresh read and review, not a blind retry.
+
+Omitted fields preserve current values. Provider/executor config objects and
+collections replace rather than deep-merge. `bindings_update` patches only explicitly
+supplied task types; `bindings_reset` clears only the specified task types.
+Named routes use `cognis/<name>` references, distinct from their route IDs.
+`resolve` uses the inference planner without generating a response.
+
+Create providers and executors with explicit stable IDs. After an uncertain result,
+read that exact ID before retrying; duplicate IDs do not overwrite resources.
+Dependency conflicts never cascade or silently rewrite consumers.
+
+Provider discovery and enrichment do not save model metadata. Provider tests may
+incur inference charges and are cooldown-limited; OAuth status polling can complete
+authorization. Inline credentials are rejected. Use `config.api_key_secret` to
+reference stored provider credentials and secure user-facing credential flows.
+Executor token provisioning/rotation remains in the authenticated UI so tokens
+never enter agent context.
+
+Saving settings or executor configuration does not prove remote initialization.
+Read back durable values and runtime status separately. Web setting changes validate
+backend readiness and trigger cancellation-safe executor reconfiguration; disabling
+an active backend restores affected defaults to direct access. Typed settings expose
+their application timing. Failed hot application attempts guarded recovery without
+overwriting a newer durable value. These tools do not expose arbitrary database
+keys, environment editing, service restarts, secret retrieval, or user administration.
 
 ## Providers and routing
 
@@ -40,6 +98,98 @@ Use the provider and routing tabs to decide:
 - whether a provider should run on the controller or through an executor
 
 For a first deployment, configure one provider, test it, then add routing rules only when you need different models for different jobs.
+
+Image tools offer configured models from active providers visible to the caller,
+using `provider_id/model_id` references to avoid ambiguity. Omit `model` to use
+the image-generation route; its resolved provider/model is shown as the default.
+Options are rebuilt when a new turn's runtime is created, including in an existing
+conversation. An already-running turn retains its current tool schema.
+
+For Gemini image generation and editing, `size` is a sizing hint rather than
+exact output dimensions: `WxH` maps to the nearest supported aspect ratio and
+1K/2K/4K resolution tier. Gemini 2.5 Flash receives only the aspect ratio because
+it does not support selectable resolution. Missing, `auto`, or invalid sizes
+leave provider defaults unchanged. This applies to controller and executor
+inference; OpenAI image sizes are passed through unchanged.
+
+### Model discovery metadata
+
+**Discover** lists available wire model IDs and enriches them with hosting-provider
+catalog metadata. The same resolver supplies runtime metadata and manual model
+enrichment. It loads reported context/input/output limits, capabilities, supported
+parameters and reasoning values, token and cache prices, model mode, and other
+pricing units (for example transcription prices per second). Provider-reported
+fields take precedence over catalog fields; saved model overrides take precedence
+over both. Discovery never changes saved overrides.
+
+For OpenAI-compatible endpoints, the protocol is not the hosting identity. Cognis
+recognizes exact known API hosts, including Groq, and preserves publisher
+namespaces such as `openai/gpt-oss-20b`. For an unrecognized compatible endpoint,
+set the provider advanced setting **catalog_provider** to its LiteLLM provider
+name only when that catalog describes the actual host (for example `groq` behind
+a private gateway). This setting changes metadata lookup, not inference routing.
+Unknown compatible endpoints do not inherit OpenAI pricing merely because their
+model IDs resemble OpenAI model names.
+
+Metadata can be partial. Missing/null fields remain unknown in discovery, and
+catalog lookup status and field sources are returned in `provider_metadata`.
+Runtime still uses existing safety defaults when limits are unknown; the editor
+does not present or save those defaults as discovered facts. Catalog prices are
+estimates, not account-specific billing quotes. Live provider endpoints need not
+report prices or every capability. Existing richer proxy and Ollama adapters
+continue to supply their own metadata. Saved discovery snapshots can enrich
+runtime metadata for 60 seconds; saving selected fields preserves them as model
+configuration, and changing provider configuration prevents snapshot reuse.
+
+### Provider health and usage
+
+Enabled providers appear in the dashboard's compact Providers strip. Notifications
+is the default tab when issues exist. Use the chevron beside the tabs to collapse
+or expand the panel; the tabs and counts remain visible even with a single tab.
+Selecting a different tab opens its content; clicking the current tab toggles
+the panel. This browser remembers the collapse choice across visits.
+The activity sidebar and provider editor use the same cached observations.
+
+Provider settings include **Automatic health and usage checks**, a check interval
+(default **15 minutes**), and remaining-quota thresholds (warning **20%**, critical
+**0%**). Critical must not exceed warning. Checks use subscription usage endpoints
+or a read-only metadata endpoint; they never generate an LLM response. Connectivity
+does not guarantee that generation will succeed. Unsupported checks show unknown.
+Executor-hosted connectivity probes are currently unsupported.
+
+Disabling automatic checks stops all automatic upstream refreshes, including when
+opening a view. Cached usage stays visible and the refresh icon still works.
+**Refresh now** explicitly refreshes the shared cache; ordinary loading reuses it
+until its deadline. A successful earlier check postpones the scheduled refresh.
+Database leases coordinate manual and scheduled checks across controller replicas.
+
+Last-refreshed timestamps older than one hour are amber and marked stale. Failed
+checks preserve the last successful observations and back off. Quota issues are
+evaluated from fresh, unexpired windows and appear only inside Cognis, not through
+push or external notification channels. Anthropic API-key limits come from previously
+observed response headers, not a proactive usage API; refreshing cannot make those
+observations fresh. Without observations, usage is unknown.
+
+## Notification inbox
+
+The bell opens `/notifications`: a persistent, personal inbox with an unread
+count, history, an **Unread** filter, and **Mark displayed as read**.
+New shares, access changes, and revoked access to agents, projects, and knowledge
+bases appear here. Repeating an unchanged grant does not create another entry.
+Knowledge-base grants currently have one read-only role, so note-only edits are
+not access changes.
+
+Unread inbox items also appear in the dashboard's **Notifications** tab alongside
+live system and provider notices. Reading an inbox item does not resolve an
+approval, dismiss a system issue, or change access. Approval prompts keep their
+existing attention actions. Notification links check current access; history
+does not restore a revoked grant.
+
+New entries produce an in-app toast while the app is focused and use the existing
+browser/PWA Web Push subscription when enabled for the recipient's device. Push
+and realtime hints are best effort. The inbox survives restarts and refreshes on
+reconnect, focus, and periodically while visible. Existing history is not replayed
+as push after a restart. There is no email delivery in this feature.
 
 ## Secrets
 

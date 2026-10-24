@@ -140,12 +140,12 @@ export const policyOptions = [
 ];
 
 const accountStatusClass: Record<string, string> = {
-  connected: 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20',
-  connecting: 'bg-sky-500/10 text-sky-300 border border-sky-500/20',
-  reconnecting: 'bg-sky-500/10 text-sky-300 border border-sky-500/20',
-  error: 'bg-rose-500/10 text-rose-300 border border-rose-500/20',
-  disconnected: 'bg-slate-800 text-slate-300 border border-slate-700',
-  stopped: 'bg-slate-800 text-slate-300 border border-slate-700',
+  connected: 'bg-success-subtle text-success border border-success-border',
+  connecting: 'bg-accent-subtle text-accent border border-accent/20',
+  reconnecting: 'bg-accent-subtle text-accent border border-accent/20',
+  error: 'bg-danger-subtle text-danger border border-danger-border',
+  disconnected: 'bg-raised text-secondary border border-control-border',
+  stopped: 'bg-raised text-secondary border border-control-border',
 };
 
 export function getChannelGuide(channelType: string | null | undefined): SetupGuide | null {

@@ -1,5 +1,139 @@
 # Cognis: API Specification
 
+## Controller profiling administration
+
+Admin session users and ordinary admin API keys can access
+`/api/v1/system/profiling`; inference-only keys cannot. Discovery lists ready
+controller incarnation IDs. `POST /captures` accepts a UUID `capture_id`,
+`options` (light/cpu/allocations/full with bounded duration and sampling settings),
+and optional exact `targets`; omission selects all currently-ready replicas.
+It returns 202 admission, not proof of execution. `GET /captures/{id}` returns
+per-controller states; `GET /captures/{id}/report` includes bounded aggregate
+reports. `POST /captures/{id}/stop` requests an idempotent stop of only that capture.
+
+Options and targets are immutable per retained ID. Conflicts return 409,
+unavailable Redis coordination 503, and expired/unknown captures 404. Reports
+are retained for the latest four captures for at most one hour. Replacements
+do not inherit commands for old incarnations. API responses include `version=1`.
+See [the operational guide](../development/controller-allocation-pressure.md)
+for authentication through Cognis tooling, overhead, retention, boot flags and
+limitations of Python rather than native/distributed tracing.
+
+## Metadata command palette
+
+`GET /api/v1/search/palette` is an authenticated, human-authorized global
+navigation index, not a content-search endpoint. It searches accessible
+conversation/task titles, schedule names, current live deliverable titles, and
+current live artifact filenames, primary agent internal/display names, and
+project names. Ownership and existing project grants apply
+before candidate limits; administrator status does not bypass those checks.
+Main-agent destinations require ownership or an active direct-use grant;
+project assignment alone does not authorize a private main conversation.
+App pages, actions and role-visible Settings destinations are searched locally
+using the shell's shared navigation registry.
+
+| Query parameter | Contract |
+|---|---|
+| `q` | Optional name query, at most 160 characters; blank returns recent metadata |
+| `limit` | Page size, default 20, range 1–40 |
+| `types` | Optional repeated entity kinds: `agent`, `project`, `conversation`, `task`, `schedule`, `deliverable`, `artifact`; applied before candidate limits |
+| `cursor` | Opaque keyset continuation, bound to the user, query, selected kinds and ranking version |
+
+The response is `{items, next_cursor}`. Each compact item contains `kind`, `id`,
+`title`, nullable `project_id`, `agent_id`, `status`, and `format`, plus
+`updated_at`, canonical `href`, and `size_bytes`. Authorized agent metadata adds
+nullable `agent_name` and `agent_avatar_url`. Project destinations add
+`project_avatar_url`, `project_icon`, and `project_color`, using the same avatar
+precedence and validated icon/color defaults as project identity elsewhere.
+Only these display fields are selected, not project definitions or full metadata.
+Content items include `origin`
+(`agent`, `user`, `other`) and a `producer_name` for user uploads. Attachment
+context alone never establishes agent authorship. It contains no message,
+document, artifact, memory, or tool-result content. Native SQLite FTS /
+PostgreSQL GIN indexes generate prefix-anchored candidates, with bounded typo
+refinement. Strong name matches precede typo candidates. Operational type
+priority and two promoted rows per content kind diversify mixed searches
+before seek and candidate limits; content-only searches keep unrestricted
+content ordering. Remaining content is not dropped. Agent-produced file
+priority, update time, kind and ID provide deterministic tie-breaks.
+Main-agent links resolve the canonical `agent_direct` web conversation after
+activation; project links explicitly select Overview.
+Scheduled tasks retain only their latest readable
+execution by creation time and ID, grouped by owner and scheduler source reference.
+This selection precedes title matching, candidate limits and keyset pagination.
+Continuation advances over scanned candidates, so a sparse or empty page can
+still have `next_cursor`; clients must bound automatic continuation.
+
+The process-local admission guard permits one active request per human and four
+per controller, with per-second start limits of four per human and twelve
+globally. Database work has a two-second deadline and the operation has a three-second
+outer timeout. Admission rejects with `429 search_busy`; deadline expiry returns
+`503 search_timeout`; invalid or mismatched cursors return `400 invalid_cursor`.
+Responses use `Cache-Control: no-store`. The UI owns its bounded, short-lived
+metadata cache and fences results after access-scope changes. Proven owner-only
+chat metadata and account-sidebar reconciliation may carry `metadata_only: true`
+on scope invalidation events; they dirty caches without replacing the visible
+snapshot. Unmarked chat/sidebar invalidations remain fail-closed. Refresh and
+access invalidations must not coalesce into the same outgoing slot.
+Keystrokes never
+request external search, embeddings, LLM inference, or content hydration.
+
+## Library browsing
+
+### Artifact authoring and document sharing
+
+Human authoring uses existing immutable artifact lineage/storage and does not
+require an agent runtime or conversation. Mutations are owner-only, reject
+viewer-role callers, and preserve source provenance on new revisions.
+
+- `POST /api/v1/library/artifacts`: durable UTF-8 text creation; filename,
+  MIME type, content, optional project and selected agent IDs.
+- `POST /api/v1/library/artifacts/upload`: durable multipart creation; file,
+  optional display filename, JSON-encoded agent IDs, optional project.
+- `GET /api/v1/library/artifacts/{ref}/edit`: bounded exact-revision source.
+- `POST /api/v1/library/artifacts/{ref}/revisions`: create a successor of that
+  exact current revision. Stale targets return 409. JSON syntax errors return 400.
+- `GET /api/v1/library/agents`: selectable active owned primary agents.
+- `GET/PUT /api/v1/library/items/{kind}/{ref}/sharing`: describe inherited versus
+  explicit agent access, or replace explicit recipients across the lineage.
+- `POST /api/v1/library/items/{kind}/{ref}/public-link`: signed exact-revision
+  `view` or `download` link; expiry uses the existing deliverable sharing contract.
+  Omitted mode selects View only for eligible formats.
+
+Text authoring is limited to 1 MiB and uploaded files to 20 MiB. Object storage
+writes and failed-write cleanup use the canonical revision service. Revision
+creation and explicit sharing serialize on immutable lineage roots before locking
+revision rows; grant revocation therefore includes concurrent successors.
+
+### Browsing endpoints
+
+Authenticated human readers can browse metadata independently of conversations:
+
+- `GET /api/v1/library/items`: current eligible deliverable/file revisions with
+  keyset pagination (`cursor`, `limit`, maximum 100).
+- `GET /api/v1/library/groups`: lazy folders/facets with complete matching counts;
+  `group_by=project|conversation|agent|format`.
+- `GET /api/v1/library/items/{kind}/{ref}`: exact authorized metadata.
+- `PUT /api/v1/library/items/{kind}/{ref}/favorite`: set personal lineage bookmark
+  state with `{"favorite": true|false}` and return metadata including
+  `is_favorite`. Any authenticated reader with current document access can
+  bookmark it; inaccessible references return 404. Writes are idempotent and do
+  not modify document timestamps, revisions, or grants.
+- `GET /api/v1/library/deliverables/{ref}/content`: exact chat, task, or
+  source-detached deliverable payload.
+
+Shared filters: `kind=deliverable|artifact`, literal title/filename tokens `q`,
+`project_id`, `conversation_id`, `agent_id`, `origin=all|user|agent|other`,
+`ownership=all|mine|shared`, `format`, `after`, `before`, and
+`sort=updated|created`, plus `favorites=true` to restrict to the caller's
+bookmarked lineages. Empty project/conversation IDs select unassigned folders.
+Authorization precedes pagination and aggregation. Cursors are bound to actor,
+filters, and grouping; they never grant access.
+
+Existing ownership, project membership, and revision metadata remain canonical.
+Existing artifact preview/download and deliverable revision/export/share routes
+serve the corresponding operations.
+
 ## Overview
 
 Cognis exposes a REST + WebSocket API. All clients use the same surface.
@@ -23,6 +157,31 @@ WebSocket: authenticate via first message `{type: "auth", token: "..."}`.
 Do NOT put tokens in query params.
 
 ## REST Endpoints
+
+### Navigation attention summary
+
+`GET /api/v1/dashboard/navigation-summary` requires an authenticated user and
+returns only that user's active conversation attention groups, complete dashboard
+issue severity totals, unresolved schedule failure count, and paused task count.
+The response follows `NavigationSummaryResponse` in OpenAPI. Groups contain
+`count`, `has_unread`, `session_observed`, active-session status/completion reason,
+and deduplicated pending notification types; they contain no IDs, titles, or
+message content. The frontend applies the shared conversation color policy.
+Totals are independent of page-size and dashboard candidate limits. Dashboard
+inbox unread counts and companion-service notices are combined by the shell from
+their existing stores. Schedule dismissal and recovery use the same issue
+projection as `/api/v1/dashboard/issues`.
+
+### Typed inference (outside the management prefix)
+
+`POST /v1/systemone` is the native TypeSafe-compatible decision operation:
+`model`, JSON `state`, and keyed Choice/Score/Noul `questions` produce validated
+typed `answers` and provider usage. It shares inference authentication,
+ownership, admission limits, sanitized errors, and metadata-only observability
+with chat and embeddings. Intaris service JWTs may use
+`routes/intaris_evaluation`; matching that alias to a Jev model does not make it
+chat-compatible. The operation uses OpenRouter or direct System One transport,
+on the controller or configured executor, without chat fallbacks.
 
 ### Bootstrap (Unauthenticated)
 
@@ -122,7 +281,23 @@ PATCH  /api/v1/conversations/:id/queue/:queue_id          → Edit pending queue
 DELETE /api/v1/conversations/:id/queue/:queue_id          → Cancel pending queued message
 GET    /api/v1/conversations/:id/sessions                 → List sessions
 GET    /api/v1/conversations/:id/delegations              → Active delegations
+POST   /api/v1/conversations/:id/handoff-links           → Link a created recipient to a handoff
 ```
+
+#### Handoff Recipient Link
+
+`POST /api/v1/conversations/:id/handoff-links` accepts `source_session_id`,
+`source_event_seq`, and `recipient_conversation_id`, returning `{ "ok": true }`.
+It requires a mutable owned source, an existing owned recipient, and a source
+session belonging to that conversation. The referenced Intaris event must be a
+completed handoff. Content is read from Intaris, not supplied by the client.
+The source lifecycle update is idempotent for the event/recipient pair and
+preserves the original handoff identity. This operation creates no conversation
+and sends no message; call it only after successful recipient creation.
+
+Handoff lifecycle projection uses one card per request, from `running` through
+`complete` or `failed`. Recipient-link updates preserve that card and its initial
+timeline position. Legacy completed handoffs without request IDs remain linkable.
 
 #### Resolve Conversation (find-or-create)
 ```http
@@ -251,6 +426,23 @@ WebSocket command path.
 
 Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
 `session_suspended` (409), `rate_limited` / `queue_full` (429).
+
+#### Move a Running Tool Call to the Background (Chat v2)
+```http
+POST /api/v1/chat/v2/conversations/conv_abc/tool-calls/toolu_01.../background
+
+→ 200 OK
+{ "conversation_id": "conv_abc", "call_id": "toolu_01...", "tool_name": "bash",
+  "status": "requested", "server_time": "..." }
+```
+
+Asks the executor to continue a running foreground `bash` call of the active
+turn as a background shell. The call's own tool result reports the handoff
+(`moved_to_background`, `shell_id`); `status` is `already_requested` for a
+repeated request. Requires mutation access to the conversation.
+
+Error codes: `unknown_call` (404), `no_active_turn` / `unsupported_tool` /
+`not_backgroundable` / `executor_unsupported` (409), `executor_unavailable` (503).
 
 #### Queued Messages
 
@@ -415,6 +607,7 @@ PUT    /api/v1/executors/:id                   → Update executor configuration
 DELETE /api/v1/executors/:id                   → Delete executor configuration
 POST   /api/v1/executors/:id/default           → Set as default executor
 POST   /api/v1/executors/:id/token             → Generate executor JWT (owner-scoped)
+POST   /api/v1/executors/:id/reconfigure       → Retry active WebSocket runtime initialization (202, ExecutorConfigResponse)
 GET    /api/v1/executor/status                 → Executor status and capabilities
 GET    /api/v1/tools/executor                  → List executor-native tool definitions
 GET    /api/v1/mcp-servers                      → List current user's MCP server configs
@@ -940,6 +1133,29 @@ JSON-RPC protocol specification.
 | `internal_error` | 500 | Server error |
 
 ## Conversation Sidebar Projection
+
+`GET /api/v1/conversations/waiting` pages unread/actionable candidates separately
+from history. It accepts `cursor`, `limit` (1–100), channel/agent/project filters,
+and title query `q`. It always excludes archived/deleted, task-execution,
+task-control, and agent-direct conversations and enforces user ownership.
+Without an explicit context filter (or with only `web` selected), its scope is
+ordinary web topics: no channels, managed/workflow conversations, main/direct
+chats, or legacy default/direct refs. Explicit channel filters can request channel
+Waiting, but do not broaden the Chat navigation badge's fixed topic scope.
+The response contains `conversations: CursorPage<ConversationResponse>` and
+`active_conversation_ids`, resolved through the same direct/managed/background
+activity owners as navigation. Clients exhaust these candidate pages and apply
+the shared Waiting predicate before publishing a replacement snapshot.
+`activity_complete=false` indicates that optional executor telemetry failed or
+timed out; the endpoint still returns fresh database-backed candidates and known
+active IDs with HTTP 200. Clients retain last-known active classifications for
+returned candidates in the same owner/filter scope until a complete lookup
+confirms activity again. They must not infer idle from missing activity on an
+incomplete page. Activity knowledge is committed only after the full traversal
+succeeds. Unread/attention data is not cached as a substitute for a failed query.
+Waiting cursors cannot be reused with history or a different filter scope.
+This endpoint does not read messages, mark conversations read, or dismiss
+notifications.
 
 `GET /api/v1/conversations/sidebar` supports full snapshots and
 `changed_since` deltas. Full responses include `background_work` and set

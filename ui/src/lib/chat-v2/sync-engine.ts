@@ -17,6 +17,7 @@ import type {
 } from './types';
 import type { AttachmentRef } from '$lib/types/api';
 import { conversationTimelineScope, type TimelineScope } from './types';
+import { runtimeHistoryVisibility } from './runtime-history';
 
 export type ChatV2SyncOutcome =
   | 'applied'
@@ -849,8 +850,11 @@ function applySyncLike(
     // rejected does not terminalize the still-active overlay's items.
     localItems,
     admissionPlacements: reconcileAdmissionPlacements(next.admissionPlacements, next.timelineItems),
-    syncStatus: 'ready',
-    lastError: null
+    // A runtime-only frame cannot repair a missing canonical base.
+    syncStatus: isRealtimeFrame(response) && response.ops.length === 0
+      && response.cursor_before === response.cursor_after ? state.syncStatus : 'ready',
+    lastError: isRealtimeFrame(response) && response.ops.length === 0
+      && response.cursor_before === response.cursor_after ? state.lastError : null
   }, getTimelineById(next));
   return { outcome: 'applied', state: next };
 }
@@ -1053,6 +1057,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   }
 
   const visible = [...baseItems];
+  const keepRuntimeHistory = runtimeHistoryVisibility(state.timelineItems);
   const visibleById = baseItems === state.timelineItems
     ? new Map(derived.timelineById)
     : buildTimelineById(baseItems);
@@ -1060,6 +1065,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   // state.localItems is reconciled at transition sites; the visible derive
   // trusts it and only merges it into the already-sorted canonical array.
   for (const item of state.localItems) {
+    if (!keepRuntimeHistory(item)) continue;
     if (
       item.kind === 'message'
       && item.role === 'user'
@@ -1074,6 +1080,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
     upsertVisibleTimelineItem(visible, visibleById, item);
   }
   for (const item of runtimeItems) {
+    if (!keepRuntimeHistory(item)) continue;
     if (isConfirmedLegacyAdmission(item, canonicalIds)) continue;
     if (item.kind === 'message' && item.role === 'user' && item.client_message_id) {
       if (canonicalClientMessageIds.has(item.client_message_id)) continue;
@@ -1151,7 +1158,8 @@ export function visibleQueueMessages(state: ChatV2ClientState): QueueState {
       created_at: admission.createdAt ?? localItem?.created_at ?? existing?.created_at ?? null,
       updated_at: admission.updatedAt ?? existing?.updated_at ?? null,
       status: existing?.status ?? 'queued',
-      cancel_requested: existing?.cancel_requested ?? false
+      cancel_requested: existing?.cancel_requested ?? false,
+      can_edit: existing?.can_edit ?? false
     };
     if (existing) {
       visible[visible.indexOf(existing)] = projected;
@@ -1219,8 +1227,27 @@ function itemTurnIdOf(item: TimelineItem): string | null {
 }
 
 function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): TimelineItem {
-  if (existing.kind !== incoming.kind) return incoming;
+    if (existing.kind !== incoming.kind) return incoming;
   const sort_key = existing.sort_key <= incoming.sort_key ? existing.sort_key : incoming.sort_key;
+  if (existing.kind === 'handoff' && incoming.kind === 'handoff') {
+    // Snapshot/backfill page arrival order cannot undo a result or recipient.
+    const revision = (item: typeof existing) => Math.max(0, ...item.source_refs.map(ref => ref.seq));
+    const [older, newer] = revision(incoming) >= revision(existing)
+      ? [existing, incoming] : [incoming, existing];
+    const terminal = older.status !== 'running' ? older : newer;
+    const sourceRefs = new Map([...existing.source_refs, ...incoming.source_refs]
+      .map(ref => [`${ref.store}:${ref.session_id}:${ref.seq}:${ref.event_type}`, ref]));
+    return {
+      ...older, ...newer, sort_key,
+      status: newer.status === 'running' && terminal.status !== 'running' ? terminal.status : newer.status,
+      text: newer.text || older.text,
+      error: newer.status === 'running' ? terminal.error : newer.error,
+      recipient_conversation_id: newer.recipient_conversation_id ?? older.recipient_conversation_id,
+      source_refs: [...sourceRefs.values()].sort((a, b) => a.seq - b.seq),
+      created_at: existing.sort_key <= incoming.sort_key
+        ? existing.created_at ?? incoming.created_at : incoming.created_at ?? existing.created_at,
+    };
+  }
   if (existing.kind === 'compaction' && incoming.kind === 'compaction') {
     if (existing.status !== 'running' && incoming.status === 'running') return existing;
     return { ...existing, ...incoming, sort_key };

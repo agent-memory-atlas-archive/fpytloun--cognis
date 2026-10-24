@@ -20,6 +20,6 @@
   <meta http-equiv="refresh" content="0; url=/settings?tab=web" />
 </svelte:head>
 
-<div class="flex min-h-[40vh] items-center justify-center p-8 text-sm text-slate-400">
+<div class="flex min-h-[40vh] items-center justify-center p-8 text-sm text-muted">
   Opening settings…
 </div>

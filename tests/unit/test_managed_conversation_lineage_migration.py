@@ -68,7 +68,11 @@ def test_migration_graph_has_single_linear_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["151_task_escalation_timeout"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert "144_work_v8_projection_repair" in {
+        revision.revision for revision in script.walk_revisions("base", heads[0])
+    }
     revisions = list(script.walk_revisions("base", "144_work_v8_projection_repair"))
     assert [revision.revision for revision in revisions[:17]] == [
         "144_work_v8_projection_repair",

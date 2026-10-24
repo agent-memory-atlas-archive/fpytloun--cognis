@@ -21,7 +21,12 @@ LEGACY_EXTRA_INDEXES = {
     ("tasks", "ix_tasks_project_id"),
     ("tasks", "ix_tasks_status_priority"),
 }
-SEMANTIC_UNIQUE_INDEX_EQUIVALENTS = {("llm_providers", "uq_llm_providers_managed_local_key")}
+SEMANTIC_UNIQUE_INDEX_EQUIVALENTS = {
+    ("llm_providers", "uq_llm_providers_managed_local_key"),
+    # SQLite bootstrap implements the same idempotency uniqueness as a named
+    # index, in addition to the migration's constraint.
+    ("executor_pin_notice_outbox", "uq_executor_pin_notice_outbox_idempotency_key"),
+}
 DIALECT_FK_OVERRIDES = {("browser_sessions", ("user_email",), "users", ("email",), None, "CASCADE")}
 
 
@@ -130,6 +135,8 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
                 )
 
         actual_indexes = _actual_index_signatures(inspector, table_name)
+        if table_name == "executor_pin_notice_outbox":
+            assert (("idempotency_key",), True, False) in actual_indexes
         assert _expected_index_signatures(table, inspector.bind.dialect.name) <= actual_indexes, (
             table_name
         )

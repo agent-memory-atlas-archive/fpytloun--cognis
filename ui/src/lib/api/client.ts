@@ -1,8 +1,18 @@
 import { apiUrl } from '$lib/config';
+import type { EntityKind, PalettePage } from '$lib/palette/model';
+import type { VideoJob, VideoPolicy } from '$lib/video';
+import { libraryQuery, type LibraryFilters, type LibraryKind, type LibraryItem, type LibraryPage, type LibraryGroupsPage } from '$lib/library';
+import type { AgentHook, HookAssignment, HookDefinition, HookRun } from '$lib/hooks';
+import { documentCoordination, StaleDocumentError } from '$lib/document-coordination';
+import { hostAllowsObservation } from '$lib/native/host';
+import type { InferenceRoute, InferenceRouteConfig } from '$lib/inference-routes';
 import { reportError } from '$lib/errors';
-import { fetchWithTimeout, isFetchTimeoutError } from '$lib/api/fetch';
+import { fetchWithTimeout, withRequestDeadline, readJsonWithSignal, cancelResponseOnAbort, isFetchTimeoutError, isReplayableBody } from '$lib/api/fetch';
 import { auth } from '$lib/stores/auth';
+import { MetadataReadInvalidatedError, metadataReadFlights, type MetadataInvalidationOwner } from '$lib/api/read-flights';
+import { loadCompleteWaiting, type WaitingActivity } from '$lib/complete-waiting';
 import type {
+  InboxPage,
   ApiKeyCreateResponse,
   Agent,
   AgentGrant,
@@ -10,6 +20,7 @@ import type {
   AttentionActionResolvePayload,
   AttentionActionResolveResponse,
   DashboardIssuesResponse,
+  ProviderMonitor,
   MemoryBackendDescriptor,
   AttachmentRef,
   ChannelAccount,
@@ -30,6 +41,8 @@ import type {
   CursorPage,
   Deliverable,
   DeliverableShareLink,
+  DeliverableRevisions,
+  ArtifactRevisions,
   Escalation,
   ExecutorConfig,
   ExecutorCreateRequest,
@@ -105,7 +118,14 @@ import type {
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
+  AgentProjectAssignment,
+  ResourceVisibility,
+  ExecutorScope,
   Project,
+  ProjectActivity,
+  ProjectAgent,
+  ProjectGrantRole,
+  ProjectTaskSummary,
   ProjectGrant,
   ProjectSource,
   QuestionSetReply,
@@ -154,11 +174,13 @@ import type {
   WorkflowRun
 } from '$lib/types/api';
 import { isRecord, toErrorMessage } from '$lib/utils';
+import { reportRequestFailure, reportRequestSuccess } from '$lib/server-reachability';
 
 export class ApiError extends Error {
   code: string;
   status: number;
   details: Record<string, unknown> | null;
+  retryAfterMs?: number;
 
   constructor(message: string, options: { code?: string; status: number; details?: Record<string, unknown> | null }) {
     super(message);
@@ -172,17 +194,20 @@ export class ApiError extends Error {
 type RequestOptions = RequestInit & {
   auth?: boolean;
   timeoutMs?: number;
+  coalesceMetadata?: boolean;
+  invalidationOwner?: MetadataInvalidationOwner;
 };
 
 const UI_LOAD_REQUEST_TIMEOUT_MS = 30_000;
 const DISABLE_API_REQUEST_TIMEOUT_MS = 0;
 
-async function readError(response: Response): Promise<ApiError> {
+async function readError(response: Response, signal?: AbortSignal | null): Promise<ApiError> {
   let payload: ApiErrorResponse | null = null;
 
   try {
-    payload = (await response.json()) as ApiErrorResponse;
+    payload = (await readJsonWithSignal(response, signal)) as ApiErrorResponse;
   } catch {
+    signal?.throwIfAborted();
     payload = null;
   }
 
@@ -210,39 +235,149 @@ async function readError(response: Response): Promise<ApiError> {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { coalesceMetadata, invalidationOwner = 'transport', ...requestOptions } = options;
+  if (coalesceMetadata) {
+    const lease = documentCoordination().capture();
+    const signal = options.signal ? AbortSignal.any([options.signal, lease.signal]) : lease.signal;
+    const key = JSON.stringify([apiUrl(path), lease.owner, lease.epoch, options.timeoutMs, invalidationOwner]);
+    try {
+      return await withRequestDeadline(async consumerSignal => {
+        for (;;) {
+          try {
+            const result = await metadataReadFlights.run(
+              key, sharedSignal => request<T>(path, { ...requestOptions, signal: sharedSignal }), consumerSignal,
+              invalidationOwner,
+            );
+            consumerSignal.throwIfAborted();
+            lease.assertCurrent();
+            return result;
+          } catch (error) {
+            consumerSignal.throwIfAborted();
+            lease.assertCurrent();
+            // Invalidations replace the transport, not the consumer's deadline.
+            if (!(error instanceof MetadataReadInvalidatedError)) throw error;
+          }
+        }
+      }, { signal, timeoutMs: options.timeoutMs });
+    } catch (error) {
+      if (isFetchTimeoutError(error)) {
+        throw new ApiError(error.message, { code: 'request_timeout', status: 0 });
+      }
+      throw error;
+    }
+  }
+  const mutates = !['GET', 'HEAD'].includes(options.method ?? 'GET');
+  if (mutates) metadataReadFlights.invalidate();
+  const requiresAuth = options.auth !== false;
+  const lease = requiresAuth ? documentCoordination().capture() : null;
+  const signal = lease
+    ? (options.signal ? AbortSignal.any([options.signal, lease.signal]) : lease.signal)
+    : options.signal;
+  let unauthorizedResponse = false;
+  try {
+    return await withRequestDeadline(
+      operationSignal => requestWithinDeadline<T>(
+        path, { ...options, signal: operationSignal, timeoutMs: 0 }, lease,
+        () => { unauthorizedResponse = true; },
+      ),
+      { signal, timeoutMs: options.timeoutMs },
+    );
+  } catch (error) {
+    // Session recovery can itself revoke the captured lease. Preserve the
+    // server's 401 outcome in that case, but never mask an account switch or
+    // navigation cancellation as an authorization failure.
+    const normalized = unauthorizedResponse && error instanceof StaleDocumentError
+      && !options.signal?.aborted && documentCoordination().owner === null
+      ? new ApiError('Your session has expired. Please log in again.', { code: 'unauthorized', status: 401 })
+      : isFetchTimeoutError(error)
+      ? new ApiError(error.message, { code: 'request_timeout', status: 0 })
+      : error;
+    reportRequestFailure(normalized);
+    throw normalized;
+  } finally {
+    if (mutates) metadataReadFlights.invalidate();
+  }
+}
+
+async function requestWithinDeadline<T>(
+  path: string,
+  options: RequestOptions,
+  lease: ReturnType<ReturnType<typeof documentCoordination>['capture']> | null,
+  onUnauthorized: () => void,
+): Promise<T> {
   const { auth: requiresAuth = true, headers, body, timeoutMs, ...rest } = options;
+  const signal = rest.signal;
+  const responseOwners: Array<() => void> = [];
+  try {
   const nextHeaders = new Headers(headers ?? {});
 
   if (body && !nextHeaders.has('Content-Type') && !(body instanceof FormData)) {
     nextHeaders.set('Content-Type', 'application/json');
   }
 
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(apiUrl(path), {
-      ...rest,
-      credentials: 'include',
-      headers: nextHeaders,
-      body
-    }, { timeoutMs });
-  } catch (error) {
-    if (isFetchTimeoutError(error)) {
-      throw new ApiError(error.message, { code: 'request_timeout', status: 0 });
-    }
-    throw error;
-  }
+  const send = async (): Promise<Response> => {
+      await lease?.validate();
+      signal?.throwIfAborted();
+      const response = await fetchWithTimeout(apiUrl(path), {
+        ...rest,
+        signal,
+        credentials: 'include',
+        headers: nextHeaders,
+        body
+      }, { timeoutMs });
+      responseOwners.push(cancelResponseOnAbort(response, signal));
+      await lease?.validate();
+      signal?.throwIfAborted();
+      // Feed the global connectivity status (see $lib/server-reachability).
+      // Gateway/unavailable responses are reported once parsed (below), so
+      // critical application 503s (event_store_*) are not mistaken for an
+      // unreachable server.
+      if (response.status !== 502 && response.status !== 503 && response.status !== 504) {
+        reportRequestSuccess();
+      }
+      return response;
+  };
+
+  let response = await send();
 
   if (response.status === 401 && requiresAuth) {
-    const message = 'Your session has expired. Please log in again.';
-    auth.clear(message);
-    throw new ApiError(message, {
-      code: 'unauthorized',
-      status: 401
-    });
+    onUnauthorized();
+    void response.body?.cancel().catch(() => {});
+    // The server rejects unauthenticated requests before handling them, so a
+    // single retry after a shared session refresh cannot duplicate effects.
+    const recovery = await auth.recoverSession();
+    signal?.throwIfAborted();
+    const retried = recovery === 'valid' && isReplayableBody(body);
+    if (retried) {
+      await lease?.validate();
+      response = await send();
+    }
+    if (response.status === 401) {
+      const sessionRejected = recovery === 'expired' || retried;
+      const message = sessionRejected
+        ? 'Your session has expired. Please log in again.'
+        : 'Could not verify your session. Check your connection.';
+    if (sessionRejected && documentCoordination().owner !== null) {
+      await lease?.validate();
+      signal?.throwIfAborted();
+      await auth.clear(message, lease ?? undefined);
+    }
+      throw new ApiError(message, { code: 'unauthorized', status: 401 });
+    }
   }
 
   if (!response.ok) {
-    throw await readError(response);
+    const error = await readError(response, signal);
+    await lease?.validate();
+    signal?.throwIfAborted();
+    const retryAfter = response.headers.get('Retry-After');
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const delay = Number.isFinite(seconds)
+        ? seconds * 1_000 : Date.parse(retryAfter) - Date.now();
+      if (Number.isFinite(delay)) error.retryAfterMs = Math.max(0, delay);
+    }
+    throw error;
   }
 
   if (response.status === 204) {
@@ -254,7 +389,13 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     return undefined as T;
   }
 
-  return (await response.json()) as T;
+  const result = (await readJsonWithSignal(response, signal)) as T;
+  await lease?.validate();
+  signal?.throwIfAborted();
+  return result;
+  } finally {
+    for (const release of responseOwners) release();
+  }
 }
 
 async function collectCursorPages<T>(fetchPage: (cursor: string | null) => Promise<CursorPage<T>>): Promise<T[]> {
@@ -299,6 +440,50 @@ function rememberExecutorConfigVersion(executor: ExecutorConfig): ExecutorConfig
 }
 
 export const api = {
+  artifactDocuments: {
+    source(ref: string): Promise<import('$lib/artifact-authoring').EditableArtifact> {
+      return request(`/api/v1/library/artifacts/${encodeURIComponent(ref)}/edit`);
+    },
+    create(body: import('$lib/artifact-authoring').ArtifactDraft): Promise<LibraryItem> {
+      return request('/api/v1/library/artifacts', { method: 'POST', body: JSON.stringify(body) });
+    },
+    revise(ref: string, body: import('$lib/artifact-authoring').ArtifactDraft): Promise<LibraryItem> {
+      return request(`/api/v1/library/artifacts/${encodeURIComponent(ref)}/revisions`, { method: 'POST', body: JSON.stringify(body) });
+    },
+    upload(file: File, filename: string, agentIds: string[], projectId?: string): Promise<LibraryItem> {
+      const body = new FormData();
+      body.set('file', file); body.set('filename', filename); body.set('agent_ids', JSON.stringify(agentIds));
+      if (projectId) body.set('project_id', projectId);
+      return request('/api/v1/library/artifacts/upload', { method: 'POST', body });
+    },
+    agents(): Promise<import('$lib/artifact-authoring').AgentAccess[]> { return request('/api/v1/library/agents'); },
+    sharing(kind: string, ref: string): Promise<import('$lib/artifact-authoring').DocumentAccess> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/sharing`);
+    },
+    setSharing(kind: string, ref: string, agentIds: string[]): Promise<import('$lib/artifact-authoring').DocumentAccess> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/sharing`, { method: 'PUT', body: JSON.stringify({ agent_ids: agentIds }) });
+    },
+    publicLink(kind: string, ref: string, options: import('$lib/artifact-authoring').PublicLinkOptions): Promise<import('$lib/artifact-authoring').PublicLink> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/public-link`, { method: 'POST', body: JSON.stringify(options) });
+    },
+  },
+  library: {
+    favorite(kind: LibraryKind, id: string, favorite: boolean): Promise<LibraryItem> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(id)}/favorite`, { method: 'PUT', body: JSON.stringify({ favorite }) });
+    },
+    list(filters: LibraryFilters, cursor?: string): Promise<LibraryPage> {
+      return request(`/api/v1/library/items?${libraryQuery({ ...filters, cursor })}`);
+    },
+    groups(filters: LibraryFilters, group_by: 'project' | 'conversation' | 'agent' | 'format', cursor?: string): Promise<LibraryGroupsPage> {
+      return request(`/api/v1/library/groups?${libraryQuery({ ...filters, group_by, cursor })}`);
+    },
+    item(kind: LibraryKind, id: string): Promise<LibraryItem> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(id)}`);
+    },
+    content(id: string): Promise<Deliverable> {
+      return request(`/api/v1/library/deliverables/${encodeURIComponent(id)}/content`);
+    },
+  },
   auth: {
     bootstrapStatus(): Promise<BootstrapStatusResponse> {
       return request<BootstrapStatusResponse>('/api/bootstrap-status', { auth: false });
@@ -387,6 +572,12 @@ export const api = {
   },
 
   system: {
+    onboarding(): Promise<{ status: 'pending' | 'completed' | 'dismissed' }> {
+      return request('/api/v1/onboarding');
+    },
+    finishOnboarding(status: 'completed' | 'dismissed'): Promise<{ status: 'completed' | 'dismissed' }> {
+      return request('/api/v1/onboarding', { method: 'PUT', body: JSON.stringify({ status }) });
+    },
     bootstrapStatus(): Promise<BootstrapStatusResponse> {
       return request<BootstrapStatusResponse>('/api/bootstrap-status', { auth: false });
     },
@@ -405,9 +596,14 @@ export const api = {
   },
 
   dashboard: {
+    navigationSummary(): Promise<import('$lib/types/api').NavigationSummary> {
+      return request<import('$lib/types/api').NavigationSummary>('/api/v1/dashboard/navigation-summary', {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, coalesceMetadata: true
+      });
+    },
     issues(): Promise<DashboardIssuesResponse> {
       return request<DashboardIssuesResponse>('/api/v1/dashboard/issues', {
-        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, coalesceMetadata: true
       });
     },
 
@@ -423,6 +619,12 @@ export const api = {
   },
 
   search: {
+    palette(query: string, cursor: string | null, signal: AbortSignal, types?: readonly EntityKind[]): Promise<PalettePage> {
+      const params = new URLSearchParams({ q: query, limit: '24' });
+      for (const type of types ?? []) params.append('types', type);
+      if (cursor) params.set('cursor', cursor);
+      return request(`/api/v1/search/palette?${params}`, { signal, timeoutMs: 5000 });
+    },
     health(): Promise<SearchHealth> {
       return request<SearchHealth>('/api/v1/search/health');
     },
@@ -465,6 +667,18 @@ export const api = {
   },
 
   conversations: {
+    linkHandoff(conversationId: string, payload: {
+      source_session_id: string; source_event_seq: number; recipient_conversation_id: string;
+    }): Promise<{ ok: boolean }> {
+      return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/handoff-links`, {
+        method: 'POST', body: JSON.stringify(payload),
+      });
+    },
+    backgroundCommand(conversationId: string, shellId: string): Promise<import('$lib/types/api').BackgroundCommandDetail> {
+      return request(`/api/v1/conversations/${encodeURIComponent(conversationId)}/background-commands/${encodeURIComponent(shellId)}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
+    },
     getQueue(conversationId: string): Promise<QueuedMessagesResponse> {
       return request<QueuedMessagesResponse>(`/api/v1/conversations/${conversationId}/queue`, {
         timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
@@ -473,7 +687,7 @@ export const api = {
 
     list(
       cursor: string | null = null,
-      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; projectId?: string | null; status?: string | null; includeAgentDirect?: boolean | null; includeAttentionActions?: boolean | null; query?: string | null; limit?: number } = {},
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; projectId?: string | null; status?: string | null; includeShared?: boolean; includeAgentDirect?: boolean | null; includeAttentionActions?: boolean | null; query?: string | null; limit?: number } = {},
       options: { signal?: AbortSignal } = {}
     ): Promise<CursorPage<Conversation>> {
       return request<CursorPage<Conversation>>(
@@ -487,10 +701,11 @@ export const api = {
           project_id: filters.projectId,
           status: filters.status,
           include_agent_direct: filters.includeAgentDirect,
+          include_shared: filters.includeShared,
           include_attention_actions: filters.includeAttentionActions,
           q: filters.query
         })}`,
-        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal }
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal, coalesceMetadata: true }
       );
     },
 
@@ -500,10 +715,31 @@ export const api = {
       return collectCursorPages((cursor) => this.list(cursor, filters));
     },
 
-    sidebar(
+    waiting(
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; projectId?: string | null; query?: string | null } = {},
+      options: { signal?: AbortSignal; activity?: WaitingActivity; scope?: string } = {},
+    ): Promise<Conversation[]> {
+      return loadCompleteWaiting((cursor) => request<import('$lib/types/api').WaitingConversationPage>(
+        `/api/v1/conversations/waiting${encodeQuery({
+          cursor, limit: 100,
+          context_type: filters.contextType,
+          context_types: filters.contextTypes ?? undefined,
+          agent_id: filters.agentId,
+          agent_ids: filters.agentIds ?? undefined,
+          project_id: filters.projectId ?? undefined,
+          q: filters.query,
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal },
+      ), options.activity, options.scope);
+    },
+
+    async sidebar(
       cursor: string | null = null,
-      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {},
-      options: { changedSince?: string | null; sidebarRevision?: string | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; projectId?: string | null; status?: string | null; includeShared?: boolean } = {},
+      options: {
+        changedSince?: string | null; sidebarRevision?: string | null; signal?: AbortSignal;
+        invalidationOwner?: MetadataInvalidationOwner;
+      } = {}
     ): Promise<SidebarProjection> {
       return request<SidebarProjection>(
         `/api/v1/conversations/sidebar${encodeQuery({
@@ -511,13 +747,27 @@ export const api = {
           limit: 50,
           changed_since: options.changedSince,
           sidebar_revision: options.sidebarRevision,
+          include_shared: filters.includeShared ?? true,
           context_type: filters.contextType,
           context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
           agent_ids: filters.agentIds ?? undefined,
+          project_id: filters.projectId ?? undefined,
           status: filters.status
         })}`,
-        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
+        {
+          timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal, coalesceMetadata: true,
+          invalidationOwner: options.invalidationOwner,
+        }
+      );
+    },
+
+    backgroundWork(options: { includeAgentDirect?: boolean; signal?: AbortSignal } = {}): Promise<import('$lib/types/api').BackgroundWorkRead> {
+      return request<import('$lib/types/api').BackgroundWorkRead>(
+        `/api/v1/conversations/background-work${encodeQuery({
+          include_agent_direct: options.includeAgentDirect ?? false,
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal, coalesceMetadata: true },
       );
     },
 
@@ -546,6 +796,8 @@ export const api = {
       agent_profile_id?: string | null;
       title?: string | null;
       context?: Record<string, unknown>;
+      project_id?: string | null;
+      visibility?: ResourceVisibility | null;
     }): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations', {
         method: 'POST',
@@ -646,6 +898,7 @@ export const api = {
     },
 
     markRead(conversationId: string): Promise<{ ok: boolean }> {
+      if (!hostAllowsObservation()) return Promise.resolve({ ok: false });
       return request<{ ok: boolean }>(`/api/v1/conversations/${conversationId}/read`, {
         method: 'POST'
       });
@@ -742,10 +995,14 @@ export const api = {
       return request<EffectiveToolsResponse>(`/api/v1/agents/${agentId}/effective-tools`);
     },
 
-    previewEffectiveTools(payload: EffectiveToolsPreviewRequest): Promise<EffectiveToolsResponse> {
+    previewEffectiveTools(
+      payload: EffectiveToolsPreviewRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<EffectiveToolsResponse> {
       return request<EffectiveToolsResponse>(`/api/v1/agents/effective-tools/preview`, {
         method: 'POST',
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: options.signal
       });
     },
 
@@ -808,6 +1065,21 @@ export const api = {
     }
   },
 
+  videos: {
+    policy: () => request<VideoPolicy>('/api/v1/videos/policy'),
+    savePolicy: (policy: VideoPolicy) => request<VideoPolicy>('/api/v1/videos/policy', {
+      method: 'PUT', body: JSON.stringify(policy)
+    }),
+    list: (conversationId: string) => request<VideoJob[]>(
+      `/api/v1/videos/jobs?conversation_id=${encodeURIComponent(conversationId)}`
+    ),
+    cancel: (job: VideoJob) => request<VideoJob>(`/api/v1/videos/jobs/${encodeURIComponent(job.job_id)}/cancel`, {
+      method: 'POST', body: JSON.stringify({ expected_version: job.version, idempotency_key: crypto.randomUUID() })
+    }),
+    recover: (job: VideoJob, action: string) => request<VideoJob>(`/api/v1/videos/jobs/${encodeURIComponent(job.job_id)}/recover`, {
+      method: 'POST', body: JSON.stringify({ action, expected_version: job.version, idempotency_key: crypto.randomUUID() })
+    })
+  },
   images: {
     upload(file: File): Promise<{ image_id: string; url: string }> {
       const formData = new FormData();
@@ -847,8 +1119,14 @@ export const api = {
       });
     },
 
-    signedUrl(artifactId: string, ttlSeconds = 3600, mode: 'download' | 'view' = 'download'): Promise<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }> {
-      return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`);
+    signedUrl(artifactId: string, ttlSeconds = 3600, mode: 'download' | 'view' = 'download', signal?: AbortSignal): Promise<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }> {
+      return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${encodeURIComponent(artifactId)}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`, { signal });
+    },
+
+    revisions(artifactId: string): Promise<ArtifactRevisions> {
+      return request<ArtifactRevisions>(
+        `/api/v1/artifacts/${encodeURIComponent(artifactId)}/revisions`
+      );
     },
 
     textPreview(artifactId: string): Promise<{
@@ -874,16 +1152,22 @@ export const api = {
       return request<Deliverable>(`/api/v1/deliverables/${encodeURIComponent(deliverableId)}${query}`);
     },
 
+    revisions(deliverableId: string): Promise<DeliverableRevisions> {
+      return request<DeliverableRevisions>(
+        `/api/v1/deliverables/${encodeURIComponent(deliverableId)}/revisions`
+      );
+    },
+
     getForStepRun(stepRunId: string, deliverableId: string): Promise<Deliverable> {
       return request<Deliverable>(
         `/api/v1/step-runs/${encodeURIComponent(stepRunId)}/deliverables/${encodeURIComponent(deliverableId)}`
       );
     },
 
-    shareLink(deliverableId: string): Promise<DeliverableShareLink> {
+    shareLink(deliverableId: string, options?: import('$lib/types/api').DeliverableShareOptions): Promise<DeliverableShareLink> {
       return request<DeliverableShareLink>(
         `/api/v1/deliverables/${encodeURIComponent(deliverableId)}/share-link`,
-        { method: 'POST' }
+        { method: 'POST', ...(options ? { body: JSON.stringify(options) } : {}) }
       );
     }
   },
@@ -1379,6 +1663,14 @@ export const api = {
       );
     },
 
+    async reconfigure(executorId: string): Promise<ExecutorConfig> {
+      return rememberExecutorConfigVersion(
+        await request<ExecutorConfig>(`/api/v1/executors/${encodeURIComponent(executorId)}/reconfigure`, {
+          method: 'POST'
+        })
+      );
+    },
+
     delete(executorId: string): Promise<void> {
       return request<void>(`/api/v1/executors/${executorId}`, { method: 'DELETE' });
     },
@@ -1761,7 +2053,7 @@ export const api = {
   },
 
   projects: {
-    list(params: { status?: string; q?: string } = {}): Promise<Project[]> {
+    list(params: { status?: string; q?: string; order_by_activity?: boolean } = {}): Promise<Project[]> {
       return request<Project[]>(`/api/v1/projects${encodeQuery(params)}`, {
         timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
       });
@@ -1816,6 +2108,16 @@ export const api = {
       return request<ProjectGrant[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants`);
     },
 
+    knowledgebases(projectId: string): Promise<KnowledgebaseModel[]> {
+      return request(`/api/v1/projects/${encodeURIComponent(projectId)}/knowledgebases`);
+    },
+
+    assignKnowledgebase(projectId: string, id: string, assigned: boolean): Promise<{ assigned: boolean }> {
+      return request(`/api/v1/projects/${encodeURIComponent(projectId)}/knowledgebases/${encodeURIComponent(id)}`, {
+        method: assigned ? 'PUT' : 'DELETE',
+      });
+    },
+
     createGrant(projectId: string, payload: Record<string, unknown>): Promise<ProjectGrant> {
       return request<ProjectGrant>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants`, {
         method: 'POST',
@@ -1827,11 +2129,94 @@ export const api = {
       return request<{ ok: boolean }>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants/${encodeURIComponent(grantId)}`, { method: 'DELETE' });
     },
 
+    updateGrant(projectId: string, grantId: string, permission: ProjectGrantRole): Promise<ProjectGrant> {
+      return request<ProjectGrant>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants/${encodeURIComponent(grantId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ permission })
+      });
+    },
+
+    leave(projectId: string, makePrivate = false): Promise<{ ok: boolean; made_private: number }> {
+      return request<{ ok: boolean; made_private: number }>(`/api/v1/projects/${encodeURIComponent(projectId)}/leave`, {
+        method: 'POST',
+        body: JSON.stringify({ make_private: makePrivate })
+      });
+    },
+
+    agents(projectId: string): Promise<ProjectAgent[]> {
+      return request<ProjectAgent[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/agents`);
+    },
+
+    upsertAgent(projectId: string, agentId: string, payload: { is_default?: boolean; executor_scope?: ExecutorScope }): Promise<ProjectAgent> {
+      return request<ProjectAgent>(`/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    removeAgent(projectId: string, agentId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
+    },
+
+    conversations(projectId: string, params: { agent_id?: string; limit?: number } = {}): Promise<Conversation[]> {
+      return request<Conversation[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/conversations${encodeQuery(params)}`);
+    },
+
+    tasks(projectId: string, params: { limit?: number } = {}): Promise<ProjectTaskSummary[]> {
+      return request<ProjectTaskSummary[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/tasks${encodeQuery(params)}`);
+    },
+
+    activity(projectId: string, params: { limit?: number } = {}): Promise<ProjectActivity> {
+      return request<ProjectActivity>(`/api/v1/projects/${encodeURIComponent(projectId)}/activity${encodeQuery(params)}`);
+    },
+
+    conversationsPage(projectId: string, cursor: string | null, agentId: string, signal: AbortSignal): Promise<CursorPage<Conversation>> {
+      return request(`/api/v1/projects/${encodeURIComponent(projectId)}/conversations/page${encodeQuery({ cursor, agent_id: agentId || undefined, limit: 30 })}`, { signal });
+    },
+
+    tasksPage(projectId: string, cursor: string | null, signal: AbortSignal): Promise<CursorPage<ProjectTaskSummary>> {
+      return request(`/api/v1/projects/${encodeURIComponent(projectId)}/tasks/page${encodeQuery({ cursor, limit: 30 })}`, { signal });
+    },
+
+    agentProjects(agentId: string): Promise<AgentProjectAssignment[]> {
+      return request<AgentProjectAssignment[]>(`/api/v1/agents/${encodeURIComponent(agentId)}/projects`);
+    },
+
     generateAvatar(projectId: string): Promise<{ avatar_image_id: string; avatar_url: string }> {
       return request<{ avatar_image_id: string; avatar_url: string }>(`/api/v1/projects/${encodeURIComponent(projectId)}/avatar/generate`, { method: 'POST' });
     }
   },
 
+  hooks: {
+    list(): Promise<{ items: AgentHook[] }> {
+      return request('/api/v1/hooks');
+    },
+    create(definition: HookDefinition): Promise<AgentHook> {
+      return request('/api/v1/hooks', { method: 'POST', body: JSON.stringify(definition) });
+    },
+    update(hook: AgentHook, definition: HookDefinition): Promise<AgentHook> {
+      return request(`/api/v1/hooks/${encodeURIComponent(hook.hook_id)}?expected_revision=${hook.revision}`,
+        { method: 'PUT', body: JSON.stringify(definition) });
+    },
+    remove(hook: AgentHook): Promise<{ ok: boolean }> {
+      return request(`/api/v1/hooks/${encodeURIComponent(hook.hook_id)}?expected_revision=${hook.revision}`,
+        { method: 'DELETE' });
+    },
+    assignments(agentId: string): Promise<{ items: HookAssignment[] }> {
+      return request(`/api/v1/agents/${encodeURIComponent(agentId)}/hooks`);
+    },
+    assign(agentId: string, assignment: HookAssignment): Promise<HookAssignment> {
+      return request(`/api/v1/agents/${encodeURIComponent(agentId)}/hooks`,
+        { method: 'PUT', body: JSON.stringify(assignment) });
+    },
+    unassign(agentId: string, hookId: string): Promise<{ ok: boolean }> {
+      return request(`/api/v1/agents/${encodeURIComponent(agentId)}/hooks/${encodeURIComponent(hookId)}`,
+        { method: 'DELETE' });
+    },
+    runs(agentId?: string): Promise<{ items: HookRun[] }> {
+      return request(`/api/v1/hooks/runs${encodeQuery({ agent_id: agentId })}`);
+    }
+  },
   workflows: {
     list(cursor: string | null = null, params?: { include_disabled?: boolean; include_ephemeral?: boolean; project_id?: string | null }): Promise<CursorPage<Workflow>> {
       return request<CursorPage<Workflow>>(
@@ -2038,12 +2423,15 @@ export const api = {
       provider_id?: string;
       preset: string;
       base_url: string;
+      catalog_provider?: string;
       api_key?: string;
       secret_name?: string;
       env_var?: string;
       location?: string;
       executor_id?: string;
       executor_labels?: Record<string, string>;
+      aws_region_name?: string;
+      aws_profile_name?: string;
     }): Promise<{ models: ModelEntry[] }> {
       return request<{ models: ModelEntry[] }>('/api/v1/llm-providers/discover-models-preview', {
         method: 'POST',
@@ -2061,6 +2449,7 @@ export const api = {
     enrichModelsPreview(payload: {
       preset: string;
       base_url: string;
+      catalog_provider?: string;
       model_ids: string[];
       api_key?: string;
       secret_name?: string;
@@ -2107,6 +2496,18 @@ export const api = {
       return request<ProviderUsage>(`/api/v1/llm-providers/${providerId}/usage`);
     },
 
+    monitorList(): Promise<ProviderMonitor[]> {
+      return request<ProviderMonitor[]>('/api/v1/provider-monitor');
+    },
+
+    monitor(providerId: string): Promise<ProviderMonitor> {
+      return request<ProviderMonitor>(`/api/v1/provider-monitor/${encodeURIComponent(providerId)}`);
+    },
+
+    refreshMonitor(providerId: string): Promise<ProviderMonitor> {
+      return request<ProviderMonitor>(`/api/v1/provider-monitor/${encodeURIComponent(providerId)}/refresh`, { method: 'POST' });
+    },
+
     clearChatgptOAuth(providerId: string): Promise<{ ok: boolean }> {
       return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt`, {
         method: 'DELETE'
@@ -2121,6 +2522,26 @@ export const api = {
 
   },
 
+  inferenceRoutes: {
+    list(): Promise<{ routes: InferenceRoute[] }> {
+      return request('/api/v1/inference-routes');
+    },
+    create(config: InferenceRouteConfig): Promise<InferenceRoute> {
+      return request('/api/v1/inference-routes', {
+        method: 'POST', body: JSON.stringify(config)
+      });
+    },
+    update(route: InferenceRoute, config: InferenceRouteConfig): Promise<InferenceRoute> {
+      return request(`/api/v1/inference-routes/${encodeURIComponent(route.route_id)}`, {
+        method: 'PUT', body: JSON.stringify({config, expected_revision: route.revision})
+      });
+    },
+    remove(route: InferenceRoute): Promise<{deleted: boolean}> {
+      return request(`/api/v1/inference-routes/${encodeURIComponent(route.route_id)}?expected_revision=${route.revision}`, {
+        method: 'DELETE'
+      });
+    }
+  },
   modelRouting: {
     get(): Promise<ModelRouting> {
       return request<ModelRouting>('/api/v1/model-routing');
@@ -2288,14 +2709,14 @@ export const api = {
   notifications: {
     list(
       conversationId?: string | null,
-      params: { taskId?: string | null; sessionId?: string | null } = {}
+      params: { taskId?: string | null; sessionId?: string | null; signal?: AbortSignal } = {}
     ): Promise<Notification[]> {
       return request<Notification[]>(
         `/api/v1/notifications${encodeQuery({
           conversation_id: conversationId,
           task_id: params.taskId ?? null,
           session_id: params.sessionId ?? null,
-        })}`
+        })}`, { signal: params.signal }
       );
     },
 
@@ -2309,6 +2730,18 @@ export const api = {
         body: JSON.stringify(payload)
       });
     }
+  },
+
+  inbox: {
+    list(params: { cursor?: string | null; unread?: boolean; limit?: number } = {}): Promise<InboxPage> {
+      return request<InboxPage>(`/api/v1/inbox${encodeQuery(params)}`);
+    },
+    markRead(notificationIds: string[]): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>('/api/v1/inbox/read', {
+        method: 'POST',
+        body: JSON.stringify({ notification_ids: notificationIds }),
+      });
+    },
   },
 
   attentionActions: {

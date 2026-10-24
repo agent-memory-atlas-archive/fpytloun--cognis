@@ -93,8 +93,9 @@ new authored payloads.
   only to communicate meaning; the label remains required and visible.
 - Use `key_value` with `variant: "summary"` for a compact ordered fact strip.
   Item `tone` is semantic. Do not author columns, widths, colors, or styles.
-- Standalone and full-view readers provide a flat viewer shell with theme,
-  copy, download, and table-of-contents controls. The viewer shell is
+- Standalone and full-view readers provide a flat viewer shell with
+  copy, download, and table-of-contents controls. Only external standalone
+  readers offer theme controls; in-app views follow account appearance. The viewer shell is
   renderer-owned; do not model it with authored action blocks.
 
 ## Reference screenshots

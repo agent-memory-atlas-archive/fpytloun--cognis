@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -173,6 +175,32 @@ async def test_channel_resolve_recipient_runner_dispatches_typed_request() -> No
 
 
 @pytest.mark.asyncio
+async def test_unknown_rpc_method_replies_method_not_found() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = IncomingWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": "req-1", "method": "future.method", "params": {}},
+            {"jsonrpc": "2.0", "method": "future.notification", "params": {}},
+            {"jsonrpc": "2.0", "id": "resp-1", "result": {}},
+        ]
+    )
+
+    await runner._message_loop(ws)
+
+    assert ws.sent == [
+        {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32601,
+                "message": "Method not found: future.method",
+                "data": {"method": "future.method"},
+            },
+            "id": "req-1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_channel_resolve_recipient_runner_rejects_malformed_request() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     runner._channel_handler = SimpleNamespace(resolve_recipient=AsyncMock())
@@ -336,6 +364,7 @@ async def test_local_inference_disabled_is_advertised_and_enforced_at_dispatch()
         "llm.complete",
         "llm.discover_models",
         "llm.image_generate",
+        "llm.video",
         "llm.transcribe",
         "llm.synthesize",
         "local_model.show",
@@ -908,13 +937,12 @@ async def test_handle_configure_retries_pending_background_shell_completion() ->
 
 
 @pytest.mark.asyncio
-async def test_handle_configure_exposes_skill_assets_to_materialize_tool(
+async def test_skill_assets_prepare_uses_current_bundle_without_reconfigure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
-    target = tmp_path / "data" / "skill_assets" / "custom" / "youtube_transcript.py"
 
     await runner._handle_configure(
         ws,
@@ -939,24 +967,33 @@ async def test_handle_configure_exposes_skill_assets_to_materialize_tool(
         },
     )
 
-    await runner._handle_tool_execute(
-        ws,
-        "call-1",
-        {
-            "call_id": "call-1",
-            "tool_name": "skill_asset_materialize",
-            "arguments": {
+    for version, content in (
+        ("sv-first", b"print('first')\n"),
+        ("sv-second", b"print('second')\n"),
+    ):
+        await runner._handle_skill_assets_prepare(
+            ws,
+            version,
+            {
+                "owner_email": "user@example.com",
                 "skill_id": "youtube-transcript",
-                "asset_id": "sa-script",
-                "target_path": str(target),
+                "version_id": version,
+                "assets": [
+                    {
+                        "asset_id": version,
+                        "filename": "scripts/youtube_transcript.py",
+                        "content_hash": hashlib.sha256(content).hexdigest(),
+                        "size_bytes": len(content),
+                        "content_type": "text/x-python",
+                        "content_b64": base64.b64encode(content).decode(),
+                    }
+                ],
             },
-            "runtime_metadata": _contract_metadata(runner, "skill_asset_materialize"),
-        },
-    )
-
-    result = ws.sent[-1]["result"]
-    assert result["is_error"] is False
-    assert target.read_text() == "print('hi')\n"
+        )
+        result = ws.sent[-1]["result"]
+        assert Path(result["asset_manifest"][0]["local_path"]).read_bytes() == content
+        assert result["version_id"] == version
+    assert not any(t.name == "skill_asset_materialize" for t in runner._configured_tool_definitions)
     assert "skill_manifests" not in ws.sent[0]["result"]["runtime_metadata"]
 
 
@@ -1326,6 +1363,93 @@ async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
     degraded_server = ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
     assert degraded_server["message"] == "github startup timed out"
     assert degraded_server["stderr_summary"] == "npm error: missing token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_mcp_retry_stages_without_blocking_healthy_tools_and_fences_version(
+    monkeypatch: pytest.MonkeyPatch, superseded: bool
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._configured = True
+    runner._runtime_state = "degraded"
+    runner._config_version = 7
+    healthy = AsyncMock()
+    recovered = AsyncMock()
+    runner._mcp_clients = {"healthy": healthy}
+    runner._runtime_metadata = {
+        "mcp_servers": [
+            {"server_id": "healthy", "name": "healthy", "status": "ready"},
+            {
+                "server_id": "hass",
+                "name": "hass",
+                "status": "failed",
+                "timed_out": True,
+                "phase": "initialize",
+            },
+        ],
+        "warnings": ["MCP server hass failed during initialize."],
+    }
+    tool = ToolDefinition(
+        name="mcp_hass__status",
+        description="Status",
+        parameters={},
+        source=ToolSource(
+            type="local_mcp", server_id="hass", server_name="hass", raw_tool_name="status"
+        ),
+        category="mcp",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(servers: list[MCPServerConfig], secrets: dict[str, str]) -> tuple:
+        assert [server.server_id for server in servers] == ["hass"]
+        entered.set()
+        await release.wait()
+        return (
+            {"hass": recovered},
+            [tool],
+            [{"server_id": "hass", "name": "hass", "status": "ready"}],
+            [],
+        )
+
+    monkeypatch.setattr(runner, "_prepare_mcp_runtime", prepare)
+    ws = DummyWebSocket()
+    task = asyncio.create_task(
+        runner._handle_mcp_retry(
+            ws,
+            "retry",
+            {
+                "config_version": 7,
+                "mcp_servers": [
+                    {"server_id": "hass", "name": "hass", "command": "uvx"},
+                    {"server_id": "healthy", "name": "healthy", "command": "uvx"},
+                ],
+            },
+        )
+    )
+    await entered.wait()
+    # Preparation does not hold the shared configuration lock or gate tools.
+    async with asyncio.timeout(1):
+        async with runner._runtime_config_lock:
+            assert runner._runtime_state == "degraded"
+            assert runner._mcp_clients["healthy"] is healthy
+            if superseded:
+                runner._config_version = 8
+    release.set()
+    await task
+    healthy.close.assert_not_awaited()
+    if superseded:
+        assert ws.sent[-1]["result"]["state"] == "superseded"
+        recovered.close.assert_awaited_once()
+        assert "hass" not in runner._mcp_clients
+    else:
+        assert ws.sent[-1]["result"]["state"] == "applied"
+        assert runner._runtime_state == "active"
+        assert runner._runtime_metadata["warnings"] == []
+        assert runner._mcp_clients["hass"] is recovered
+        assert tool.name in runner._tool_handlers
+        assert ws.sent[-1]["result"]["observed_tools"][0]["name"] == tool.name
 
 
 @pytest.mark.asyncio

@@ -85,9 +85,12 @@ def resolve_daily_brief_contract(
     task_expected_output: str | None,
     loaded_skill_names: Iterable[str] = (),
     loaded_skill_snapshots: Mapping[str, Mapping[str, Any]] | None = None,
+    task_output: bool | None = None,
 ) -> DailyBriefContractActivation | None:
     """Resolve the exact contract version without upgrading older loaded skills."""
 
+    if task_output is False:
+        return None
     snapshots = loaded_skill_snapshots or {}
     daily_snapshots = [
         snapshot

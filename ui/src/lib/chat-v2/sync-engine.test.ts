@@ -55,6 +55,27 @@ function runtime(revision: number, overrides: Partial<RuntimeOverlaySnapshot> = 
 }
 
 describe('user admission handover', () => {
+  it('keeps a linked handoff when older lifecycle pages arrive after the snapshot', () => {
+    const handoff = (seq: number, overrides: Record<string, unknown> = {}): TimelineItem => ({
+      id: 'handoff:sess-1:request', kind: 'handoff', source_session_id: 'sess-1', source_seq: 5,
+      sort_key: `0000:${String(seq).padStart(14, '0')}:000000:10:000000000`, stable: true,
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq, event_type: 'lifecycle' }],
+      focus: 'Review', text: 'Verified handoff.', status: 'complete', ...overrides,
+    } as TimelineItem);
+    const linked = handoff(15, { recipient_conversation_id: 'conv-recipient' });
+    const completed = handoff(10);
+    const running = handoff(6, { status: 'running', text: '' });
+    const initial = applySnapshot(snapshot({ timeline: { items: [linked], has_more_before: true } }));
+    const backfilled = applyBackfill(initial, {
+      schema_version: 2, projection_version: 'chat-v2-test', conversation_id: 'conv-1',
+      server_time: '2026-01-01T00:00:00Z', items: [completed, running], has_more_before: false,
+    });
+    const items = visibleTimelineItems(backfilled);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ status: 'complete', text: 'Verified handoff.',
+      recipient_conversation_id: 'conv-recipient', sort_key: running.sort_key });
+    expect(items[0].source_refs.map(ref => ref.seq)).toEqual([6, 10, 15]);
+  });
   it('reconciles legacy server input through active refresh, settlement and reconnect', () => {
     const pending = message({
       id: 'user:dtr-admission', message_id: 'queue:dtr-admission', role: 'user',
@@ -317,6 +338,92 @@ function authority(
 }
 
 describe('authoritative runtime overlay ordering', () => {
+  it('does not append old runtime history after a newer bounded canonical snapshot', () => {
+    const oldMessage = message({
+      id: 'message:old:phase:1', message_id: 'old', turn_id: 'turn-1',
+      assistant_phase_index: 1, turn_cycle_index: 2, status: 'complete',
+      stable: false, source_refs: [],
+      sort_key: '9998:999999999999999:000001:02:000000000',
+      content: 'Earlier progress'
+    });
+    const oldTool: TimelineItem = {
+      id: 'tool:earlier', kind: 'tool_call', call_id: 'earlier', tool_name: 'read',
+      turn_id: 'turn-1', assistant_phase_index: 1, turn_cycle_index: 2,
+      status: 'complete', stable: false, source_refs: [],
+      sort_key: '9998:999999999999999:000001:03:000000000',
+      attachments: [], file_diffs: [], is_error: false, truncated: false, has_full_output: false
+    };
+    const live = runtime(2, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_revision: 2 }),
+      volatile_items: [oldMessage, oldTool]
+    });
+    const initial = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false }, runtime: live
+    }));
+    const latest = message({
+      id: 'message:latest:phase:30', message_id: 'latest', turn_id: 'turn-1',
+      assistant_phase_index: 30, turn_cycle_index: 40, status: 'complete',
+      sort_key: '0000:000000000001140:000030:02:000000000', content: 'Latest progress'
+    });
+    const current = message({
+      id: 'message:current:phase:31', message_id: 'current', turn_id: 'turn-1',
+      assistant_phase_index: 31, turn_cycle_index: 41, status: 'running', partial: true,
+      stable: false, source_refs: [],
+      sort_key: '9998:999999999999999:000031:02:000000000', content: 'Still working'
+    });
+    const recovered = applySnapshot(snapshot({
+      timeline: { items: [latest], has_more_before: true, before_cursor: 'older-page' },
+      runtime: {
+        ...live, runtime_revision: 3, authority: authority({ source_revision: 3 }),
+        volatile_items: [current], volatile_items_complete: false
+      }
+    }), initial);
+    expect(visibleTimelineItems(recovered).map(item => item.id)).toEqual([latest.id, current.id]);
+    expect(recovered.runtime?.volatile_items).toHaveLength(3);
+
+    const correctCachedView = applySnapshot(snapshot({
+      timeline: { items: [latest], has_more_before: true, before_cursor: 'older-page' },
+      runtime: runtime(1)
+    }));
+    expect(visibleTimelineItems(correctCachedView).map(item => item.id)).toEqual([latest.id]);
+    const delayedRuntime = applyRealtimeFrame(correctCachedView, {
+      type: 'chat_v2_frame', schema_version: 2, projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1', cursor_before: 'cursor-1', cursor_after: 'cursor-1', ops: [],
+      runtime: { ...live, volatile_items: [oldMessage, oldTool, current] },
+      server_time: '2026-01-01T00:00:03Z'
+    });
+    expect(delayedRuntime.outcome).toBe('applied');
+    expect(visibleTimelineItems(delayedRuntime.state).map(item => item.id)).toEqual([latest.id, current.id]);
+
+    const settled = applySyncResponse(recovered, syncResponse({
+      runtime: runtime(4, {
+        authority: authority({ source_revision: 4, lifecycle: 'terminal' }),
+        volatile_items_complete: true
+      })
+    })).state;
+    expect(visibleTimelineItems(settled).map(item => item.id)).toEqual([latest.id, current.id]);
+
+    const canonicalOld = {
+      ...oldMessage, stable: true, sort_key: '0000:000000000000263:000001:02:000000000',
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 263, event_type: 'assistant_message' }]
+    };
+    const canonicalTool = {
+      ...oldTool, stable: true, sort_key: '0000:000000000000264:000001:03:000000000',
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 264, event_type: 'tool_call' }]
+    };
+    const backfilled = applyBackfill(settled, {
+      schema_version: 2, projection_version: 'chat-v2-test', conversation_id: 'conv-1',
+      server_time: '2026-01-01T00:00:05Z',
+      items: [canonicalOld, canonicalTool], has_more_before: false
+    });
+    expect(visibleTimelineItems(backfilled).map(item => item.id)).toEqual([
+      oldMessage.id, oldTool.id, latest.id, current.id
+    ]);
+    expect(visibleTimelineItems(backfilled).slice(0, 2)).toEqual([canonicalOld, canonicalTool]);
+  });
+
   it('orders by fencing token before source revision', () => {
     const current = runtime(8, {
       has_active_turn: true,
@@ -610,6 +717,7 @@ describe('Chat v2 sync engine', () => {
         updated_at: '2026-01-01T00:00:01Z',
         status: 'queued',
         cancel_requested: false,
+        can_edit: false,
       }],
       queued_count: 1,
     });

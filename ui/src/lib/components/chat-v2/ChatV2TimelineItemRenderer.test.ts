@@ -118,6 +118,16 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
     expect(screen.getByText('87.0% effective')).toBeTruthy();
   });
 
+  it('describes compaction inside the current turn instead of zero turns', () => {
+    render(ChatV2TimelineItemRenderer, {
+      item: { ...compaction('compacted'), turns_compacted: 0, events_compacted: 120 },
+      scope,
+    });
+
+    expect(screen.getByText(/Earlier work in the current turn summarized/)).toBeTruthy();
+    expect(screen.queryByText(/0 turns summarized/)).toBeNull();
+  });
+
   it('preserves user messages and gives system messages a compact activity row', () => {
     const user = render(ChatV2TimelineItemRenderer, { item: message('user', '# User Markdown'), scope });
     expect(user.container.querySelector('[data-role="user"] .prose-user h1')?.textContent).toBe('User Markdown');

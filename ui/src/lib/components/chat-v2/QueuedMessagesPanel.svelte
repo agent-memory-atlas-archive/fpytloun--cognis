@@ -54,7 +54,7 @@
   }
 
   function startEdit(message: QueueMessage): void {
-    if (message.status === 'committing') return;
+    if (message.status === 'committing' || !message.can_edit) return;
     editingId = message.queue_id;
     editContent = message.content;
     error = '';
@@ -67,7 +67,8 @@
   }
 
   async function save(queueId: string): Promise<void> {
-    if (visibleMessages.find((message) => message.queue_id === queueId)?.status === 'committing') {
+    const current = visibleMessages.find((message) => message.queue_id === queueId);
+    if (!current?.can_edit || current.status === 'committing') {
       cancelEdit();
       return;
     }
@@ -135,17 +136,17 @@
 </script>
 
 {#if visibleMessages.length > 0}
-  <section class={`shrink-0 border-t border-sky-400/20 bg-sky-500/10 ${compact ? 'px-3 py-2' : 'px-3 py-2.5'}`} aria-label="Queued messages">
-    {#if error}<p class="mt-1 text-xs text-rose-200" role="alert">{error}</p>{/if}
+  <section class={`shrink-0 border-t border-separator bg-inset ${compact ? 'px-3 py-2' : 'px-3 py-2.5'}`} aria-label="Queued messages">
+    {#if error}<p class="mt-1 text-xs text-danger" role="alert">{error}</p>{/if}
     <div class="max-h-48 space-y-1.5 overflow-auto">
       {#each visibleMessages as message (message.queue_id)}
         {@const automatic = isAutomaticContinuation(message)}
         {@const committing = message.status === 'committing'}
         {@const expanded = expandedIds.has(message.queue_id)}
         {@const accessibleLabel = queuedMessageAccessibleLabel(message)}
-        <div class="rounded-lg border border-sky-300/20 bg-slate-950/50 p-2">
+        <div class="rounded-lg bg-surface p-2">
           <div class="flex min-w-0 flex-wrap items-center gap-2">
-            <p class="min-w-0 flex-1 truncate text-xs text-slate-100">{queuedMessageLabel(message)}</p>
+            <p class="queue-message-text min-w-0 flex-1 truncate text-foreground">{queuedMessageLabel(message)}</p>
             <Button
               size="sm"
               variant="ghost"
@@ -156,32 +157,34 @@
               {expanded ? 'Collapse' : 'Details'}
             </Button>
             {#if committing}
-              <span class="shrink-0 text-[11px] font-medium text-sky-200">Committing…</span>
+              <span class="shrink-0 text-[11px] font-medium text-info">Committing…</span>
             {:else if !automatic}
+              {#if message.can_edit}
               <Button size="sm" variant="secondary" disabled={busyId !== null} aria-label={`Edit queued message: ${accessibleLabel}`} onclick={() => startEdit(message)}>Edit</Button>
+              {/if}
               <Button size="sm" variant="danger" disabled={busyId !== null} aria-label={`${busyId === message.queue_id ? 'Deleting' : 'Delete'} queued message: ${accessibleLabel}`} onclick={() => void remove(message)}>
                 {busyId === message.queue_id ? 'Deleting…' : 'Delete'}
               </Button>
             {/if}
           </div>
           {#if expanded}
-            <div class="mt-2 rounded-lg border border-slate-800/70 bg-slate-950/70 p-2.5">
-              <p class="max-h-48 overflow-auto whitespace-pre-wrap break-words text-xs text-slate-100">{message.content || queuedMessageLabel(message)}</p>
+            <div class="mt-2 rounded-lg bg-inset p-2.5">
+              <p class="queue-message-text max-h-48 overflow-auto whitespace-pre-wrap break-words text-foreground">{message.content || queuedMessageLabel(message)}</p>
               {#if message.attachments?.length}
-                <p class="mt-1 text-[11px] text-sky-100/70">{message.attachments.length} attachment{message.attachments.length === 1 ? '' : 's'}</p>
+                <p class="mt-1 text-[11px] text-secondary">{message.attachments.length} attachment{message.attachments.length === 1 ? '' : 's'}</p>
               {/if}
             </div>
           {/if}
-            {#if editingId === message.queue_id && !committing}
+            {#if editingId === message.queue_id && !committing && message.can_edit}
             <div class="mt-2">
               <textarea
-                class="min-h-20 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 text-xs text-slate-100 outline-none focus:border-sky-400"
+                class="queue-message-text min-h-20 w-full resize-y rounded-lg border border-control-border bg-surface px-2.5 py-2 text-foreground outline-none focus:border-accent"
                 bind:value={editContent}
                 disabled={busyId === message.queue_id}
                 aria-label={`Edit queued message: ${accessibleLabel}`}
               ></textarea>
               {#if message.attachments?.length}
-                <p class="mt-1 text-[11px] text-sky-100/70">{message.attachments.length} attachment{message.attachments.length === 1 ? '' : 's'} will be preserved.</p>
+                <p class="mt-1 text-[11px] text-secondary">{message.attachments.length} attachment{message.attachments.length === 1 ? '' : 's'} will be preserved.</p>
               {/if}
               <div class="mt-2 flex justify-end gap-2">
                 <Button size="sm" variant="ghost" disabled={busyId !== null} onclick={cancelEdit}>Cancel</Button>
@@ -196,3 +199,7 @@
     </div>
   </section>
 {/if}
+
+<style>
+  .queue-message-text { font-size: var(--chat-message-font-size); }
+</style>

@@ -16,8 +16,19 @@ vi.mock('$lib/errors', () => ({
   reportError: vi.fn()
 }));
 
-import { CognisWebSocketClient } from './client';
+import { CognisWebSocketClient, isMetadataRefreshOnlyScope } from './client';
+import { metadataReadFlights } from '$lib/api/read-flights';
 import { conversationTimelineScope, sessionTimelineScope, taskStepTimelineScope, type ChatRealtimeFrame } from '$lib/chat-v2/types';
+
+it('requires an explicit server proof for routine chat/sidebar changes and stays fail-closed otherwise', () => {
+  for (const reason of ['chat_scope_changed', 'sidebar_changed']) {
+    expect(isMetadataRefreshOnlyScope(reason, true)).toBe(true);
+    for (const marker of [undefined, false, 'true', 1]) {
+      expect(isMetadataRefreshOnlyScope(reason, marker)).toBe(false);
+    }
+  }
+  expect(isMetadataRefreshOnlyScope('permission_revoked', true)).toBe(false);
+});
 
 function frame(conversationId: string, cursor: string): ChatRealtimeFrame {
   return {
@@ -35,8 +46,131 @@ function frame(conversationId: string, cursor: string): ChatRealtimeFrame {
 }
 
 describe('CognisWebSocketClient', () => {
+  it('does not invalidate metadata for heartbeats but fences relevant invalidations before consumers', () => {
+    const invalidate = vi.spyOn(metadataReadFlights, 'invalidate');
+    const client = new CognisWebSocketClient();
+    const handleMessage = (client as unknown as { handleMessage(raw: string): void }).handleMessage.bind(client);
+    const listener = vi.fn(() => expect(invalidate).toHaveBeenCalledTimes(1));
+    handleMessage(JSON.stringify({ type: 'pong' }));
+    handleMessage(JSON.stringify({ type: 'pong' }));
+    expect(invalidate).not.toHaveBeenCalled();
+    const stop = client.subscribe(listener);
+    handleMessage(JSON.stringify({ type: 'scope_invalidated', reason: 'sidebar_changed' }));
+    expect(listener).toHaveBeenCalledTimes(1);
+    stop();
+    client.disconnect();
+  });
+
+  it('delivers routine refreshes without cancelling metadata reads, but fences access and reconnect events', () => {
+    const invalidate = vi.spyOn(metadataReadFlights, 'invalidate');
+    const client = new CognisWebSocketClient();
+    const handleMessage = (client as unknown as { handleMessage(raw: string): void }).handleMessage.bind(client);
+    const listener = vi.fn();
+    const stop = client.subscribe(listener);
+    for (const type of [
+      'message_complete', 'turn_started', 'turn_settled', 'queued',
+      'queued_messages_updated', 'conversation_runtime_snapshot', 'conversation_state_delta',
+    ]) handleMessage(JSON.stringify({ type }));
+    for (const reason of [
+      'executor_state_changed', 'notification_state_changed',
+      'task_progress_changed', 'schedule_action_changed',
+    ]) handleMessage(JSON.stringify({ type: 'scope_invalidated', reason }));
+    expect(listener).toHaveBeenCalledTimes(11);
+    expect(invalidate).not.toHaveBeenCalled();
+    for (const event of [
+      { type: 'scope_invalidated', reason: 'sidebar_changed' },
+      { type: 'scope_invalidated', reason: 'chat_scope_changed' },
+      { type: 'scope_invalidated', reason: 'future_access_change' },
+      { type: 'sidebar_conversation_removed', conversation_id: 'shared-conversation' },
+      { type: 'reconnected' },
+    ]) handleMessage(JSON.stringify(event));
+    expect(invalidate).toHaveBeenCalledTimes(5);
+    stop();
+    client.disconnect();
+  });
+
+  it('reference-counts executor monitoring, resubscribes after auth and releases idempotently', () => {
+    vi.useFakeTimers();
+    const socket = { readyState: WebSocket.OPEN, send: vi.fn(), close: vi.fn() } as unknown as WebSocket;
+    const client = new CognisWebSocketClient();
+    const internals = client as unknown as { socket: WebSocket; handleMessage(raw: string): void };
+    internals.socket = socket;
+    const first = client.acquireExecutorMonitor();
+    const second = client.acquireExecutorMonitor();
+    expect(socket.send).not.toHaveBeenCalled();
+    internals.handleMessage(JSON.stringify({ type: 'authenticated' }));
+    expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ type: 'executor_monitor_subscribe' }));
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    internals.handleMessage(JSON.stringify({ type: 'authenticated' }));
+    expect(socket.send).toHaveBeenCalledTimes(2);
+    first();
+    first();
+    expect(socket.send).toHaveBeenCalledTimes(2);
+    second();
+    second();
+    expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ type: 'executor_monitor_unsubscribe' }));
+    expect(socket.send).toHaveBeenCalledTimes(3);
+    internals.handleMessage(JSON.stringify({ type: 'authenticated' }));
+    expect(socket.send).toHaveBeenCalledTimes(3);
+    client.disconnect();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('keeps streaming in order when animation frames stop running', () => {
+    vi.useFakeTimers();
+    vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(1);
+    const cancel = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+    const client = new CognisWebSocketClient();
+    const received: string[] = [];
+    client.subscribe((event) => {
+      if (event.type === 'chat_v2_frame') received.push(event.cursor_before!);
+    });
+    const handleMessage = (client as unknown as { handleMessage(raw: string): void }).handleMessage.bind(client);
+
+    handleMessage(JSON.stringify(frame('conv', 'first')));
+    vi.advanceTimersByTime(50);
+    handleMessage(JSON.stringify(frame('conv', 'second')));
+    vi.advanceTimersByTime(50);
+    expect(received).toEqual(['first', 'second']);
+    expect(cancel).toHaveBeenCalled();
+
+    handleMessage(JSON.stringify(frame('conv', 'third')));
+    vi.advanceTimersByTime(100);
+    expect(received).toEqual(['first', 'second', 'third']);
+    client.disconnect();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels the fallback after a normal animation-frame flush or unsubscribe', () => {
+    vi.useFakeTimers();
+    const callbacks: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callbacks.push(callback);
+      return callbacks.length;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+    const client = new CognisWebSocketClient();
+    const received = vi.fn();
+    client.subscribe(received);
+    const handleMessage = (client as unknown as { handleMessage(raw: string): void }).handleMessage.bind(client);
+
+    handleMessage(JSON.stringify(frame('conv', 'first')));
+    callbacks[0](0);
+    vi.advanceTimersByTime(100);
+    expect(received).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+
+    handleMessage(JSON.stringify(frame('conv', 'second')));
+    client.unsubscribeConversation('conv');
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(100);
+    expect(received).toHaveBeenCalledTimes(1);
+    client.disconnect();
   });
 
   it('drops queued Chat v2 frames for an unsubscribed conversation before flush', () => {
@@ -108,7 +242,7 @@ describe('CognisWebSocketClient', () => {
     authenticate(secondSocket);
 
     expect(secondSocket.sent.map((payload) => JSON.parse(payload))).toEqual([
-      { type: 'chat_v2_subscribe', scope: conversation, cursor: 'conversation-cursor-2' },
+      { type: 'chat_v2_subscribe', scope: conversation, cursor: 'conversation-cursor-2', catch_up: true },
       { type: 'chat_v2_subscribe', scope: session, cursor: 'session-cursor-2' },
       { type: 'chat_v2_subscribe', scope: taskStep, cursor: 'task-cursor-2' }
     ]);

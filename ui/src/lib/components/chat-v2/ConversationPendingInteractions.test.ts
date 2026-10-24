@@ -83,6 +83,30 @@ describe('ConversationPendingInteractions', () => {
     vi.useRealTimers();
   });
 
+  it('owns and aborts read consumers on scope switch and unmount; late responses cannot publish or schedule work', async () => {
+    const reads: Array<{ signal: AbortSignal; resolve: (value: unknown[]) => void }> = [];
+    mocks.list.mockImplementation((_id: string, options: { signal: AbortSignal }) => new Promise(resolve => {
+      reads.push({ signal: options.signal, resolve });
+    }));
+    const view = render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
+    await waitFor(() => expect(reads).toHaveLength(1));
+    await view.rerender({ conversationId: 'conversation-two' });
+    await waitFor(() => expect(reads).toHaveLength(2));
+    expect(reads[0].signal.aborted).toBe(true);
+    expect(reads[1].signal.aborted).toBe(false);
+    reads[0].resolve([escalation()]);
+    expect(screen.queryByRole('heading', { name: 'deploy_service' })).toBeNull();
+    // Queue a WS refresh immediately before teardown; it must not create
+    // another consumer after the scope's subscription has been released.
+    mocks.wsListener?.({ type: 'escalation', conversation_id: 'conversation-two' });
+    view.unmount();
+    expect(reads[1].signal.aborted).toBe(true);
+    reads[1].resolve([escalation()]);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('heading', { name: 'deploy_service' })).toBeNull();
+  });
+
   it('shows safe tool approval details and dispatches the canonical decision', async () => {
     mocks.list.mockResolvedValueOnce([escalation()]).mockResolvedValueOnce([]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
@@ -90,6 +114,10 @@ describe('ConversationPendingInteractions', () => {
     expect(await screen.findByRole('heading', { name: 'deploy_service' })).toBeInTheDocument();
     expect(screen.getByText(/"environment": "staging"/)).toBeInTheDocument();
     expect(screen.getByText('Service interruption risk')).toBeInTheDocument();
+    expect(screen.getByText('notification-approval')).toBeInTheDocument();
+    expect(screen.getByText('/approve --id notification-approval')).toBeInTheDocument();
+    expect(screen.getByText('/deny --id notification-approval')).toBeInTheDocument();
+    expect(screen.getByText('Deployment changes external state.').closest('details')).toHaveAttribute('open');
 
     await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
 
@@ -100,6 +128,33 @@ describe('ConversationPendingInteractions', () => {
       });
       expect(screen.queryByRole('heading', { name: 'deploy_service' })).not.toBeInTheDocument();
     });
+  });
+
+  it('shows bounded Gmail scope and the concrete reason without raw-payload expansion', async () => {
+    const old = escalation();
+    const item = {
+      ...old,
+      payload: {
+        ...old.payload,
+        tool_name: 'mcp_googleworkspace__search_gmail_messages',
+        arguments_display: {
+          query: 'after:2026/10/12 before:2026/10/14',
+          page_size: 1,
+          include_headers: false,
+        },
+        reasoning: 'Read at most one result to verify Gmail availability.',
+        risk: 'low',
+      },
+    };
+    mocks.list.mockResolvedValue([item]);
+    render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
+    expect(await screen.findByText('after:2026/10/12 before:2026/10/14')).toBeInTheDocument();
+    expect(screen.getByText('page size')).toBeInTheDocument();
+    expect(screen.getByText('1')).toBeInTheDocument();
+    expect(screen.getByText('include headers')).toBeInTheDocument();
+    expect(screen.getByText('false')).toBeInTheDocument();
+    expect(screen.getByText(item.payload.reasoning).closest('details')).toHaveAttribute('open');
+    expect(mocks.resolve).not.toHaveBeenCalled();
   });
 
   it('uses an opaque bounded scroll surface only for floating presentation', async () => {
@@ -116,7 +171,7 @@ describe('ConversationPendingInteractions', () => {
       'overflow-y-auto',
       'rounded-2xl',
       'border',
-      'bg-slate-950',
+      'bg-elevated',
       'shadow-2xl',
     );
     expect(panel).not.toHaveClass('max-h-[45%]', 'shrink-0');
@@ -174,7 +229,7 @@ describe('ConversationPendingInteractions', () => {
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
 
     expect(await screen.findByRole('heading', { name: 'deploy_service' })).toBeInTheDocument();
-    expect(mocks.list).toHaveBeenCalledWith('conversation-one');
+    expect(mocks.list).toHaveBeenCalledWith('conversation-one', { signal: expect.any(AbortSignal) });
   });
 
   it('refreshes for a managed-origin event but ignores unrelated child approvals', async () => {

@@ -702,11 +702,15 @@ async def test_run_schema_bootstrap_upgrades_managed_conversation_lineage(
 ) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy_managed.db'}")
 
+    # Retain the original link identity fields; only lineage fields are absent.
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 "CREATE TABLE managed_conversation_links ("
                 "link_id TEXT PRIMARY KEY, "
+                "user_email TEXT, controller_conversation_id TEXT, "
+                "controller_agent_id TEXT, controller_session_id TEXT, "
+                "target_conversation_id TEXT, target_agent_id TEXT, "
                 "target_agent_profile_id TEXT"
                 ")"
             )
@@ -1184,9 +1188,12 @@ async def test_run_schema_bootstrap_upgrades_legacy_chart_payload_twice(tmp_path
         ]
     }
     async with engine.begin() as conn:
+        # Chart migration starts from a deliverable with its existing provenance
+        # fields, not a synthetic table missing unrelated baseline columns.
         await conn.execute(
             text(
-                "CREATE TABLE deliverables (deliverable_id VARCHAR PRIMARY KEY, rich_payload JSON)"
+                "CREATE TABLE deliverables (deliverable_id VARCHAR PRIMARY KEY, "
+                "step_run_id TEXT, conversation_id TEXT, session_id TEXT, rich_payload JSON)"
             )
         )
         await conn.execute(

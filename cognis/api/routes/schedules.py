@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Query, Request
 
@@ -45,6 +45,14 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(tags=["schedules"])
+
+
+def _effective_project(body: Any, existing: Any) -> str | None:
+    """Project a schedule will belong to after an update."""
+
+    if "project_id" in body.model_fields_set:
+        return cast(str | None, body.project_id)
+    return cast(str | None, existing.project_id)
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +325,7 @@ async def create_schedule_route(
         agent = await get_agent(db, body.agent_id)
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="use", project_id=body.project_id)
         if body.agent_profile_id is not None:
             agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
             try:
@@ -380,7 +388,7 @@ async def create_schedule_route(
     task_template = dict(body.task_template)
     task_template.pop("workflow_id", None)
     task_template.pop("skill_id", None)
-    if body.session_policy:
+    if "session_policy" in body.model_fields_set or "session_policy" not in task_template:
         task_template["session_policy"] = body.session_policy.model_dump()
 
     async with request.app.state.session_factory() as db:
@@ -409,6 +417,7 @@ async def create_schedule_route(
             interaction_mode_override=body.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=user.email,
+            creation_origin="owner_configured",
         )
         await db.commit()
         # Re-read to get all defaults
@@ -470,7 +479,9 @@ async def update_schedule_route(
         current_agent = await get_agent(db, existing.agent_id)
         if current_agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, current_agent, required="use")
+        await check_agent_access(
+            request, current_agent, required="use", project_id=_effective_project(body, existing)
+        )
 
         effective_agent = current_agent
         # Validate agent if changing
@@ -478,7 +489,9 @@ async def update_schedule_route(
             agent = await get_agent(db, body.agent_id)
             if agent is None:
                 raise api_exception(404, "agent_not_found", "Agent not found")
-            await check_agent_access(request, agent, required="use")
+            await check_agent_access(
+                request, agent, required="use", project_id=_effective_project(body, existing)
+            )
             effective_agent = agent
         if "agent_profile_id" in body.model_fields_set and body.agent_profile_id is not None:
             agent_definition = AgentDefinition.model_validate(
@@ -627,7 +640,7 @@ async def delete_schedule_route(
         agent = await get_agent(db, existing.agent_id)
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="use", project_id=existing.project_id)
         await delete_schedule(db, schedule_id)
         await db.commit()
     await request.app.state.notification_service.resolve_schedule_action(
@@ -657,7 +670,7 @@ async def trigger_schedule_route(
         agent = await get_agent(db, row.agent_id)
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="use", project_id=row.project_id)
 
     # Use the scheduler to fire it
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -699,7 +712,7 @@ async def enable_schedule_route(
         agent = await get_agent(db, existing.agent_id)
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="use", project_id=existing.project_id)
         row = await update_schedule(
             db,
             schedule_id,
@@ -734,7 +747,7 @@ async def disable_schedule_route(
         agent = await get_agent(db, existing.agent_id)
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="use", project_id=existing.project_id)
         row = await update_schedule(
             db,
             schedule_id,

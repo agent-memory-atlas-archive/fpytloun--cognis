@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from cognis import json_codec as json
@@ -46,6 +46,41 @@ class ResolvedDeliverableAuthoring:
     rich: dict[str, Any] | None
     source_artifact_id: str | None = None
     source_digest: str | None = None
+    supersedes: str | None = None
+    project_id: str | None = None
+
+
+_DELIVERABLE_ID_RE = re.compile(r"^dlv_[0-9a-f]{32}$")
+
+
+def _supersedes_argument(arguments: dict[str, Any]) -> str | None:
+    """Return the validated revision target, if one was supplied."""
+
+    if "supersedes" not in arguments:
+        return None
+    value = arguments.get("supersedes")
+    if not isinstance(value, str) or _DELIVERABLE_ID_RE.fullmatch(value) is None:
+        raise DeliverableAuthoringError(
+            "invalid_supersedes",
+            "$.supersedes",
+            "supersedes must be the dlv_ ID of the latest revision to replace.",
+        )
+    return value
+
+
+def _project_id_argument(arguments: dict[str, Any]) -> str | None:
+    """Return the requested document project, if one was supplied."""
+
+    if "project_id" not in arguments:
+        return None
+    value = arguments.get("project_id")
+    if not isinstance(value, str) or not value.strip():
+        raise DeliverableAuthoringError(
+            "invalid_project_id",
+            "$.project_id",
+            "project_id must be a project ID.",
+        )
+    return value.strip()
 
 
 def is_rich_authoring_action(action: object) -> bool:
@@ -95,8 +130,10 @@ async def resolve_deliverable_authoring(
     """Resolve and normalize one authoring call under the current access scope."""
 
     action = arguments.get("action")
+    supersedes = _supersedes_argument(arguments)
+    project_id = _project_id_argument(arguments)
     if action not in _RICH_ACTIONS:
-        return _resolve_text(arguments)
+        return replace(_resolve_text(arguments), supersedes=supersedes, project_id=project_id)
 
     forbidden = sorted(_FORBIDDEN_RICH_ARGUMENTS.intersection(arguments))
     if forbidden:
@@ -184,6 +221,8 @@ async def resolve_deliverable_authoring(
         rich=normalized,
         source_artifact_id=artifact_id,
         source_digest=digest,
+        supersedes=supersedes,
+        project_id=project_id,
     )
 
 
@@ -259,7 +298,6 @@ async def _load_payload_artifact(
             or record.status != ArtifactStatus.ATTACHED
             or record.deleted_at is not None
             or record.expires_at is not None
-            or record.conversation_id is not None
             or record.purpose != "artifact_publish"
         ):
             raise DeliverableAuthoringError(

@@ -142,9 +142,10 @@ class _HydrationRecord:
     session_id: str | None
     status: str
     deleted_at: datetime | None
+    authorized: bool = False
 
     @classmethod
-    def from_row(cls, row: ArtifactRecordRow) -> _HydrationRecord:
+    def from_row(cls, row: ArtifactRecordRow, *, authorized: bool = False) -> _HydrationRecord:
         return cls(
             artifact_id=row.artifact_id,
             namespace=row.namespace,
@@ -158,6 +159,7 @@ class _HydrationRecord:
             session_id=row.session_id,
             status=row.status,
             deleted_at=row.deleted_at,
+            authorized=authorized,
         )
 
 
@@ -173,12 +175,34 @@ def _attachment_size_bytes(
 async def _load_hydration_records(
     session_factory: async_sessionmaker[AsyncSession],
     artifact_ids: list[str],
+    *,
+    owner_email: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, _HydrationRecord]:
     async with session_factory() as session:
+        from cognis.core.artifact_access import readable_artifact_ids
+
+        # This transaction ends before URL work. PostgreSQL overestimates the
+        # recursive provenance fallback; JIT compilation dwarfs its execution.
+        # SET LOCAL is rolled back on session close, including cancellation.
+        if session.get_bind().dialect.name == "postgresql":
+            await session.execute(sa.text("SET LOCAL jit = off"))
+        allowed = await readable_artifact_ids(
+            session,
+            artifact_ids,
+            owner_email=owner_email,
+            agent_id=None,
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
         result = await session.execute(
             sa.select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
         )
-        return {row.artifact_id: _HydrationRecord.from_row(row) for row in result.scalars().all()}
+        return {
+            row.artifact_id: _HydrationRecord.from_row(row, authorized=row.artifact_id in allowed)
+            for row in result.scalars().all()
+        }
 
 
 async def hydrate_attachment_refs(
@@ -190,63 +214,15 @@ async def hydrate_attachment_refs(
     conversation_id: str | None = None,
     session_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    normalized = normalize_attachment_refs(attachments)
-    if not normalized:
-        return []
-
-    artifact_ids = [item["artifact_id"] for item in normalized]
-    rows = await _load_hydration_records(session_factory, artifact_ids)
-
-    hydrated: list[dict[str, Any]] = []
-    for attachment in normalized:
-        artifact_id = str(attachment["artifact_id"])
-        row = rows.get(artifact_id)
-        if row is None:
-            legacy = _legacy_attachment_fallback(attachment)
-            if legacy is not None:
-                hydrated.append(legacy)
-            continue
-        if (
-            owner_email is not None
-            and row.owner_email is not None
-            and row.owner_email != owner_email
-        ):
-            continue
-        if (
-            conversation_id is not None
-            and row.conversation_id is not None
-            and row.conversation_id != conversation_id
-        ):
-            continue
-        if session_id is not None and row.session_id is not None and row.session_id != session_id:
-            continue
-        if row.status == "deleted":
-            legacy = _deleted_attachment_fallback(attachment, row)
-            if legacy is not None:
-                hydrated.append(legacy)
-            continue
-
-        hydrated_attachment = {
-            **attachment,
-            "kind": str(attachment.get("kind") or row.kind or ArtifactKind.FILE.value),
-            "mime_type": str(attachment.get("mime_type") or row.mime_type),
-            "filename": str(attachment.get("filename") or row.object_id or row.filename),
-            "size_bytes": _attachment_size_bytes(attachment, row),
-        }
-        try:
-            hydrated_attachment["url"] = await artifact_store.async_get_public_url(
-                row.namespace,
-                row.object_id,
-                row.filename,
-            )
-        except Exception:
-            if (
-                not isinstance(hydrated_attachment.get("url"), str)
-                or not hydrated_attachment["url"]
-            ):
-                hydrated_attachment.pop("url", None)
-        hydrated.append(hydrated_attachment)
-    return hydrated
+    groups = await hydrate_attachment_ref_groups(
+        session_factory,
+        artifact_store,
+        [attachments],
+        owner_email=owner_email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+    )
+    return groups[0]
 
 
 async def hydrate_attachment_ref_groups(
@@ -272,7 +248,13 @@ async def hydrate_attachment_ref_groups(
     if not artifact_ids:
         return [[] for _group in normalized_groups]
 
-    rows = await _load_hydration_records(session_factory, artifact_ids)
+    rows = await _load_hydration_records(
+        session_factory,
+        artifact_ids,
+        owner_email=owner_email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+    )
 
     hydrated_groups: list[list[dict[str, Any]]] = []
     public_urls: dict[str, str] = {}
@@ -292,17 +274,7 @@ async def hydrate_attachment_ref_groups(
                 and row.owner_email != owner_email
             ):
                 continue
-            if (
-                conversation_id is not None
-                and row.conversation_id is not None
-                and row.conversation_id != conversation_id
-            ):
-                continue
-            if (
-                session_id is not None
-                and row.session_id is not None
-                and row.session_id != session_id
-            ):
+            if not row.authorized:
                 continue
             if row.status == "deleted":
                 legacy = _deleted_attachment_fallback(attachment, row)

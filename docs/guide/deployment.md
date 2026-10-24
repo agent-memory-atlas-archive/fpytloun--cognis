@@ -1,8 +1,32 @@
 # Deployment
 
+## Unified companion inference
+
+Intaris and Mnemory can use Cognis's OpenAI-compatible `/v1` endpoint instead of
+separately configured upstream keys. The [Inference API guide](inference-api.md)
+describes global admin routing, service JWT mounts, rotation, startup ordering,
+metrics and embedding migration. The [local Compose stack](local-compose.md)
+wires the endpoint and isolated credentials automatically. Use compatible
+companion releases; older direct-provider installations remain supported.
+
 Cognis is designed as a cloud-native controller with one or more executors. The controller can run in a stable server environment while executors run wherever tools, browsers, credentials, files, or network access should live.
 
 ## Deployment model
+
+S3 tool-output retention uses a temporary disk-backed metadata inventory with
+a 1 MiB SQLite page cache rather than retaining the whole bucket listing in
+Python memory. Provide writable temporary storage (`TMPDIR`, or the system
+default) with enough disk space for keys, timestamps, sizes and their index.
+Do not use a memory-backed temporary volume when reducing container memory is
+the goal. Incomplete inventories never initiate deletion; failed maintenance
+is retried by the normal maintenance loop. Temporary files are removed on
+normal completion, errors and cooperative cancellation. Abrupt process death
+can leave scratch directories until the container's temporary storage is recycled.
+
+For opt-in, bounded controller CPU and memory attribution, see the repository
+guide `docs/development/controller-allocation-pressure.md`.
+`COGNIS_RESOURCE_PROFILING` is disabled by default and independent of the
+more expensive allocation-tracing flag `COGNIS_MEMORY_PROFILING`.
 
 The controller owns:
 
@@ -29,10 +53,12 @@ An infrastructure administrator can permit an internal HTTPS origin through the
 controller environment:
 
 ```bash
-COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS='{"mcp-gws.fpy.cz:443":["192.168.33.208/32"]}'
+COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS='{"oauth-gateway.example.test:443":["10.73.5.19/32"]}'
 ```
 
-Restart the controller after a change. This policy is not an MCP server setting,
+The hostname and address above are fictional; configure your own exact origin
+and permitted host address. Restart the controller after a change.
+This policy is not an MCP server setting,
 tool argument, or OAuth metadata field. It grants network access, not user access.
 
 Keys must be exact lowercase DNS hostnames with explicit ports. Wildcards, URLs,
@@ -322,8 +348,9 @@ flag disabled. Enable the canary only after all Cognis replicas use this binary.
 
 ### External rolling-update watchdog
 
-Run the watchdog on Maitrea. Do not run it in a Cognis controller pod. Start it
-before the Argo sync that changes the controller configuration:
+Run the watchdog on an independent management host with the approved cluster
+access. Do not run it in a Cognis controller pod. Start it before the Argo sync
+that changes the controller configuration:
 
 ```bash
 python3 scripts/watch_statefulset_rollout.py \
@@ -391,6 +418,22 @@ Before upgrading production:
 - back up Cognis, Mnemory, and Intaris data
 - review release notes for schema or executor changes
 - restart executors after controller upgrades when tool schemas or browser settings changed
+
+### Preparing for 0.18.0
+
+Review the upcoming notes in **Docs → What's new** before upgrading. Changes
+since 0.17.1 include project collaboration and knowledgebase grants, document
+revisions and access, notification inbox, inference routes, and persistent hooks.
+Production/HA deployments must migrate and validate the database before admitting
+work to the upgraded fleet. Backups must include artifact storage as well as
+database state.
+
+Upgrade Intaris alongside Cognis for the [planning-intent policy](chat-modes.md):
+plan mode is not itself a strict read-only sandbox. Keep explicit read-only
+restrictions where required. Upgrade executors for the current skill asset and
+background-shell contracts. Follow the [hook rollout constraints](agent-hooks.md)
+before mixing controller versions or attempting a downgrade. A Helm rollback
+alone does not undo schema changes or reconcile active hook work.
 
 Helm rollback does not reverse a completed database migration. Use
 expand-contract migrations so old and new controllers can overlap safely.

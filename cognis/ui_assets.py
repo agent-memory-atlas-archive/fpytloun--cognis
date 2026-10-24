@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from starlette.datastructures import Headers
 from starlette.responses import FileResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -49,12 +50,14 @@ def resolve_standalone_build_dir() -> Path | None:
     return None
 
 
-def resolve_standalone_manifest() -> StandaloneAssetManifest | None:
+def resolve_standalone_manifest(*, offline: bool = False) -> StandaloneAssetManifest | None:
     """Resolve and validate the standalone Vite entry manifest."""
 
     directory = resolve_standalone_build_dir()
     if directory is None:
         return None
+    if offline:
+        directory = directory / "offline"
     raw = _load_standalone_manifest(directory)
     if not isinstance(raw, dict):
         return None
@@ -63,6 +66,11 @@ def resolve_standalone_manifest() -> StandaloneAssetManifest | None:
         return None
     script = entry.get("file")
     styles = entry.get("css", [])
+    if offline and not styles:
+        stylesheet = raw.get("style.css")
+        styles = [stylesheet.get("file")] if isinstance(stylesheet, dict) else []
+    if offline and not styles:
+        return None
     if (
         not isinstance(script, str)
         or not isinstance(styles, list)
@@ -152,7 +160,7 @@ def resolve_ui_build_dir() -> Path | None:
 
 # Prefixes that should always be handled by the FastAPI router, never
 # by the SPA middleware.
-_API_PREFIXES = ("/api/", "/api", "/.well-known/")
+_API_PREFIXES = ("/api/", "/api", "/v1/", "/.well-known/")
 
 
 def _cache_control_for_path(path: Path, relative_path: str) -> str | None:
@@ -166,18 +174,73 @@ def _cache_control_for_path(path: Path, relative_path: str) -> str | None:
     return None
 
 
-def _file_response(path: Path, *, media_type: str, relative_path: str) -> FileResponse:
+# Build-time sidecar encodings written by ``ui/scripts/precompress-build.mjs``,
+# in server preference order.
+_PRECOMPRESSED_ENCODINGS = (("br", ".br"), ("gzip", ".gz"))
+
+
+def _accepted_encodings(accept_encoding: str) -> set[str]:
+    accepted: set[str] = set()
+    for part in accept_encoding.split(","):
+        token, _, params = part.strip().partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        quality = params.strip().lower()
+        if quality.startswith("q="):
+            try:
+                if float(quality[2:]) <= 0:
+                    continue
+            except ValueError:
+                continue
+        accepted.add(token)
+    return accepted
+
+
+def _precompressed_variant(path: Path, accept_encoding: str) -> tuple[Path, str] | None:
+    """Return the best build-time compressed sidecar the client accepts."""
+
+    if not accept_encoding:
+        return None
+    accepted = _accepted_encodings(accept_encoding)
+    for encoding, suffix in _PRECOMPRESSED_ENCODINGS:
+        if encoding not in accepted:
+            continue
+        candidate = path.with_name(path.name + suffix)
+        if candidate.is_file():
+            return candidate, encoding
+    return None
+
+
+def _file_response(
+    path: Path,
+    *,
+    media_type: str,
+    relative_path: str,
+    accept_encoding: str = "",
+) -> FileResponse:
     headers: dict[str, str] = {}
     cache_control = _cache_control_for_path(path, relative_path)
     if cache_control:
         headers["Cache-Control"] = cache_control
+    has_sidecar = any(
+        path.with_name(path.name + suffix).is_file()
+        for _encoding, suffix in _PRECOMPRESSED_ENCODINGS
+    )
+    if has_sidecar:
+        headers["Vary"] = "Accept-Encoding"
+    variant = _precompressed_variant(path, accept_encoding) if has_sidecar else None
+    if variant is not None:
+        compressed_path, encoding = variant
+        headers["Content-Encoding"] = encoding
+        return FileResponse(compressed_path, media_type=media_type, headers=headers)
     return FileResponse(path, media_type=media_type, headers=headers)
 
 
 class SPAMiddleware:
     """ASGI middleware that serves the SPA for non-API GET/HEAD requests.
 
-    For requests whose path does NOT start with ``/api/`` or
+    For requests whose path does NOT start with ``/api/``, ``/v1/`` or
     ``/.well-known/``, the middleware tries to serve a matching static
     file from *directory*.  If no file is found and the path has no file
     extension, ``index.html`` is served (SPA client-side routing).
@@ -207,8 +270,13 @@ class SPAMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Try to serve a static file.
-        response = self._resolve_file(path)
+        # Try to serve a static file. Range requests always use identity
+        # bytes so byte offsets keep their uncompressed meaning.
+        request_headers = Headers(scope=scope)
+        accept_encoding = (
+            "" if "range" in request_headers else request_headers.get("accept-encoding", "")
+        )
+        response = self._resolve_file(path, accept_encoding=accept_encoding)
         if response is not None:
             await response(scope, receive, send)
             return
@@ -220,13 +288,18 @@ class SPAMiddleware:
         if "." not in Path(path).name:
             index = self.directory / "index.html"
             if index.is_file():
-                response = _file_response(index, media_type="text/html", relative_path="index.html")
+                response = _file_response(
+                    index,
+                    media_type="text/html",
+                    relative_path="index.html",
+                    accept_encoding=accept_encoding,
+                )
                 await response(scope, receive, send)
                 return
 
         await self.app(scope, receive, send)
 
-    def _resolve_file(self, path: str) -> Response | None:
+    def _resolve_file(self, path: str, *, accept_encoding: str = "") -> Response | None:
         """Try to find a static file for the given URL path."""
 
         # Normalise: strip leading slash, reject path traversal.
@@ -235,7 +308,12 @@ class SPAMiddleware:
             # Root — serve index.html.
             index = self.directory / "index.html"
             return (
-                _file_response(index, media_type="text/html", relative_path="index.html")
+                _file_response(
+                    index,
+                    media_type="text/html",
+                    relative_path="index.html",
+                    accept_encoding=accept_encoding,
+                )
                 if index.is_file()
                 else None
             )
@@ -251,21 +329,32 @@ class SPAMiddleware:
         # Exact file match (e.g. /favicon.svg, /_app/immutable/…).
         if resolved.is_file():
             media_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
-            return _file_response(resolved, media_type=media_type, relative_path=relative)
+            return _file_response(
+                resolved,
+                media_type=media_type,
+                relative_path=relative,
+                accept_encoding=accept_encoding,
+            )
 
         # SvelteKit adapter-static generates <route>.html files
         # (e.g. setup.html for /setup).
         html_path = self.directory / f"{relative}.html"
         if html_path.is_file():
             return _file_response(
-                html_path, media_type="text/html", relative_path=f"{relative}.html"
+                html_path,
+                media_type="text/html",
+                relative_path=f"{relative}.html",
+                accept_encoding=accept_encoding,
             )
 
         # Try <route>/index.html (directory index).
         dir_index = self.directory / relative / "index.html"
         if dir_index.is_file():
             return _file_response(
-                dir_index, media_type="text/html", relative_path=f"{relative}/index.html"
+                dir_index,
+                media_type="text/html",
+                relative_path=f"{relative}/index.html",
+                accept_encoding=accept_encoding,
             )
 
         return None

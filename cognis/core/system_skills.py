@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Final
 
+from cognis.core.system_management_skills import SYSTEM_MANAGEMENT_SKILLS
+
 SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
+    **SYSTEM_MANAGEMENT_SKILLS,
     "cognis-orchestrator": {
         "skill_id": "cognis-orchestrator",
         "content": """---
@@ -287,6 +290,10 @@ Workflow step objectives and controller completion contracts override this skill
 
 # Tool Use
 
+- Invoke a tool directly only when its schema is visible in the current request.
+  If a needed capability is not visible, discover it with `search_tools` when
+  that tool is available; never guess or call a hidden tool. This applies to
+  every tool name mentioned in these instructions and loaded skill guidance.
 - Prefer `read`, `grep`, and `glob` for code inspection.
 - When `lsp` is available, use it before `grep` for semantic questions: `goToDefinition` for an imported or re-exported symbol, `findReferences` or `incomingCalls` before renaming or changing a signature, `documentSymbol` or `outline` before reading a large file or package, `hover` for a type or docstring. Use `grep` for text patterns, strings, config files, and languages without a server. If `lsp` reports `unsupported` or no results, fall back to `grep` and `read`.
 - Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `sed`, or `echo` separators for file/code inspection when structured tools such as `read`, `grep`, `glob`, or `list_directory` are visible.
@@ -741,7 +748,7 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
         "skill_id": "cognis-agent-manager",
         "content": """---
 name: Cognis Agent Manager
-description: Safe operating procedure for managing user-owned Cognis agents from main chat.
+description: Safe operating procedure for managing user-owned Cognis agents and per-user system agent overrides from main chat.
 tags:
   - cognis
   - management
@@ -778,9 +785,18 @@ Use this skill when the user asks the current primary agent to manage agents own
 - `tools_get`, `tools_set`, `tools_add`, and `tools_remove` for explicit tool assignment CRUD; `describe_tool` and `validate_tool_call` are the unified discovery and preflight path.
 - `skills_get`, `skills_set`, `skills_add`, `skills_update`, and `skills_remove` for per-agent skill assignment, enablement, and instruction autoload behavior.
 - `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove` for explicit assigned knowledgebase CRUD.
-- `bindings_get` and `bindings_set` for primary-to-secondary agent bindings.
+- `bindings_get` and `bindings_set` for primary-to-secondary agent bindings. Only primary agents take bindings, and only user-owned secondary agents can be bound; shipped `system:*` agents are always available without a binding.
+- `create` with `agent_type="secondary"` for user-owned secondary agents. They are managed with the same actions as primary agents but cannot hold management tools.
 - `shares_list`, `share_create`, `share_update`, and `share_revoke` for owner-only share management.
 - `sync_personality` after intentional identity/personality changes if synchronization is needed.
+
+# Shipped System Agents
+
+- `list` returns shipped `system:*` agents separately under `system_agents`. They are code-defined and cannot be created, renamed, re-prompted, archived, or shared.
+- Inspect with `system_overrides_get` (or `get`). It returns the shipped values, the caller's stored override, the effective definition, and `override_updated_at`.
+- Tune with `system_overrides_update` and an `overrides` patch of `llm_config`, `skills`, `tools`, `permissions`, `agent_profiles`, and `default_agent_profile_id`. Omitted fields keep the stored override, `null` restores the shipped value, and a supplied object replaces the whole field, so start from the current effective value.
+- Use `system_disable` / `system_enable` to hide or restore a system agent for this user, and `system_overrides_reset` to drop all overrides. Pass `expected_updated_at` from the last read to avoid overwriting concurrent edits.
+- Overrides apply only to the current user. Do not grant system agents management tools or tools outside the caller's own assignable inventory.
 
 # Do Not Do
 

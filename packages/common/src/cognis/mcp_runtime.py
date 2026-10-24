@@ -354,6 +354,11 @@ class _SessionMCPClient:
                 )
             )
             await session.initialize()
+        except asyncio.CancelledError:
+            # SDK transports own task-affine AnyIO scopes before initialize completes.
+            # Unwind here, not later from async-generator finalization in another task.
+            await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
+            raise
         except Exception as exc:
             self._last_owner_error = exc
             await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)

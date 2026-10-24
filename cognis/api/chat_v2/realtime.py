@@ -33,6 +33,7 @@ from cognis.api.chat_v2.schemas import (
     TimelineScope,
     ToolCallTimelineItem,
 )
+from cognis.api.chat_v2.status import normalize_timeline_status
 from cognis.api.chat_v2.sync import current_projection_version, runtime_epoch_for
 from cognis.models.artifact import AttachmentRef
 from cognis.models.config import GenerationPerformanceSnapshot
@@ -184,6 +185,7 @@ def compaction_runtime_item(
         ),
         method=_str(event_data.get("method")) or "pending",
         turns_compacted=max(0, _int(event_data.get("turns_compacted")) or 0),
+        events_compacted=max(0, _int(event_data.get("events_compacted")) or 0),
         trigger=_str(event_data.get("trigger")),
         reason=_str(event_data.get("fallback_reason")) or _str(event_data.get("reason")),
         previous_usage_percentage=_float(event_data.get("previous_usage_percentage")),
@@ -257,6 +259,8 @@ def assistant_stream_runtime_item(
     if "turn_cycle_index" not in snapshot and phase is not None:
         turn_cycle_index = phase
     timestamp = _str(snapshot.get("updated_at"))
+    # Older controller snapshots lack this field during rolling upgrades.
+    text_streaming = snapshot.get("text_streaming", True) is not False
     return MessageTimelineItem(
         id=assistant_message_item_id(message_id=message_id, phase=phase),
         kind="message",
@@ -277,6 +281,7 @@ def assistant_stream_runtime_item(
         assistant_phase_index=phase,
         turn_cycle_index=turn_cycle_index,
         partial=True,
+        text_streaming=text_streaming,
         chat_mode=cast(Any, chat_mode) if chat_mode in {"default", "plan", "build"} else None,
         chat_mode_source=chat_mode_source if isinstance(chat_mode_source, str) else None,
     )
@@ -752,15 +757,7 @@ def _attachments(value: Any) -> list[AttachmentRef]:
 
 
 def _status(value: Any) -> TimelineItemStatus | None:
-    if value in {"pending", "running", "waiting", "complete", "failed", "cancelled"}:
-        return cast(TimelineItemStatus, value)
-    if value in {"started", "in_progress"}:
-        return "running"
-    if value in {"completed", "success", "succeeded"}:
-        return "complete"
-    if value == "error":
-        return "failed"
-    return None
+    return normalize_timeline_status(value)
 
 
 def _preview(value: Any) -> str | None:

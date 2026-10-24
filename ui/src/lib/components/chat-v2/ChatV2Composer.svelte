@@ -3,7 +3,7 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, type Snippet } from 'svelte';
   import ArrowUp from 'lucide-svelte/icons/arrow-up';
   import ListPlus from 'lucide-svelte/icons/list-plus';
   import Headphones from 'lucide-svelte/icons/headphones';
@@ -52,6 +52,9 @@
     onRecorded,
     onSendRecorded,
     onOpenMode,
+    onRemoveAttachment,
+    onRetryAttachment,
+    settings,
   } = $props<{
     value?: string;
     attachments?: AttachmentRef[];
@@ -79,6 +82,9 @@
     onRecorded?: (attachment: AttachmentRef) => void;
     onSendRecorded?: () => void | Promise<void>;
     onOpenMode?: () => void;
+    onRemoveAttachment?: (attachment: AttachmentRef) => void;
+    onRetryAttachment?: (attachment: AttachmentRef) => void;
+    settings?: Snippet;
   }>();
 
   const hasDraft = $derived(Boolean(value.trim() || attachments.length));
@@ -195,7 +201,9 @@
   });
 
   function removeAttachment(artifactId: string): void {
+    const removed = attachments.find((item: AttachmentRef) => item.artifact_id === artifactId);
     attachments = attachments.filter((item: AttachmentRef) => item.artifact_id !== artifactId);
+    if (removed) onRemoveAttachment?.(removed);
   }
 
   function dispatchSend(): void {
@@ -308,7 +316,7 @@
   }
 </script>
 
-<div class:space-y-2={attachments.length > 0} data-testid="chat-v2-composer">
+<div class="chat-composer" class:space-y-2={attachments.length > 0} data-testid="chat-v2-composer">
   {#if slashSuggestionsVisible}
     <SlashCommandSuggestions
       suggestions={slashSuggestions}
@@ -317,11 +325,11 @@
       onSelect={selectSlashSuggestion}
     />
   {/if}
-  <ComposerAttachments {attachments} onremove={removeAttachment} disabled={disabled || busy || uploading} />
-  <div class={`flex items-center gap-1 border border-slate-700 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-300/20 ${compact ? 'rounded-2xl bg-slate-900 p-1.5' : 'rounded-3xl bg-transparent px-2 py-1'}`}>
+  <ComposerAttachments {attachments} onremove={removeAttachment} onretry={onRetryAttachment} disabled={disabled || busy || uploading} />
+  <div class:chat-composer-compact={compact} class={`chat-composer-surface flex items-center gap-1 border border-control-border transition focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20 ${compact ? 'p-1.5' : 'px-2 py-1'}`}>
     <label
       aria-label="Attach files"
-      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted transition hover:bg-surface-hover hover:text-foreground focus-within:bg-surface-hover focus-within:text-foreground"
       class:pointer-events-none={disabled || busy || uploading}
       class:opacity-40={disabled || busy || uploading}
     >
@@ -332,7 +340,7 @@
       bind:this={textarea}
       bind:value
       rows={1}
-      class={`max-h-[200px] flex-1 resize-none self-center bg-transparent px-1 py-[0.4rem] text-[16px] leading-5 text-slate-100 placeholder:text-slate-500 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 sm:text-sm ${compact ? 'min-h-10' : 'min-h-[36px]'}`}
+      class={`chat-composer-input max-h-[200px] min-w-0 flex-1 resize-none self-center bg-transparent px-1 py-[0.4rem] leading-5 text-foreground placeholder:text-quiet focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 ${compact ? 'min-h-10' : 'min-h-[36px]'}`}
       {placeholder}
       aria-label={ariaLabel}
       aria-controls={slashSuggestionsVisible ? slashAutocompleteId : undefined}
@@ -348,12 +356,15 @@
       }}
       onpaste={(event) => { if (onPaste) void onPaste(event); }}
     ></textarea>
+    {#if settings && !active}
+      {@render settings()}
+    {/if}
     {#if canSend}
       <button
         type="button"
         aria-label={sendAriaLabel ?? (active ? 'Queue message' : 'Send')}
         title={active ? 'Queue message after current turn' : 'Send'}
-        class="relative inline-flex h-9 w-9 shrink-0 touch-manipulation items-center justify-center rounded-full bg-sky-500 text-slate-950 transition duration-100 hover:bg-sky-400 active:scale-90 disabled:opacity-50"
+        class="relative inline-flex h-9 w-9 shrink-0 touch-manipulation items-center justify-center rounded-full bg-accent text-on-accent transition duration-100 hover:bg-accent-hover active:scale-90 disabled:opacity-50"
         onpointerdown={beginDirectPointerSend}
         onpointerup={finishDirectPointerSend}
         onpointercancel={cancelDirectPointerSend}
@@ -361,7 +372,7 @@
       >
         <ArrowUp class="h-4 w-4" stroke-width="2.5" />
         {#if active}
-          <span class="absolute -bottom-0.5 -right-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-950 bg-slate-950 text-sky-300">
+          <span class="absolute -bottom-0.5 -right-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full border border-surface bg-surface text-accent">
             <ListPlus class="h-2.5 w-2.5" stroke-width="2.5" />
           </span>
         {/if}
@@ -371,15 +382,15 @@
         type="button"
         aria-label={stopping ? 'Cancelling turn' : stopAriaLabel ?? 'Cancel turn'}
         title={stopping ? 'Cancelling…' : 'Cancel turn'}
-        class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
+        class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-raised text-foreground transition hover:bg-surface-hover"
         disabled={stopping}
         onclick={() => void onStop()}
       >
         <span class:conversation-turn-orbit--stopping={stopping} class="conversation-turn-orbit" aria-hidden="true"><span></span></span>
         {#if stopping}
-          <span class="conversation-turn-stop-pulse absolute h-2.5 w-2.5 animate-pulse rounded-sm bg-slate-100" aria-hidden="true"></span>
+          <span class="conversation-turn-stop-pulse absolute h-2.5 w-2.5 animate-pulse rounded-sm bg-foreground" aria-hidden="true"></span>
         {:else}
-          <Square class="absolute h-2.5 w-2.5 fill-current text-slate-100" />
+          <Square class="absolute h-2.5 w-2.5 fill-current text-foreground" />
         {/if}
       </button>
     {:else if showMic}
@@ -388,7 +399,7 @@
           type="button"
           aria-label="Open conversation mode"
           title="Conversation mode"
-          class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+          class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted transition hover:bg-surface-hover hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
           disabled={disabled || busy}
           onclick={onOpenMode}
         >
@@ -408,15 +419,31 @@
 </div>
 
 <style>
+  .chat-composer-surface {
+    background: var(--chat-composer-bg, transparent);
+    border-radius: var(--chat-composer-radius, 1.5rem);
+    box-shadow: var(--tw-ring-offset-shadow, 0 0 #0000),
+      var(--tw-ring-shadow, 0 0 #0000), var(--chat-composer-shadow);
+  }
+  .chat-composer-compact {
+    background: var(--chat-composer-bg, rgb(var(--color-surface)));
+    border-radius: var(--chat-composer-radius, 1rem);
+  }
+  .chat-composer-input { font-size: var(--chat-message-font-size); }
+  @media (pointer: coarse) {
+    .chat-composer-input { font-size: 16px; }
+  }
+  .chat-composer { container: chat-composer / inline-size; }
+
   @keyframes conversation-turn-orbit {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
   }
 
   .conversation-turn-orbit {
-    --turn-orbit-rgb: 56 189 248;
-    --turn-orbit-tip-rgb: 125 211 252;
-    --turn-orbit-shadow-rgb: 14 165 233;
+    --turn-orbit-rgb: var(--color-info);
+    --turn-orbit-tip-rgb: var(--color-info);
+    --turn-orbit-shadow-rgb: var(--color-info);
     position: absolute;
     inset: 0;
     border-radius: 9999px;

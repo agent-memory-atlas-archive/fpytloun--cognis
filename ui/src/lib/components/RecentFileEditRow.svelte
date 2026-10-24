@@ -107,24 +107,24 @@
   });
 </script>
 
-<article class="rounded-lg border border-slate-800 bg-slate-950/30" data-testid={`recent-file-edit-${event.id}-${fileKey}`}>
+<article class="rounded-lg border border-separator bg-inset/30" data-testid={`recent-file-edit-${event.id}-${fileKey}`}>
   <div class="flex min-w-0 items-center gap-1 px-2 py-1.5 text-xs">
-    <button type="button" class="flex min-w-0 flex-1 items-center gap-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400" onclick={toggle} aria-expanded={expanded} aria-controls={panelId} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${fileLabel}`}>
-      <span class="inline-flex h-4 min-w-5 shrink-0 items-center justify-center rounded bg-slate-800 px-1 font-mono text-[8px] font-semibold text-slate-300" title={fileType.label} aria-label={`${fileType.label} file`} data-testid="recent-file-type">{fileType.icon}</span>
-      <span bind:this={pathElement} class="scrollbar-hidden-x min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-slate-300" title={fileLabel} data-testid="recent-file-path">{fileLabel}</span>
-      {#if occurredAt}<span class="shrink-0 text-[9px] text-slate-500" title={occurredAt} data-testid="recent-file-time">{formatCompactTime(occurredAt)}</span>{/if}
-      <span class="shrink-0 font-mono text-lime-300">+{additions}</span><span class="shrink-0 font-mono text-rose-300">−{deletions}</span>
+    <button type="button" class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent" onclick={toggle} aria-expanded={expanded} aria-controls={panelId} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${fileLabel}`}>
+      <span class="inline-flex h-4 min-w-5 shrink-0 items-center justify-center rounded bg-raised px-1 font-mono text-[8px] font-semibold text-secondary" title={fileType.label} aria-label={`${fileType.label} file`} data-testid="recent-file-type">{fileType.icon}</span>
+      <span bind:this={pathElement} class="scrollbar-hidden-x min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-secondary" title={fileLabel} data-testid="recent-file-path">{fileLabel}</span>
+      {#if occurredAt}<span class="shrink-0 text-[9px] text-muted" title={occurredAt} data-testid="recent-file-time">{formatCompactTime(occurredAt)}</span>{/if}
+      <span class="shrink-0 font-mono text-success">+{additions}</span><span class="shrink-0 font-mono text-danger">−{deletions}</span>
       <ChevronDown class={`h-3.5 w-3.5 shrink-0 transition ${expanded ? 'rotate-180' : ''}`} aria-hidden="true" />
     </button>
-    <button type="button" class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded text-sky-300 hover:bg-slate-800" onclick={openInWork} aria-label={`Open ${fileLabel} in Work`} title="Open in Work"><ExternalLink class="h-3 w-3" aria-hidden="true" /></button>
+    <button type="button" class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded text-accent hover:text-accent-hover hover:bg-surface-hover" onclick={openInWork} aria-label={`Open ${fileLabel} in Work`} title="Open in Work"><ExternalLink class="h-3 w-3" aria-hidden="true" /></button>
   </div>
-  {#if event.source_workstream}<p class="truncate px-2 pb-1 text-[10px] text-slate-500">{event.source_workstream.agent_id} · {event.source_workstream.title} · {event.source_workstream.status}</p>{/if}
+  {#if event.source_workstream}<p class="truncate px-2 pb-1 text-[10px] text-quiet">{event.source_workstream.agent_id} · {event.source_workstream.title} · {event.source_workstream.status}</p>{/if}
   {#if expanded}
-    <div id={panelId} class="space-y-2 border-t border-slate-800 p-2" role="region" aria-label={`Exact changes for ${fileLabel}`}>
-      {#if loading}<p role="status" aria-live="polite" aria-busy="true" class="text-xs text-slate-400">Loading exact file changes…</p>
-      {:else if error}<p role="alert" class="text-xs text-rose-300">{error} <button type="button" class="underline" onclick={() => void loadExactDiffs()}>Retry</button></p>
+    <div id={panelId} class="space-y-2 border-t border-separator p-2" role="region" aria-label={`Exact changes for ${fileLabel}`}>
+      {#if loading}<p role="status" aria-live="polite" aria-busy="true" class="text-xs text-muted">Loading exact file changes…</p>
+      {:else if error}<p role="alert" class="text-xs text-danger">{error} <button type="button" class="underline" onclick={() => void loadExactDiffs()}>Retry</button></p>
       {:else if visibleDiffs.length}<FileDiffViewer diffs={visibleDiffs} collapsible={false} />
-      {:else if unavailable}<p role="status" class="text-xs text-amber-200">Exact diff content is no longer retained. Event statistics remain available.</p>{/if}
+      {:else if unavailable}<p role="status" class="text-xs text-warning">Exact diff content is no longer retained. Event statistics remain available.</p>{/if}
     </div>
   {/if}
 </article>

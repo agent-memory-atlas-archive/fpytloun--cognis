@@ -244,7 +244,7 @@ generic recovery message that points the user back to the conversation.
 Channel accounts also expose an `Assistant delivery mode` setting:
 
 - `final` sends one consolidated assistant reply when the turn completes
-- `immediate` sends buffered assistant text while the turn is still running, then sends any remaining tail on completion
+- `immediate` queues committed assistant messages at tool-call boundaries for delivery while the turn is running, then sends any remaining tail on completion. It does not stream individual tokens or wait for transport acknowledgements before tools can run. Progress uses the durable channel outbox, so it also works when different controllers execute the turn and own the channel adapter. Retries do not include queued progress again in the final reply.
 
 #### Default behavior in direct mode
 

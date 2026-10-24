@@ -47,7 +47,7 @@ CLAUDE_CODE_IDENTITY_BRIDGE = "The operative agent identity follows."
 # Anthropic rejects a request outright when the reported client version is
 # older than the model requires. `test_integration.py` asserts both modules
 # produce the same user agent, so a partial bump fails the suite.
-CLAUDE_CODE_VERSION = "2.1.281"
+CLAUDE_CODE_VERSION = "2.1.293"
 CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 CCH_SALT = "59cf53e54c78"
@@ -329,6 +329,30 @@ def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
             "max_output_tokens": 128_000,
             "input_cost_per_mtok": 3.0,
             "output_cost_per_mtok": 15.0,
+        },
+        {
+            **common,
+            "model_id": "claude-sonnet-5-5",
+            "name": "Claude Sonnet 5.5",
+            "display_name": "Claude Sonnet 5.5",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 2.0,
+            "output_cost_per_mtok": 10.0,
+        },
+        {
+            **common,
+            "model_id": "claude-haiku-5-5",
+            "name": "Claude Haiku 5.5",
+            "display_name": "Claude Haiku 5.5",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 0.1,
+            "output_cost_per_mtok": 0.5,
         },
         {
             **common,

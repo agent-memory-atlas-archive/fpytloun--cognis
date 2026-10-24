@@ -476,6 +476,29 @@ def test_stale_session_recovery_on_restart(
             json={"default": {"model": llm_model, "reasoning_effort": None}},
         )
 
+        # Declare capacity for the controlled provider: it has no discovery
+        # endpoint or remote model metadata. Prompt-pressure recovery must not
+        # preempt this test's independently controlled crash/restart boundary.
+        providers = http.get(f"{cognis_url}/api/v1/llm-providers", headers=headers)
+        providers.raise_for_status()
+        provider = next(
+            item for item in providers.json()["items"] if item["provider_id"] == "default"
+        )
+        provider_config = dict(provider["config"])
+        provider_config["models"] = [
+            {
+                "model_id": llm_model,
+                "context_window": 128_000,
+                "max_output_tokens": 4096,
+            }
+        ]
+        configured = http.put(
+            f"{cognis_url}/api/v1/llm-providers/{provider['provider_id']}",
+            headers=headers,
+            json={"config": provider_config},
+        )
+        configured.raise_for_status()
+
         # Create agent and conversation
         agent_resp = http.post(
             f"{cognis_url}/api/v1/agents",
@@ -583,6 +606,15 @@ def test_stale_session_recovery_on_restart(
                 "UPDATE coordination_leases SET lease_expires_at = ? WHERE resource_key = ?",
                 ("2000-01-01 00:00:00.000000", f"direct-turn:conversation:{cid}"),
             )
+            # The same simulated downtime must expire the crashed provider's
+            # pending binding reservation. Otherwise the successor correctly
+            # waits for that independent lease despite owning the direct turn.
+            expired = database.execute(
+                "UPDATE inference_bindings SET claim_until = ? "
+                "WHERE owner_email = ? AND claim_token IS NOT NULL",
+                ("2000-01-01 00:00:00.000000", admin_email),
+            )
+            assert expired.rowcount == 1
             database.commit()
         aged = snapshot(cognis_dir / "cognis.db", "after-aging")
         (base_dir / "crash-snapshots.json").write_text(json.dumps([before, aged], indent=2))

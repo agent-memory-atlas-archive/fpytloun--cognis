@@ -26,6 +26,7 @@ function queued(overrides: Partial<QueueMessage> = {}): QueueMessage {
     attachments: [],
     created_at: '2026-08-26T00:00:00Z',
     position: 1,
+    can_edit: true,
     ...overrides
   };
 }
@@ -64,6 +65,28 @@ describe('QueuedMessagesPanel', () => {
 
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     expect(mocks.update).not.toHaveBeenCalled();
+  });
+
+  it.each([false, undefined])('hides Edit without server permission (%s) but keeps Delete', (can_edit) => {
+    render(QueuedMessagesPanel, {
+      conversationId: 'conv-1',
+      messages: [queued({ can_edit })],
+      onMutation: vi.fn()
+    });
+    expect(screen.queryByRole('button', { name: /^Edit queued message:/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Delete queued message:/ })).toBeInTheDocument();
+  });
+
+  it('honors a refreshed server capability while an editor is open', async () => {
+    const props = { conversationId: 'conv-1', messages: [queued()], onMutation: vi.fn() };
+    const { rerender } = render(QueuedMessagesPanel, props);
+    await fireEvent.click(screen.getByRole('button', { name: /^Edit queued message:/ }));
+    await rerender({ ...props, messages: [queued({ can_edit: false })] });
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Edit queued message:/ })).not.toBeInTheDocument();
+    expect(mocks.update).not.toHaveBeenCalled();
+    await rerender({ ...props, messages: [queued({ can_edit: true })] });
+    expect(screen.getByRole('button', { name: /^Edit queued message:/ })).toBeInTheDocument();
   });
 
   it('preserves the editor and original server item after a failed save', async () => {

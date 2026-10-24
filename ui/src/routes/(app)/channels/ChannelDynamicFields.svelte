@@ -27,7 +27,7 @@
 </script>
 
 {#each meta.credential_fields as field}
-  <label class="grid gap-2 text-sm text-slate-300">
+  <label class="grid gap-2 text-sm text-secondary">
     {field.label}
     <Input
       value={editing
@@ -45,22 +45,22 @@
       placeholder={editing ? 'Configured (enter new value to replace)' : (field.description || field.label)}
     />
     {#if field.description}
-      <span class="text-xs text-slate-500">{field.description}</span>
+      <span class="text-xs text-quiet">{field.description}</span>
     {/if}
   </label>
 {/each}
 
 {#each meta.setting_fields as field}
-  <label class="grid gap-2 text-sm text-slate-300">
+  <label class="grid gap-2 text-sm text-secondary">
     {field.label}
     {#if field.field_type === 'select' && field.options}
-      <select bind:value={draft.settingValues[field.name]} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+      <select bind:value={draft.settingValues[field.name]} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
         {#each field.options as option}
           <option value={option}>{optionLabel(field.name, option)}</option>
         {/each}
       </select>
     {:else if field.field_type === 'boolean'}
-      <select bind:value={draft.settingValues[field.name]} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+      <select bind:value={draft.settingValues[field.name]} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
         <option value="true">Enabled</option>
         <option value="false">Disabled</option>
       </select>
@@ -68,7 +68,7 @@
       <Input bind:value={draft.settingValues[field.name]} placeholder={field.description || field.label} />
     {/if}
     {#if field.description}
-      <span class="text-xs text-slate-500">{field.description}</span>
+      <span class="text-xs text-quiet">{field.description}</span>
     {/if}
   </label>
 {/each}

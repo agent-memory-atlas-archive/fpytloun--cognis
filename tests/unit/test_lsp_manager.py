@@ -66,7 +66,7 @@ class TestFindProjectRoot:
         assert _should_skip_server_for_path("pyright", "/var/tmp/cognis/foo.py", "/var/tmp")
         assert not _should_skip_server_for_path("ruff", "/tmp/cognis/foo.py", "/tmp/cognis")
         assert not _should_skip_server_for_path(
-            "pyright", "/home/riker/src/cognis/foo.py", "/home/riker/src/cognis"
+            "pyright", "/home/alice/src/sample-app/foo.py", "/home/alice/src/sample-app"
         )
 
 
@@ -621,6 +621,30 @@ class TestPrepareAndQuery:
         assert manager._cold_clients == {client_key}
         fake_client.close = AsyncMock()
         await manager._remove_client(client_key)
+        assert manager._cold_clients == set()
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize("server_id", ["typescript", "pyright"])
+    @pytest.mark.parametrize("diagnostics_timeout", [False, True])
+    async def test_cold_typescript_waits_for_project_diagnostics_only_once(
+        self, server_id: str, diagnostics_timeout: bool
+    ) -> None:
+        manager = LSPManager(enabled=True)
+        entry, client = _prepared_client(server_id)
+        client.wait_for_progress_idle = AsyncMock(return_value=True)
+        manager._cold_clients.add(entry.client_key)
+        diagnostics = AsyncMock(side_effect=TimeoutError if diagnostics_timeout else None)
+        with (
+            patch.object(manager, "_sync_file", AsyncMock(return_value=[entry])),
+            patch.object(manager, "_wait_client_diagnostics", diagnostics),
+        ):
+            assert await manager.prepare_file("/project/a.ts") == [entry]
+            assert await manager.prepare_file("/project/a.ts") == [entry]
+        if server_id == "typescript":
+            diagnostics.assert_awaited_once_with(client, entry.uri, entry.version)
+        else:
+            diagnostics.assert_not_awaited()
+        client.wait_for_progress_idle.assert_awaited_once()
         assert manager._cold_clients == set()
 
     @pytest.mark.asyncio()

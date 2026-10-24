@@ -15,19 +15,19 @@
       "context_window": "1M tokens",
       "max_output": "128K tokens"
     },
-    "claude-sonnet-5": {
+    "claude-sonnet-5-5": {
       "pricing": "$2 / input MTok, $10 / output MTok",
       "thinking": "Adaptive",
       "default_effort": "`high`",
       "context_window": "1M tokens",
       "max_output": "128K tokens"
     },
-    "claude-haiku-4-5-20251001": {
-      "pricing": "$1 / input MTok, $5 / output MTok",
-      "thinking": "Extended",
-      "default_effort": "Not supported",
-      "context_window": "200K tokens",
-      "max_output": "64K tokens"
+    "claude-haiku-5-5": {
+      "pricing": "From $0.10 / input MTok, From $0.50 / output MTok",
+      "thinking": "Adaptive",
+      "default_effort": "`medium`",
+      "context_window": "1M tokens",
+      "max_output": "128K tokens"
     }
   },
   "openai": [
@@ -80,7 +80,8 @@
     "gpt-5.6-terra",
     "gpt-6-astra",
     "gpt-6-luna",
-    "gpt-6-sol"
+    "gpt-6-sol",
+    "gpt-6.1-sol"
   ],
   "openai_details": {
     "gpt-5.6-cyber": {
@@ -313,6 +314,46 @@
       },
       "reasoning_efforts": [
         "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-6.1-sol": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$2",
+        "cached_input": "$0.1",
+        "output": "$10"
+      },
+      "reasoning_efforts": [
         "low",
         "medium",
         "high",

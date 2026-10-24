@@ -4,13 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections.abc import Awaitable, Callable
 from time import perf_counter
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, get_args
 
 import httpx
 from prometheus_client import Counter, Histogram
+from pydantic_core.core_schema import ErrorType
 
+from cognis.core.workflow_step_scope import (
+    WorkflowEvaluationBinding,
+    WorkflowStepDeclaration,
+    WorkflowStepDeclarationError,
+    WorkflowStepReceipt,
+    canonical_digest,
+)
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.search import (
@@ -31,11 +40,15 @@ from cognis.models.session import (
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.providers.guardrails.conflicts import EvaluationConflict
 from cognis.providers.guardrails.events import (
     EventAppendListener,
     EventAppendNotification,
     EventStoreAuthority,
 )
+from cognis.providers.guardrails.mcp_listing_cache import MCPListingCache
+from cognis.providers.guardrails.process_scope import ProcessEvaluationBinding
+from cognis.providers.guardrails.resolution_errors import ResolutionRejected
 from cognis.providers.retry import is_retryable_http_error, with_retry
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 
@@ -65,6 +78,88 @@ def _coerce_attachment_b64(value: str) -> str:
         return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
+def _safe_evaluation_error_detail(response: httpx.Response) -> dict[str, Any]:
+    """Project only known validation fields and numeric model capacity diagnostics."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if response.status_code == 422 and isinstance(detail, list):
+        fields = {
+            "body",
+            "session_id",
+            "agent_id",
+            "tool",
+            "args",
+            "context",
+            "minimum_outcome",
+            "approval_call_id",
+            "intention_pending",
+            "evaluation_policy_version",
+            "logical_call_id",
+            "expected_policy_revision",
+            "expected_policy_hash",
+            "controller_context",
+        }
+        errors = []
+        for error in detail[:8]:
+            if not isinstance(error, dict):
+                continue
+            loc = error.get("loc")
+            safe_loc = (
+                [
+                    part if isinstance(part, str) and part in fields else "[redacted]"
+                    for part in loc[:2]
+                ]
+                if isinstance(loc, list)
+                else []
+            )
+            error_type = error.get("type")
+            size_error = isinstance(error_type, str) and error_type in {
+                "args_too_large",
+                "context_too_large",
+            }
+            safe_error: dict[str, Any] = {
+                "loc": safe_loc,
+                "type": error_type
+                if size_error or error_type in get_args(ErrorType)
+                else "unknown",
+            }
+            if size_error and isinstance(error.get("ctx"), dict):
+                for key in ("size", "limit"):
+                    count = error["ctx"].get(key)
+                    if type(count) is int and 0 <= count <= 2**63 - 1:
+                        safe_error[key] = count
+            errors.append(safe_error)
+        return {"validation": errors}
+    if (
+        response.status_code == 413
+        and isinstance(detail, dict)
+        and detail.get("code") == "context_insufficient"
+    ):
+        view = detail.get("model_view")
+        counts = {
+            key: value
+            for key, value in (view.items() if isinstance(view, dict) else ())
+            if key
+            in {
+                "bytes",
+                "characters",
+                "estimated_input_tokens",
+                "framing_tokens",
+                "margin_tokens",
+                "input_ceiling_tokens",
+                "requested_output_reserve",
+                "application_fallback_bytes",
+            }
+            and type(value) is int
+            and 0 <= value <= 2**63 - 1
+        }
+        return {"code": "context_insufficient", "model_view": counts}
+    return {}
+
+
 class IntarisProvider:
     """HTTP client for Intaris with fail-closed evaluate semantics.
 
@@ -81,18 +176,33 @@ class IntarisProvider:
         user_email: str = SYSTEM_USER_EMAIL,
         *,
         event_append_listener_timeout: float = DEFAULT_EVENT_APPEND_LISTENER_TIMEOUT,
+        evaluation_timeout: float = 65.0,
     ) -> None:
         if event_append_listener_timeout <= 0:
             raise ValueError("event_append_listener_timeout must be positive")
+        if evaluation_timeout <= 0:
+            raise ValueError("evaluation_timeout must be positive")
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
+        self._process_scope_supported: bool | None = None
         self.user_email = user_email
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10)
+        # Only evaluation needs the sequential review budget; other endpoints
+        # retain 10 s. This exceeds Intaris's shared 60 s request deadline.
+        self._evaluation_timeout = evaluation_timeout
         # Separate circuit breakers by endpoint family so a failure in one
         # operational path does not unnecessarily poison unrelated calls.
-        self.eval_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.eval_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            should_trip=lambda exc: not isinstance(exc, EvaluationConflict),
+        )
         self.reasoning_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
-        self.session_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.session_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            should_trip=lambda exc: not isinstance(exc, ResolutionRejected),
+        )
         self.events_breaker = CircuitBreaker(
             failure_threshold=5,
             recovery_timeout=30.0,
@@ -100,6 +210,7 @@ class IntarisProvider:
         )
         self.mcp_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.search_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self._mcp_listing_cache = MCPListingCache()
         self._event_append_listeners: list[EventAppendListener] = []
         self._event_append_listener_timeout = event_append_listener_timeout
 
@@ -241,6 +352,71 @@ class IntarisProvider:
             "X-Agent-Owner": resolved_agent_owner,
         }
 
+    async def declare_workflow_step(
+        self,
+        declaration: WorkflowStepDeclaration,
+        *,
+        user_email: str,
+        agent_id: str,
+    ) -> WorkflowStepReceipt:
+        """Declare exact controller scope without creating or updating an intention."""
+        from cognis.core.workflow_step_scope import (
+            WorkflowStepDeclarationError,
+            WorkflowStepReceipt,
+        )
+
+        try:
+            token = self.auth_provider.sign_workflow_step_jwt(
+                user_email,
+                agent_id,
+                session_id=declaration.session_id,
+                governing_execution_id=declaration.step_run_id,
+                governing_snapshot_id=declaration.workflow_definition_digest,
+                declaration_digest=declaration.declaration_digest,
+            )
+        except (AttributeError, ValueError, RuntimeError) as exc:
+            raise WorkflowStepDeclarationError("workflow_step.declaration_auth_failed") from exc
+
+        async def _do() -> WorkflowStepReceipt:
+            response = await self.client.post(
+                "/api/v1/intention",
+                json={
+                    "session_id": declaration.session_id,
+                    "workflow_step": declaration.model_dump(mode="json"),
+                },
+                headers={"Authorization": f"Bearer {token}", "X-Agent-Id": agent_id},
+            )
+            if not response.is_success:
+                code = (
+                    "workflow_step_conflict"
+                    if response.status_code == 409
+                    else "workflow_step.declaration_auth_failed"
+                    if response.status_code in {401, 403}
+                    else "workflow_step.declaration_schema_failed"
+                    if response.status_code in {400, 422}
+                    else "workflow_step.declaration_http_failed"
+                )
+                raise WorkflowStepDeclarationError(code)
+            try:
+                receipt = WorkflowStepReceipt.model_validate(response.json())
+            except ValueError as exc:
+                raise WorkflowStepDeclarationError(
+                    "workflow_step.declaration_schema_failed"
+                ) from exc
+            if receipt.declaration_digest != declaration.declaration_digest:
+                raise WorkflowStepDeclarationError("workflow_step.declaration_receipt_mismatch")
+            return receipt
+
+        try:
+            # A failed declaration never falls back to evaluate or session creation.
+            return await self._call_with_retry(
+                _do, max_retries=0, operation="intaris declare_workflow_step"
+            )
+        except httpx.HTTPError as exc:
+            raise WorkflowStepDeclarationError(
+                "workflow_step.declaration_transport_failed"
+            ) from exc
+
     async def create_session(
         self,
         session_id: str,
@@ -269,10 +445,10 @@ class IntarisProvider:
                 headers=self._headers(agent_id, user_id),
             )
             response.raise_for_status()
-            if (policy or {}).get("maximum_outcome") is not None and (
-                response.json().get("policy") or {}
-            ).get("maximum_outcome") != (policy or {}).get("maximum_outcome"):
-                raise ValueError("Intaris did not acknowledge maximum_outcome.")
+            stored = response.json()
+            if parent_session_id and stored.get("parent_session_id") != parent_session_id:
+                raise ValueError("Intaris did not acknowledge the delegated parent.")
+            self._verify_policy_ack(policy or {}, stored)
 
         async def _do() -> None:
             response = await self.client.post(
@@ -311,7 +487,30 @@ class IntarisProvider:
                     },
                 )
             response.raise_for_status()
-            if (policy or {}).get("maximum_outcome") is not None:
+            created = response.json()
+            if parent_session_id:
+                # Verify canonical source composition, including the stored
+                # parent relationship and session-level inherited bounds.
+                await _verify_existing_session()
+                return
+            if not isinstance(created.get("policy"), dict) and any(
+                (policy or {}).get(field) is not None
+                for field in ("minimum_outcome", "maximum_outcome")
+            ):
+                # The compact create response contains only active_policy;
+                # request/session bounds are deliberately not in that snapshot.
+                await _verify_existing_session()
+                return
+            if isinstance(created.get("active_policy"), dict) and (
+                isinstance(created.get("policy"), dict)
+                or (policy or {}).get("maximum_outcome") is None
+            ):
+                self._verify_policy_ack(policy or {}, created, delegated=bool(parent_session_id))
+            elif (policy or {}).get("evaluation_policy_version") == "hybrid_v1" and not (
+                isinstance(created.get("active_policy"), dict)
+            ):
+                raise ValueError("Intaris did not acknowledge active_policy.")
+            elif (policy or {}).get("maximum_outcome") is not None:
                 # Intaris responds to intention declaration with {"ok": true};
                 # check the persisted session before accepting a permissive policy.
                 await _verify_existing_session()
@@ -336,13 +535,13 @@ class IntarisProvider:
         details: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
         agent_owner_email: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         logger.info(
             "intaris: update_session_policy",
             extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
         )
 
-        async def _do() -> None:
+        async def _do() -> dict[str, Any]:
             response = await self.client.patch(
                 f"/api/v1/session/{session_id}",
                 json={"details": details or {}, "policy": policy or {}},
@@ -359,17 +558,79 @@ class IntarisProvider:
                     },
                 )
             response.raise_for_status()
-            if (response.json().get("policy") or {}).get("maximum_outcome") != (policy or {}).get(
-                "maximum_outcome"
-            ):
-                raise ValueError("Intaris did not acknowledge maximum_outcome.")
+            self._verify_policy_ack(policy or {}, response.json())
+            return dict(response.json().get("policy") or policy or {})
 
-        await self._call_with_retry(
+        return await self._call_with_retry(
             _do,
             max_retries=2,
             operation=f"intaris update_session_policy({session_id})",
             breaker=self.session_breaker,
         )
+
+    @staticmethod
+    def _verify_policy_ack(
+        policy: dict[str, Any], response: dict[str, Any], *, delegated: bool = False
+    ) -> None:
+        """Validate activated policy; tolerate the deployed legacy schema's omitted version.
+
+        The hybrid ``active_policy`` snapshot carries version and profile, but
+        ``maximum_outcome`` is a session policy field returned in ``policy``.
+        """
+        acknowledged = response.get("active_policy")
+        stored = response.get("policy")
+        delegated = delegated or bool(response.get("parent_session_id"))
+        if (
+            not delegated
+            and policy.get("evaluation_policy_version") == "hybrid_v1"
+            and not isinstance(acknowledged, dict)
+        ):
+            raise ValueError("Intaris did not acknowledge active_policy.")
+        if not isinstance(acknowledged, dict):
+            acknowledged = stored or {}
+        if not isinstance(acknowledged, dict):
+            raise ValueError("Intaris did not acknowledge policy.")
+        if not isinstance(stored, dict):
+            stored = acknowledged
+        version = policy.get("evaluation_policy_version")
+        if delegated:
+            # Activation, not an earlier potentially stale parent GET, owns
+            # inherited mode. This also handles nested parent-mode changes.
+            version = acknowledged.get("evaluation_policy_version", "legacy")
+            if version not in {"legacy", "hybrid_v1"} or (
+                version == "hybrid_v1"
+                and acknowledged.get("profile") not in {"strict", "balanced", "bounded_autonomy"}
+            ):
+                raise ValueError("Intaris did not acknowledge a valid inherited policy.")
+            policy = {**policy, "evaluation_policy_version": version}
+            if version == "hybrid_v1":
+                policy["profile"] = acknowledged["profile"]
+        if version == "hybrid_v1":
+            for field in ("evaluation_policy_version", "profile"):
+                if acknowledged.get(field) != policy.get(field):
+                    raise ValueError(f"Intaris did not acknowledge {field}.")
+        elif version == "legacy" and acknowledged.get("evaluation_policy_version") not in (
+            None,
+            "legacy",
+        ):
+            raise ValueError("Intaris did not acknowledge legacy evaluation.")
+        actual_cap, requested_cap = stored.get("maximum_outcome"), policy.get("maximum_outcome")
+        caps = {None: 0, "deny": 0, "escalate": 1, "approve": 2}
+        valid_cap = actual_cap == requested_cap
+        if delegated and actual_cap in caps and requested_cap in caps:
+            valid_cap = (
+                caps[actual_cap] <= caps[requested_cap] if requested_cap is not None else True
+            )
+        if not valid_cap:
+            raise ValueError("Intaris did not acknowledge maximum_outcome.")
+        actual_floor, requested_floor = stored.get("minimum_outcome"), policy.get("minimum_outcome")
+        floors = {None: 0, "approve": 0, "escalate": 1, "deny": 2}
+        if (
+            actual_floor not in floors
+            or requested_floor not in floors
+            or floors[actual_floor] < floors[requested_floor]
+        ):
+            raise ValueError("Intaris did not acknowledge minimum_outcome.")
 
     async def evaluate(
         self,
@@ -377,13 +638,86 @@ class IntarisProvider:
         tool_name: str,
         arguments: dict[str, Any],
         context: dict[str, Any] | None = None,
+        *,
+        workflow_binding: WorkflowEvaluationBinding | None = None,
+        process_binding: ProcessEvaluationBinding | None = None,
     ) -> EvaluationResult:
         logger.debug(
             "intaris: evaluate",
             extra={"extra_data": {"session_id": session_id, "tool_name": tool_name}},
         )
+        from cognis.providers.guardrails.evaluation_context import fit_evaluation_context
+
+        # Fit after the router adds floors/receipts; arguments and binding hashes
+        # remain untouched. Oversized protected context fails before dispatch.
+        context = fit_evaluation_context(context)
 
         async def _do() -> EvaluationResult:
+            extensions: dict[str, Any] = {}
+            if workflow_binding is None:
+                headers = self._headers(user_email=current_user_email.get())
+            else:
+                declaration = workflow_binding.declaration
+                if (
+                    declaration.session_id != session_id
+                    or declaration.tool != tool_name
+                    or declaration.evaluated_args_digest != canonical_digest(arguments)
+                ):
+                    raise WorkflowStepDeclarationError("workflow_step.declaration_mismatch")
+                extensions = {
+                    "logical_call_id": declaration.logical_call_id,
+                    "controller_context": workflow_binding.controller_context,
+                }
+                token = self.auth_provider.sign_workflow_step_jwt(
+                    workflow_binding.user_email,
+                    workflow_binding.agent_id,
+                    session_id=declaration.session_id,
+                    governing_execution_id=declaration.step_run_id,
+                    governing_snapshot_id=declaration.workflow_definition_digest,
+                    declaration_digest=declaration.declaration_digest,
+                )
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "X-Agent-Id": workflow_binding.agent_id,
+                }
+            if process_binding is not None:
+                process_declaration = process_binding.declaration
+                if (
+                    process_declaration["session_id"] != session_id
+                    or process_declaration["tool"] != tool_name
+                    or process_declaration["evaluated_args_digest"] != canonical_digest(arguments)
+                ):
+                    raise ValueError("Process lifecycle binding mismatch")
+                if self._process_scope_supported is None:
+                    capability = await self.client.get(
+                        "/api/v1/process-lifecycle-capabilities", headers=headers
+                    )
+                    if capability.status_code in {404, 405}:
+                        self._process_scope_supported = False
+                    else:
+                        capability.raise_for_status()
+                        self._process_scope_supported = 1 in capability.json().get("versions", [])
+                if self._process_scope_supported:
+                    workflow_claims = None
+                    if workflow_binding is not None:
+                        configured = workflow_binding.declaration
+                        workflow_claims = {
+                            "governing_execution_id": configured.step_run_id,
+                            "governing_snapshot_id": configured.workflow_definition_digest,
+                            "declaration_digest": configured.declaration_digest,
+                        }
+                    token = self.auth_provider.sign_process_scope_jwt(
+                        process_binding.user_email,
+                        process_binding.agent_id,
+                        session_id=session_id,
+                        process_scope_digest=process_binding.digest,
+                        workflow_claims=workflow_claims,
+                    )
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "X-Agent-Id": process_binding.agent_id,
+                    }
+                    extensions["process_scope"] = process_declaration
             response = await self.client.post(
                 "/api/v1/evaluate",
                 json={
@@ -394,16 +728,64 @@ class IntarisProvider:
                     **(
                         {
                             "minimum_outcome": context["minimum_outcome"],
-                            "approval_call_id": context.get("approval_call_id"),
                         }
                         if context and context.get("minimum_outcome") is not None
                         else {}
                     ),
+                    **(
+                        {"approval_call_id": context["approval_call_id"]}
+                        if context and context.get("approval_call_id") is not None
+                        else {}
+                    ),
+                    **extensions,
                 },
-                headers=self._headers(user_email=current_user_email.get()),
+                headers=headers,
+                timeout=self._evaluation_timeout,
             )
-            response.raise_for_status()
+            if response.status_code == 409:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                conflict = EvaluationConflict.from_payload(payload)
+                logger.warning(
+                    "intaris: evaluate conflict",
+                    extra={
+                        "extra_data": {
+                            "code": conflict.code,
+                            "status_code": 409,
+                            "session_id": session_id,
+                            "tool_name": tool_name,
+                            "call_id": (context or {}).get("tool_call_id"),
+                        }
+                    },
+                )
+                raise conflict
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code not in {413, 422}:
+                    raise
+                detail = _safe_evaluation_error_detail(response)
+                raise httpx.HTTPStatusError(
+                    f"Intaris evaluation failed with HTTP {response.status_code}: "
+                    f"{json.dumps(detail, separators=(',', ':'))}",
+                    request=exc.request,
+                    response=exc.response,
+                ) from None
             data = response.json()
+            if process_binding is not None and "process_scope" in extensions:
+                acknowledged = (data.get("evaluation_metadata") or {}).get(
+                    "process_lifecycle"
+                ) or {}
+                if (
+                    acknowledged.get("authenticated") is True
+                    and acknowledged.get("declaration") == process_binding.declaration
+                ):
+                    data["process_scope_digest"] = process_binding.digest
+                elif data.get("decision") == "approve":
+                    # A successful ordinary evaluation is not lifecycle admission.
+                    data["process_scope_digest"] = None
             if (
                 context
                 and context.get("minimum_outcome") is not None
@@ -416,6 +798,7 @@ class IntarisProvider:
             _do,
             max_retries=2,
             base_delay=0.5,
+            respect_retry_after=True,
             operation=f"intaris evaluate({tool_name})",
             breaker=self.eval_breaker,
         )
@@ -557,6 +940,12 @@ class IntarisProvider:
                 json={"call_id": call_id, "decision": decision, "note": note},
                 headers=self._headers(user_email=current_user_email.get()),
             )
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                raise ResolutionRejected(response.status_code, payload)
             response.raise_for_status()
 
         await self._call_with_retry(
@@ -653,7 +1042,10 @@ class IntarisProvider:
                 params=params,
                 timeout=30.0,
             )
-            if response.status_code == 404:
+            # Older receivers have no code. Do not infer session absence from
+            # message text: disabled recording also historically returned 404.
+            event_error = getattr(response, "headers", {}).get("X-Intaris-Event-Error")
+            if response.status_code == 404 and event_error == "session_not_found":
                 if missing_session_attempt < len(missing_session_delays):
                     delay = missing_session_delays[missing_session_attempt]
                     missing_session_attempt += 1
@@ -677,11 +1069,18 @@ class IntarisProvider:
             response.raise_for_status()
             return EventAppendResult.model_validate(response.json())
 
+        def retryable_append(exc: Exception) -> bool:
+            response = getattr(exc, "response", None)
+            if getattr(response, "headers", {}).get("X-Intaris-Event-Error") == "append_uncertain":
+                return False
+            return is_retryable_http_error(exc)
+
         result = await self._call_with_retry(
             _do,
             max_retries=3,
             operation="intaris record_events",
             breaker=self.events_breaker,
+            retryable_check=retryable_append,
         )
         logger.debug(
             "intaris: events recorded",
@@ -974,11 +1373,15 @@ class IntarisProvider:
                 )
                 return items
 
-            return await self._call_with_retry(
-                _do,
-                max_retries=1,
-                operation="intaris list_mcp_servers",
-                breaker=self.mcp_breaker,
+            user_email = current_user_email.get()
+            return await self._mcp_listing_cache.get(
+                ("servers", enabled_only, user_email),
+                lambda: self._call_with_retry(
+                    _do,
+                    max_retries=1,
+                    operation="intaris list_mcp_servers",
+                    breaker=self.mcp_breaker,
+                ),
             )
         except Exception:
             logger.warning("intaris: list_mcp_servers failed", exc_info=True)
@@ -1000,11 +1403,15 @@ class IntarisProvider:
                 )
                 return tools
 
-            return await self._call_with_retry(
-                _do,
-                max_retries=1,
-                operation="intaris list_mcp_tools",
-                breaker=self.mcp_breaker,
+            user_email = current_user_email.get()
+            return await self._mcp_listing_cache.get(
+                ("tools", user_email),
+                lambda: self._call_with_retry(
+                    _do,
+                    max_retries=1,
+                    operation="intaris list_mcp_tools",
+                    breaker=self.mcp_breaker,
+                ),
             )
         except Exception:
             logger.warning("intaris: list_mcp_tools failed", exc_info=True)

@@ -29,6 +29,8 @@ class NativeValidationContext:
     task_title: str = ""
     task_description: str = ""
     task_expected_output: str | None = None
+    daily_brief_task_output: bool | None = None
+    deliverable_step_run_id: str | None = None
     loaded_skill_names: frozenset[str] = frozenset()
     loaded_skill_snapshots: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] = ()
     executed_tool_names: tuple[str, ...] = ()
@@ -96,6 +98,10 @@ def write_deliverable_validation_state_fingerprint(
         "conversation_id": context.conversation_id,
         "conversation_agent_id": context.conversation_agent_id,
         "write_deliverable_available": context.write_deliverable_available,
+        "daily_brief_task_output": context.daily_brief_task_output,
+        "deliverable_step_run_id": context.deliverable_step_run_id,
+        "actor_email": context.actor_email,
+        "current_agent_id": context.current_agent_id,
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode()).hexdigest()
@@ -370,6 +376,16 @@ async def _validate_schedule_definition(
     ]
 
 
+async def _validate_write_deliverable_text(
+    arguments: dict[str, Any],
+    context: NativeValidationContext,
+) -> list[NativeValidationIssue]:
+    """Enforce final task domains without changing non-task text authoring."""
+    if context.deliverable_step_run_id is None:
+        return []
+    return await _validate_write_deliverable_rich(arguments, context)
+
+
 async def _validate_write_deliverable_rich(
     arguments: dict[str, Any],
     context: NativeValidationContext,
@@ -414,8 +430,10 @@ async def _validate_write_deliverable_rich(
             normalized_rich = resolved.rich
         except DeliverableAuthoringError as exc:
             issues.append(NativeValidationIssue(code=exc.code, path=exc.path, message=exc.message))
+            return issues
         except RichPayloadValidationError as exc:
             issues.extend(_rich_payload_validation_issues(exc, prefix="$.payload"))
+            return issues
     elif arguments.get("format") == "rich" or "rich" in arguments:
         issues.append(
             NativeValidationIssue(
@@ -424,6 +442,25 @@ async def _validate_write_deliverable_rich(
                 message="Use action='rich' with exactly one payload source.",
             )
         )
+
+    supersedes = arguments.get("supersedes")
+    if isinstance(supersedes, str) and context.session_factory is not None:
+        from cognis.core.content_refs import authorize_supersedes_target
+        from cognis.models.deliverable import DeliverableRevisionError
+
+        async with context.session_factory() as session:
+            try:
+                await authorize_supersedes_target(
+                    session,
+                    supersedes,
+                    user_email=context.actor_email,
+                    accessor_conversation_id=context.conversation_id,
+                    accessor_agent_id=context.conversation_agent_id,
+                )
+            except DeliverableRevisionError as exc:
+                issues.append(
+                    NativeValidationIssue(code=exc.code, path="$.supersedes", message=exc.message)
+                )
 
     format_name = (
         "rich" if normalized_rich is not None else str(arguments.get("format") or "markdown")
@@ -442,6 +479,7 @@ async def _validate_write_deliverable_rich(
         task_expected_output=context.task_expected_output,
         loaded_skill_names=context.loaded_skill_names,
         loaded_skill_snapshots=snapshots,
+        task_output=context.daily_brief_task_output,
     )
     if activation is not None and activation.version >= CURRENT_DAILY_BRIEF_CONTRACT_VERSION:
         daily_brief_issues = validate_daily_brief_deliverable(
@@ -519,4 +557,5 @@ _VALIDATORS: dict[str, NativeValidator] = {
     "manage_agents.update": _validate_agent_update,
     "schedule.definition": _validate_schedule_definition,
     "write_deliverable.rich": _validate_write_deliverable_rich,
+    "write_deliverable.text": _validate_write_deliverable_text,
 }

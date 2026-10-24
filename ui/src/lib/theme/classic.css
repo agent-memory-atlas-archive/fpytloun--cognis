@@ -1,0 +1,265 @@
+@import './classic-tool-paints.css';
+/* Review candidate. Source: pre-semantic 07a413ce4 app.css, Card.svelte,
+   ChatMessage.svelte and ui/Button.svelte. Semantic roles merge formerly
+   distinct utility shades; this is source-based restoration, not pixel parity. */
+:root:not([data-theme-family]),
+[data-theme-family='classic'][data-resolved-theme='light'] {
+  /* Light: near-white content, a faintly tinted frame, hairline borders.
+     Layers separate by small value steps, not by dark chrome or outlines. */
+  --app-chrome-bg: #e9eef4;
+  --color-canvas: 248 250 252;
+  --color-chrome: 233 238 244;
+  --color-surface: 255 255 255;
+  --color-inset: 241 245 249;
+  --color-elevated: 255 255 255;
+  --color-surface-hover: 226 232 240;
+  --color-foreground: 15 23 42;
+  --color-secondary: 51 65 85;
+  --color-muted: 90 104 124;
+  --color-separator: 226 232 240;
+  --color-control-border: 203 213 225;
+  --color-border-strong: 100 116 139;
+  --color-accent-subtle: 228 240 250;
+  --color-success-subtle: 236 246 241;
+  --color-warning-subtle: 251 245 232;
+  --color-danger-subtle: 252 239 239;
+  --color-info-subtle: 233 242 249;
+}
+
+/* Shade and alpha are component contracts, not interchangeable category
+   aliases. Values below come from pre-theme 07a413ce4 owners. */
+[data-theme-family='classic'][data-resolved-theme='dark'] {
+  --compaction-info-bg: rgb(6 182 212 / .1);
+  --compaction-info-border: rgb(6 182 212 / .3);
+  --compaction-info-fg: rgb(207 250 254);
+  --compaction-error-bg: rgb(244 63 94 / .1);
+  --compaction-error-border: rgb(244 63 94 / .3);
+  --compaction-error-fg: rgb(255 228 230);
+  --helper-managed-bg: rgb(139 92 246 / .05);
+  --helper-managed-border: rgb(167 139 250 / .25);
+  --helper-managed-header-border: rgb(167 139 250 / .15);
+  --helper-error-bg: rgb(244 63 94 / .05);
+  --helper-error-border: rgb(244 63 94 / .3);
+  --helper-error-header-border: rgb(244 63 94 / .15);
+  --recap-bg: rgb(15 23 42 / .9);
+  --recap-border: rgb(14 165 233 / .25);
+  --primitive-card-bg: rgb(15 23 42 / .8);
+  --primitive-card-border: rgb(30 41 59 / .8);
+  --primitive-badge-bg: rgb(30 41 59 / .8);
+  --primitive-badge-fg: rgb(226 232 240);
+  --primitive-danger-bg: rgb(244 63 94);
+  --primitive-danger-hover: rgb(251 113 133);
+  --primitive-danger-fg: rgb(255 255 255);
+  --primitive-focus: rgb(125 211 252);
+  --primitive-control-hover: rgb(30 41 59);
+  --primitive-ghost-hover-fg: rgb(255 255 255);
+}
+
+/* Before bootstrap, Classic follows the OS without changing explicit scopes.
+   The baseline palette supplies light categories; dark categories use the
+   original dark constants already shared by the explicit dark fallback. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme-family]) {
+    color-scheme: dark;
+    --app-chrome-bg: #07111a;
+    --color-canvas: 2 6 23;
+    --color-chrome: 7 17 26;
+    --color-surface: 15 23 42;
+    --color-inset: 2 6 23;
+    --color-elevated: 2 6 23;
+    --color-surface-hover: 30 41 59;
+    --color-foreground: 241 245 249;
+    --color-secondary: 203 213 225;
+    --color-muted: 148 163 184;
+    --color-separator: 30 41 59;
+    --color-control-border: 51 65 85;
+    --color-border-strong: 100 116 139;
+    --color-accent: 14 165 233;
+    --color-accent-hover: 56 189 248;
+    --color-on-accent: 2 6 23;
+    --color-accent-subtle: 8 47 73;
+    --color-success: 52 211 153;
+    --color-warning: 251 191 36;
+    --color-danger: 251 113 133;
+    --color-info: 56 189 248;
+    --color-success-subtle: 6 50 40;
+    --color-warning-subtle: 69 40 14;
+    --color-danger-subtle: 69 20 28;
+    --color-info-subtle: 8 47 73;
+    --color-violet-tone: 196 181 253;
+    --color-violet-subtle: 46 25 80;
+    --color-cyan-tone: 103 232 249;
+    --color-cyan-subtle: 8 51 68;
+    --color-pink-tone: var(--fallback-dark-pink-tone);
+    --color-pink-subtle: var(--fallback-dark-pink-subtle);
+    --color-orange-tone: var(--fallback-dark-orange-tone);
+    --color-orange-subtle: var(--fallback-dark-orange-subtle);
+    --color-indigo-tone: var(--fallback-dark-indigo-tone);
+    --color-indigo-subtle: var(--fallback-dark-indigo-subtle);
+    --color-teal-tone: var(--fallback-dark-teal-tone);
+    --color-teal-subtle: var(--fallback-dark-teal-subtle);
+    --color-lime-tone: var(--fallback-dark-lime-tone);
+    --color-lime-subtle: var(--fallback-dark-lime-subtle);
+    --color-purple-tone: var(--fallback-dark-purple-tone);
+    --color-purple-subtle: var(--fallback-dark-purple-subtle);
+    --color-blue-tone: var(--fallback-dark-blue-tone);
+    --color-blue-subtle: var(--fallback-dark-blue-subtle);
+    --color-fuchsia-tone: var(--fallback-dark-fuchsia-tone);
+    --color-fuchsia-subtle: var(--fallback-dark-fuchsia-subtle);
+    --color-success-border: 52 143 110;
+    --color-warning-border: 180 113 15;
+    --color-danger-border: 211 73 73;
+    --color-info-border: 40 132 180;
+    --color-violet-border: 139 92 246;
+    --color-cyan-border: 8 145 178;
+    --color-pink-border: 219 39 119;
+    --color-orange-border: 194 65 12;
+    --color-indigo-border: 99 102 241;
+    --color-teal-border: 13 148 136;
+    --color-lime-border: 101 139 20;
+    --color-purple-border: 147 51 234;
+    --color-blue-border: 59 130 246;
+    --color-fuchsia-border: 192 38 211;
+    --color-syntax-keyword: 125 211 252;
+    --color-syntax-string: 110 231 183;
+    --color-syntax-number: 103 232 249;
+    --color-syntax-comment: 100 116 139;
+    --color-syntax-punctuation: 100 116 139;
+    --color-syntax-title: 186 230 253;
+    --message-user-bg: rgb(2 132 199 / .9);
+    --message-user-fg: rgb(248 250 252);
+    --message-user-border: rgb(56 189 248 / .3);
+  }
+}
+
+[data-theme-family='classic'][data-resolved-theme='dark'] {
+  --color-canvas: 2 6 23;
+  --color-surface: 15 23 42;
+  --color-inset: 2 6 23;
+  --color-elevated: 30 41 59;
+  --color-surface-hover: 30 41 59;
+  --color-foreground: 241 245 249;
+  --color-secondary: 203 213 225;
+  --color-muted: 148 163 184;
+  --color-separator: 30 41 59;
+  --color-control-border: 51 65 85;
+  --color-border-strong: 100 116 139;
+  --color-accent: 14 165 233;
+  --color-accent-hover: 56 189 248;
+  --color-on-accent: 2 6 23;
+  --message-user-bg: rgb(2 132 199 / .9);
+  --message-user-fg: rgb(248 250 252);
+  --message-user-border: rgb(56 189 248 / .3);
+  /* Original state icons used 400, result prose 300: shared role uses 400. */
+  --color-success: 52 211 153;
+  --color-warning: 251 191 36;
+  --color-danger: 251 113 133;
+  --color-info: 56 189 248;
+  --color-syntax-keyword: 125 211 252;
+  --color-syntax-string: 110 231 183;
+  --color-syntax-number: 103 232 249;
+  /* Original slate-500 comments fail small text contrast; retain slate-400. */
+  /* Original Slate 500 comments/punctuation: preserve the source's sub-AA
+     small-text contrast rather than silently adapting its color. */
+  --color-syntax-comment: 100 116 139;
+  --color-syntax-punctuation: 100 116 139;
+  --link-fg: #38bdf8;
+  --link-hover-fg: #bae6fd;
+  --inline-code-fg: rgb(186 230 253);
+  --prose-strong-fg: rgb(248 250 252);
+  --prose-emphasis-fg: rgb(226 232 240);
+  --user-link-fg: rgb(224 242 254);
+  --user-inline-code-fg: rgb(240 249 255);
+  --user-code-fg: rgb(224 242 254);
+  --quiet-control-fg: rgb(100 116 139);
+  --json-number-fg: rgb(186 230 253);
+  --json-literal-fg: rgb(103 232 249);
+  --syntax-variable-fg: rgb(226 232 240);
+  --color-syntax-title: 186 230 253;
+  /* Values below restore the dominant pre-theme 07a413ce4 shade for each role,
+     measured by scripts/audit-classic-dark-migration.mjs. */
+  --color-elevated: 2 6 23;
+  --color-foreground: 226 232 240;
+  --color-strong: 255 255 255;
+  --color-quiet: 100 116 139;
+  --color-raised: 30 41 59;
+  --color-border-strong: 148 163 184;
+  --text-accent: 125 211 252;
+  --text-accent-hover: 186 230 253;
+  --text-danger: 253 164 175;
+  --text-warning: 253 230 138;
+  --text-success: 110 231 183;
+  --text-info: 224 242 254;
+  --color-orange-tone: 253 230 138;
+  /* Original tints were translucent 500-series over slate surfaces. */
+  --color-accent-subtle: 14 165 233;
+  --alpha-accent-subtle: .1;
+  --color-info-subtle: 14 165 233;
+  --alpha-info-subtle: .1;
+  --color-info-border: 14 165 233;
+  --alpha-info-border: .3;
+  --color-success-subtle: 16 185 129;
+  --alpha-success-subtle: .1;
+  --color-success-border: 16 185 129;
+  --alpha-success-border: .3;
+  --color-warning-subtle: 245 158 11;
+  --alpha-warning-subtle: .1;
+  --color-warning-border: 245 158 11;
+  --alpha-warning-border: .3;
+  --color-danger-subtle: 244 63 94;
+  --alpha-danger-subtle: .1;
+  --color-danger-border: 244 63 94;
+  --alpha-danger-border: .3;
+  --color-violet-subtle: 139 92 246;
+  --alpha-violet-subtle: .1;
+  --color-violet-border: 139 92 246;
+  --alpha-violet-border: .2;
+  --color-cyan-subtle: 6 182 212;
+  --alpha-cyan-subtle: .15;
+  --color-cyan-border: 6 182 212;
+  --alpha-cyan-border: .2;
+  --color-blue-subtle: 56 189 248;
+  --alpha-blue-subtle: .08;
+  --color-blue-border: 56 189 248;
+  --alpha-blue-border: .15;
+  --color-orange-subtle: 245 158 11;
+  --alpha-orange-subtle: .1;
+  --color-orange-border: 251 191 36;
+  --alpha-orange-border: .3;
+  --color-pink-subtle: 236 72 153;
+  --alpha-pink-subtle: .1;
+  --color-pink-border: 236 72 153;
+  --alpha-pink-border: .3;
+  --color-indigo-subtle: 99 102 241;
+  --alpha-indigo-subtle: .1;
+  --color-indigo-border: 99 102 241;
+  --alpha-indigo-border: .3;
+  --color-teal-subtle: 20 184 166;
+  --alpha-teal-subtle: .1;
+  --color-teal-border: 20 184 166;
+  --alpha-teal-border: .3;
+  --color-lime-subtle: 132 204 22;
+  --alpha-lime-subtle: .1;
+  --color-lime-border: 132 204 22;
+  --alpha-lime-border: .3;
+  --color-purple-subtle: 168 85 247;
+  --alpha-purple-subtle: .1;
+  --color-purple-border: 168 85 247;
+  --alpha-purple-border: .3;
+  --color-fuchsia-subtle: 217 70 239;
+  --alpha-fuchsia-subtle: .1;
+  --color-fuchsia-border: 217 70 239;
+  --alpha-fuchsia-border: .3;
+}
+
+/* Original timeline labels used the -200 shade of each category. */
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind] > button { color: rgb(226 232 240); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='explore'] > button { color: rgb(186 230 253); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='command'] > button { color: rgb(221 214 254); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='edit'] > button { color: rgb(167 243 208); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='delegate'] > button { color: rgb(253 230 138); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='web'] > button { color: rgb(165 243 252); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='browser'] > button { color: rgb(199 210 254); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='image'] > button { color: rgb(251 207 232); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='memory'] > button { color: rgb(245 208 254); }
+[data-theme-family='classic'][data-resolved-theme='dark'] [data-tool-group-kind='knowledgebase'] > button { color: rgb(153 246 228); }

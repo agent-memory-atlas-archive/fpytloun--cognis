@@ -503,7 +503,10 @@ def test_split_events_compacts_tool_heavy_single_turn_at_tool_cycle_boundary() -
 
     assert older
     assert preserved
-    assert preserved[0].type == "tool_call"
+    # The active instruction stays verbatim ahead of the preserved cycles.
+    assert preserved[0] is events[0]
+    assert events[0] not in older
+    assert preserved[1].type == "tool_call"
     assert older[-1].type == "tool_result"
     assert len(older) + len(preserved) == len(events)
 
@@ -541,8 +544,9 @@ def test_split_events_keeps_parallel_tool_call_batch_together() -> None:
     older, preserved = _split_events(events, preserve_turns=10)
 
     assert older
-    assert preserved[0].type == "tool_call"
+    assert preserved[0] is events[0]
     assert preserved[1].type == "tool_call"
+    assert preserved[2].type == "tool_call"
     preserved_call_ids = {
         event.data.get("call_id") for event in preserved if event.type == "tool_call"
     }
@@ -799,3 +803,265 @@ async def test_compaction_max_input_uses_compaction_route_provider_only_for_same
 
     assert result.compacted is True
     assert llm.model_info_provider_ids == [None]
+
+
+def _long_single_turn_events(
+    *, cycles: int = 60, result_chars: int = 6_000, with_retry_notice: bool = True
+) -> list[CachedEvent]:
+    """One user turn extended by many tool cycles, as system continuations do."""
+    events = [
+        CachedEvent(
+            seq=1,
+            type="developer_message",
+            data={"content": "context seed", "context_injection": True},
+        ),
+        CachedEvent(
+            seq=2,
+            type="user_message",
+            data={"content": "Work it out fully until QA ready", "turn_id": "turn-1"},
+        ),
+    ]
+    if with_retry_notice:
+        events.append(
+            CachedEvent(
+                seq=3,
+                type="system_message",
+                data={
+                    "event": "system_notice",
+                    "kind": "model_recovery",
+                    "scope": "turn",
+                    "retry_source_turn_id": "turn-1",
+                    "turn_id": "turn-2",
+                },
+            )
+        )
+    for index in range(cycles):
+        call_id = f"call-{index}"
+        events.extend(
+            [
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="assistant_message",
+                    data={"content": f"step {index}", "turn_id": "turn-2"},
+                ),
+                CachedEvent(
+                    seq=len(events) + 2,
+                    type="tool_call",
+                    data={"call_id": call_id, "name": "bash", "arguments": {"command": "x"}},
+                ),
+                CachedEvent(
+                    seq=len(events) + 3,
+                    type="tool_result",
+                    data={"call_id": call_id, "name": "bash", "result": "r" * result_chars},
+                ),
+            ]
+        )
+    return events
+
+
+def _char_tokens(text: str, _model: str) -> int:
+    return len(text)
+
+
+def test_split_events_cuts_inside_oversized_turn_and_pins_admission() -> None:
+    from cognis.core.compaction.strategy import _event_prompt_text
+
+    events = _long_single_turn_events()
+    budget = 40_000
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=budget,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+
+    # Admission anchors stay verbatim, in order, ahead of the contiguous tail.
+    assert [event.seq for event in preserved[:2]] == [2, 3]
+    assert all(event.seq not in {2, 3} for event in older)
+    suffix = preserved[2:]
+    assert suffix[0].type in {"assistant_message", "tool_call"}
+    assert [event.seq for event in suffix] == list(range(suffix[0].seq, events[-1].seq + 1))
+    assert len(older) + len(preserved) == len(events)
+    # The tail is sized on raw replay cost, not the truncated compaction text.
+    assert sum(len(_event_prompt_text(event)) for event in suffix) <= budget
+    assert any(event.type == "tool_result" for event in older)
+
+
+def test_split_events_keeps_whole_latest_turn_when_it_fits() -> None:
+    events = _long_single_turn_events(cycles=3, result_chars=10)
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=100_000,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+
+    assert [event.seq for event in older] == [1]
+    assert preserved == events[1:]
+
+
+def test_split_events_keeps_last_cycle_when_it_alone_exceeds_budget() -> None:
+    events = _long_single_turn_events(cycles=4, result_chars=50_000, with_retry_notice=False)
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=1_000,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+
+    assert preserved[0].seq == 2
+    # The tool exchange stays complete even though it alone exceeds the budget.
+    assert [event.type for event in preserved[1:]] == ["tool_call", "tool_result"]
+    assert preserved[-1] is events[-1]
+    assert older
+
+
+def test_split_events_does_not_snap_over_unbudgeted_parallel_batch_call() -> None:
+    """A later call in a parallel batch is not a boundary on its own."""
+    events = _long_single_turn_events(cycles=10, result_chars=10, with_retry_notice=False)
+    seq = events[-1].seq
+    events.extend(
+        [
+            CachedEvent(
+                seq=seq + 1,
+                type="tool_call",
+                data={"call_id": "big", "name": "write", "arguments": {"content": "a" * 50_000}},
+            ),
+            CachedEvent(seq=seq + 2, type="tool_call", data={"call_id": "small", "name": "read"}),
+            CachedEvent(seq=seq + 3, type="tool_result", data={"call_id": "big", "result": "ok"}),
+            CachedEvent(seq=seq + 4, type="tool_result", data={"call_id": "small", "result": "ok"}),
+            CachedEvent(seq=seq + 5, type="assistant_message", data={"content": "next"}),
+            CachedEvent(seq=seq + 6, type="tool_call", data={"call_id": "last", "name": "read"}),
+            CachedEvent(seq=seq + 7, type="tool_result", data={"call_id": "last", "result": "ok"}),
+        ]
+    )
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=5_000,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+
+    # The oversized batch is summarized; compaction is not a no-op.
+    assert any(event.data.get("call_id") == "big" for event in older)
+    assert any(event.data.get("call_id") == "small" for event in older)
+    assert preserved[0].seq == 2
+    assert [event.seq for event in preserved[1:]] == [seq + 5, seq + 6, seq + 7]
+
+
+def test_pinned_admission_satisfies_continuation_validation_after_rotation() -> None:
+    from cognis.core.canonical_history import CanonicalHistoryUnavailable
+    from cognis.core.session_cache import CanonicalContextSnapshot
+
+    events = _long_single_turn_events()
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=40_000,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+    assert older
+
+    def rotated_snapshot(tail: list[CachedEvent]) -> CanonicalContextSnapshot:
+        # Rotation re-appends the tail in order under fresh sequence numbers.
+        reseeded = [
+            CachedEvent(seq=index + 10, type=event.type, data=dict(event.data))
+            for index, event in enumerate(tail)
+        ]
+        return CanonicalContextSnapshot(
+            events=reseeded,
+            prefix_entries=[],
+            last_compaction_summary="summary",
+            last_event_seq=reseeded[-1].seq,
+            last_compaction_seq=9,
+            projection_revision=1,
+        )
+
+    # The retry execution resolves its admission through the pinned notice.
+    rotated_snapshot(preserved).require_turn("turn-2", user_event=True, profile_switch=False)
+    rotated_snapshot(preserved).require_turn("turn-1", user_event=True, profile_switch=False)
+    unpinned_tail = [event for event in preserved if event.seq > older[-1].seq]
+    with pytest.raises(CanonicalHistoryUnavailable):
+        rotated_snapshot(unpinned_tail).require_turn(
+            "turn-2", user_event=True, profile_switch=False
+        )
+
+
+class _CapturingGuardrails(_Guardrails):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded: list[object] = []
+
+    async def record_events(self, **kwargs: object) -> EventAppendResult:
+        events = kwargs.get("events")
+        if isinstance(events, list):
+            self.recorded.extend(events)
+        return await super().record_events(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_compaction_summarizes_inside_long_single_turn() -> None:
+    cache = _Cache()
+    cache.entry.events = _long_single_turn_events()
+    guardrails = _CapturingGuardrails()
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=guardrails,
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=10,
+    )
+    # 30% of this budget is the preserved-tail budget.
+    strategy.max_input_tokens = 130_000
+
+    result = await strategy.compact(_session(), trigger="tool_loop_pressure")
+
+    assert result.compacted is True
+    assert result.turns_compacted == 0
+    assert result.events_compacted > 0
+    assert [event.seq for event in result.preserved_tail_events[:2]] == [2, 3]
+    suffix_start = result.preserved_tail_events[2].seq
+    assert result.tail_start_seq == suffix_start
+    marker = guardrails.recorded[-1]
+    marker_data = getattr(marker, "data", {})
+    assert marker_data["tail_pinned_seqs"] == [2, 3]
+    assert marker_data["tail_start_seq"] == suffix_start
+    assert marker_data["events_compacted"] == result.events_compacted
+    assert marker_data["turns_compacted"] == 0
+    # The summarizer still reads the active instruction it reports progress on.
+    summary_input = str(llm.messages[0][1]["content"])
+    assert "Work it out fully until QA ready" in summary_input
+
+
+@pytest.mark.asyncio
+async def test_compaction_is_noop_before_recording_when_only_seeds_would_be_summarized() -> None:
+    cache = _Cache()
+    cache.entry.events = _long_single_turn_events(cycles=3, result_chars=10)
+    guardrails = _CapturingGuardrails()
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=guardrails,
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=10,
+    )
+    strategy.max_input_tokens = 1_000_000
+
+    result = await strategy.compact(_session(), trigger="tool_loop_pressure")
+
+    assert result.compacted is False
+    assert result.method == "noop"
+    assert llm.messages == []
+    assert guardrails.calls == 0
+    assert cache.applied == []

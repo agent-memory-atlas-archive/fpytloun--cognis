@@ -6,20 +6,27 @@
  */
 
 import { api } from '$lib/api/client';
+import { auth } from '$lib/stores/auth';
+import { isNativeHost } from '$lib/native/host';
 
 const PERMISSION_KEY = 'cognis_notification_permission_asked';
 const WEB_PUSH_ENABLED_KEY = 'cognis_web_push_enabled';
 const WEB_PUSH_PROMPT_DISMISSED_KEY = 'cognis_web_push_prompt_dismissed';
+// The user's intent to receive push on this device. Unlike the enabled flag
+// (current health), it survives the browser or push service dropping the
+// subscription, so the app can silently resubscribe instead of asking again.
+// Cleared only by an explicit disable or logout.
+const WEB_PUSH_WANTED_KEY = 'cognis_web_push_wanted';
 
 /** Whether the browser supports the Notification API. */
 export function isSupported(): boolean {
-  return typeof window !== 'undefined' && 'Notification' in window;
+  return !isNativeHost() && typeof window !== 'undefined' && 'Notification' in window;
 }
 
 /** Whether this browser can subscribe to Web Push from the current context. */
 export function isWebPushSupported(): boolean {
   return (
-    typeof window !== 'undefined'
+    !isNativeHost() && typeof window !== 'undefined'
     && 'serviceWorker' in navigator
     && 'PushManager' in window
     && 'Notification' in window
@@ -64,6 +71,34 @@ export function hasAskedPermission(): boolean {
 export function hasEnabledWebPush(): boolean {
   if (typeof localStorage === 'undefined') return false;
   return localStorage.getItem(WEB_PUSH_ENABLED_KEY) === 'true';
+}
+
+// Bumped by an explicit disable; reconciliations started earlier stop.
+let pushIntentGeneration = 0;
+
+function currentUserEmail(): string | null {
+  return auth.getSnapshot().user?.email?.trim().toLowerCase() || null;
+}
+
+/**
+ * Whether the signed-in user opted in to push on this device. The intent is
+ * bound to the user who enabled it, so it never carries over to another
+ * account (logout and account switches also clear it).
+ */
+export function wantsWebPush(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  const owner = localStorage.getItem(WEB_PUSH_WANTED_KEY);
+  const user = currentUserEmail();
+  if (owner) return Boolean(user) && owner === user;
+  // Devices enabled before the intent key existed count as wanting push.
+  return hasEnabledWebPush();
+}
+
+function setWebPushWanted(wanted: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  const user = currentUserEmail();
+  if (wanted && user) localStorage.setItem(WEB_PUSH_WANTED_KEY, user);
+  else localStorage.removeItem(WEB_PUSH_WANTED_KEY);
 }
 
 export function hasDismissedWebPushPrompt(): boolean {
@@ -133,6 +168,65 @@ export interface EnableWebPushResult {
   message: string;
 }
 
+interface SubscriptionJson {
+  endpoint?: string;
+  expirationTime?: number | null;
+  keys?: { p256dh?: string; auth?: string };
+}
+
+/** Upload a browser subscription; returns the server's verdict. */
+async function uploadSubscription(subscription: PushSubscription): Promise<'ok' | 'gone' | 'invalid'> {
+  const json = subscription.toJSON() as SubscriptionJson;
+  const endpoint = json.endpoint ?? subscription.endpoint;
+  const p256dh = json.keys?.p256dh;
+  const auth = json.keys?.auth;
+  if (!endpoint || !p256dh || !auth) return 'invalid';
+  const response = await api.push.subscribe({
+    endpoint,
+    expirationTime: json.expirationTime ?? null,
+    keys: { p256dh, auth },
+    platform: isStandaloneDisplay() ? 'pwa' : 'browser'
+  });
+  return response.gone ? 'gone' : 'ok';
+}
+
+/**
+ * Ensure this browser holds a live subscription registered with the server.
+ * Replaces subscriptions with a stale key or an endpoint the push service has
+ * declared gone (iOS revokes subscriptions; the old endpoint stays readable
+ * locally but never delivers again).
+ */
+async function ensureRegisteredSubscription(
+  registration: ServiceWorkerRegistration,
+  publicKey: string,
+  stillWanted: () => boolean = () => true,
+): Promise<PushSubscription | null> {
+  let subscription = await registration.pushManager.getSubscription();
+  if (!stillWanted()) return null;
+  const existingKey = arrayBufferToUrlBase64(subscription?.options.applicationServerKey ?? null);
+  if (subscription && existingKey && existingKey !== publicKey) {
+    await subscription.unsubscribe();
+    subscription = null;
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    subscription ??= await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToArrayBuffer(publicKey)
+    });
+    // Checked synchronously right before the upload (which uses the current
+    // session cookie): logout, disable, or an account switch while we were
+    // waiting must not register this device for anyone.
+    if (!stillWanted()) return null;
+    const verdict = await uploadSubscription(subscription);
+    if (verdict === 'ok') return subscription;
+    if (verdict === 'invalid') return null;
+    // Gone: drop the dead endpoint and create a fresh one once.
+    await subscription.unsubscribe().catch(() => false);
+    subscription = null;
+  }
+  return null;
+}
+
 /** Subscribe this browser to native Web Push notifications. */
 export async function enableWebPush(): Promise<EnableWebPushResult> {
   if (!isWebPushSupported()) {
@@ -162,34 +256,10 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
     }
 
     const registration = await navigator.serviceWorker.ready;
-    let existing = await registration.pushManager.getSubscription();
-    const existingKey = arrayBufferToUrlBase64(existing?.options.applicationServerKey ?? null);
-    if (existing && existingKey && existingKey !== keyResponse.public_key) {
-      await existing.unsubscribe();
-      existing = null;
+    const subscription = await ensureRegisteredSubscription(registration, keyResponse.public_key);
+    if (!subscription) {
+      return { ok: false, status: 'error', message: 'Browser returned an unusable push subscription.' };
     }
-    const subscription = existing ?? await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToArrayBuffer(keyResponse.public_key)
-    });
-    const json = subscription.toJSON() as {
-      endpoint?: string;
-      expirationTime?: number | null;
-      keys?: { p256dh?: string; auth?: string };
-    };
-    const endpoint = json.endpoint ?? subscription.endpoint;
-    const p256dh = json.keys?.p256dh;
-    const auth = json.keys?.auth;
-    if (!endpoint || !p256dh || !auth) {
-      return { ok: false, status: 'error', message: 'Browser returned an incomplete push subscription.' };
-    }
-
-    await api.push.subscribe({
-      endpoint,
-      expirationTime: json.expirationTime ?? null,
-      keys: { p256dh, auth },
-      platform: isStandaloneDisplay() ? 'pwa' : 'browser'
-    });
     const verifiedSubscription = await registration.pushManager.getSubscription();
     if (!verifiedSubscription) {
       setWebPushEnabled(false);
@@ -200,6 +270,7 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
       };
     }
     setWebPushEnabled(true);
+    setWebPushWanted(true);
     setWebPushPromptDismissed(true);
     return { ok: true, status: 'enabled', message: 'Native notifications are enabled.' };
   } catch (error) {
@@ -219,47 +290,56 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
  * prompts do not assume Web Push is healthy when no usable subscription exists.
  */
 export async function reconcileWebPushSubscription(): Promise<boolean> {
-  if (!hasEnabledWebPush()) return false;
+  if (!wantsWebPush()) return false;
   if (!isWebPushSupported() || !isGranted()) {
     setWebPushEnabled(false);
     return false;
   }
+  const owner = currentUserEmail();
+  const generation = pushIntentGeneration;
+  // Same user, intent still present (not disabled/logged out meanwhile).
+  const stillWanted = () => (
+    generation === pushIntentGeneration
+    && wantsWebPush()
+    && currentUserEmail() === owner
+  );
 
+  let registration: ServiceWorkerRegistration | null = null;
   try {
-    const registration = await navigator.serviceWorker.ready;
-    const subscription = await registration.pushManager.getSubscription();
-    if (!subscription) {
-      setWebPushEnabled(false);
-      return false;
-    }
-    const json = subscription.toJSON() as {
-      endpoint?: string;
-      expirationTime?: number | null;
-      keys?: { p256dh?: string; auth?: string };
-    };
-    const endpoint = json.endpoint ?? subscription.endpoint;
-    const p256dh = json.keys?.p256dh;
-    const auth = json.keys?.auth;
-    if (!endpoint || !p256dh || !auth) {
-      setWebPushEnabled(false);
-      return false;
-    }
-    await api.push.subscribe({
-      endpoint,
-      expirationTime: json.expirationTime ?? null,
-      keys: { p256dh, auth },
-      platform: isStandaloneDisplay() ? 'pwa' : 'browser'
-    });
-    setWebPushEnabled(true);
-    return true;
+    const keyResponse = await api.push.vapidPublicKey();
+    if (!keyResponse.enabled || !keyResponse.public_key) return hasEnabledWebPush();
+    registration = await navigator.serviceWorker.ready;
+    // Permission is already granted, so a dropped or revoked subscription is
+    // replaced silently instead of asking the user to enable it again.
+    const subscription = await ensureRegisteredSubscription(
+      registration,
+      keyResponse.public_key,
+      stillWanted,
+    );
+    if (!stillWanted()) return false;
+    setWebPushEnabled(Boolean(subscription));
+    if (subscription && !localStorage.getItem(WEB_PUSH_WANTED_KEY)) setWebPushWanted(true);
+    return Boolean(subscription);
   } catch {
+    // Network trouble, or a browser that needs a user gesture to subscribe.
+    // Keep the intent (retried on the next reconcile) but report health
+    // truthfully so Settings offers Enable when no subscription exists.
+    const present = registration
+      ? await registration.pushManager.getSubscription().catch(() => null)
+      : undefined;
+    if (present === null && stillWanted()) setWebPushEnabled(false);
     return hasEnabledWebPush();
   }
 }
 
 export async function disableWebPushForCurrentDevice(): Promise<boolean> {
+  // An explicit disable ends the intent immediately and on every path (even
+  // if the browser already dropped the subscription) and cancels in-flight
+  // reconciliations, so nothing can recreate the subscription afterwards.
+  pushIntentGeneration += 1;
+  setWebPushWanted(false);
+  setWebPushEnabled(false);
   if (!isWebPushSupported()) {
-    setWebPushEnabled(false);
     return false;
   }
 
@@ -300,7 +380,7 @@ export function showNotification(
   try {
     const notification = new Notification(title, {
       body,
-      icon: '/favicon.png',
+      icon: '/pwa/icon-192.png',
       tag: conversationId ?? 'cognis',
       // Reuse the same tag to avoid notification spam for the same conversation
     });

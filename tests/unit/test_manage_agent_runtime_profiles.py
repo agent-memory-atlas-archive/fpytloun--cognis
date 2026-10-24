@@ -117,10 +117,16 @@ def test_runtime_profile_crud_clear_default_and_audit_sanitization(tmp_path: Pat
                     "provider_id": "provider-a",
                     "model": "model-a",
                     "system_prompt_extra": "never store this in audit",
+                    "quick_switch": True,
+                    "quick_switch_index": 2,
+                    "quick_switch_color": "teal",
                 },
             },
         )
         assert created["status"] == "created"
+        assert created["profile"]["quick_switch"] is True  # type: ignore[index]
+        assert created["profile"]["quick_switch_index"] == 2  # type: ignore[index]
+        assert created["profile"]["quick_switch_color"] == "teal"  # type: ignore[index]
         revision = created["updated_at"]
         assert isinstance(revision, str)
 
@@ -131,11 +137,36 @@ def test_runtime_profile_crud_clear_default_and_audit_sanitization(tmp_path: Pat
                 "agent_id": "target",
                 "profile_id": "fast",
                 "expected_updated_at": revision,
-                "profile": {"system_prompt_extra": None, "reasoning_effort": "low"},
+                "profile": {
+                    "system_prompt_extra": None,
+                    "reasoning_effort": "low",
+                    "quick_switch_index": 1,
+                    "quick_switch_color": "amber",
+                },
             },
         )
         assert updated["profile"]["system_prompt_extra"] is None  # type: ignore[index]
         assert updated["profile"]["model"] == "model-a"  # type: ignore[index]
+        assert updated["profile"]["quick_switch"] is True  # type: ignore[index]
+        assert updated["profile"]["quick_switch_index"] == 1  # type: ignore[index]
+        assert updated["profile"]["quick_switch_color"] == "amber"  # type: ignore[index]
+        for action in ("runtime_profiles_get", "runtime_profiles_list"):
+            result = await _action(
+                deps, {"action": action, "agent_id": "target", "profile_id": "fast"}
+            )
+            assert result["profiles"]["fast"]["quick_switch_index"] == 1  # type: ignore[index]
+            assert result["profiles"]["fast"]["quick_switch_color"] == "amber"  # type: ignore[index]
+        hidden = await _action(
+            deps,
+            {
+                "action": "runtime_profiles_update",
+                "agent_id": "target",
+                "profile_id": "fast",
+                "profile": {"quick_switch": False},
+            },
+        )
+        assert hidden["profile"]["quick_switch"] is False  # type: ignore[index]
+        assert hidden["profile"]["quick_switch_index"] == 1  # type: ignore[index]
 
         defaulted = await _action(
             deps,
@@ -165,6 +196,7 @@ def test_runtime_profile_crud_clear_default_and_audit_sanitization(tmp_path: Pat
             },
         )
         assert deleted["status"] == "deleted"
+        assert deleted["profiles"] == {}
         assert event_bus.events == []
         async with deps.session_factory() as session:
             audit_rows = (await session.execute(AuditLog.__table__.select())).all()

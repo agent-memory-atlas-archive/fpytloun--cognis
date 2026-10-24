@@ -152,7 +152,13 @@ def _build_parser() -> argparse.ArgumentParser:
             command, help=f"{command.capitalize()} the installed executor service"
         )
         _add_connection_options(lifecycle_parser, suppress_defaults=True)
+        lifecycle_parser.add_argument(
+            "--json", action="store_true", help="Versioned local companion contract"
+        )
     logs_parser = subparsers.add_parser("logs", help="Read installed executor service logs")
+    logs_parser.add_argument(
+        "--json", action="store_true", help="Bounded severity-only log summary"
+    )
     logs_parser.add_argument(
         "-n",
         "--lines",
@@ -305,6 +311,9 @@ def _service_is_configured() -> tuple[ExecutorSettings | None, int]:
 def _lifecycle(args: argparse.Namespace) -> int:
     from cognis.executor.service import get_service_manager
 
+    if args.json:
+        return _companion_service(args.command)
+
     if args.command in {"start", "restart"}:
         _, code = _service_is_configured()
         if code:
@@ -331,10 +340,45 @@ def _lifecycle(args: argparse.Namespace) -> int:
 def _logs(args: argparse.Namespace) -> int:
     from cognis.executor.service import get_service_manager
 
+    if args.json:
+        if args.follow:
+            return 2
+        return _companion_service("logs")
+
     result = get_service_manager().logs(lines=args.lines, follow=args.follow)
     if result.message:
         sys.stderr.write(f"ERROR: {result.message}\n")
     return result.returncode
+
+
+def _companion_service(action: str) -> int:
+    import signal
+
+    from cognis import json_codec as json
+    from cognis.executor.service import companion_service
+
+    configured = False
+    if action in {"start", "restart"}:
+        try:
+            settings = normalized_settings(load_config())
+            configured = bool(settings.controller_url and settings.token)
+        except (ConfigError, OSError):
+            pass
+
+    # The native parent owns a dedicated process group. TERM must unwind Python's
+    # subprocess.run context so the current Homebrew child is killed and reaped,
+    # rather than abandoning it through Python's default immediate termination.
+    def cancel(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, cancel)
+    try:
+        result = companion_service(action, configured=configured)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    sys.stdout.write(json.dumps(result) + "\n")
+    # Valid JSON includes unsuccessful observed states. No prose parsing required.
+    return 0
 
 
 def _run(args: argparse.Namespace) -> int:

@@ -32,6 +32,50 @@ class ToolCapability(StrEnum):
     DESTRUCTIVE = "destructive"
 
 
+NATIVE_TOOL_SOURCE_TYPES = frozenset({"builtin", "controller", "executor"})
+
+# Native categories are declarations, not text-classifier hints. New categories
+# must be mapped here or declare a profile_group at their owning definition.
+NATIVE_CATEGORY_PROFILE_GROUPS: dict[str, str] = {
+    "filesystem": "filesystem",
+    "lsp": "filesystem",
+    "shell": "shell",
+    "web": "web",
+    "browser": "browser",
+    "memory": "memory",
+    "conversations": "conversations",
+    "office": "office",
+    "development": "development",
+    "personal": "personal",
+    "communication": "communication",
+    # Preserve existing profile routing for these legacy category labels.
+    "channels": "development",
+    "document": "development",
+    "image": "development",
+    "knowledgebase": "development",
+    "projects": "development",
+    "task_continuation": "development",
+    **dict.fromkeys(
+        (
+            "system",
+            "context",
+            "workflow",
+            "orchestration",
+            "deliverable",
+            "schedule",
+            "artifact",
+            "datetime",
+            "skill",
+            "mcp",
+            "general",
+        ),
+        "system",
+    ),
+    "agent_management": "development",
+    "mcp_management": "development",
+}
+
+
 class ToolSource(BaseModel):
     """Origin metadata for a tool definition."""
 
@@ -189,6 +233,35 @@ class ToolDefinition(BaseModel):
         self.parameters = self.descriptor.input_schema
         self.annotations = self.descriptor.annotations
         self.output_schema = self.descriptor.output_schema
+        return self
+
+    @model_validator(mode="after")
+    def _declare_native_classification(self) -> ToolDefinition:
+        """Normalize native metadata from structured declarations only."""
+
+        if self.source.type not in NATIVE_TOOL_SOURCE_TYPES:
+            return self
+        self.profile_group = self.profile_group or NATIVE_CATEGORY_PROFILE_GROUPS.get(self.category)
+        if not self.capabilities:
+            self.capabilities = [ToolCapability.READ if self.read_only else ToolCapability.WRITE]
+        if (
+            any(
+                operation.mutation_kind is ToolMutationKind.DELETE
+                for operation in (self.native_operations or [])
+            )
+            and ToolCapability.DESTRUCTIVE not in self.capabilities
+        ):
+            self.capabilities.append(ToolCapability.DESTRUCTIVE)
+        if self.read_only and set(self.capabilities) != {ToolCapability.READ}:
+            raise ValueError(f"read-only native tool {self.name!r} declares mutating capabilities")
+        if not self.read_only and not (
+            set(self.capabilities)
+            & {ToolCapability.WRITE, ToolCapability.PRIVILEGED, ToolCapability.DESTRUCTIVE}
+        ):
+            raise ValueError(f"mutating native tool {self.name!r} declares only read capabilities")
+        self.classification_status = "ready"
+        self.classification_source = "declared"
+        self.classification_confidence = 1.0
         return self
 
 
@@ -516,38 +589,31 @@ RESERVED_PROFILE_GROUPS: tuple[str, ...] = ("memory", "system")
 ALL_PROFILE_GROUPS: tuple[str, ...] = (*AUTO_PROFILE_GROUPS, *RESERVED_PROFILE_GROUPS)
 
 
+def native_tool_classification_error(tool: ToolDefinition) -> str | None:
+    """Validate native declarations at registration and inventory boundaries."""
+
+    if tool.source.type not in NATIVE_TOOL_SOURCE_TYPES:
+        return None
+    if not (
+        tool.profile_group in ALL_PROFILE_GROUPS
+        and tool.capabilities
+        and tool.classification_source == "declared"
+        and tool.classification_status == "ready"
+        and tool.classification_confidence == 1.0
+    ):
+        return "missing or invalid declared native classification"
+    capabilities = set(tool.capabilities)
+    if tool.read_only != (capabilities == {ToolCapability.READ}):
+        return "native classification conflicts with read_only"
+    return None
+
+
 def tool_profile_group(tool: ToolDefinition) -> str:
     """Return the effective profile group for a tool."""
 
     if tool.profile_group:
         return tool.profile_group
-    if tool.category in {"filesystem", "lsp"}:
-        return "filesystem"
-    if tool.category == "shell":
-        return "shell"
-    if tool.category == "web":
-        return "web"
-    if tool.category == "browser":
-        return "browser"
-    if tool.category == "memory":
-        return "memory"
-    if tool.category == "conversations":
-        return "conversations"
-    if tool.category in {
-        "system",
-        "context",
-        "workflow",
-        "orchestration",
-        "deliverable",
-        "schedule",
-        "artifact",
-        "datetime",
-        "skill",
-        "mcp",
-        "general",
-    }:
-        return "system"
-    return "development"
+    return NATIVE_CATEGORY_PROFILE_GROUPS.get(tool.category, "development")
 
 
 def stable_tool_id(tool: ToolDefinition) -> str:
@@ -830,6 +896,7 @@ class EvaluationResult(BaseModel):
     """Intaris evaluate response."""
 
     call_id: str
+    process_scope_digest: str | None = None
     decision: str
     reasoning: str | None = None
     risk: str | None = None

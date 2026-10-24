@@ -1,0 +1,25 @@
+# Overlay after compose.local.yml and compose.e2e.yml.
+# Dedicated project: cognis-macos-companion-m1. No production services or credentials.
+services:
+  cognis:
+    image: cognis-macos-companion-m1:local
+    ports: !override ["127.0.0.1:18762:8080"]
+    environment:
+      COGNIS_PUBLIC_BASE_URL: http://127.0.0.1:18762
+      COGNIS_INITIAL_ADMIN_EMAIL: mac-companion@cognis-e2e.localdev.me
+      COGNIS_INITIAL_ADMIN_PASSWORD: mac-companion-local-acceptance
+  mock-llm:
+    ports: !override []
+  qdrant:
+    ports: !override []
+  mnemory:
+    ports: !override []
+  intaris:
+    ports: !override []
+  cognis-executor:
+    image: cognis-executor-local:latest
+  seed-e2e:
+    image: cognis-macos-companion-m1:local
+    environment:
+      COGNIS_LOCAL_ADMIN_EMAIL: mac-companion@cognis-e2e.localdev.me
+      COGNIS_LOCAL_ADMIN_PASSWORD: mac-companion-local-acceptance

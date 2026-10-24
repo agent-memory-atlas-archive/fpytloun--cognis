@@ -635,8 +635,13 @@ export interface CockpitFixture {
 
 export async function installTaskCockpitFixture(
   page: Page,
-  options: { dashboardWorkspaceWindows?: boolean } = {},
+  options: { dashboardWorkspaceWindows?: boolean; dashboardConversation?: boolean } = {},
 ): Promise<CockpitFixture> {
+  const dashboardConversation = {
+    ...taskChatConversation,
+    title_source: 'manual',
+    context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+  };
   let status: CockpitStatus = 'paused';
   let heavyRequestCount = 0;
   const actionRequests: string[] = [];
@@ -891,6 +896,8 @@ export async function installTaskCockpitFixture(
           agent_id: 'agent-stage39',
           name: 'stage39',
           display_name: 'Stage 39 Agent',
+          agent_type: 'primary',
+          status: 'active',
           avatar_url: null,
           avatar_image_id: null
         }],
@@ -903,6 +910,8 @@ export async function installTaskCockpitFixture(
         agent_id: 'agent-stage39',
         name: 'stage39',
         display_name: 'Stage 39 Agent',
+        agent_type: 'primary',
+        status: 'active',
         avatar_url: null,
         avatar_image_id: null
       });
@@ -910,7 +919,15 @@ export async function installTaskCockpitFixture(
     if (path === '/api/v1/workflows/step-profiles') return json([]);
     if (path === '/api/v1/workflows') return json({ items: [workflow], next_cursor: null, has_more: false });
     if (path === '/api/v1/workflows/wf-stage39') return json(workflow);
-    if (path === '/api/v1/conversations') return json({ items: [], next_cursor: null, has_more: false });
+    if (path === '/api/v1/conversations') return json({
+      items: options.dashboardConversation ? [dashboardConversation] : [],
+      next_cursor: null,
+      has_more: false,
+    });
+    if (path === '/api/v1/conversations/waiting') return json({
+      conversations: { items: [], cursor: null, has_more: false },
+      active_conversation_ids: [],
+    });
     if (path === '/api/v1/conversations/open' && method === 'POST') return json(taskChatConversation);
     if (path === '/api/v1/tasks') return json({ items: [task(status)], next_cursor: null, has_more: false });
     if (path === '/api/v1/projects') return json([]);
@@ -930,7 +947,9 @@ export async function installTaskCockpitFixture(
         attempt_number: 1
       });
     }
-    if (path === '/api/v1/conversations/conv-task-chat') return json(taskChatConversation);
+    if (path === '/api/v1/conversations/conv-task-chat') return json(
+      options.dashboardConversation ? dashboardConversation : taskChatConversation,
+    );
     if (path === '/api/v1/conversations/conv-task-chat-b') return json(taskChatConversationB);
     if (path === '/api/v1/conversations/conv-task-chat-b/opened' && method === 'POST') return json({ ok: true });
     if (path === '/api/v1/conversations/conv-task-chat-b/read' && method === 'POST') return json({ ok: true });
@@ -1210,6 +1229,13 @@ export async function installTaskCockpitFixture(
     if (path === '/api/v1/work/refresh' && method === 'POST') {
       return json({ accepted: true, session_count: 1, scope_count: 1 }, 202);
     }
+    if (path === '/api/v1/conversations/background-work') {
+      return json({
+        background_work: { items: [], active_count: 0, truncated: false, generated_at: NOW },
+        background_work_changed: true,
+        agent_direct_chats: [],
+      });
+    }
     if (path === '/api/v1/conversations/sidebar') {
       const isTaskFilter = url.searchParams.get('status') === 'task';
       return json({
@@ -1217,6 +1243,8 @@ export async function installTaskCockpitFixture(
           agent_id: 'agent-stage39',
           name: 'stage39',
           display_name: 'Stage 39 Agent',
+          agent_type: 'primary',
+          status: 'active',
           avatar_url: null,
           avatar_image_id: null,
         }],

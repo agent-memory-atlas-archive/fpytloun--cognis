@@ -73,8 +73,8 @@
 <BlockingDialog label="Generate avatar" onClose={onClose} titleId="avatar-generate-title">
   {#snippet header()}
     <div class="flex items-center justify-between gap-3">
-      <h3 class="text-lg font-semibold text-slate-100" id="avatar-generate-title">Generate Avatar</h3>
-      <button type="button" class="text-slate-400 hover:text-slate-200" onclick={onClose}>&times;</button>
+      <h3 class="text-lg font-semibold text-foreground" id="avatar-generate-title">Generate Avatar</h3>
+      <button type="button" class="text-muted hover:text-foreground" onclick={onClose}>&times;</button>
     </div>
   {/snippet}
 
@@ -83,15 +83,15 @@
       <!-- Prompt section -->
       <div class="mb-4">
       <div class="mb-2 flex items-center justify-between">
-        <label class="text-sm font-medium text-slate-200" for="avatar-prompt">Prompt</label>
+        <label class="text-sm font-medium text-foreground" for="avatar-prompt">Prompt</label>
         <button
           type="button"
-          class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50"
+          class="flex items-center gap-1 text-xs text-accent hover:text-accent-hover disabled:opacity-50"
           onclick={generatePrompt}
           disabled={generatingPrompt}
         >
           {#if generatingPrompt}
-            <span class="inline-block h-3 w-3 animate-spin rounded-full border border-slate-600 border-t-sky-400"></span>
+            <span class="inline-block h-3 w-3 animate-spin rounded-full border border-control-border border-t-accent"></span>
           {/if}
           Regenerate prompt
         </button>
@@ -99,7 +99,7 @@
       <textarea
         id="avatar-prompt"
         bind:value={prompt}
-        class="min-h-[100px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+        class="min-h-[100px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
         placeholder="Describe the avatar you want to generate..."
         disabled={generatingPrompt}
       ></textarea>
@@ -107,11 +107,11 @@
 
       <!-- Preview section -->
       <div class="mb-4">
-      <p class="mb-2 text-sm font-medium text-slate-200">Preview</p>
-      <div class="flex h-48 items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/80">
+      <p class="mb-2 text-sm font-medium text-foreground">Preview</p>
+      <div class="flex h-48 items-center justify-center rounded-2xl border border-control-border bg-canvas/80">
         {#if generatingImage}
-          <div class="flex flex-col items-center gap-2 text-slate-400">
-            <span class="inline-block h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-sky-400"></span>
+          <div class="flex flex-col items-center gap-2 text-muted">
+            <span class="inline-block h-8 w-8 animate-spin rounded-full border-2 border-control-border border-t-accent"></span>
             <span class="text-sm">Generating...</span>
           </div>
         {:else if generatedImageUrl}
@@ -121,14 +121,14 @@
             class="h-full max-h-44 rounded-xl object-contain"
           />
         {:else}
-          <span class="text-sm text-slate-500">No image generated yet</span>
+          <span class="text-sm text-quiet">No image generated yet</span>
         {/if}
       </div>
     </div>
 
       <!-- Error -->
       {#if error}
-        <p class="mb-4 text-sm text-rose-300">{error}</p>
+        <p class="mb-4 text-sm text-danger">{error}</p>
       {/if}
     </div>
   {/snippet}

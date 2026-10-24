@@ -12,6 +12,7 @@
     idPrefix,
     ariaLabel,
     onChange,
+    onReselect,
     sticky = false,
     edgeFade = true,
     testIdPrefix = 'tab',
@@ -21,6 +22,7 @@
     idPrefix: string;
     ariaLabel: string;
     onChange: (id: string) => void;
+    onReselect?: (id: string) => void;
     sticky?: boolean;
     edgeFade?: boolean;
     testIdPrefix?: string;
@@ -45,7 +47,7 @@
   }
 </script>
 
-<div class={`${sticky ? 'sticky top-0 z-20 bg-slate-950/95 backdrop-blur' : ''} relative border-b border-slate-800`}>
+<div class={`${sticky ? 'sticky top-0 z-20 bg-chrome/95 material-chrome' : ''} relative border-b border-separator`}>
   <div class="tabs-scroll overflow-x-auto [scrollbar-width:none]" role="tablist" aria-label={ariaLabel}>
     <div class="flex min-w-max gap-1 pr-8">
       {#each tabs as tab, index (tab.id)}
@@ -56,14 +58,14 @@
           aria-selected={activeId === tab.id}
           aria-controls={`${idPrefix}-panel-${tab.id}`}
           tabindex={activeId === tab.id ? 0 : -1}
-          class={`inline-flex min-h-10 items-center gap-2 rounded-t-lg border-b-2 px-3 text-xs font-medium transition ${activeId === tab.id ? 'border-sky-300 bg-sky-500/10 text-sky-100' : 'border-transparent text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'}`}
-          onclick={() => onChange(tab.id)}
+          class={`inline-flex min-h-10 items-center gap-2 rounded-t-lg border-b-2 px-3 text-xs font-medium transition ${activeId === tab.id ? 'border-accent bg-accent-subtle text-accent' : 'border-transparent text-muted hover:bg-raised/60 hover:text-foreground'}`}
+          onclick={() => activeId === tab.id && onReselect ? onReselect(tab.id) : onChange(tab.id)}
           onkeydown={(event) => onKeydown(event, index)}
           data-testid={`${testIdPrefix}-${tab.id}`}
         >
           {tab.label}
           {#if tab.count !== undefined}
-            <span class="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] tabular-nums">{tab.count}</span>
+            <span class="rounded-full bg-raised px-1.5 py-0.5 text-[10px] tabular-nums">{tab.count}</span>
           {/if}
           {#if tab.suffix}<span class="font-mono text-[10px]">{tab.suffix}</span>{/if}
         </button>
@@ -71,7 +73,7 @@
     </div>
   </div>
   {#if edgeFade}
-    <div class="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-slate-950 to-transparent" aria-hidden="true" data-testid="tabs-edge-fade"></div>
+    <div class="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-chrome to-transparent" aria-hidden="true" data-testid="tabs-edge-fade"></div>
   {/if}
 </div>
 

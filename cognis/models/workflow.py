@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_serializer, model_
 
 from cognis import json_codec as json
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
+from cognis.models.intaris_policy import IntarisEvaluation
 from cognis.models.tool import ToolCapability
 
 
@@ -59,30 +60,33 @@ class SessionPolicy(BaseModel):
 
     allow_policies: list[str | dict[str, Any]] = Field(default_factory=list)
     deny_policies: list[str | dict[str, Any]] = Field(default_factory=list)
+    intaris_evaluation: IntarisEvaluation | None = None
 
     @classmethod
     def empty(cls) -> SessionPolicy:
         return cls()
 
 
-def normalize_session_policy(value: Any) -> dict[str, list[str | dict[str, Any]]]:
+def normalize_session_policy(value: Any) -> dict[str, Any]:
     """Return a compact session policy dict containing only supported keys."""
 
     if value is None:
         return {}
     policy = value if isinstance(value, SessionPolicy) else SessionPolicy.model_validate(value)
-    result: dict[str, list[str | dict[str, Any]]] = {}
+    result: dict[str, Any] = {}
     if policy.allow_policies:
         result["allow_policies"] = policy.allow_policies
     if policy.deny_policies:
         result["deny_policies"] = policy.deny_policies
+    if policy.intaris_evaluation is not None:
+        result["intaris_evaluation"] = policy.intaris_evaluation
     return result
 
 
-def merge_session_policies(*policies: Any) -> dict[str, list[str | dict[str, Any]]]:
+def merge_session_policies(*policies: Any) -> dict[str, Any]:
     """Merge session policies in precedence order without interpreting text."""
 
-    merged: dict[str, list[str | dict[str, Any]]] = {
+    merged: dict[str, Any] = {
         "allow_policies": [],
         "deny_policies": [],
     }
@@ -90,6 +94,8 @@ def merge_session_policies(*policies: Any) -> dict[str, list[str | dict[str, Any
         normalized = normalize_session_policy(policy)
         merged["allow_policies"].extend(normalized.get("allow_policies", []))
         merged["deny_policies"].extend(normalized.get("deny_policies", []))
+        if normalized.get("intaris_evaluation") is not None:
+            merged["intaris_evaluation"] = normalized["intaris_evaluation"]
     return {key: value for key, value in merged.items() if value}
 
 
@@ -115,6 +121,15 @@ class WorkflowDefaults(BaseModel):
     on_exhausted: Literal["continue", "fail", "gate"] = "gate"
     delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
+
+    @field_validator("session_policy")
+    @classmethod
+    def _clauses_only(cls, policy: SessionPolicy) -> SessionPolicy:
+        if policy.intaris_evaluation is not None:
+            raise ValueError(
+                "Intaris evaluation belongs to the agent or task, not workflow defaults"
+            )
+        return policy
 
 
 class GateOption(BaseModel):
@@ -758,6 +773,7 @@ class WorkflowState(BaseModel):
     step_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     loop_iterations: dict[str, int] = Field(default_factory=dict)  # "step_a->step_b" -> count
     version: int = 0  # Optimistic concurrency — incremented on each persist
+    last_consumed_gate_id: str | None = None
     status: Literal["running", "paused", "completed", "failed", "cancelled"] = "running"
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     routing_skips: dict[str, str] = Field(default_factory=dict)
@@ -771,7 +787,8 @@ class WorkflowState(BaseModel):
     last_revision_context: str | None = None  # Full reviewer output for backward revisions
     last_operator_instruction: str | None = None  # One-shot human instruction for next step
     pending_pause_type: (
-        Literal["gate", "step_input", "credential_request", "auth_challenge"] | None
+        Literal["gate", "step_input", "agent_question", "credential_request", "auth_challenge"]
+        | None
     ) = None
     pending_pause_payload: dict[str, Any] | None = None
     current_step_status: Literal["running", "paused"] | None = None

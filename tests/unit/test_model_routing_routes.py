@@ -218,6 +218,75 @@ def test_model_routing_get_does_not_invent_reasoning_defaults(
         assert payload["evaluator"] == {"model": None, "reasoning_effort": None}
 
 
+def test_companion_routing_preserves_provider_references_across_save_reload_and_resave(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def seed() -> None:
+            await _seed_user(app, "admin@example.com", "admin")
+            async with app.state.session_factory() as session:
+                for provider_id in ("groq", "alternate"):
+                    await create_llm_provider(
+                        session,
+                        provider_id=provider_id,
+                        display_name=provider_id,
+                        location="controller",
+                        backend="litellm",
+                        owner_email=SYSTEM_USER_EMAIL,
+                        config={
+                            "models": [
+                                {"model_id": "openai/gpt-oss-20b"},
+                                {"model_id": "openai/gpt-oss-120b"},
+                                {
+                                    "model_id": "text-embedding-3-small",
+                                    "supports_embedding": True,
+                                },
+                            ],
+                        },
+                        status="active",
+                    )
+                await session.commit()
+
+        client.portal.call(seed)
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        expected = {
+            "companion_lite": {"model": "groq/openai/gpt-oss-20b", "reasoning_effort": None},
+            "companion_smart": {"model": "groq/openai/gpt-oss-120b", "reasoning_effort": None},
+            "companion_embedding": {
+                "model": "groq/text-embedding-3-small",
+                "reasoning_effort": None,
+            },
+            "intaris_judge": {"model": "alternate/openai/gpt-oss-120b", "reasoning_effort": None},
+            "mnemory_extraction": {
+                "model": "alternate/openai/gpt-oss-20b",
+                "reasoning_effort": None,
+            },
+        }
+        response = client.put("/api/v1/model-routing", headers=headers, json=expected)
+        assert response.status_code == 200, response.text
+        for role, entry in expected.items():
+            assert response.json()[role] == entry
+        loaded = client.get("/api/v1/model-routing", headers=headers)
+        assert loaded.status_code == 200
+        assert loaded.json() == response.json()
+        resaved = client.put("/api/v1/model-routing", headers=headers, json=loaded.json())
+        assert resaved.status_code == 200, resaved.text
+        assert resaved.json() == loaded.json()
+
+        async def assert_storage() -> None:
+            async with app.state.session_factory() as session:
+                rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)
+            by_role = {row.task_type: row for row in rows}
+            for role, entry in expected.items():
+                provider, model = entry["model"].split("/", 1)
+                assert by_role[role].provider_id == provider
+                assert by_role[role].model == model
+
+        client.portal.call(assert_storage)
+
+
 def test_model_routing_put_rejects_models_not_visible_to_system_routing(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -275,8 +344,8 @@ def test_non_admin_can_create_and_manage_user_owned_anthropic_executor_provider(
                 )
                 await create_executor(
                     session,
-                    executor_id="maitrea",
-                    name="Maitrea",
+                    executor_id="exec-linux",
+                    name="Linux executor",
                     executor_type="websocket",
                     owner_email="owner@example.com",
                 )
@@ -294,7 +363,7 @@ def test_non_admin_can_create_and_manage_user_owned_anthropic_executor_provider(
                 "default_model": "claude-opus-4-7",
                 "models": [{"model_id": "claude-opus-4-7", "supports_tools": True}],
                 "auth_config": {"mode": "none"},
-                "executor_id": "maitrea",
+                "executor_id": "exec-linux",
                 "base_url": "http://127.0.0.1:8090",
                 "api_base": "http://127.0.0.1:8090",
             },
@@ -338,8 +407,8 @@ def test_executor_provider_requires_explicit_executor_target(
                 )
                 await create_executor(
                     session,
-                    executor_id="maitrea",
-                    name="Maitrea",
+                    executor_id="exec-linux",
+                    name="Linux executor",
                     executor_type="websocket",
                     shared=True,
                 )
@@ -363,10 +432,10 @@ def test_executor_provider_requires_explicit_executor_target(
         assert response.status_code == 400
         assert "executor_id or executor_labels" in response.text
 
-        payload["config"] = {**payload["config"], "executor_id": "maitrea"}
+        payload["config"] = {**payload["config"], "executor_id": "exec-linux"}
         response = client.post("/api/v1/llm-providers", headers=headers, json=payload)
         assert response.status_code == 200
-        assert response.json()["config"]["executor_id"] == "maitrea"
+        assert response.json()["config"]["executor_id"] == "exec-linux"
 
 
 def test_admin_provider_create_defaults_to_user_owned(monkeypatch: object, tmp_path: Path) -> None:
@@ -1194,3 +1263,101 @@ def test_provider_usage_route_returns_anthropic_usage_for_visible_provider(
 
         missing = client.get("/api/v1/llm-providers/nope/usage", headers=headers)
         assert missing.status_code == 404
+
+
+def test_monitor_routes_cache_manual_only_usage_and_enforce_visibility(monkeypatch, tmp_path):
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        calls = []
+
+        async def usage(provider_id):
+            from datetime import UTC, datetime
+
+            calls.append(provider_id)
+            return {
+                "ok": True,
+                "source": "chatgpt_codex_usage",
+                "fetched_at": datetime.now(UTC).isoformat(),
+                "primary": {"used_percent": 90},
+            }
+
+        app.state.providers.llm.get_provider_usage = usage
+
+        async def seed():
+            await _seed_user(app, "monitor-owner@example.com", "user")
+            await _seed_user(app, "monitor-other@example.com", "admin")
+            await _seed_user(app, "monitor-viewer@example.com", "viewer")
+            async with app.state.session_factory() as session:
+                await create_llm_provider(
+                    session,
+                    provider_id="manual-monitor",
+                    display_name="Manual",
+                    location="controller",
+                    backend="litellm",
+                    owner_email="monitor-owner@example.com",
+                    config={"preset": "chatgpt", "monitoring": {"enabled": False}},
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(seed)
+        owner = _auth_headers(app, email="monitor-owner@example.com")
+        other = _auth_headers(app, email="monitor-other@example.com", role="admin")
+        viewer = _auth_headers(app, email="monitor-viewer@example.com", role="viewer")
+        detail = client.get("/api/v1/provider-monitor/manual-monitor", headers=owner)
+        assert detail.status_code == 200
+        assert detail.json()["checked_at"] is None
+        assert calls == []
+        refreshed = client.post("/api/v1/provider-monitor/manual-monitor/refresh", headers=owner)
+        assert refreshed.status_code == 200
+        assert refreshed.json()["alert_severity"] == "warning"
+        assert calls == ["manual-monitor"]
+        cached = client.get("/api/v1/llm-providers/manual-monitor/usage", headers=owner)
+        assert cached.json()["primary"]["used_percent"] == 90
+        assert calls == ["manual-monitor"]
+
+        async def authorized_status(provider_id):
+            return {"provider_id": provider_id, "status": "authorized"}
+
+        async def clear_oauth(provider_id):
+            return True
+
+        app.state.providers.llm.get_chatgpt_oauth_status = authorized_status
+        app.state.providers.llm.clear_chatgpt_oauth = clear_oauth
+        for _ in range(2):
+            status = client.get(
+                "/api/v1/llm-providers/manual-monitor/oauth/chatgpt/status", headers=owner
+            )
+            assert status.json()["status"] == "authorized"
+            assert (
+                client.get("/api/v1/provider-monitor/manual-monitor", headers=owner).json()[
+                    "checked_at"
+                ]
+                == refreshed.json()["checked_at"]
+            )
+        cleared = client.delete("/api/v1/llm-providers/manual-monitor/oauth/chatgpt", headers=owner)
+        assert cleared.status_code == 200
+        assert (
+            client.get("/api/v1/provider-monitor/manual-monitor", headers=owner).json()["usage"]
+            is None
+        )
+        assert calls == ["manual-monitor"]
+        assert (
+            client.get("/api/v1/provider-monitor/manual-monitor", headers=other).status_code == 404
+        )
+        assert (
+            client.post(
+                "/api/v1/provider-monitor/manual-monitor/refresh", headers=other
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/v1/provider-monitor/manual-monitor/refresh", headers=viewer
+            ).status_code
+            == 403
+        )
+        assert not any(
+            item["provider_id"] == "manual-monitor"
+            for item in client.get("/api/v1/provider-monitor", headers=other).json()
+        )

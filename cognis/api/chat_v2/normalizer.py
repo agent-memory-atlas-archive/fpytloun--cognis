@@ -42,6 +42,7 @@ NormalizedEventKind = Literal[
     "notice",
     "compaction",
     "recap",
+    "handoff",
     "error",
     "unknown",
 ]
@@ -85,6 +86,8 @@ VISIBLE_LIFECYCLE_EVENTS: frozenset[str] = frozenset(
         "session_compaction_started",
         "session_recovered",
         "conversation_recap",
+        "conversation_handoff",
+        "agent_hook",
     }
 )
 _CANCELLED_TURN_ERROR_CODES: frozenset[str] = frozenset(
@@ -170,6 +173,13 @@ def normalize_session_events(
 
 def _should_skip_event(raw_event: RawSessionEvent, *, visible_lanes: frozenset[str | None]) -> bool:
     if raw_event.type in IGNORED_EVENT_TYPES:
+        return True
+    # Question JSON is recorded for intention analysis, not as an assistant reply.
+    # Match its source so persisted history is fixed without hiding ordinary JSON.
+    if raw_event.data.get("source") == "question_context" and (
+        raw_event.type == "assistant_message"
+        or (raw_event.type == "message" and raw_event.data.get("role") == "assistant")
+    ):
         return True
     if raw_event.type == "system_message" and not is_visible_persisted_system_message(
         raw_event.data
@@ -285,8 +295,12 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
 
     if event_type == "lifecycle":
         lifecycle_event = str(data.get("event") or data.get("type") or "")
+        if lifecycle_event == "agent_hook":
+            return "notice"
         if lifecycle_event == "conversation_recap":
             return "recap"
+        if lifecycle_event == "conversation_handoff":
+            return "handoff"
         if lifecycle_event in {"task_result", "task_failed", "task_cancelled", "workflow_composed"}:
             return "task"
         if lifecycle_event == "assistant_deliverable":

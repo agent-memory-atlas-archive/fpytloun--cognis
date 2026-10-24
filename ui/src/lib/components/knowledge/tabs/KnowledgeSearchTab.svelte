@@ -24,15 +24,17 @@
     kb,
     searchReady,
     askReady,
-    onOpenDocument
+    onOpenDocument,
+    persistUrl = true
   }: {
     kb: KnowledgebaseModel;
     searchReady: boolean;
     askReady: boolean;
     onOpenDocument: (docId: string) => void;
+    persistUrl?: boolean;
   } = $props();
 
-  const initialState = searchStateFromParams(new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''));
+  const initialState = searchStateFromParams(new URLSearchParams(persistUrl && typeof window !== 'undefined' ? window.location.search : ''));
 
   let mode = $state<'search' | 'ask'>(initialState.mode);
   let query = $state(initialState.query);
@@ -49,7 +51,7 @@
   const requests = new LatestRequestController();
 
   function syncUrl(): void {
-    if (typeof window === 'undefined') return;
+    if (!persistUrl || typeof window === 'undefined') return;
     const params = searchStateToParams({ mode, query, limit, filters });
     params.set('tab', 'search');
     const url = new URL(window.location.href);
@@ -62,11 +64,13 @@
   }
 
   function restoreUrlState(): void {
+    if (!persistUrl) return;
     const restored = searchStateFromParams(new URLSearchParams(window.location.search));
     mode = restored.mode; query = restored.query; limit = restored.limit; filters = restored.filters;
     filterRevision = `${kb.knowledgebase_id}:${window.location.search}`;
   }
   onMount(() => {
+    if (!persistUrl) return;
     filterRevision = `${kb.knowledgebase_id}:${window.location.search}`;
     window.addEventListener('popstate', restoreUrlState);
   });
@@ -164,13 +168,13 @@
 </script>
 
 <div class="flex flex-col gap-5">
-  <div class="flex gap-1 self-start rounded-xl border border-slate-800/80 bg-slate-900/60 p-1 text-sm" role="tablist" aria-label="Search mode">
+  <div class="flex gap-1 self-start rounded-xl border border-separator/80 bg-surface/60 p-1 text-sm" role="tablist" aria-label="Search mode">
     <button
       type="button"
       role="tab"
       aria-selected={mode === 'search'}
       disabled={!searchReady}
-      class={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === 'search' ? 'bg-sky-500 text-slate-950' : 'text-slate-300 hover:bg-slate-800'}`}
+      class={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === 'search' ? 'bg-accent text-on-accent' : 'text-secondary hover:bg-raised'}`}
       onclick={() => handleModeChange('search')}
     >
       <Search class="h-3.5 w-3.5" /> Search
@@ -180,7 +184,7 @@
       role="tab"
       aria-selected={mode === 'ask'}
       disabled={!askReady}
-      class={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === 'ask' ? 'bg-sky-500 text-slate-950' : 'text-slate-300 hover:bg-slate-800'}`}
+      class={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${mode === 'ask' ? 'bg-accent text-on-accent' : 'text-secondary hover:bg-raised'}`}
       onclick={() => handleModeChange('ask')}
     >
       <Sparkles class="h-3.5 w-3.5" /> Ask
@@ -191,11 +195,12 @@
     <div class="flex flex-wrap gap-2">
       <Input
         bind:value={query}
+        find={mode === 'search'}
         placeholder={mode === 'search' ? 'Search documents…' : 'Ask a question…'}
         class="flex-1 min-w-[220px]"
         data-testid="knowledge-search-query-input"
       />
-      <label class="flex items-center gap-2 text-sm text-slate-400">
+      <label class="flex items-center gap-2 text-sm text-muted">
         Limit
         <input
           type="number"
@@ -206,7 +211,7 @@
             const value = Number((event.currentTarget as HTMLInputElement).value);
             limit = Math.max(1, Math.min(mode === 'ask' ? 20 : 50, Number.isFinite(value) ? value : 10));
           }}
-          class="w-16 rounded-xl border border-slate-700 bg-slate-950/80 px-2 py-2 text-sm text-slate-100"
+          class="w-16 rounded-xl border border-control-border bg-canvas/80 px-2 py-2 text-sm text-foreground"
         />
       </label>
       <Button
@@ -226,14 +231,14 @@
   <div aria-live="polite">
     {#if error}
       <div class="flex flex-col gap-3">
-        <div class="rounded-2xl border border-rose-800/60 bg-rose-950/40 px-4 py-3 text-sm text-rose-300" role="alert">{error}</div>
+        <div class="rounded-2xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger" role="alert">{error}</div>
         {#if matches.length > 0}
-          <p class="text-xs text-amber-300">Evidence from the previous request.</p>
+          <p class="text-xs text-warning">Evidence from the previous request.</p>
           <RawResultList knowledgebaseId={kb.knowledgebase_id} {matches} {highlightedChunkId} onOpenDocument={handleOpenDocument} />
         {/if}
       </div>
     {:else if loading}
-      <p class="text-sm text-slate-400">{mode === 'search' ? 'Searching…' : 'Thinking…'}</p>
+      <p class="text-sm text-muted">{mode === 'search' ? 'Searching…' : 'Thinking…'}</p>
     {:else if mode === 'ask' && askResponse}
       <div class="flex flex-col gap-4">
         <AskAnswerCard
@@ -248,16 +253,16 @@
         />
         {#if matches.length > 0}
           <div>
-            <h3 class="mb-2 text-sm font-semibold text-white">Evidence</h3>
+            <h3 class="mb-2 text-sm font-semibold text-strong">Evidence</h3>
             <RawResultList knowledgebaseId={kb.knowledgebase_id} {matches} {highlightedChunkId} onOpenDocument={handleOpenDocument} />
           </div>
         {/if}
       </div>
     {:else if mode === 'search' && matches.length > 0}
-      {#if staleEvidence}<p class="mb-2 text-xs text-amber-300">Evidence from the previous request.</p>{/if}
+      {#if staleEvidence}<p class="mb-2 text-xs text-warning">Evidence from the previous request.</p>{/if}
       <RawResultList knowledgebaseId={kb.knowledgebase_id} {matches} {highlightedChunkId} onOpenDocument={handleOpenDocument} />
     {:else if query.trim() && !loading}
-      <p class="rounded-2xl border border-dashed border-slate-800/80 px-4 py-8 text-center text-sm text-slate-400">
+      <p class="rounded-2xl border border-dashed border-separator/80 px-4 py-8 text-center text-sm text-muted">
         No results yet — try a different query or fewer filters.
       </p>
     {/if}

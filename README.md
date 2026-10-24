@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="files/banner.jpg" alt="cognis banner" />
+  <img src="ui/static/brand/cognis-mark-color.svg" alt="Cognis" width="128" height="128" />
 </p>
 
 # cognis
@@ -41,31 +41,16 @@ Open several conversations and tasks from the dashboard. Keep active work in
 separate windows, switch between them, and inspect rich deliverables without
 losing your place.
 
-<p align="center">
-  <img src="docs/assets/screenshots/desktop-window-deliverable.webp" alt="Cognis dashboard with several managed windows and a rich daily brief deliverable" />
-</p>
-
 ### See what agents are doing
 
 The activity sidebar shows the files, commands, mutations, artifacts, and
 deliverables for the current work graph. Open command output or inspect a diff
 while the agent continues its work.
 
-<p align="center">
-  <img src="docs/assets/screenshots/desktop-work-commands.webp" alt="Cognis desktop workspace with command history, validation output, and execution details beside the conversation" width="49%" />
-  <img src="docs/assets/screenshots/desktop-work-diff.webp" alt="Cognis desktop workspace with a source diff beside the active conversation" width="49%" />
-</p>
-
 ### Keep working from mobile
 
 Monitor ongoing sessions, inspect the activity overview, and review changed
 files from the installable mobile app.
-
-<p align="center">
-  <img src="docs/assets/screenshots/mobile-conversations.webp" alt="Cognis mobile conversation list with active work indicators" width="31%" />
-  <img src="docs/assets/screenshots/mobile-ongoing-work.webp" alt="Cognis mobile conversation with three ongoing execution sessions" width="31%" />
-  <img src="docs/assets/screenshots/mobile-activity-overview.webp" alt="Cognis mobile activity overview with context use, changed files, commands, and recent activity" width="31%" />
-</p>
 
 [See the complete product showcase](docs/guide/showcase.md), including window
 management, desktop activity inspection, mobile diffs, and command output.
@@ -74,7 +59,9 @@ management, desktop activity inspection, mobile diffs, and command output.
 
 - **Streaming chat workspace**: WebSocket chat with token streaming, tool activity, todos, approvals, delegation cards, reconnect handling, search, timestamps, and mobile-friendly navigation.
 - **Agent identity**: Agents have names, descriptions, personality, behavioral guidance, model/provider overrides, skills, avatars, sharing rules, and executor/tool boundaries.
-- **Projects**: Group work around projects with source hints, workflow bindings, grants, project-aware tasks, schedules, conversations, and context injection for relevant paths.
+- **Projects and collaboration**: Share project agents, knowledgebases, documents, and read-only conversation history through explicit membership and access grants.
+- **Library and revisions**: Browse artifacts and deliverables, author versioned documents, inspect revision history, and manage public links and agent access.
+- **Agent hooks**: Attach reusable reminders and background actions to lifecycle events, including idle skill learning. Manage definitions in Tools and inspect outcomes in chat.
 - **Tasks and workflows**: Durable task board, dependencies, priorities, step runs, gates, deliverables, comments, reruns, revisions, schedules, and reusable workflow templates.
 - **Remote executors**: In-process, subprocess, and WebSocket executors. Use stateless cloud executors for ephemeral work or persistent executor homes for browser profiles, workspaces, caches, and local identity.
 - **Browser and web tools**: Web search/fetch/crawl/map/research plus executor-native browser sessions, snapshots, queries, clicks, typing, forms, console/network inspection, screenshots, and saved auth state.
@@ -85,8 +72,14 @@ management, desktop activity inspection, mobile diffs, and command output.
 - **Guardrails and approvals**: Intaris evaluates tool calls, escalates sensitive actions, records session content, and keeps an audit trail.
 - **Credentials without prompt leakage**: Secrets are encrypted at rest and referenced through value refs. Agents and LLMs receive references, not raw secret values; executors resolve values only at execution time.
 - **Channels**: Connect agents to external platforms through channel accounts, verified contacts, webhook/gateway adapters, and pairing flows. Signal and iMessage via BlueBubbles have the most complete setup paths today.
-- **PWA and mobile UX**: Installable web app with offline shell, iOS/Android safe-area layout, bottom tabs, drawers, and task/workflow views tuned for small screens.
+- **PWA and mobile UX**: Installable web app with offline workspace caching, queued attachment uploads, resilient reconnects, iOS/Android safe-area layout, and compact chat windows.
+- **Inference API and routes**: Serve authenticated OpenAI-compatible inference, configure reusable routes with recovery and executor-aware targets, and monitor provider health and model capacity.
+- **Notifications**: Persistent in-app inbox with targeted approval, task-failure, and provider-recovery actions.
 - **Admin and operations**: Setup flow, diagnostics, provider presets, model routing, secrets, executor tokens, system health, metrics, reconciliation, CLI admin commands, Docker images, and systemd templates.
+
+[Read the release history](CHANGELOG.md). In the app, open **Docs → What's new**
+to compare versions and review upgrade notes. Contributors maintain release
+fragments as described in [changelog.d](changelog.d/README.md).
 
 ## Architecture
 

@@ -15,6 +15,37 @@ from cognis.api.chat_v2.realtime import (
 from cognis.api.chat_v2.schemas import TimelineScope
 
 
+def test_paused_text_keeps_runtime_identity_and_accepts_later_chunks() -> None:
+    snapshot = {
+        "content": "Commentary before tool input.",
+        "message_id": "msg-1",
+        "session_id": "sess-1",
+        "turn_id": "turn-1",
+        "assistant_phase_index": 3,
+        "turn_cycle_index": 2,
+        "text_streaming": False,
+    }
+    paused = assistant_stream_runtime_item(snapshot, local=0)
+    assert paused is not None
+    assert paused.status == "running"
+    assert paused.partial is True
+    assert paused.text_streaming is False
+    resumed = assistant_stream_runtime_item(
+        {**snapshot, "text_streaming": True, "content": snapshot["content"] + " More text."},
+        local=0,
+    )
+    assert resumed is not None
+    assert resumed.text_streaming is True
+    assert resumed.id == paused.id
+    assert resumed.turn_cycle_index == paused.turn_cycle_index
+    assert resumed.assistant_phase_index == paused.assistant_phase_index
+    legacy = assistant_stream_runtime_item(
+        {key: value for key, value in snapshot.items() if key != "text_streaming"}, local=0
+    )
+    assert legacy is not None
+    assert legacy.text_streaming is True
+
+
 def test_runtime_snapshots_become_strict_volatile_items() -> None:
     items = runtime_items_from_snapshots(
         active_streams=[

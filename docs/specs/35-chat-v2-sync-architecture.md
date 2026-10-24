@@ -2,6 +2,81 @@
 
 ## Status: Approved for Phase 2 implementation
 
+### Shared browser timeline ownership
+
+Canonical append notifications wake local readers before remote cluster
+publication, including when cluster transport is disabled or fails. An admission
+hint can precede persistence; it is not a substitute for this post-append wake-up.
+Views admit matching invalidations through the shared timeline controller. A hint
+arriving during a read schedules a subsequent cursor read, not a forced snapshot.
+The canonical invalidation policy excludes executor/schedule health hints even
+when explicitly scoped. Matching routes and genuinely unrouted non-health hints
+(including unknown reasons) retain conservative recovery. Conflicting explicit
+scope/conversation/session/task/step fields never become global hints. Opaque
+post-append notifications remain supported through server-authorized socket
+routing until their producers can provide explicit scope keys.
+
+Scope acquisition depends on canonical scope fields and effective provider
+identities, not the identity of a parent props object. Equivalent publications
+must preserve view-local expansion, viewport state, and subscriptions.
+
+Each account/scope controller has an immutable API provider. A different provider
+may replace an entry only after its last consumer releases it; old requests are
+cancelled and fenced even if still pending. With active consumers, acquisition
+throws `TimelineProviderConflictError`. The requesting scoped view displays an
+isolated error and offers explicit retry; existing consumers are not invalidated.
+Provider identity is never added to the canonical timeline key.
+
+`ui/src/lib/chat-v2/timeline-controller.svelte.ts` owns the owner/scope-keyed
+timeline registry and loading policy for full chat, its preloader, and scoped
+timelines (compact, dashboard, and tray). A registry entry owns one `ChatV2Store`
+and a detached Svelte projection root. Equivalent snapshot/sync and backfill
+requests share work; consumer cancellation releases only that consumer. Views
+retain their own viewport, scroll, route metadata, and reference-counted WS
+subscriptions. At most twenty inactive/resident scope entries are retained,
+except entries still referenced by a view or request. Eviction and account
+changes dispose projection roots; account changes also abort requests and fence
+late network/device completions.
+
+Equivalent consumers still join one load. A newer server invalidation marks that
+load dirty and is drained by the same controller as one trailing intent; it must
+not cancel a valid request or be mistaken for an equivalent open. Consumers join
+before releasing their previous interest. Existing deadlines, owner fencing and
+canonical revision watermarks still govern the entire operation. Device hydration
+is readable but unreconciled until an authoritative load completes.
+
+New device timeline writes use the existing IndexedDB record envelope with kind
+`timeline`. Read-only migration accepts deployed `scoped-view.state` and
+`conversation-view.chatV2State` records, choosing the newest legacy timestamp.
+This compatibility reader supports installed clients' offline history; no new
+legacy timeline copies are written. Existing record TTL/pruning retires legacy
+records. Route `conversation-view` records now contain only view metadata.
+Device copies settle volatile runtime overlays; live shared memory does not.
+Canonical recovery watermarks reject reads overtaken by newer canonical state
+or a new reset, not runtime-only or local admissions. Snapshot application
+preserves accepted overlays and local admissions through the sync engine.
+Recovery settles only on an accepted base, a ready newer canonical state, or
+a bounded actionable error; a runtime frame cannot mark a canonical gap ready.
+
+The store's membership transition boundary prepares every registered view
+before replacing state and commits their view-local reconciliation afterwards.
+Full chat maps its reading window by stable item identities; each viewport
+captures/restores its own row anchor and fences pending restoration by its
+attachment generation. Backfill request ownership does not confer DOM ownership.
+`TimelineViewportStateStore` separately tracks whether the current scope/load's
+window has been constructed. This logical retention survives DOM settlement,
+child-view hiding, and pending parent-return animation frames. Controller/view
+replacement, load reset and teardown invalidate it. DOM readiness controls only
+anchor capture/restoration, never canonical membership reconciliation.
+
+Chat v2 typed requests apply their deadline to lease/auth waits, headers, and
+body/error decoding, aborting body readers and cleaning timers/listeners.
+Raw-response, streaming, and upload fetch consumers retain their separate
+headers-only/explicit timeout-opt-out contracts. Settled critical event-store
+errors remain actionable even during degraded WS connectivity. Required empty
+history backfill advances with bounded page/cursor progress independently of
+animation frames; RAF is reserved for viewport positioning.
+
 ### Implemented runtime completion boundaries
 
 Transient recovery notices belong to one wait occurrence, not the entire turn.
@@ -23,6 +98,16 @@ retains its text as complete until canonical synchronization replaces it.
 Canonical assistant phases supersede earlier runtime phases by message identity,
 even when the runtime text is only a prefix of the saved text.
 
+Bounded recovery snapshots can omit earlier persisted cycles of an active turn.
+The visible projection suppresses terminal assistant, tool, and thinking overlays
+absent from canonical history when one same-turn canonical item has both a
+strictly later explicit cycle and phase. This applies to runtime overlays and
+settled local carry alike, including delayed runtime hydration after cached
+history renders. Live work, missing or conflicting coordinates, and canonical
+identity matches remain eligible for merging. Suppression does not delete stored
+items or change runtime authority; backfill restores older canonical history in
+its canonical position.
+
 Native tool-input progress is not tool admission: it must neither advance the
 assistant phase nor clear the preceding assistant stream before persistence.
 The scheduler owns these turn-lifetime buffers and per-call phase assignments.
@@ -33,11 +118,30 @@ no execution, cancellation, transaction, or external-tool side-effect ownership;
 snapshot updates retain their existing locks and reconstructable L2 persistence.
 No event schema or historical event rewrite is required.
 
+The scheduler's volatile stream also tracks `text_streaming` separately from
+unpersisted content. Same-turn, same-cycle native input preparation pauses text
+animation under the existing stream lock without clearing content, changing
+phase, or consuming a message identity. A new text chunk resumes it. Late
+progress from an older cycle cannot pause a newer message. The additive runtime
+message field survives relay hydration and REST/WS projection; an absent field
+defaults to the previous behavior for rolling-controller snapshots. `partial`
+describes incomplete content, never typing activity by itself. No durable state,
+transaction, external operation, cancellation owner, or retry policy changes.
+
 The completion observer can publish a terminal envelope before the execution
 wrapper commits settlement. A receiving replica accepts this envelope only for
 the exact current request, turn, fence, and owner. A different owner or a newer
 fence still invalidates the envelope. This ordering adds no database operation
 to the streaming path.
+
+Inactive runtime authority retains the latest execution fence, not the latest
+message admission. Recovery may advance an older request beyond later absorbed
+messages; absorbed rows never own that turn's lifecycle. Unclaimed queue
+cancellations must not hide the last execution generation. Error observers
+announce a recoverable lifecycle only for automatic transient recovery; manual
+retry eligibility, including cancellation, still ends the current generation.
+These are read and presentation rules under the existing direct-turn lease and
+settlement owner, with no schema, cancellation, or retry-policy changes.
 
 ## Purpose
 
@@ -889,6 +993,15 @@ Rules:
   local cursor from the send response alone.
 - The authoritative user message eventually appears through snapshot/sync/
   realtime, not by trusting the send response as final timeline state.
+- Full and compact composers share `ComposerSubmission`: persist the draft,
+  establish durable attachment bytes or an authenticated persisted artifact
+  receipt through the attachment owner, and commit the outbox before consuming
+  input. Consumption compares the captured lease, view generation and draft
+  revision; newer edits or a replacement view must not be cleared.
+- Outbox writes detach reactive metadata before opening IndexedDB transactions.
+  Request success is not commit. Callback exceptions explicitly abort and retain
+  their original cause; persistence failure must not consume input or downgrade
+  the durable queue to memory.
 
 ### Queue delete
 

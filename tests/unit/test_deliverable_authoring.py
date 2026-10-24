@@ -48,7 +48,7 @@ def _record(**updates: object) -> SimpleNamespace:
         "object_id": _ARTIFACT_ID,
         "filename": "payload.json",
         "owner_email": "owner@example.com",
-        "conversation_id": None,
+        "conversation_id": "conv_1",
         "purpose": "artifact_publish",
         "mime_type": "application/json",
         "size_bytes": len(json.dumps(_PAYLOAD).encode()),

@@ -873,6 +873,59 @@ class WorkflowRegistry:
             return None
         return _row_to_workflow(row)
 
+    async def get_for_management(
+        self,
+        workflow_id: str,
+        *,
+        owner_email: str,
+        include_disabled: bool = False,
+    ) -> Workflow | None:
+        """Resolve an owner's definition independently of execution project scope."""
+        if workflow_id not in SYSTEM_WORKFLOWS:
+            async with self._session_factory() as db_session:
+                row = await get_workflow(db_session, workflow_id)
+            if row is not None and not row.is_system and row.owner_email == owner_email:
+                return _row_to_workflow(row)
+        # Non-owner and system lookups retain their existing visibility rules.
+        return await self.get(
+            workflow_id, owner_email=owner_email, include_disabled=include_disabled
+        )
+
+    async def list_for_management(
+        self,
+        *,
+        owner_email: str,
+        include_disabled: bool = False,
+        include_ephemeral: bool = False,
+        project_id: str | None = None,
+    ) -> list[Workflow]:
+        """Include owned project definitions in the unscoped administrative list."""
+        result = await self.list_all(
+            owner_email=owner_email,
+            include_disabled=include_disabled,
+            include_ephemeral=include_ephemeral,
+            project_id=project_id,
+        )
+        if project_id is not None:
+            return result
+        async with self._session_factory() as db_session:
+            rows = await list_workflows(
+                db_session,
+                owner_email=owner_email,
+                include_system=False,
+                include_ephemeral=include_ephemeral,
+            )
+        visible_ids = {workflow.workflow_id for workflow in result}
+        result.extend(
+            _row_to_workflow(row)
+            for row in rows
+            if not row.is_system
+            and row.owner_email == owner_email
+            and row.workflow_id not in SYSTEM_WORKFLOWS
+            and row.workflow_id not in visible_ids
+        )
+        return result
+
     async def list_all(
         self,
         *,

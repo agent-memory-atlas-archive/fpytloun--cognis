@@ -152,8 +152,16 @@ KNOWLEDGEBASE_TOOLS = [
     ),
     _tool(
         "knowledgebase_list",
-        "List knowledgebases available to the current actor and active agent session.",
-        {},
+        "Discover knowledgebases available to the active agent session, optionally by name. "
+        "This does not list unassigned owner KBs; use knowledgebase_list_owned for management.",
+        {"query": {"type": "string"}},
+        read_only=True,
+    ),
+    _tool(
+        "knowledgebase_list_owned",
+        "Discover metadata for actor-owned knowledgebases for management, optionally by name. "
+        "Does not grant the active agent retrieval access to unassigned KBs.",
+        {"query": {"type": "string"}},
         read_only=True,
     ),
     _tool(
@@ -332,10 +340,12 @@ def build_knowledgebase_tool_handlers(service: Any | None) -> dict[str, Any]:
             agent_id = None
         if not isinstance(agent_owner_email, str):
             agent_owner_email = None
+        project_id = runtime_access.get("project_id")
         return KnowledgebaseAccessContext(
             actor_email=actor,
             agent_id=agent_id,
             agent_owner_email=agent_owner_email,
+            project_id=project_id if isinstance(project_id, str) and project_id else None,
         )
 
     def _unavailable(knowledgebase_id: str, operation: str) -> dict[str, Any]:
@@ -375,7 +385,40 @@ def build_knowledgebase_tool_handlers(service: Any | None) -> dict[str, Any]:
         rows = await _service().list(
             owner_email=_user(context), access_context=_access_context(context)
         )
-        return [row.model_dump(mode="json") for row in rows]
+        query = str(arguments.get("query") or "").strip().casefold()
+        return [
+            {
+                **row.model_dump(mode="json"),
+                "effective_permissions": {
+                    "view": True,
+                    "use": True,
+                    "manage": row.owner_email == _user(context),
+                },
+            }
+            for row in rows
+            if not query or query in row.name.casefold()
+        ]
+
+    async def list_owned(
+        arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> list[dict[str, Any]]:
+        actor = _user(context)
+        rows = await _service().list(
+            owner_email=actor, access_context=KnowledgebaseAccessContext(actor_email=actor)
+        )
+        query = str(arguments.get("query") or "").strip().casefold()
+        return [
+            {
+                "knowledgebase_id": row.knowledgebase_id,
+                "name": row.name,
+                "description": row.description,
+                "owner_email": row.owner_email,
+                "status": row.status,
+                "effective_permissions": {"manage": True, "authorize_sharing": True},
+            }
+            for row in rows
+            if row.owner_email == actor and (not query or query in row.name.casefold())
+        ]
 
     async def get(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
         knowledgebase_id = str(arguments["knowledgebase_id"])
@@ -588,6 +631,7 @@ def build_knowledgebase_tool_handlers(service: Any | None) -> dict[str, Any]:
     return {
         "knowledgebase_create": create,
         "knowledgebase_list": list_,
+        "knowledgebase_list_owned": list_owned,
         "knowledgebase_get": get,
         "knowledgebase_update": update,
         "knowledgebase_list_artifacts": artifacts,

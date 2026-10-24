@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   let admissions = $state(0);
+  export function stageOptimisticMessage(): boolean { return true; }
   export async function reconcileMessageAdmission(): Promise<boolean> {
     admissions += 1;
     return true;
@@ -10,12 +11,14 @@
     onQueueChange,
     onTodosChange,
     onOngoingWorkChange,
+    onRuntimeActiveChange,
     showQueuedMessages = true,
     showTodoDrawer = true,
   } = $props<{
     onQueueChange?: (messages: Array<Record<string, unknown>>) => void;
     onTodosChange?: (todos: Array<Record<string, unknown>>) => void;
     onOngoingWorkChange?: (work: Array<Record<string, unknown>>) => void;
+    onRuntimeActiveChange?: (active: boolean) => void;
     showQueuedMessages?: boolean;
     showTodoDrawer?: boolean;
   }>();
@@ -48,5 +51,6 @@
 
 <div class="min-h-0 flex-1" data-testid="compact-timeline-fixture" data-show-queue={showQueuedMessages} data-show-todo-drawer={showTodoDrawer} data-admissions={admissions}>
   Timeline
+  <button type="button" onclick={() => onRuntimeActiveChange?.(true)}>Activate fixture turn</button>
   {#if showQueuedMessages}<p>Queued once</p>{/if}
 </div>

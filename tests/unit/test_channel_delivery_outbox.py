@@ -191,6 +191,48 @@ async def test_fenced_direct_turn_loads_request_by_public_request_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("progress_status", ["pending", "failed", "uncertain", "sent"])
+async def test_direct_final_waits_only_for_retryable_progress(
+    tmp_path: Path, progress_status: str
+) -> None:
+    from types import SimpleNamespace
+
+    engine, factory = await _database(tmp_path, "progress-order.db")
+    try:
+        await _outbox(factory, "channel-progress:prior")
+        await _outbox(factory, "direct-turn:request:final")
+        async with factory() as db:
+            progress = await get_channel_delivery_outbox(db, "channel-progress:prior")
+            final = await get_channel_delivery_outbox(db, "direct-turn:request:final")
+            progress.status = progress_status
+            progress.created_at = final.created_at - timedelta(seconds=1)
+            final.direct_turn_request_id = "request"
+            await db.commit()
+        adapter = SimpleNamespace(
+            capabilities=ChannelCapabilities(supports_idempotent_send=True),
+            send_message=AsyncMock(return_value="$final"),
+        )
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: _Manager(adapter),
+        )
+        await service._deliver_outbox(
+            delivery_id="direct-turn:request:final",
+            final_content=None,
+            fallback_text=None,
+            attachments=None,
+            ignore_next_attempt=True,
+        )
+        if progress_status in {"pending", "failed"}:
+            adapter.send_message.assert_not_awaited()
+        else:
+            adapter.send_message.assert_awaited_once()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_permanent_delivery_settlement_requires_current_lease(
     tmp_path: Path,
 ) -> None:
@@ -1252,6 +1294,8 @@ async def test_unauthorized_outbox_attachment_never_loads_or_sends(
 async def test_attachment_materialization_allows_direct_and_managed_descendant_artifacts(
     tmp_path: Path,
 ) -> None:
+    from cognis.store.models import Agent, ArtifactGrantRow
+
     engine, factory = await _database(tmp_path)
     try:
         async with factory() as session:
@@ -1260,12 +1304,14 @@ async def test_attachment_materialization_allows_direct_and_managed_descendant_a
                 agent_id="agent-root",
                 owner_email="user@example.com",
                 name="Root",
+                status="active",
             )
             await create_agent(
                 session,
                 agent_id="agent-child",
                 owner_email="user@example.com",
                 name="Child",
+                status="active",
             )
             root = await create_conversation(
                 session,
@@ -1308,6 +1354,9 @@ async def test_attachment_materialization_allows_direct_and_managed_descendant_a
                     object_id=artifact_id,
                     filename=f"{artifact_id}.txt",
                     owner_email="user@example.com",
+                    owner_agent_id="agent-root"
+                    if artifact_id == "artifact-direct"
+                    else "agent-child",
                     conversation_id=conversation_id,
                     purpose="chat_input",
                     kind="file",
@@ -1315,6 +1364,12 @@ async def test_attachment_materialization_allows_direct_and_managed_descendant_a
                     size_bytes=2,
                     status="attached",
                 )
+            output_grant = ArtifactGrantRow(
+                owner_email="user@example.com",
+                content_ref="artifact-descendant",
+                agent_id="agent-root",
+            )
+            session.add(output_grant)
             await session.commit()
 
         class _Store:
@@ -1377,6 +1432,20 @@ async def test_attachment_materialization_allows_direct_and_managed_descendant_a
             owner_email="user@example.com",
             conversation_id=root.conversation_id,
         )
+        # A previously issued output entitlement survives source-link closure.
+        assert materialized is True
+        async with factory() as session:
+            # Source provenance and output entitlements are durable. Disabling
+            # the recipient must still revoke outbound access at delivery time.
+            recipient = await session.get(Agent, "agent-root")
+            assert recipient is not None
+            recipient.status = "archived"
+            await session.commit()
+        _media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+            grants["artifact-descendant"],
+            owner_email="user@example.com",
+            conversation_id=root.conversation_id,
+        )
         assert materialized is False
         _media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
             {"artifact_id": "artifact-direct"},
@@ -1400,6 +1469,7 @@ async def test_attachment_materialization_allows_owned_one_shot_artifact(
                 agent_id="agent-one-shot",
                 owner_email="user@example.com",
                 name="One shot",
+                status="active",
             )
             conversation = await create_conversation(
                 session,
@@ -1417,6 +1487,7 @@ async def test_attachment_materialization_allows_owned_one_shot_artifact(
                 object_id="artifact-one-shot",
                 filename="photo.png",
                 owner_email="user@example.com",
+                owner_agent_id=conversation.agent_id,
                 purpose="chat_input",
                 kind="image",
                 mime_type="image/png",

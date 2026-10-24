@@ -31,6 +31,7 @@ from cognis.store.models import (
     StepRun,
     Task,
 )
+from cognis.store.notification_expiry import notification_is_expired
 from cognis.store.queries import (
     get_conversation,
     get_step_run,
@@ -233,7 +234,10 @@ async def _pending_state(
     result = await session.execute(stmt)
     pending = ConversationPendingState()
     seen_types: set[str] = set()
+    now = datetime.now(UTC)
     for row in result.scalars().all():
+        if notification_is_expired(row, now=now):
+            continue
         if not (
             _notification_visible_in_conversation(row, conversation_id)
             or (task_id is not None and row.task_id == task_id)
@@ -281,7 +285,10 @@ def _fallback_task_reference(
 def _pending_state_from_rows(rows: list[NotificationRow]) -> ConversationPendingState:
     pending = ConversationPendingState()
     seen_types: set[str] = set()
+    now = datetime.now(UTC)
     for row in rows:
+        if notification_is_expired(row, now=now):
+            continue
         if row.notification_type not in seen_types:
             pending.notification_types.append(row.notification_type)
             seen_types.add(row.notification_type)

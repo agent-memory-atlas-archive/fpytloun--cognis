@@ -94,7 +94,8 @@ describe('dashboard presentation and canvas resolution', () => {
     });
 
     expect(screen.getByRole('heading', { level: 1, name: 'Host dashboard title' })).toBeTruthy();
-    expect(screen.queryByTestId('rich-deliverable-toolbar')?.className).not.toContain('actions-only');
+    expect(screen.queryByTestId('rich-deliverable-toolbar')?.className).toContain('actions-only');
+    expect(screen.getByRole('heading', { level: 1, name: 'Host dashboard title' })).toHaveClass('document-title');
   });
 });
 
@@ -340,7 +341,7 @@ describe('capacity-dashboard fixture scenario', () => {
     expect(container.querySelector('[data-testid="rich-deliverable"]')).toHaveAttribute('data-rich-canvas', 'wide');
     expect(container.querySelectorAll('[data-rich-block-type="metric"] [role="progressbar"]')).toHaveLength(4);
     expect(container.querySelector('[data-rich-role="metadata"]')).toHaveTextContent('orchid-primary');
-    expect(container.querySelector('[data-rich-role="status"]')).toHaveTextContent('9 suggested indexes');
+    expect(container.querySelector('[data-rich-role="status"]')).toHaveTextContent('5 suggested indexes');
     expect(container.querySelectorAll('[data-rich-block-type="card"]')).toHaveLength(1);
   });
 });

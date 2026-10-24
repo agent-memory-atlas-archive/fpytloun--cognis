@@ -150,6 +150,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
             context_usage=_context_usage_for_session(request, row.session_id),
             token_usage=_token_usage_for_session(request, row.session_id),
             last_generation=_last_generation_for_session(request, row.session_id),
+            inference_target=request.app.state.session_cache.get_inference_target(row.session_id),
             runtime_selection=runtime_selection,
         )
     except Exception as exc:

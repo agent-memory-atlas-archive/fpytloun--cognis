@@ -86,11 +86,14 @@ def _bounded_revision(revision: str | int | datetime) -> str:
 
 class ClusterSignalKind(StrEnum):
     CHAT_SCOPE_CHANGED = "chat_scope_changed"
+    CHANNEL_OUTBOX_CHANGED = "channel_outbox_changed"
     TASK_PROGRESS_CHANGED = "task_progress_changed"
     TASK_QUEUE_CHANGED = "task_queue_changed"
     NOTIFICATION_STATE_CHANGED = "notification_state_changed"
+    INBOX_CHANGED = "inbox_changed"
     SCHEDULE_ACTION_CHANGED = "schedule_action_changed"
     EXECUTOR_STATE_CHANGED = "executor_state_changed"
+    EXECUTOR_MONITOR_CHANGED = "executor_monitor_changed"
     SIDEBAR_CHANGED = "sidebar_changed"
     EVENT_STORE_SESSION_INVALIDATED = "event_store_session_invalidated"
     WORK_INVALIDATED = "work_invalidated"
@@ -428,13 +431,23 @@ class ClusterSignalService:
         revision: str | int | datetime,
     ) -> bool:
         """Publish one identity-free canonical event-cache invalidation."""
+        scope = ClusterSignalScope(
+            event_store_id=store_id,
+            event_session_token=session_token,
+        )
+        signal = ClusterSignal(
+            kind=ClusterSignalKind.EVENT_STORE_SESSION_INVALIDATED,
+            origin_controller_id=self.controller_id,
+            scope=scope,
+            revision=_bounded_revision(revision),
+        )
+        # The append-producing controller ignores its transport echo. Local
+        # readers must wake even when cluster transport is disabled or fails.
+        await self._emit_local(signal)
         return await self.publish(
-            ClusterSignalKind.EVENT_STORE_SESSION_INVALIDATED,
-            scope=ClusterSignalScope(
-                event_store_id=store_id,
-                event_session_token=session_token,
-            ),
-            revision=revision,
+            signal.kind,
+            scope=scope,
+            revision=signal.revision,
         )
 
     async def publish_work_invalidation(
@@ -566,7 +579,24 @@ class ClusterSignalService:
                         origin_controller_id="reconciliation",
                         scope=scope,
                         revision=_bounded_revision(watermark),
-                    )
+                    ),
+                    # This watermark contains only the account's own sidebar
+                    # metadata, not membership or permission state.
+                    metadata_only=bool(
+                        kind == ClusterSignalKind.SIDEBAR_CHANGED
+                        and scope.owner_token
+                        and not any(
+                            (
+                                scope.conversation_id,
+                                scope.session_id,
+                                scope.task_id,
+                                scope.step_run_id,
+                                scope.schedule_id,
+                                scope.notification_id,
+                                scope.executor_id,
+                            )
+                        )
+                    ),
                 )
             self._watermarks[key] = watermark
         self._watermarks = {
@@ -675,7 +705,7 @@ class ClusterSignalService:
             except Exception:
                 logger.warning("cluster_signals: reconciliation failed", exc_info=True)
 
-    async def _emit_local(self, signal: ClusterSignal) -> None:
+    async def _emit_local(self, signal: ClusterSignal, *, metadata_only: bool = False) -> None:
         await self._event_bus.publish(
             Event(
                 type=EventType.CLUSTER_SCOPE_INVALIDATED,
@@ -683,6 +713,7 @@ class ClusterSignalService:
                     "kind": signal.kind,
                     "scope": signal.scope.model_dump(exclude_none=True),
                     "revision": signal.revision,
+                    **({"metadata_only": True} if metadata_only else {}),
                 },
             )
         )

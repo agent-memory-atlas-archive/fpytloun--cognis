@@ -5,6 +5,66 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from cognis.core.executor_pin_notice_dispatch import recovery_notice_idempotency_key
+
+
+def test_recovery_notice_append_identity(
+    http_client: httpx.Client,
+    intaris_url: str,
+    make_service_jwt: Callable[..., str],
+    contract_agent_id: str,
+    unique_session_id: Callable[[str], str],
+) -> None:
+    session_id = unique_session_id("recovery-key")
+    headers = {
+        "Authorization": f"Bearer {make_service_jwt('intaris', agent_id=contract_agent_id)}",
+        "X-Agent-Id": contract_agent_id,
+        "X-Intaris-Source": "cognis_executor_recovery",
+    }
+    http_client.post(
+        f"{intaris_url}/api/v1/intention",
+        headers=headers,
+        json={"session_id": session_id, "intention": "Recovery notice contract"},
+    ).raise_for_status()
+    url = f"{intaris_url}/api/v1/session/{session_id}/events"
+    baseline = http_client.get(url, headers=headers)
+    baseline.raise_for_status()
+    previous_seq = baseline.json()["last_seq"]
+    notice_id = "executor_recovery:conv-a:executor-a:2026-01-01T10:00:00+00:00:unavailable"
+    payload = [{"type": "lifecycle", "data": {"notice_id": notice_id, "kind": "executor_recovery"}}]
+    legacy_key = f"{session_id}:{notice_id}"
+    key = recovery_notice_idempotency_key(session_id, notice_id)
+    for invalid_key in (legacy_key, recovery_notice_idempotency_key("other-session", notice_id)):
+        rejected = http_client.post(
+            url, headers=headers, params={"idempotency_key": invalid_key}, json=payload
+        )
+        assert rejected.status_code == 400
+        assert rejected.headers["X-Intaris-Event-Error"] == "invalid_idempotency_key"
+
+    first = http_client.post(url, headers=headers, params={"idempotency_key": key}, json=payload)
+    first.raise_for_status()
+    replay = http_client.post(url, headers=headers, params={"idempotency_key": key}, json=payload)
+    replay.raise_for_status()
+    assert replay.json() == first.json()
+    assert first.json()["ok"] is True
+    assert first.json()["count"] == 1
+    assert first.json()["first_seq"] == first.json()["last_seq"] == previous_seq + 1
+    conflict = http_client.post(
+        url,
+        headers=headers,
+        params={"idempotency_key": key},
+        json=[{"type": "lifecycle", "data": {"notice_id": notice_id, "kind": "changed"}}],
+    )
+    assert conflict.status_code == 409
+    events = http_client.get(url, headers=headers)
+    events.raise_for_status()
+    assert events.json()["last_seq"] == previous_seq + 1
+    notices = [
+        event for event in events.json()["events"] if event["data"].get("notice_id") == notice_id
+    ]
+    assert len(notices) == 1
+    assert notices[0]["data"] == payload[0]["data"]
+
 
 def test_whoami_accepts_cognis_jwt(
     http_client: httpx.Client,

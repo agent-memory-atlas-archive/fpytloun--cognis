@@ -26,6 +26,14 @@ class _Result:
     def scalars(self) -> _Scalars:
         return _Scalars(self._rows)
 
+    def scalar_one_or_none(self) -> Any:
+        return SimpleNamespace(
+            owner_email="user@example.com",
+            agent_id="agent-reader",
+            status="active",
+            permissions={},
+        )
+
 
 class _Session:
     def __init__(self, state: SimpleNamespace, rows: list[Any]) -> None:
@@ -41,6 +49,26 @@ class _Session:
 
     async def execute(self, _statement: object) -> _Result:
         return _Result(self._rows)
+
+    async def get(self, model: Any, _key: str) -> Any:
+        from cognis.store.models import Agent, Conversation
+
+        if model is Conversation:
+            return SimpleNamespace(user_email="user@example.com", agent_id="agent-reader")
+        if model is Agent:
+            return SimpleNamespace(
+                owner_email="user@example.com",
+                status="active",
+                permissions={},
+                agent_id="agent-reader",
+            )
+        raise AssertionError(model)
+
+    async def scalars(self, _statement: object) -> _Scalars:
+        return _Scalars([row.artifact_id for row in self._rows])
+
+    def get_bind(self) -> Any:
+        return SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
 
 
 class _SessionFactory:

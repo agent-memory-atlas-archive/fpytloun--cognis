@@ -1103,6 +1103,13 @@ async def responses_stream_to_chat_chunks(
                 }
                 continue
             yield provider_liveness_chunk
+        if last_error_event_details is not None and not state.completed_seen:
+            # Some providers close after `error` without sending `response.failed`.
+            yield {
+                "error": str(last_error_event_details.get("message") or "Responses stream failed"),
+                "response_error": classify_response_failure(last_error_event_details),
+                "mid_stream_failure": True,
+            }
     finally:
         logger.debug(
             "Responses bridge stream summary",

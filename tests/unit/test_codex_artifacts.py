@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import io
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from cognis.core.attachment_compat import DEFAULT_NATIVE_IMAGE_MIME_TYPES
 from cognis.models.artifact import ArtifactKind, ArtifactStatus
@@ -35,6 +36,16 @@ def _jpeg(*, size: tuple[int, int] = (4, 3)) -> bytes:
 def _webp(*, size: tuple[int, int] = (4, 3)) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", size, "red").save(output, format="WEBP")
+    return output.getvalue()
+
+
+def _mpo(*, size: tuple[int, int] = (4, 3), orientation: int = 1) -> bytes:
+    output = io.BytesIO()
+    exif = Image.Exif()
+    exif[274] = orientation
+    primary = Image.new("RGB", size, "red")
+    auxiliary = Image.new("RGB", (4, 3), "blue")
+    primary.save(output, format="MPO", save_all=True, append_images=[auxiliary], exif=exif)
     return output.getvalue()
 
 
@@ -513,6 +524,119 @@ def test_every_declared_native_image_type_is_deliverable() -> None:
         )
         assert encoded
         assert resolved_mime in codex_artifacts._FORMAT_MIME_TYPES.values()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_factory", [_jpeg, _mpo], ids=["jpeg", "mpo"])
+async def test_camera_jpeg_is_resized_once_across_concurrent_materializations(
+    monkeypatch: pytest.MonkeyPatch,
+    image_factory: Any,
+) -> None:
+    content = image_factory(size=(5712, 4284))
+    store = _Store(content)
+    cache = CodexImageNormalizationCache()
+    normalization_calls = 0
+    authorization_calls = 0
+    original_normalize = codex_artifacts._normalize_image
+
+    async def _records(session: object, artifact_ids: list[str]) -> list[SimpleNamespace]:
+        return [_record(filename="camera.jpeg", size_bytes=len(content))]
+
+    async def _authorized(session: object, **kwargs: Any) -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        return True
+
+    def _normalize(content: bytes, *, artifact_id: str) -> tuple[bytes, str]:
+        nonlocal normalization_calls
+        normalization_calls += 1
+        return original_normalize(content, artifact_id=artifact_id)
+
+    monkeypatch.setattr(codex_artifacts, "get_artifact_records", _records)
+    monkeypatch.setattr(codex_artifacts, "artifact_authorized_for_conversation", _authorized)
+    monkeypatch.setattr(codex_artifacts, "_normalize_image", _normalize)
+    messages = _messages()
+    original = copy.deepcopy(messages)
+
+    async def _materialize() -> list[dict[str, Any]]:
+        return await materialize_codex_artifact_images(
+            messages,
+            session_factory=_session_factory,
+            artifact_store=store,
+            owner_email="owner@example.com",
+            conversation_id="conv_123",
+            agent_id="agent_123",
+            normalization_cache=cache,
+        )
+
+    results = await asyncio.gather(_materialize(), _materialize())
+    results.append(await _materialize())
+    for result in results:
+        url = _image_parts(result)[0]["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+        with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as image:
+            assert image.size == (2048, 1536)
+            assert image.format == "JPEG"
+            assert getattr(image, "n_frames", 1) == 1
+            assert image.getpixel((100, 100))[0] > 240
+            image.load()
+    assert normalization_calls == 1
+    assert authorization_calls == 3
+    assert messages == original
+    assert store.content == content
+
+
+@pytest.mark.parametrize("image_factory", [_jpeg, _mpo], ids=["jpeg", "mpo"])
+def test_jpeg_draft_must_reduce_actual_decode_size_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    image_factory: Any,
+) -> None:
+    content = image_factory(size=(5712, 4284))
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", lambda *args: None)
+
+    def _unexpected_load(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("The full-resolution JPEG must not be decoded")
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", _unexpected_load)
+    with pytest.raises(codex_artifacts.CodexArtifactError, match="decode pixel budget"):
+        codex_artifacts._normalize_image(content, artifact_id="img_camera")
+
+
+@pytest.mark.parametrize("format", ["JPEG", "PNG"])
+def test_normalization_rejects_source_over_its_budget(
+    monkeypatch: pytest.MonkeyPatch, format: str
+) -> None:
+    output = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(output, format=format)
+    monkeypatch.setattr(codex_artifacts, "MAX_CODEX_JPEG_SOURCE_PIXELS", 1000)
+    monkeypatch.setattr(codex_artifacts, "MAX_CODEX_IMAGE_PIXELS", 1000)
+    with pytest.raises(codex_artifacts.CodexArtifactError, match="source pixel budget"):
+        codex_artifacts._normalize_image(output.getvalue(), artifact_id="img_over_budget")
+
+
+@pytest.mark.parametrize("size", [(5712, 4284), (400, 300)])
+@pytest.mark.parametrize("format", ["JPEG", "MPO"])
+def test_normalization_applies_camera_orientation(size: tuple[int, int], format: str) -> None:
+    if format == "MPO":
+        content = _mpo(size=size, orientation=6)
+    else:
+        output = io.BytesIO()
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.new("RGB", size, "red").save(output, format="JPEG", exif=exif)
+        content = output.getvalue()
+    normalized, mime = codex_artifacts._normalize_image(content, artifact_id="img_portrait")
+    assert mime == "image/jpeg"
+    with Image.open(io.BytesIO(normalized)) as image:
+        assert image.size == ((1536, 2048) if size[0] > 2048 else (300, 400))
+        assert image.getexif().get(274, 1) == 1
+
+
+def test_mpo_source_budget_is_checked_before_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    content = _mpo(size=(32, 32))
+    monkeypatch.setattr(codex_artifacts, "MAX_CODEX_JPEG_SOURCE_PIXELS", 1000)
+    with pytest.raises(codex_artifacts.CodexArtifactError, match="source pixel budget"):
+        codex_artifacts._normalize_image(content, artifact_id="img_mpo")
 
 
 def test_strip_cognis_artifact_metadata_preserves_url_and_source() -> None:

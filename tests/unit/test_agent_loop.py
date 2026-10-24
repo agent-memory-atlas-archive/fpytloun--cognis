@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import cognis.core.agent_loop as agent_loop_module
 from cognis.channels.managed import ManagedChannelRecoveryResult, OneShotRouteRecoveryResult
 from cognis.core.agent_loop import (
+    _BOOTSTRAP_INTENTION_WAIT_MS,
     _DELEGATION_RESULT_MAX_CHARS,
     _MAX_TOOL_CALL_ARGUMENT_CHARS,
     _RECOVERY_NON_RETRYABLE_CATEGORIES,
@@ -94,7 +96,11 @@ from cognis.core.context_projection import (
     ProjectionTurnState,
 )
 from cognis.core.daily_brief_contract import CURRENT_DAILY_BRIEF_CONTRACT_VERSION
-from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
+from cognis.core.direct_turn_runtime import (
+    BackgroundDirectTurnFence,
+    DirectTurnExecutionFence,
+    StaleDirectTurnOwner,
+)
 from cognis.core.events import EventType
 from cognis.core.followups import LLM_CYCLE_CEILING_CONTINUATION_REASON, ContinuationFollowUp
 from cognis.core.harness_guards import SameTurnToolCallLedger
@@ -114,7 +120,7 @@ from cognis.core.step_profiles import (
     resolve_step_profile,
     step_profile_allows_tool,
 )
-from cognis.core.task_execution import TaskExecutionFence
+from cognis.core.task_execution import StaleTaskExecutionOwner, TaskExecutionFence
 from cognis.core.tool_result_settlement import (
     CanonicalToolRepairUnavailable,
     canonical_tool_continuation_events,
@@ -191,6 +197,7 @@ class _SessionStub(SimpleNamespace):
     reasoning_effort_override = None
     fast_mode_override = None
     runtime_override_revision = 0
+    delegation_mode = None
 
 
 def test_unreadable_tool_repair_uses_valid_continuation_without_redispatch() -> None:
@@ -748,6 +755,7 @@ async def test_validate_tool_call_live_path_passes_authoritative_context(
     loop._session_factory = object()
     ctx = SimpleNamespace(
         session=_SessionStub(user_email="owner@example.org"),
+        tool_registry=ToolRegistry(),
         agent=SimpleNamespace(
             agent_id="agent-1",
             permissions=SimpleNamespace(allowed_knowledgebases=["kb-authorized"]),
@@ -791,7 +799,11 @@ async def test_validate_tool_call_live_path_passes_authoritative_context(
     )
     assert captured["identifier"] == "write_deliverable"
     assert deps.memory is loop.providers.memory
-    assert deps.assignable_knowledgebase_ids == {"kb-authorized"}
+    # Effective KB grants are resolved from the database for the acting caller.
+    assert deps.assignable_knowledgebase_ids is None
+    assert deps.caller_agent_id == "agent-1"
+    assert validation_context.actor_email == "owner@example.org"
+    assert deps.session_factory is loop._session_factory
 
 
 def test_write_deliverable_revalidation_preserves_exact_valid_receipt() -> None:
@@ -1143,6 +1155,16 @@ def test_invalid_request_mid_stream_failures_are_terminal() -> None:
             "message": "Claude Code 2.1.87 does not support this model",
         },
     )
+    assert not _should_continue_after_exhausted_mid_stream_failure(
+        {
+            "category": "invalid_request",
+            "message": "attempted to call tool bash which was not in request.tools",
+        },
+    )
+    # Transient provider failures remain eligible for recovery.
+    assert _should_continue_after_exhausted_mid_stream_failure(
+        {"category": MidStreamErrorCategory.CONNECTION.value},
+    )
 
 
 def test_attachment_recovery_detects_real_transcript_progress() -> None:
@@ -1326,6 +1348,10 @@ def test_stream_accumulator_collects_tool_calls() -> None:
     assert tool_calls[0].name == "step_complete"
     assert tool_calls[0].arguments == {"summary": "done"}
     assert tool_calls[0].call_id == "call_123"
+    assert tool_calls[0].runtime_metadata["provider_arguments_json"] == '{"summary": "done"}'
+    events = []
+    _append_tool_call_event(events, tool_calls[0])
+    assert events[0].data["provider_arguments_json"] == '{"summary": "done"}'
 
 
 def test_stream_accumulator_preserves_text_when_tool_calls_follow() -> None:
@@ -2812,9 +2838,21 @@ async def test_run_step_uses_step_local_pending_events_on_concurrent_failures(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "memory_search",
+        "executor_pool_reminder",
+        "orchestration_capability_guidance",
+        "edit_tool_guidance",
+    ],
+)
 async def test_record_outgoing_audit_messages_copies_replay_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    source: str,
 ) -> None:
+    from cognis.core.context import events_to_messages
+
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
@@ -2852,36 +2890,30 @@ async def test_record_outgoing_audit_messages_copies_replay_metadata(
         turn_id="turn-1",
     )
 
-    await agent_loop._record_outgoing_audit_messages(
-        ctx,
-        [
-            {
-                "role": "developer",
-                "source": "memory_search",
-                "content": '<memory_context trust="untrusted">remembered</memory_context>',
-                "content_type": "text",
-                "position": 3,
-                "hash": "hash",
-                "metadata": {
-                    "context_injection": True,
-                    "replayable": True,
-                    "replay_scope": "same_session",
-                    "visibility": "agent_context",
-                    "model_role": "system",
-                    "trust": "untrusted",
-                },
-            }
-        ],
+    content = '<memory_context trust="untrusted">remembered</memory_context>'
+    pending: list[dict[str, Any]] = []
+    agent_loop._append_pending_audit_message(
+        [{"role": "system", "content": content}],
+        pending,
+        role="developer",
+        source=source,
+        content=content,
     )
+    await agent_loop._record_outgoing_audit_messages(ctx, pending)
 
     assert len(captured) == 1
     assert captured[0].type == "developer_message"
-    assert captured[0].data["source"] == "memory_search"
+    assert captured[0].data["source"] == source
     assert captured[0].data["turn_id"] == "turn-1"
     assert captured[0].data["context_injection"] is True
     assert captured[0].data["replayable"] is True
     assert captured[0].data["visibility"] == "agent_context"
     assert captured[0].data["model_role"] == "system"
+    replayed = events_to_messages([{"type": captured[0].type, "data": captured[0].data}])
+    assert len(replayed) == 1
+    assert replayed[0]["role"] == "system"
+    assert replayed[0]["content"] == content
+    assert replayed[0]["_audit_metadata"]["replayable"] is True
 
 
 @pytest.mark.asyncio
@@ -3526,8 +3558,9 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
         parent_agent: AgentDefinition,
         *,
         user_email: str,
+        project_id: str | None = None,
     ) -> AgentDefinition:
-        del child_agent_id, parent_agent, user_email
+        del child_agent_id, parent_agent, user_email, project_id
         return AgentDefinition(
             agent_id="system:code-review",
             owner_email="system",
@@ -3767,8 +3800,12 @@ async def test_run_child_session_uses_explicit_runtime_workdir() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fence_kind", ["direct", "task", "none"])
+@pytest.mark.parametrize("child_outcome", ["completed", "cancelled", "stale_task"])
 async def test_run_child_session_async_preserves_explicit_workspace_context(
     monkeypatch: pytest.MonkeyPatch,
+    fence_kind: str,
+    child_outcome: str,
 ) -> None:
     captured_kwargs: dict[str, object] = {}
     published_events: list[object] = []
@@ -3792,6 +3829,13 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
 
     async def _fake_run_child_session(**kwargs: object) -> StepOutput:
         captured_kwargs.update(kwargs)
+        child_fence = kwargs.get("execution_fence")
+        if child_fence is not None:
+            await child_fence.assert_current()
+        if child_outcome == "cancelled":
+            raise asyncio.CancelledError
+        if child_outcome == "stale_task":
+            raise StaleTaskExecutionOwner("task-parent")
         on_tool_call = kwargs.get("on_tool_call")
         if callable(on_tool_call):
             await on_tool_call("grep", "call-child-1", {"pattern": "x"})
@@ -3806,7 +3850,39 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
     monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
     monkeypatch.setattr(agent_loop, "_untrack_child", _fake_untrack_child)
     cancel_event = asyncio.Event()
-    execution_fence = SimpleNamespace()
+    execution_fence = None
+    if fence_kind == "direct":
+        # The spawning direct turn has completed before the child resumes.
+        execution_fence = DirectTurnExecutionFence(
+            store=SimpleNamespace(
+                has_fence=AsyncMock(return_value=False),
+                get=AsyncMock(
+                    return_value=SimpleNamespace(
+                        status="completed",
+                        cancel_requested_at=None,
+                        fencing_token=1,
+                        owner_controller_id="controller",
+                        owner_incarnation_id="incarnation",
+                        conversation_id="conv-1",
+                    )
+                ),
+            ),
+            request_id="dtr-parent",
+            lease=SimpleNamespace(
+                fencing_token=1,
+                owner_id="controller:incarnation",
+                resource_key="direct-turn:conversation:conv-1",
+            ),
+        )
+        with pytest.raises(StaleDirectTurnOwner):
+            await execution_fence.assert_current()
+    elif fence_kind == "task":
+        execution_fence = TaskExecutionFence(
+            store=SimpleNamespace(),
+            claim=SimpleNamespace(task_id="task-parent"),
+            cancel_event=cancel_event,
+        )
+        monkeypatch.setattr(execution_fence, "assert_current", AsyncMock())
 
     await agent_loop._run_child_session_async(
         child_session=_SessionStub(
@@ -3841,8 +3917,15 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
     assert captured_kwargs["working_directory_explicit"] is True
     assert captured_kwargs["parent_turn_cycle_index"] == 4
     assert captured_kwargs["cancel_event"] is cancel_event
-    assert captured_kwargs["execution_fence"] is execution_fence
+    if fence_kind == "direct":
+        assert isinstance(captured_kwargs["execution_fence"], BackgroundDirectTurnFence)
+        assert captured_kwargs["execution_fence"].parent is execution_fence
+    else:
+        assert captured_kwargs["execution_fence"] is execution_fence
     assert captured_kwargs["untracked"] == ("parent", "child")
+    if child_outcome != "completed":
+        assert not published_events
+        return
     assert published_events
     progress_events = [
         event
@@ -3855,6 +3938,13 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
     assert progress_events[0].data["turn_cycle_index"] == 4
     assert progress_events[0].data["tool_call_count"] == 1
     assert progress_events[0].data["last_tool"] == "grep"
+    follow_up_events = [
+        event
+        for event in published_events
+        if getattr(event, "type", None) == EventType.FOLLOW_UP_TURN_REQUESTED
+    ]
+    assert len(follow_up_events) == 1
+    assert "done" in str(follow_up_events[0].data)
 
 
 @pytest.mark.asyncio
@@ -4489,6 +4579,17 @@ class _SilentThenRecoveredDirectLLM:
         yield {"choices": [{"delta": {"content": "Recovered after silence."}}]}
 
 
+@pytest.fixture
+def _configured_model_error_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the synthetic download failure to its explicit controller origin."""
+    monkeypatch.setenv("COGNIS_PUBLIC_BASE_URL", "https://cognis.example.com")
+    monkeypatch.setattr(
+        agent_loop_module,
+        "_COGNIS_ARTIFACT_URL_RE",
+        agent_loop_module._artifact_url_pattern(),
+    )
+
+
 class _ModelErrorThenRecoveredDirectLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -4507,12 +4608,12 @@ class _ModelErrorThenRecoveredDirectLLM:
             if len(self.calls) == 2:
                 assert "report.pdf" in str(messages)
                 assert (
-                    "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+                    "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
                     not in str(messages)
                 )
             raise RuntimeError(
                 'BadRequestError: {"error":{"message":"Timeout while downloading '
-                'https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf.",'
+                'https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf.",'
                 '"param": "url"}}'
             )
         yield {"choices": [{"delta": {"content": "Recovered after model error."}}]}
@@ -4538,7 +4639,7 @@ class _AlwaysRateLimitedDirectLLM:
             payload={
                 "category": MidStreamErrorCategory.RATE_LIMIT.value,
                 "message": "This request would exceed your account's rate limit. Please try again later.",
-                "provider_id": "anthropic-lumilens",
+                "provider_id": "anthropic-sample",
                 "model": "claude-fable-5",
                 "status_code": 429,
                 "retry_after_seconds": self.retry_after_seconds,
@@ -4568,12 +4669,132 @@ class _RateLimitedThenRecoveredDirectLLM:
                 payload={
                     "category": MidStreamErrorCategory.RATE_LIMIT.value,
                     "message": "Rate limited; retry later.",
-                    "provider_id": "anthropic-lumilens",
+                    "provider_id": "anthropic-sample",
                     "model": "claude-fable-5",
                     "retry_after_seconds": self.retry_after_seconds,
                 },
             )
         yield {"choices": [{"delta": {"content": "Recovered after rate limit."}}]}
+
+
+class _UnknownRejectedToolThenRecoveredDirectLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            raise LLMStreamProviderError(
+                "MidStreamFallbackError: attempted to call tool "
+                "'repo_browser.list_directory' which was not in request.tools",
+                payload={
+                    "category": MidStreamErrorCategory.INVALID_REQUEST.value,
+                    "message": "executor: attempted to call tool "
+                    "'repo_browser.list_directory' which was not in request.tools",
+                },
+            )
+        assert any(
+            message["role"] == "system" and "search_tools" in str(message.get("content", ""))
+            for message in messages
+        )
+        yield {"choices": [{"delta": {"content": "Recovered after tool correction."}}]}
+
+
+class _NamedRejectedToolCycleLLM:
+    def __init__(self, *, behavior: str, rejected_name: str = "bash") -> None:
+        self.behavior = behavior
+        self.rejected_name = rejected_name
+        self.calls: list[list[dict[str, object]]] = []
+        self.tool_names: list[list[str]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+        self.calls.append([dict(message) for message in messages])
+        raw_tools = kwargs.get("tools", [])
+        names = [
+            schema["function"]["name"]
+            for schema in raw_tools
+            if isinstance(schema, dict)
+            and isinstance(schema.get("function"), dict)
+            and isinstance(schema["function"].get("name"), str)
+        ]
+        self.tool_names.append(names)
+        if self.behavior == "aggregate":
+            rejected = f"unknown_tool_{len(self.calls)}"
+            raise LLMStreamProviderError(
+                f"attempted to call tool '{rejected}' which was not in request.tools",
+                payload={
+                    "category": MidStreamErrorCategory.INVALID_REQUEST.value,
+                    "message": f"attempted to call tool '{rejected}' "
+                    "which was not in request.tools",
+                },
+            )
+        if len(self.calls) == 1:
+            if self.behavior == "raw":
+                from litellm import BadRequestError
+
+                raise BadRequestError(
+                    f"GroqException: attempted to call tool '{self.rejected_name}' "
+                    "which was not in request.tools",
+                    model="groq/gpt-oss",
+                    llm_provider="groq",
+                )
+            if self.behavior == "partial":
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_rejected_partial",
+                                        "function": {
+                                            "name": self.rejected_name,
+                                            "arguments": '{"command":"must not run"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            raise LLMStreamProviderError(
+                f"MidStreamFallbackError: attempted to call tool '{self.rejected_name}' "
+                "which was not in request.tools",
+                payload={
+                    "category": MidStreamErrorCategory.INVALID_REQUEST.value,
+                    "message": f"executor: attempted to call tool '{self.rejected_name}' "
+                    "which was not in request.tools",
+                },
+            )
+        if self.behavior == "repeat":
+            raise LLMStreamProviderError(
+                f"attempted to call tool '{self.rejected_name}' which was not in request.tools",
+                payload={
+                    "category": MidStreamErrorCategory.INVALID_REQUEST.value,
+                    "message": f"attempted to call tool '{self.rejected_name}' "
+                    "which was not in request.tools",
+                },
+            )
+        assert self.rejected_name not in names
+        assert "call_tool" in names
+        assert any("through `call_tool`" in str(m.get("content", "")) for m in messages)
+        yield {"choices": [{"delta": {"content": "Recovered with a plain-text answer."}}]}
 
 
 class _ImageInputErrorThenRecoveredDirectLLM:
@@ -4601,10 +4822,11 @@ class _ImageInputErrorThenRecoveredDirectLLM:
                 },
             )
         assert "photo.png" in str(messages)
-        assert "https://cognis.fpy.cz/api/v1/artifacts/content/images/img_1/photo.png" not in str(
-            messages
+        assert (
+            "https://cognis.example.com/api/v1/artifacts/content/images/img_1/photo.png"
+            not in str(messages)
         )
-        assert "https://cognis.fpy.cz/api/v1/artifacts/content/images/img_2/good.png" in str(
+        assert "https://cognis.example.com/api/v1/artifacts/content/images/img_2/good.png" in str(
             messages
         )
         yield {"choices": [{"delta": {"content": "Recovered without native image."}}]}
@@ -4630,8 +4852,9 @@ class _CodexImageDownloadTimeoutThenRecoveredDirectLLM:
                 "from the provided URL before the timeout.",
             )
         assert "photo.png" in str(messages)
-        assert "https://cognis.fpy.cz/api/v1/artifacts/content/images/img_1/photo.png" not in str(
-            messages
+        assert (
+            "https://cognis.example.com/api/v1/artifacts/content/images/img_1/photo.png"
+            not in str(messages)
         )
         yield {"choices": [{"delta": {"content": "Recovered after Codex attachment timeout."}}]}
 
@@ -4790,8 +5013,8 @@ class _FakeNativeImageContextAssembler:
         disabled_urls = set(kwargs.get("disabled_artifact_urls") or [])
         disabled_ids = set(kwargs.get("disabled_artifact_ids") or [])
         image_urls = {
-            "img_1": "https://cognis.fpy.cz/api/v1/artifacts/content/images/img_1/photo.png",
-            "img_2": "https://cognis.fpy.cz/api/v1/artifacts/content/images/img_2/good.png",
+            "img_1": "https://cognis.example.com/api/v1/artifacts/content/images/img_1/photo.png",
+            "img_2": "https://cognis.example.com/api/v1/artifacts/content/images/img_2/good.png",
         }
         content: list[dict[str, object]] = [
             {"type": "text", "text": "photo.png artifact_id=img_1, good.png artifact_id=img_2"}
@@ -8609,6 +8832,9 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
             mime_type="image/png",
             size_bytes=12,
             status="attached",
+            owner_agent_id="controller-agent",
+            conversation_id=controller.conversation_id,
+            session_id="controller-session",
         )
         await db_session.commit()
 
@@ -9602,6 +9828,12 @@ class _NoopSessionCache:
     def get_model_override(self, _: str) -> None:
         return None
 
+    def get_loaded_skill_snapshots(self, _: str) -> dict[str, dict[str, object]]:
+        return {}
+
+    def get_events_since_compaction(self, _: str, types: list[str] | None = None) -> list[object]:
+        return []
+
     def get_reasoning_effort_override(self, _: str) -> None:
         return None
 
@@ -9789,6 +10021,171 @@ async def test_handle_delegate_defaults_to_sync_from_managed_agent_conversation(
     payload = json.loads(result.output)
     assert payload["status"] == "completed"
     assert captured["wait"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", [False, True])
+async def test_joined_delegate_yields_to_scheduler_question_and_preserves_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    stop: bool,
+) -> None:
+    from cognis.core.events import Event, EventBus, EventType
+    from cognis.core.followups import (
+        FollowUpMode,
+        FollowUpOriginKind,
+        FollowUpRelevanceHint,
+        FollowUpRequiredAction,
+        FollowUpStatus,
+        QuestionFollowUp,
+        render_follow_up_block,
+    )
+    from cognis.core.questions import QuestionOrigin
+    from cognis.core.turn_scheduler import TurnScheduler, _QueuedMessage
+
+    bus = EventBus()
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=bus,
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=loop,
+        pause_waiter=loop.pause_waiter,
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    done = asyncio.Event()
+    cancelled = asyncio.Event()
+    completions: list[Event] = []
+
+    async def intake(event: Event) -> None:
+        if event.data["follow_up"]["origin_kind"] == "delegation_result":
+            completions.append(event)
+            done.set()
+            return
+        follow_up = QuestionFollowUp.model_validate(event.data["follow_up"])
+        scheduler._queued_messages["conv-1"].append(
+            _QueuedMessage(
+                content=render_follow_up_block(follow_up),
+                user_email="user@example.com",
+                system_initiated=True,
+                follow_up=follow_up,
+            )
+        )
+        scheduler._signal_boundary_input_change("conv-1")
+
+    bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, intake)
+    answered = asyncio.Event()
+
+    async def child(**kwargs: Any) -> StepOutput:
+        request = QuestionFollowUp(
+            follow_up_id="question-join",
+            mode=FollowUpMode.INTEGRATE,
+            origin_kind=FollowUpOriginKind.QUESTION,
+            relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+            required_action=FollowUpRequiredAction.ANSWER_QUESTION,
+            status=FollowUpStatus.PAUSED,
+            question_id="question-join",
+            revision=1,
+            origin=QuestionOrigin(
+                conversation_id="conv-1",
+                session_id="child-1",
+                agent_id="system:explore",
+                tool_call_id="ask-1",
+                tool_name="request_user_input",
+            ),
+            questions=[{"id": "scope", "question": "Which scope?"}],
+        )
+        await bus.publish(
+            Event(
+                type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                data={"conversation_id": "conv-1", "follow_up": request.model_dump(mode="json")},
+            )
+        )
+        try:
+            await answered.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return StepOutput(summary="done", content="done")
+
+    async def create_child(*args: Any, **kwargs: Any) -> Any:
+        return ToolResult(output=json.dumps({"status": "started"})), SimpleNamespace(
+            session_id="child-1",
+            intaris_session_id="child-1",
+            agent_id="system:explore",
+        )
+
+    monkeypatch.setattr(agent_loop_module, "handle_delegate_tool_call", create_child)
+    monkeypatch.setattr(loop, "_run_child_session", child)
+    monkeypatch.setattr(loop, "_record_events_strict", AsyncMock(return_value=True))
+    ctx = StepContext(
+        step_definition=StepDefinition(name="parent", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="worker",
+        ),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="worker",
+            context=ConversationContext(type="agent_work", platform_data={"kind": "agent_work"}),
+        ),
+        agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+        wait_for_boundary_input=lambda generation: scheduler.wait_for_boundary_input(
+            "conv-1",
+            after_generation=generation,
+        ),
+        get_boundary_action_generation=lambda: scheduler.boundary_action_generation("conv-1"),
+    )
+    result = await asyncio.wait_for(
+        loop._handle_delegate(
+            ToolCall(
+                call_id="delegate-1",
+                name="delegate",
+                arguments={"task": "Investigate.", "agent_id": "system:explore"},
+            ),
+            ctx=ctx,
+            events_to_record=[],
+        ),
+        timeout=1,
+    )
+    assert json.loads(result.output)["wait_yield_reason"] == "queued_completion"
+    assert not cancelled.is_set()
+    assert loop._active_children["sess-1"]
+    scheduler._queued_messages["conv-1"].clear()
+    if stop:
+        assert await loop.cancel_children("sess-1") == 1
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        if loop._joined_child_observers:
+            await asyncio.gather(*loop._joined_child_observers)
+        assert completions == []
+    else:
+        answered.set()
+        await asyncio.wait_for(done.wait(), timeout=1)
+        assert completions[0].data["follow_up"]["status"] == "completed"
+    assert "sess-1" not in loop._active_children
 
 
 @pytest.mark.asyncio
@@ -9981,9 +10378,9 @@ def test_controller_orchestration_schema_and_validation_share_target_snapshot() 
             ),
             managed=(
                 OrchestrationTarget(
-                    agent_id="lumi",
-                    name="Lumi",
-                    description="Lumilens primary agent",
+                    agent_id="operations",
+                    name="Operations",
+                    description="Sample primary agent",
                     agent_type="primary",
                     is_system=False,
                     profiles=(),
@@ -9999,7 +10396,7 @@ def test_controller_orchestration_schema_and_validation_share_target_snapshot() 
     }
 
     assert schemas["delegate"]["properties"]["agent_id"]["enum"] == ["system:code-review"]
-    assert schemas["agent_conversation_create"]["properties"]["agent_id"]["enum"] == ["lumi"]
+    assert schemas["agent_conversation_create"]["properties"]["agent_id"]["enum"] == ["operations"]
     assert tool_input_schema(definitions["delegate"]) == schemas["delegate"]
     assert loop._get_controller_tool_parameters("delegate", ctx=ctx) == schemas["delegate"]
     assert (
@@ -10288,6 +10685,8 @@ def test_direct_chat_controller_tools_use_chat_aliases() -> None:
         "action",
         "payload",
         "payload_artifact",
+        "project_id",
+        "supersedes",
     }
     authoritative = next(
         definition for definition in exposure.definitions if definition.name == "write_deliverable"
@@ -10340,11 +10739,16 @@ async def test_attachable_content_ref_accepts_owned_artifact_and_rejects_local_p
         )
 
     monkeypatch.setattr(agent_loop_module, "get_artifact_record", get_artifact_record)
+    authorized = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.artifact_access.artifact_authorized_for_conversation", authorized
+    )
     loop = object.__new__(AgentLoop)
     loop.session_manager = SimpleNamespace(session_factory=session_factory)
     loop.artifact_store = None
     ctx = SimpleNamespace(
-        conversation=SimpleNamespace(conversation_id="conv-1", user_email="user@example.com")
+        conversation=SimpleNamespace(conversation_id="conv-1", user_email="user@example.com"),
+        session=_SessionStub(agent_id="agent-1", session_id="sess-1"),
     )
 
     attachment, deliverable = await loop._resolve_attachable_content_ref(ctx, "art_123")
@@ -10364,6 +10768,12 @@ async def test_attachable_content_ref_accepts_owned_artifact_and_rejects_local_p
     assert generated_image is not None
     assert generated_image.artifact_id == "img_456"
     assert deliverable is None
+    assert authorized.await_args.kwargs["owner_email"] == "user@example.com"
+    assert authorized.await_args.kwargs["agent_id"] == "agent-1"
+    assert authorized.await_args.kwargs["session_id"] == "sess-1"
+    authorized.return_value = False
+    with pytest.raises(ValueError, match="not found or is unavailable"):
+        await loop._resolve_attachable_content_ref(ctx, "art_123")
     with pytest.raises(ValueError, match="persisted content references"):
         await loop._resolve_attachable_content_ref(ctx, "/tmp/result.png")
 
@@ -10381,6 +10791,10 @@ async def test_attachable_missing_deliverable_payload_is_rejected(monkeypatch) -
     )
     monkeypatch.setattr(agent_loop_module, "get_artifact_record", AsyncMock(return_value=None))
     monkeypatch.setattr(
+        "cognis.core.content_refs.authorize_deliverable_access",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
         agent_loop_module,
         "hydrate_deliverable_payload",
         AsyncMock(side_effect=FileNotFoundError("missing content")),
@@ -10389,7 +10803,8 @@ async def test_attachable_missing_deliverable_payload_is_rejected(monkeypatch) -
     loop.session_manager = SimpleNamespace(session_factory=session_factory)
     loop.artifact_store = object()
     ctx = SimpleNamespace(
-        conversation=SimpleNamespace(conversation_id="conv-1", user_email="user@example.com")
+        conversation=SimpleNamespace(conversation_id="conv-1", user_email="user@example.com"),
+        session=_SessionStub(agent_id="agent-1", session_id="sess-1"),
     )
     with pytest.raises(ValueError, match="not found or is unavailable"):
         await loop._resolve_attachable_content_ref(ctx, "dlv_missing_payload")
@@ -11214,6 +11629,7 @@ class _SuccessfulCompactionStrategy:
             method="llm",
             summary="compact summary",
             turns_compacted=3,
+            events_compacted=12,
             tokens_before=100,
             tokens_after=10,
             preserved_tail_events=[],
@@ -11325,9 +11741,11 @@ def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("projected_tokens", [10000, 200000, 300000])
+@pytest.mark.parametrize("recovery_depth", [0, 2])
 async def test_auto_compaction_requires_actual_projected_hard_pressure(
     monkeypatch: pytest.MonkeyPatch,
     projected_tokens: int,
+    recovery_depth: int,
 ) -> None:
     class _HardPressureAssembler:
         async def assemble(self, **_: object) -> SimpleNamespace:
@@ -11404,6 +11822,7 @@ async def test_auto_compaction_requires_actual_projected_hard_pressure(
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
         user_message="Continue.",
+        compaction_recursion_depth=recovery_depth,
     )
 
     output = await agent_loop.run_step(ctx)
@@ -11415,6 +11834,7 @@ async def test_auto_compaction_requires_actual_projected_hard_pressure(
         assert not fake_llm.calls
     else:
         assert output.summary == "Done."
+        assert ctx.compaction_recursion_depth == 0
         assert len(fake_llm.calls) == 1
         assert not auto_compact_saw_model_call
         assert not any(
@@ -11422,6 +11842,114 @@ async def test_auto_compaction_requires_actual_projected_hard_pressure(
             or "prioritize consolidating" in str(message.get("content", ""))
             for message in fake_llm.calls[0]
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_mode", ["safe", "stuck", "productive"])
+async def test_second_compaction_is_measured_before_recovery_limit(
+    monkeypatch: pytest.MonkeyPatch, recovery_mode: str
+) -> None:
+    fake_llm = _RecordingSingleTextLLM()
+    strategy = _SuccessfulCompactionStrategy()
+    manager = _NoopSessionManager()
+    guardrails = _RecordingGuardrails()
+
+    if recovery_mode == "productive":
+
+        async def stream_generate(messages: list[dict[str, object]], **_: object):
+            fake_llm.calls.append([dict(message) for message in messages])
+            if len(fake_llm.calls) < 4:
+                yield {"choices": [{"delta": {"content": "Working."}}]}
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"call-progress-{len(fake_llm.calls)}",
+                                        "type": "function",
+                                        "function": {"name": "lookup", "arguments": "{}"},
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": "Done."}}]}
+
+        monkeypatch.setattr(fake_llm, "stream_generate", stream_generate)
+
+    monkeypatch.setattr(
+        fake_llm,
+        "count_messages_tokens",
+        lambda *_args, **_kwargs: (
+            10_000
+            if (
+                recovery_mode == "safe"
+                and len(strategy.calls) >= 2
+                or recovery_mode == "productive"
+                and len(strategy.calls) > len(fake_llm.calls)
+            )
+            else 300_000
+        ),
+        raising=False,
+    )
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=guardrails),
+        session_manager=manager,
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=300_000),
+        compaction_strategy=strategy,
+        tool_router=_LookupToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-recovery-progress",
+            intaris_session_id="sess-recovery-progress",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-recovery-progress"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Continue.",
+    )
+
+    output = await loop.run_step(ctx)
+
+    assert output is not None
+    if recovery_mode == "productive":
+        assert len(strategy.calls) == 4
+        assert len(manager.rotations) == 4
+        assert len(fake_llm.calls) == 4
+        assert (
+            sum(
+                event.type == "assistant_message" and event.data.get("content") == "Working."
+                for event in guardrails.recorded_events
+            )
+            == 3
+        )
+        assert "Done." in output.content
+        assert ctx.compaction_recursion_depth == 0
+        return
+    assert strategy.calls == ["pre_model_pressure", "pre_model_pressure"]
+    assert len(manager.rotations) == 2
+    if recovery_mode == "safe":
+        assert output.summary == "Done."
+        assert len(fake_llm.calls) == 1
+        assert ctx.compaction_recursion_depth == 0
+    else:
+        assert not fake_llm.calls
+        assert ctx.compaction_recursion_depth == 2
+        assert output.metadata["context_pressure"]["reason"] == "compaction_recursion_exhausted"
 
 
 def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() -> None:
@@ -11467,10 +11995,11 @@ def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() ->
         {
             "role": "tool",
             "tool_call_id": "call-old",
-            "content": "old result",
+            # Large enough that its placeholder is a material reduction.
+            "content": "old result\n" + "." * 2_000,
             "_tool_name": "bash",
             "_recovery_call_id": "call-old",
-            "_output_size": 10,
+            "_output_size": 2_011,
         },
         {"role": "user", "content": "new turn"},
         {
@@ -11678,10 +12207,11 @@ def _projection_offload_fixture(
         {
             "role": "tool",
             "tool_call_id": "call-old",
-            "content": "old result",
+            # Large enough that its placeholder is a material reduction.
+            "content": "old result\n" + "." * 2_000,
             "_tool_name": "bash",
             "_recovery_call_id": "call-old",
-            "_output_size": 10,
+            "_output_size": 2_011,
         },
         {"role": "user", "content": "new turn"},
         {
@@ -13377,7 +13907,7 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
                     "kind": "pdf",
                     "mime_type": "application/pdf",
                     "filename": "report.pdf",
-                    "url": "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf",
+                    "url": "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf",
                 }
             )
         ],
@@ -13397,7 +13927,9 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
     assert calls[1][-1]["role"] == "system"
     # New prescriptive wording: "non-terminal todos" + terminal-state
     # instruction + do-not-repeat guidance.
-    content = str(calls[1][-1]["content"])
+    content = str(calls[1][-2]["content"])
+    assert calls[1][-2]["role"] == "system"
+    assert "CURRENT POLICY SNAPSHOT" in str(calls[1][-1]["content"])
     assert "non-terminal todos" in content
     assert "'completed'" in content and "'cancelled'" in content
     assert "produce no assistant text" in content
@@ -13454,13 +13986,14 @@ async def test_direct_todo_cleanup_only_can_complete_silently() -> None:
     assert output.summary == "Todo cleanup completed"
     assert output.content == ""
     assert len(fake_llm.calls) == 3
-    assert "non-terminal todos" in str(fake_llm.calls[1][-1]["content"])
+    assert "non-terminal todos" in str(fake_llm.calls[1][-2]["content"])
+    assert fake_llm.calls[1][-2]["role"] == "system"
     assert "previous response was empty" not in str(fake_llm.calls[2])
     assert ctx.todos == [{"content": "keep working", "status": "completed"}]
 
 
 @pytest.mark.asyncio
-async def test_todo_freshness_reminder_repeats_every_ten_cycles_without_accumulating() -> None:
+async def test_todo_freshness_reminder_appends_every_ten_cycles_without_rewriting_history() -> None:
     fake_llm = _RepeatingTodoReminderLLM(tool_cycles=21)
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -13502,10 +14035,11 @@ async def test_todo_freshness_reminder_repeats_every_ten_cycles_without_accumula
         sum(message.get("content") == reminder for message in call) for call in fake_llm.calls
     ]
     assert reminder_counts[10] == 1
-    assert reminder_counts[20] == 1
-    assert reminder_counts[11] == 0
-    assert reminder_counts[21] == 0
-    assert sum(reminder_counts) == 2
+    assert reminder_counts[20] == 2
+    assert reminder_counts[11] == 1
+    assert reminder_counts[21] == 2
+    assert reminder_counts[:10] == [0] * 10
+    assert reminder_counts[10:20] == [1] * 10
     assert ctx.profile_switch_agentic_step_count == 22
     assert ctx.profile_switch_todo_last_reminder_cycle == 20
 
@@ -13902,7 +14436,7 @@ def test_native_search_limit_fallback_projects_hidden_history_through_bridge() -
     assert projected[1]["tool_call_id"] == "call_gmail"
 
 
-def test_dynamic_integration_is_deferred_unless_explicit_or_activated() -> None:
+def test_dynamic_integration_stays_deferred_after_activation_unless_explicit() -> None:
     tool = ToolDefinition(
         name="mcp_calendar__search",
         description="Search calendar",
@@ -13925,10 +14459,98 @@ def test_dynamic_integration_is_deferred_unless_explicit_or_activated() -> None:
 
     assert not _tool_visible_by_default(tool, broad, activated_tool_ids=set())
     assert _tool_visible_by_default(tool, explicit, activated_tool_ids=set())
-    assert _tool_visible_by_default(
+    assert not _tool_visible_by_default(
         tool,
         broad,
         activated_tool_ids={"mcp:calendar:search"},
+    )
+
+
+def test_configured_core_groups_are_direct_visible_but_profiles_and_excludes_win() -> None:
+    from cognis.tools.builtin.mcp_management import MANAGE_MCP_TOOL
+
+    filesystem_tool = ToolDefinition(
+        name="read_file",
+        description="Read a file",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        profile_group="filesystem",
+        classification_source="declared",
+    )
+    undeclared_group_tool = ToolDefinition(
+        name="memory_delete",
+        description="Delete a memory",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="memory",
+        profile_group="shell",
+        classification_source="declared",
+    )
+    soft = resolve_step_profile(
+        StepDefinition(
+            name="direct", type="run", prompt="", step_profile_id="system:direct-default"
+        )
+    )
+    hard = ResolvedStepProfile(
+        profile_id=None,
+        mode=StepProfileMode.HARD,
+        config=StepProfileConfig(),
+    )
+    excluded = ResolvedStepProfile(
+        profile_id=None,
+        mode=StepProfileMode.SOFT,
+        config=StepProfileConfig(tool_overrides=StepToolOverrides(exclude=["read_file"])),
+    )
+
+    assert _tool_visible_by_default(
+        filesystem_tool, soft, activated_tool_ids=set(), configured_tool_groups={"filesystem"}
+    )
+    for group in ("filesystem", "shell", "development", "web"):
+        grouped_tool = ToolDefinition(
+            name=f"{group}_operation",
+            description=f"Use the {group} capability",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="executor"),
+            category=group,
+            profile_group=group,
+            classification_source="declared",
+        )
+        assert _tool_visible_by_default(
+            grouped_tool,
+            soft,
+            activated_tool_ids=set(),
+            configured_tool_groups={group},
+        )
+    assert not _tool_visible_by_default(
+        undeclared_group_tool,
+        soft,
+        activated_tool_ids=set(),
+        configured_tool_groups={"filesystem"},
+    )
+    assert not _tool_visible_by_default(
+        filesystem_tool, hard, activated_tool_ids=set(), configured_tool_groups={"filesystem"}
+    )
+    assert not _tool_visible_by_default(
+        filesystem_tool, excluded, activated_tool_ids=set(), configured_tool_groups={"filesystem"}
+    )
+    research = resolve_step_profile(
+        StepDefinition(name="research", type="run", prompt="", step_profile_id="system:research")
+    )
+    shell_tool = ToolDefinition(
+        name="shell_command",
+        description="Run a shell command",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="shell",
+        profile_group="shell",
+        classification_source="declared",
+    )
+    assert not _tool_visible_by_default(
+        shell_tool, research, activated_tool_ids=set(), configured_tool_groups={"shell"}
+    )
+    assert not _tool_visible_by_default(
+        MANAGE_MCP_TOOL, soft, activated_tool_ids=set(), configured_tool_groups={"web"}
     )
 
 
@@ -13950,7 +14572,7 @@ def test_deferred_admin_tool_requires_explicit_include() -> None:
     assert _tool_visible_by_default(MANAGE_AGENTS_TOOL, explicit, activated_tool_ids=set())
     assert not _tool_visible_by_default(MANAGE_MCP_TOOL, broad, activated_tool_ids=set())
     assert _tool_visible_by_default(MANAGE_MCP_TOOL, explicit, activated_tool_ids=set())
-    assert _tool_visible_by_default(
+    assert not _tool_visible_by_default(
         MANAGE_MCP_TOOL,
         broad,
         activated_tool_ids={stable_tool_id(MANAGE_MCP_TOOL)},
@@ -13960,7 +14582,7 @@ def test_deferred_admin_tool_requires_explicit_include() -> None:
     )
 
 
-def test_low_frequency_builtins_are_deferred_unless_explicit_or_activated() -> None:
+def test_low_frequency_builtins_stay_deferred_after_activation_unless_explicit() -> None:
     from cognis.core.tool_deferral import DEFAULT_DEFERRED_BUILTIN_NAMES
     from cognis.tools.builtin.memory import MEMORY_DELETE_TOOL
 
@@ -13974,7 +14596,7 @@ def test_low_frequency_builtins_are_deferred_unless_explicit_or_activated() -> N
     assert MEMORY_DELETE_TOOL.name in DEFAULT_DEFERRED_BUILTIN_NAMES
     assert not _tool_visible_by_default(MEMORY_DELETE_TOOL, broad, activated_tool_ids=set())
     assert _tool_visible_by_default(MEMORY_DELETE_TOOL, explicit, activated_tool_ids=set())
-    assert _tool_visible_by_default(
+    assert not _tool_visible_by_default(
         MEMORY_DELETE_TOOL,
         broad,
         activated_tool_ids={stable_tool_id(MEMORY_DELETE_TOOL)},
@@ -14035,7 +14657,7 @@ def test_common_builtin_and_executor_tools_remain_default_visible() -> None:
         assert _tool_visible_by_default(tool, broad, activated_tool_ids=set())
 
 
-def test_riker_like_static_surface_reduces_schemas_without_losing_managed_controls() -> None:
+def test_static_surface_reduces_schemas_without_losing_managed_controls() -> None:
     from cognis.api.runtime_support import static_tool_definitions
     from cognis.core.agent_loop import (
         _DEFAULT_DEFERRED_ADMIN_TOOL_NAMES,
@@ -14117,7 +14739,13 @@ def test_responses_output_items_for_persistence_filters_and_caps_payload() -> No
     persisted = _responses_output_items_for_persistence(
         [
             {"type": "reasoning", "id": "rs_1", "encrypted_content": "encrypted"},
-            {"type": "message", "id": "msg_1", "content": "not durable"},
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "durable text", "annotations": []}],
+            },
+            {"type": "image_generation_call", "id": "image_1"},
             {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
             {
                 "type": "apply_patch_call",
@@ -14129,6 +14757,7 @@ def test_responses_output_items_for_persistence_filters_and_caps_payload() -> No
 
     assert [item["type"] for item in persisted] == [
         "reasoning",
+        "message",
         "function_call",
         "apply_patch_call",
     ]
@@ -14168,6 +14797,22 @@ def test_responses_output_items_for_persistence_bounds_delegate_arguments() -> N
         "wait": True,
         "_bounded": "delegate input limited to 4000 chars per string field",
     }
+
+
+def test_large_native_message_does_not_discard_reasoning_and_tool_calls() -> None:
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"}
+    tool_call = {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"}
+    assert _responses_output_items_for_persistence(
+        [
+            reasoning,
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "漢" * (256 * 1024)}],
+            },
+            tool_call,
+        ]
+    ) == [reasoning, tool_call]
 
 
 def test_responses_output_items_for_persistence_truncates_delegate_arguments() -> None:
@@ -14266,33 +14911,45 @@ def test_cycle_cache_breakpoints_move_per_cycle_and_preserve_ttl_order() -> None
 
     assert first_cycle == [
         {"index": 0, "ttl": "1h"},
-        {"index": 2, "ttl": "5m"},
-        {"index": 3, "ttl": "5m"},
+        {"index": 2, "ttl": "1h"},
+        {"index": 3, "ttl": "1h"},
     ]
     assert second_cycle == [
         {"index": 0, "ttl": "1h"},
-        {"index": 2, "ttl": "5m"},
-        {"index": 4, "ttl": "5m"},
+        {"index": 2, "ttl": "1h"},
+        {"index": 4, "ttl": "1h"},
     ]
-    assert [item["ttl"] for item in second_cycle] == ["1h", "5m", "5m"]
+    assert [item["ttl"] for item in second_cycle] == ["1h", "1h", "1h"]
+    auxiliary = _cycle_cache_breakpoints(messages, prefix_index=0, ttl="5m")
+    assert [item["ttl"] for item in auxiliary] == ["5m", "5m", "5m"]
 
 
 @pytest.mark.asyncio
-async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
+@pytest.mark.parametrize("boundary", ["before_first_model_call", "after_assistant_message"])
+async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt(boundary: str) -> None:
     fake_llm = _FakeReminderLLM()
     consumed_reasons: list[str] = []
+    delivered = False
 
     async def _consume_boundary_batch(reason: str) -> list[dict[str, object]]:
+        nonlocal delivered
         consumed_reasons.append(reason)
-        if len(consumed_reasons) > 1:
+        if reason != boundary or delivered:
             return []
+        delivered = True
         return [
             {
                 "content": "Also include the deployment notes.",
                 "attachments": [],
                 "system_initiated": False,
                 "follow_up": None,
-            }
+            },
+            {
+                "content": "Then summarize the remaining risks.",
+                "attachments": [],
+                "system_initiated": False,
+                "follow_up": None,
+            },
         ]
 
     agent_loop = AgentLoop(
@@ -14342,8 +14999,14 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
     assert isinstance(output.error, str)
     assert "after_assistant_message" in consumed_reasons
     assert len(fake_llm.calls) >= 2
-    assert fake_llm.calls[1][-1]["role"] == "user"
-    assert fake_llm.calls[1][-1]["content"] == "Also include the deployment notes."
+    call_index = 0 if boundary == "before_first_model_call" else 1
+    transcript = "\n".join(str(message["content"]) for message in fake_llm.calls[call_index])
+    assert transcript.count("Also include the deployment notes.") == 1
+    assert transcript.count("Then summarize the remaining risks.") == 1
+    assert transcript.index("Also include the deployment notes.") < transcript.index(
+        "Then summarize the remaining risks."
+    )
+    assert consumed_reasons[0] == "before_first_model_call"
 
 
 @pytest.mark.asyncio
@@ -15687,7 +16350,10 @@ async def test_parallel_direct_turn_fence_loss_cancels_sibling_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
+@pytest.mark.parametrize("acknowledged_policy", [False, True])
+async def test_responses_api_tool_cycle_uses_canonical_projection(
+    acknowledged_policy: bool,
+) -> None:
     """Responses API must send canonical projection on every cycle.
 
     Verifies the controller never sends opaque continuation inputs
@@ -15696,6 +16362,22 @@ async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
     canonical projected transcript on the next cycle.
     """
     fake_llm = _ResponsesApiToolCycleLLM()
+    guardrails = _NoopGuardrails()
+    if acknowledged_policy:
+        from cognis.models.session import IntarisSession
+
+        guardrails.get_session = AsyncMock(
+            return_value=IntarisSession(
+                session_id="sess-responses-canonical",
+                user_id="user@example.com",
+                agent_id="agent-1",
+                status="active",
+                policy={"maximum_outcome": "approve", "evaluation_policy_version": "legacy"},
+                policy_revision=4,
+                created_at="2026-10-11T00:00:00Z",
+                updated_at="2026-10-11T00:00:00Z",
+            )
+        )
     registry = ToolRegistry()
     registry.register(
         RegisteredTool(
@@ -15710,7 +16392,7 @@ async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
         )
     )
     agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        providers=SimpleNamespace(llm=fake_llm, guardrails=guardrails),
         session_manager=_NoopSessionManager(),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
@@ -15776,6 +16458,10 @@ async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
     # The model sees the tool result in canonical projection on the second cycle.
     second_messages = fake_llm.calls[1]["messages"]
     assert "lookup result" in str(second_messages)
+    assert "CURRENT POLICY SNAPSHOT" in str(second_messages)
+    assert (
+        '"maximum_outcome": "approve"' if acknowledged_policy else '"maximum_outcome": "unknown"'
+    ) in str(second_messages)
 
 
 @pytest.mark.asyncio
@@ -15808,7 +16494,8 @@ async def test_step_complete_reprompt_is_system_message() -> None:
     )
     calls = await _run_reminder_capture(ctx)
     assert calls[1][-1]["role"] == "system"
-    assert "ensure you have called write_deliverable" in str(calls[1][-1]["content"])
+    assert "ensure you have called write_deliverable" in str(calls[1][-2]["content"])
+    assert calls[1][-2]["role"] == "system"
 
 
 @pytest.mark.asyncio
@@ -15862,7 +16549,8 @@ async def test_direct_empty_response_reprompts_instead_of_failing_step() -> None
     assert output.content == "Recovered direct reply."
     assert len(fake_llm.calls) == 2
     assert fake_llm.calls[1][-1]["role"] == "system"
-    assert "previous response was empty" in str(fake_llm.calls[1][-1]["content"])
+    assert "previous response was empty" in str(fake_llm.calls[1][-2]["content"])
+    assert fake_llm.calls[1][-2]["role"] == "system"
 
 
 @pytest.mark.asyncio
@@ -16052,7 +16740,9 @@ async def test_direct_idle_timeout_continues_after_retry_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_model_error_auto_continues_after_retry_budget() -> None:
+async def test_direct_model_error_auto_continues_after_retry_budget(
+    _configured_model_error_origin: None,
+) -> None:
     fake_llm = _ModelErrorThenRecoveredDirectLLM()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -16187,6 +16877,211 @@ async def test_rate_limit_retry_notice_includes_countdown_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_named_tool_rejection_gets_one_safe_cycle_correction() -> None:
+    fake_llm = _UnknownRejectedToolThenRecoveredDirectLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=0,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-tool-rejection",
+            intaris_session_id="sess-tool-rejection",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-tool-rejection"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-tool-rejection",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    result = await agent_loop.run_step(ctx)
+
+    assert result is not None
+    assert result.content == "Recovered after tool correction."
+    assert len(fake_llm.calls) == 2
+    assert "attempted to call tool" not in str(fake_llm.calls[1])
+
+
+async def _run_known_bash_rejection_cycle(
+    behavior: str,
+) -> tuple[Any, _NamedRejectedToolCycleLLM, Any, list[SessionEvent]]:
+    fake_llm = _NamedRejectedToolCycleLLM(behavior=behavior)
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run shell commands",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                category="shell",
+                profile_group="shell",
+                read_only=True,
+                capabilities=["read"],
+                classification_source="declared",
+            )
+        )
+    )
+
+    class RouterSpy:
+        def __init__(self) -> None:
+            self.calls: list[ToolCall] = []
+
+        async def execute(self, tool_call: ToolCall, **_: object) -> ToolResult:
+            self.calls.append(tool_call)
+            return ToolResult(output="unexpected execution")
+
+    class RecordingSessionCache(_NoopSessionCache):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recorded_events: list[SessionEvent] = []
+
+        async def append_recorded_events(
+            self, _session: object, events: list[SessionEvent], _result: object
+        ) -> None:
+            self.recorded_events.extend(events)
+
+    router = RouterSpy()
+    session_cache = RecordingSessionCache()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=router,
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=0,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="direct", type="run", prompt="", step_profile_id="system:direct-default"
+        ),
+        session=_SessionStub(
+            session_id=f"sess-known-rejection-{behavior}",
+            intaris_session_id=f"sess-known-rejection-{behavior}",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id=f"conv-known-rejection-{behavior}"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            tools={"tool_groups": []},
+        ),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="Use bash",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=False,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id=f"sr-known-rejection-{behavior}",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=registry,
+        executor_connection=None,
+    )
+    return await agent_loop.run_step(ctx), fake_llm, router, session_cache.recorded_events
+
+
+@pytest.mark.asyncio
+async def test_known_hidden_bash_rejection_appends_bridge_guidance_without_schema_change() -> None:
+    result, fake_llm, router, events = await _run_known_bash_rejection_cycle("success")
+    assert result is not None
+    assert result.content == "Recovered with a plain-text answer."
+    assert len(fake_llm.calls) == 2
+    assert "bash" not in fake_llm.tool_names[0]
+    assert fake_llm.tool_names[1] == fake_llm.tool_names[0]
+    assert router.calls == []
+    discoveries = [event.data for event in events if event.data.get("event") == "tool_discovery"]
+    assert discoveries
+    assert discoveries[0]["source_tool"] == "provider_tool_rejection_recovery"
+    assert discoveries[0]["reason"] == "provider_rejected_hidden_authorized_tool"
+    assert discoveries[0]["handles"]
+
+
+@pytest.mark.asyncio
+async def test_raw_litellm_bad_request_retries_with_bridge_guidance() -> None:
+    result, fake_llm, router, _events = await _run_known_bash_rejection_cycle("raw")
+    assert result is not None
+    assert result.content == "Recovered with a plain-text answer."
+    assert len(fake_llm.calls) == 2
+    assert "bash" not in fake_llm.tool_names[0]
+    assert fake_llm.tool_names[1] == fake_llm.tool_names[0]
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_same_named_bash_rejection_twice_stops_after_two_requests() -> None:
+    result, fake_llm, router, _events = await _run_known_bash_rejection_cycle("repeat")
+    assert result is not None
+    assert len(fake_llm.calls) == 2
+    assert "bash" not in fake_llm.tool_names[0]
+    assert fake_llm.tool_names[1] == fake_llm.tool_names[0]
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_distinct_rejected_names_are_bounded_to_four_repairs_per_turn() -> None:
+    result, fake_llm, router, _events = await _run_known_bash_rejection_cycle("aggregate")
+    assert result is not None
+    assert len(fake_llm.calls) == 5
+    assert [
+        sum("use `search_tools`" in str(message.get("content", "")).lower() for message in call)
+        for call in fake_llm.calls
+    ] == [0, 1, 2, 3, 4]
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_call_is_discarded_after_named_rejection() -> None:
+    result, fake_llm, router, _events = await _run_known_bash_rejection_cycle("partial")
+    assert result is not None
+    assert result.content == "Recovered with a plain-text answer."
+    assert len(fake_llm.calls) == 2
+    assert "bash" not in fake_llm.tool_names[0]
+    assert fake_llm.tool_names[1] == fake_llm.tool_names[0]
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("category", "attempts", "successor"),
     [
@@ -16194,23 +17089,39 @@ async def test_rate_limit_retry_notice_includes_countdown_metadata() -> None:
         ("connection", 3, True),
         ("provider_5xx", 3, True),
         ("idle_timeout_activity", 4, True),
+        ("idle_timeout_reasoning", 4, True),
         ("quota_exhausted", 1, False),
         ("content_policy", 1, False),
     ],
 )
+@pytest.mark.parametrize("output_mode", ["legacy", "native", "empty", "role"])
 async def test_exhausted_model_stream_requests_bounded_successor(
-    category: str, attempts: int, successor: bool
+    category: str, attempts: int, successor: bool, output_mode: str
 ) -> None:
     class FailingLLM(_AlwaysRateLimitedDirectLLM):
         async def stream_generate(self, messages, **kwargs):
             self.calls.append([dict(message) for message in messages])
-            yield {"choices": [{"delta": {"content": "Incomplete output"}}]}
+            if output_mode == "native":
+                yield {
+                    "provider_event_type": "response.output_item.done",
+                    "responses_output_item": {"type": "reasoning", "id": "rs_partial"},
+                }
+            elif output_mode == "role":
+                yield {"choices": [{"delta": {"role": "assistant"}}]}
+            elif output_mode == "legacy":
+                yield {"choices": [{"delta": {"content": "Incomplete output"}}]}
             raise LLMStreamProviderError(
                 "Stream failed",
                 payload={"category": category, "message": "Stream failed"},
             )
 
     fake_llm = FailingLLM()
+    if output_mode != "legacy":
+        fake_llm.inference_recovery = object()
+    recoverable = successor
+    if output_mode in {"empty", "role"}:
+        successor = False
+        attempts = 1
     guardrails = _RecordingGuardrails()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=guardrails),
@@ -16274,7 +17185,7 @@ async def test_exhausted_model_stream_requests_bounded_successor(
         "attempts": attempts,
         "continuation_attempts": attempts - 1,
         "tool_results_saved": True,
-        "recoverable": successor,
+        "recoverable": recoverable,
         "transient": False,
         "retry_after_seconds": None,
         "recovery_strategy": "automatic_continuation" if successor else "terminal",
@@ -16288,7 +17199,7 @@ async def test_exhausted_model_stream_requests_bounded_successor(
         if notice.get("kind") == ("model_recovery" if successor else "model_error")
     ][-1]
     assert final_notice["reason_class"] == category
-    assert final_notice["recoverable"] is successor
+    assert final_notice["recoverable"] is recoverable
     assert final_notice["model"] == "test-model"
     assert final_notice["attempts"] == len(fake_llm.calls)
     assert final_notice["attempts_per_cycle"] == 1
@@ -16575,7 +17486,9 @@ async def test_failed_preparation_is_abandoned_before_retry(failure: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_mid_stream_retry_keeps_notice_until_saved_state_continuation() -> None:
+async def test_mid_stream_retry_keeps_notice_until_saved_state_continuation(
+    _configured_model_error_origin: None,
+) -> None:
     fake_llm = _ModelErrorThenRecoveredDirectLLM()
     event_bus = _NoopEventBus()
     guardrails = _NoopGuardrails()
@@ -17025,9 +17938,15 @@ def test_delegated_child_hides_parent_owned_controller_tools(
         "step_complete",
         "write_deliverable",
         "attach_artifact",
-        "step_request_questions",
-        "request_user_input",
+        "answer_question",
+        "forward_question",
     }.isdisjoint(names)
+    question_tool = (
+        "request_user_input"
+        if surface == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
+        else "step_request_questions"
+    )
+    assert question_tool in names
     expected_todo_names = (
         {"todo_write", "todo_list"}
         if surface == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
@@ -17349,9 +18268,9 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
 
     # Primary and secondary delegated children both finish with assistant text.
     primary_agent = AgentDefinition(
-        agent_id="riker",
+        agent_id="coordinator",
         owner_email="user@example.com",
-        name="Riker",
+        name="Coordinator",
         agent_type="primary",
         is_system=False,
     )
@@ -17921,6 +18840,12 @@ async def test_write_deliverable_wraps_non_os_storage_failure(
         raise RuntimeError("backend unavailable")
 
     monkeypatch.setattr(agent_loop_module, "create_deliverable", _storage_failure)
+
+    async def _no_project(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(agent_loop_module, "resolve_new_content_project_id", _no_project)
+    monkeypatch.setattr(agent_loop_module, "lock_document_scope", _no_project)
     ctx = StepContext(
         step_definition=StepDefinition(name="write", type="run", prompt=""),
         session=_SessionStub(session_id="sess-runtime", user_email="user@example.com"),
@@ -17979,6 +18904,12 @@ async def test_write_deliverable_publication_scope_follows_runtime_context(
         raise RuntimeError("captured")
 
     monkeypatch.setattr(agent_loop_module, "create_deliverable", _capture)
+
+    async def _no_project(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(agent_loop_module, "resolve_new_content_project_id", _no_project)
+    monkeypatch.setattr(agent_loop_module, "lock_document_scope", _no_project)
     ctx = StepContext(
         step_definition=StepDefinition(name="write", type="run", prompt=""),
         session=_SessionStub(session_id="sess-runtime", user_email="user@example.com"),
@@ -18385,9 +19316,9 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
     monkeypatch.setattr(agent_loop, "_record_events_strict", _noop_record)
 
     primary_agent = AgentDefinition(
-        agent_id="riker",
+        agent_id="coordinator",
         owner_email="user@example.com",
-        name="Riker",
+        name="Coordinator",
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
@@ -18395,7 +19326,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
-            agent_id="riker",
+            agent_id="coordinator",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=primary_agent,
@@ -19093,8 +20024,12 @@ async def test_switch_agent_profile_reassembles_same_turn_with_new_reasoning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inventory_outcome", ["ready", "failed", "cancelled", "mixed", "reconnected"]
+)
 async def test_switch_executor_refreshes_policy_before_same_turn_tool(
     monkeypatch: pytest.MonkeyPatch,
+    inventory_outcome: str,
 ) -> None:
     from cognis.core.executor_pool import (
         ExecutorAvailability,
@@ -19113,7 +20048,7 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
     old_connection = object()
     new_connection = object()
     old_target = ResolvedExecutorTarget(
-        executor_id="maitrea_riker",
+        executor_id="exec-linux",
         executor_type="websocket",
         is_primary=True,
         selection_source="primary",
@@ -19122,7 +20057,7 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         observed_tools=[{"name": "bash"}],
     )
     new_target = ResolvedExecutorTarget(
-        executor_id="olorin",
+        executor_id="exec-mac",
         executor_type="websocket",
         is_primary=False,
         selection_source="additional",
@@ -19131,19 +20066,22 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         observed_tools=[{"name": "bash"}],
     )
     executor_pool = ExecutorPool(primary=[old_target], additional=[new_target])
+    connection_replaced = False
 
     class _Websocket:
         def get_ready_connection(self, executor_id: str) -> object | None:
-            return new_connection if executor_id == "olorin" else old_connection
+            if connection_replaced and executor_id == "exec-mac":
+                return object()
+            return new_connection if executor_id == "exec-mac" else old_connection
 
         def get_handle_metadata(self, executor_id: str) -> dict[str, object]:
-            assert executor_id == "olorin"
+            assert executor_id == "exec-mac"
             return {
                 "environment": {
-                    "home": "/Users/fpytloun",
-                    "cwd": "/Users/fpytloun/src/cognis",
+                    "home": "/Users/developer",
+                    "cwd": "/Users/developer/src/cognis",
                     "tmpdir": "/var/folders/cognis/tmp",
-                    "hostname": "olorin",
+                    "hostname": "exec-mac",
                 }
             }
 
@@ -19196,6 +20134,10 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         async def stream_generate(self, messages: list[dict[str, object]], **_: object):
             del messages
             self.calls += 1
+            if self.calls == 2 and inventory_outcome == "ready":
+                names = {tool["function"]["name"] for tool in _["tools"]}
+                assert "read" in names
+                assert "list_directory" not in names
             if self.calls == 1:
                 yield {
                     "choices": [
@@ -19207,9 +20149,23 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
                                         "id": "call_switch_executor",
                                         "function": {
                                             "name": "switch_executor",
-                                            "arguments": '{"executor_id":"olorin"}',
+                                            "arguments": '{"executor_id":"exec-mac"}',
                                         },
-                                    }
+                                    },
+                                    *(
+                                        [
+                                            {
+                                                "index": 1,
+                                                "id": "call_mixed_status",
+                                                "function": {
+                                                    "name": "switch_executor",
+                                                    "arguments": '{"executor_id":"exec-mac"}',
+                                                },
+                                            }
+                                        ]
+                                        if inventory_outcome == "mixed"
+                                        else []
+                                    ),
                                 ]
                             }
                         }
@@ -19217,7 +20173,7 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
                 }
                 yield {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}
                 return
-            if self.calls == 2:
+            if self.calls == 2 and inventory_outcome == "ready":
                 yield {
                     "choices": [
                         {
@@ -19251,10 +20207,11 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
             assert args[4] is new_connection
             return ToolResult(output="ok", is_error=False)
 
-    async def _perform_switch(**_: object) -> SwitchOutcome:
+    async def _perform_switch(**kwargs: object) -> SwitchOutcome:
+        order.append("persist:switch")
         return SwitchOutcome(
             status="ok",
-            target=new_target,
+            target=(old_target if kwargs["executor_id"] == "exec-linux" else new_target),
             is_primary=False,
             available_tools=["bash"],
         )
@@ -19278,15 +20235,45 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
             handler=None,
         )
     )
+    replacement_registry = ToolRegistry()
+    replacement_registry.register(registry.get("bash"))
+    from cognis.tools.executor.definitions import executor_tool_definitions
+
+    native = {tool.name: tool for tool in executor_tool_definitions()}
+    registry.register(
+        RegisteredTool(
+            definition=native["list_directory"],
+            handler=None,
+        )
+    )
+    replacement_registry.register(
+        RegisteredTool(
+            definition=native["read"],
+            handler=None,
+        )
+    )
+
+    async def rebuild(connection):
+        nonlocal connection_replaced
+        assert connection is new_connection
+        order.append("inventory")
+        if inventory_outcome == "failed":
+            raise OSError("inventory transport unavailable")
+        if inventory_outcome == "cancelled":
+            raise asyncio.CancelledError()
+        if inventory_outcome == "reconnected":
+            connection_replaced = True
+        return replacement_registry
+
     old_environment = environment_from_metadata(
         {
             "environment": {
-                "home": "/home/riker",
-                "cwd": "/home/riker/src/cognis",
-                "hostname": "maitrea",
+                "home": "/home/developer",
+                "cwd": "/home/developer/src/cognis",
+                "hostname": "exec-linux",
             }
         },
-        executor_id="maitrea_riker",
+        executor_id="exec-linux",
         executor_type="websocket",
         fallback_source="test",
     )
@@ -19301,7 +20288,7 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
     conversation = SimpleNamespace(
         conversation_id="conv-executor-switch",
         agent_id="agent-1",
-        active_executor_id="maitrea_riker",
+        active_executor_id="exec-linux",
         title=None,
         title_source="unset",
         context=SimpleNamespace(type="web", ref=None, platform_data={}),
@@ -19319,13 +20306,14 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         executor_connection=old_connection,
         executor_environment=old_environment,
         executor_pool=executor_pool,
-        active_executor_id="maitrea_riker",
-        workspace_root="/home/riker/src/cognis",
-        working_directory="/home/riker/src/cognis",
+        active_executor_id="exec-linux",
+        workspace_root="/home/developer/src/cognis",
+        working_directory="/home/developer/src/cognis",
         session_policy={"allow_policies": ["shell"]},
         turn_id="turn-executor-switch",
     )
     session_manager = _SessionManager()
+    ctx.rebuild_tool_registry = rebuild
     agent_loop = AgentLoop(
         providers=SimpleNamespace(
             llm=_LLM(),
@@ -19343,24 +20331,43 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         pause_waiter=PauseWaiter(),
     )
 
+    if inventory_outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await agent_loop.run_step(ctx)
+        assert "persist:switch" not in order
+        assert ctx.tool_registry is registry
+        assert ctx.active_executor_id == "exec-linux"
+        return
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
     assert output.content == "done"
+    if inventory_outcome in {"failed", "mixed", "reconnected"}:
+        if inventory_outcome != "reconnected":
+            assert "persist:switch" not in order
+        else:
+            assert order.count("persist:switch") == 2
+        assert "refresh" not in order
+        assert ctx.tool_registry is registry
+        assert ctx.active_executor_id == "exec-linux"
+        assert ctx.executor_connection is old_connection
+        return
+    assert order.index("inventory") < order.index("persist:switch")
+    assert ctx.tool_registry is replacement_registry
     assert order.index("refresh") < order.index("record:switch_result")
     assert order.index("record:switch_result") < order.index("execute:bash")
     assert len(session_manager.policy_refreshes) == 1
     refresh = session_manager.policy_refreshes[0]
     assert refresh["session"] is session
-    assert refresh["workspace_root"] == "/Users/fpytloun/src/cognis"
-    assert refresh["working_directory"] == "/Users/fpytloun/src/cognis"
-    assert cast(Any, refresh["environment"]).executor_id == "olorin"
+    assert refresh["workspace_root"] == "/Users/developer/src/cognis"
+    assert refresh["working_directory"] == "/Users/developer/src/cognis"
+    assert cast(Any, refresh["environment"]).executor_id == "exec-mac"
     assert refresh["session_policy_override"] == {"allow_policies": ["shell"]}
     assert refresh["additional_allowed_paths"] is None
-    assert ctx.active_executor_id == "olorin"
+    assert ctx.active_executor_id == "exec-mac"
     assert ctx.executor_connection is new_connection
-    assert ctx.workspace_root == "/Users/fpytloun/src/cognis"
-    assert ctx.working_directory == "/Users/fpytloun/src/cognis"
+    assert ctx.workspace_root == "/Users/developer/src/cognis"
+    assert ctx.working_directory == "/Users/developer/src/cognis"
 
 
 def test_switch_to_concrete_default_profile_is_not_synthetic_noop() -> None:
@@ -19555,11 +20562,13 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> None:
+async def test_search_tools_invokes_discovered_tool_without_changing_schema_across_turns() -> None:
     class _DiscoveryLLM:
         def __init__(self) -> None:
             self.calls = 0
             self.tool_sets: list[list[str]] = []
+            self.schemas: list[str] = []
+            self.requests: list[list[dict[str, object]]] = []
 
         async def get_model_info(self, model: str | None) -> SimpleNamespace:
             del model
@@ -19570,7 +20579,8 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
             return len(text)
 
         async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
-            del messages
+            self.requests.append(deepcopy(messages))
+            self.schemas.append(json.dumps(kwargs.get("tools", []), sort_keys=True))
             self.calls += 1
             tool_names: list[str] = []
             for schema in kwargs.get("tools", []):
@@ -19605,6 +20615,31 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
                     ]
                 }
                 return
+            if self.calls == 2:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_calendar",
+                                        "function": {
+                                            "name": "call_tool",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "tool": stable_tool_id(get_events),
+                                                    "arguments": {},
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                }
+                return
             yield {"choices": [{"delta": {"content": f"done {self.calls}"}}]}
 
     get_events = ToolDefinition(
@@ -19636,6 +20671,7 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
     registry.register(RegisteredTool(definition=get_events, handler=None))
     registry.register(RegisteredTool(definition=rohlik_orders, handler=None))
     fake_llm = _DiscoveryLLM()
+    router = SimpleNamespace(execute=AsyncMock(return_value=ToolResult(output="calendar evidence")))
     session_cache = SessionCache(_NoopGuardrails(), max_entries=10)
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -19643,7 +20679,7 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
         session_cache=session_cache,
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
+        tool_router=router,
         remember_queue=_NoopRememberQueue(),
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
@@ -19683,6 +20719,14 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
 
     assert first_output is not None
     assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[0]
+    assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[1]
+    assert len(set(fake_llm.schemas)) == 1
+    router.execute.assert_awaited_once()
+    assert router.execute.call_args.args[0].name == get_events.name
+    assert any(
+        m.get("role") == "tool" and "matches" in str(m.get("content")) for m in fake_llm.requests[1]
+    )
+    assert any("calendar evidence" in str(m.get("content")) for m in fake_llm.requests[2])
     assert stable_tool_id(get_events) in session_cache.get_discovered_tool_ids(session.session_id)
 
     second_output = await agent_loop.run_step(
@@ -19704,7 +20748,7 @@ async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> Non
     )
 
     assert second_output is not None
-    assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[2]
+    assert len(set(fake_llm.schemas)) == 1
 
 
 def test_task_control_surface_keeps_task_operations_direct() -> None:
@@ -19959,8 +21003,135 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
         stable_tool_id(hidden_tool)
     ]
     assert llm.kwargs[0]["cognis_session_id"] == "sess-skill"
-    # Promoted tool ids must also include the activated tool so it surfaces next turn.
-    assert stable_tool_id(hidden_tool) in promoted_tool_ids
+    # Eligibility must not promote a schema into the immutable prefix.
+    assert promoted_tool_ids == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference_kind", ["server_name", "callable", "stable_id", "raw_name"])
+@pytest.mark.parametrize("registry_source", ["context", "provider"])
+@pytest.mark.parametrize(
+    "restriction", ["none", "denied", "excluded", "hard_excluded", "missing", "ambiguous"]
+)
+async def test_skill_activation_canonicalizes_declared_inventory_references(
+    reference_kind: str, restriction: str, registry_source: str
+) -> None:
+    tool = ToolDefinition(
+        name="mcp_slack-sample__conversations_search_messages",
+        description="Search Slack messages.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_id="mcp_111111111111",
+            server_name="slack-sample",
+            raw_tool_name="conversations_search_messages",
+        ),
+        category="mcp",
+        read_only=True,
+    )
+    references = {
+        "server_name": "mcp:slack-sample:conversations_search_messages",
+        "callable": tool.name,
+        "stable_id": stable_tool_id(tool),
+        "raw_name": "conversations_search_messages",
+    }
+    registry = ToolRegistry()
+    if restriction != "missing":
+        registry.register(RegisteredTool(definition=tool, handler=None))
+    if restriction == "ambiguous":
+        duplicate = tool.model_copy(
+            update={
+                "name": "mcp_slack-second__conversations_search_messages",
+                "source": tool.source.model_copy(update={"server_id": "mcp_second_workspace"}),
+            }
+        )
+        registry.register(RegisteredTool(definition=duplicate, handler=None))
+    cache = _NoopSessionCache()
+    loop = AgentLoop(
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(), guardrails=_NoopGuardrails(), _tool_registry=registry
+        ),
+        session_manager=_NoopSessionManager(),
+        session_cache=cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+            step_profile_mode=(
+                StepProfileMode.HARD if restriction == "hard_excluded" else StepProfileMode.SOFT
+            ),
+            step_profile=StepProfileConfig(
+                tool_overrides=StepToolOverrides(
+                    exclude=[stable_tool_id(tool)]
+                    if restriction in {"excluded", "hard_excluded"}
+                    else []
+                )
+            ),
+        ),
+        session=_SessionStub(session_id="sess-bindings", intaris_session_id="sess-bindings"),
+        conversation=SimpleNamespace(conversation_id="conv-bindings"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            permissions=AgentPermissions(
+                tool_permissions=(
+                    {stable_tool_id(tool): Permission.DENY} if restriction == "denied" else {}
+                )
+            ),
+        ),
+        tool_registry=registry if registry_source == "context" else None,
+        policy=CHAT_POLICY,
+    )
+    promoted: set[str] = set()
+    activated: set[str] = set()
+    activation = await loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {"skill_id": "skill_weekly", "name": "weekly"},
+            "discovered_tool_ids": [references[reference_kind]],
+        },
+        promoted_tool_ids=promoted,
+        activated_tool_ids=activated,
+    )
+    expected = (
+        {stable_tool_id(tool)}
+        if restriction == "none"
+        or (restriction == "ambiguous" and reference_kind in {"stable_id", "callable"})
+        else set()
+    )
+    assert promoted == set()
+    assert activated == expected
+    assert cache.activated_skill_tool_ids == expected
+    assert activation is not None
+    assert activation.tool_ids == expected
+    notice = activation.notice
+    assert notice is not None
+    if expected:
+        assert f"{tool.name} ({stable_tool_id(tool)})" in notice
+        ctx.agent.skills = {"_auto_loaded_skill_tool_ids": [references[reference_kind]]}
+        cache.activated_skill_tool_ids.add(references[reference_kind])
+        assert loop._get_initial_promoted_tool_ids(ctx) == set()
+        assert loop._get_initial_activated_tool_ids(ctx) == expected
+    else:
+        assert "were not enabled" in notice
+        assert references[reference_kind] in notice
+    if restriction in {"denied", "excluded", "hard_excluded"}:
+        ctx.agent.skills = {"_auto_loaded_skill_tool_ids": [references[reference_kind]]}
+        cache.activated_skill_tool_ids.add(references[reference_kind])
+        assert loop._get_initial_promoted_tool_ids(ctx) == set()
+        assert loop._get_initial_activated_tool_ids(ctx) == set()
+    assert cache.skill_tool_classifications == {}
 
 
 @pytest.mark.asyncio
@@ -20396,7 +21567,7 @@ async def test_skill_activation_emits_transparency_notice_to_model() -> None:
 
     activated_tool_ids: set[str] = set()
     promoted_tool_ids: set[str] = set()
-    notice = await agent_loop._apply_skill_activation(
+    activation = await agent_loop._apply_skill_activation(
         ctx,
         metadata={
             "skill_activation": {
@@ -20413,6 +21584,8 @@ async def test_skill_activation_emits_transparency_notice_to_model() -> None:
         activated_tool_ids=activated_tool_ids,
     )
 
+    assert activation is not None
+    notice = activation.notice
     assert notice is not None, "expected an activation notice"
     assert "<skill_activation" in notice
     assert "browser_open" in notice
@@ -20464,7 +21637,7 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
     assert output.outcome.status == "failed"
     assert output.outcome.reason == "git identity missing"
     assert len(fake_llm.calls) == 2
-    second_prompt = str(fake_llm.calls[1][-1]["content"])
+    second_prompt = str(fake_llm.calls[1][-2]["content"])
     assert "invalid_step_complete_arguments" in second_prompt
     assert "outcome.reason" in second_prompt
 
@@ -21668,9 +22841,7 @@ def test_initial_skill_tool_ids_include_auto_loaded_skill_tools() -> None:
         ),
     )
 
-    assert agent_loop._get_initial_promoted_tool_ids(ctx) == {
-        "builtin:auto",
-    }
+    assert agent_loop._get_initial_promoted_tool_ids(ctx) == set()
     assert agent_loop._get_initial_activated_tool_ids(ctx) == {
         "builtin:auto",
         "builtin:existing",
@@ -21886,7 +23057,14 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
     async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
         return SimpleNamespace(
-            task_id="task-1", created_by="user@example.com", agent_id="agent-1", status="paused"
+            task_id="task-1",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            status="paused",
+            workflow_state={
+                "pending_pause_type": "gate",
+                "pending_pause_payload": {"pause_id": "gate-1"},
+            },
         )
 
     from unittest.mock import patch
@@ -21968,7 +23146,14 @@ async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> N
     async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
         return SimpleNamespace(
-            task_id="task-1", created_by="user@example.com", agent_id="agent-1", status="paused"
+            task_id="task-1",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            status="paused",
+            workflow_state={
+                "pending_pause_type": "gate",
+                "pending_pause_payload": {"pause_id": "gate-1"},
+            },
         )
 
     from unittest.mock import patch
@@ -22155,7 +23340,11 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
             delivery_mode="same_conversation",
             delivery_target=None,
             workflow_id="wf-1",
-            workflow_state=WorkflowState(current_step_index=0).model_dump(mode="json"),
+            workflow_state=WorkflowState(
+                current_step_index=0,
+                pending_pause_type="gate",
+                pending_pause_payload={"pause_id": "gate-1"},
+            ).model_dump(mode="json"),
             queue_name="default",
             scheduled_for=None,
             created_at=None,
@@ -22379,7 +23568,10 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
     assert json.loads(result.output)["task_id"] == "task-1"
 
 
-def test_tool_runtime_metadata_uses_executor_agent_for_runtime_access() -> None:
+@pytest.mark.parametrize("mode", ["default", "plan", "build"])
+def test_tool_runtime_metadata_uses_executor_agent_for_runtime_access(mode) -> None:
+    from cognis.core.chat_modes import ResolvedChatMode
+
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
@@ -22422,7 +23614,10 @@ def test_tool_runtime_metadata_uses_executor_agent_for_runtime_access() -> None:
         policy=CHAT_POLICY,
     )
 
+    ctx.chat_mode = ResolvedChatMode(mode=mode, source="one_shot")
     metadata = agent_loop._tool_runtime_metadata(ctx)  # noqa: SLF001
+    assert metadata["chat_mode"] == mode
+    assert "read_only_required" not in metadata
 
     assert metadata["runtime_access"]["agent_id"] == "agent-b"
     assert metadata["runtime_access"]["agent_owner_email"] == "user@example.com"
@@ -22969,6 +24164,8 @@ def test_append_assistant_deliverable_event_uses_valid_reference_event_shape() -
     assert event.data == {
         "event": "assistant_deliverable",
         "deliverable_id": "dlv-direct",
+        "lineage_id": "dlv-direct",
+        "revision": 1,
         "format": "rich",
         "title": "Rich report",
         "render_metadata": {"schema": "cognis.rich_deliverable.v1"},
@@ -23336,6 +24533,7 @@ def test_auto_loaded_skill_snapshot_remains_pinned_for_session() -> None:
         "skill_id": "skill_daily",
         "name": "daily-brief",
         "auto_load_instructions": True,
+        "description": "Pinned summary",
         "version_id": "sv_12",
         "version_number": 4,
         "content_hash": "hash-12",
@@ -23364,6 +24562,7 @@ def test_auto_loaded_skill_snapshot_remains_pinned_for_session() -> None:
 
     assert second.loaded_skill_snapshots["skill_daily"]["contract_version"] == 12
     assert second.loaded_skill_snapshots["skill_daily"]["version_id"] == "sv_12"
+    assert second.loaded_skill_snapshots["skill_daily"]["description"] == "Pinned summary"
 
 
 def test_replay_counts_only_successful_artifact_reads() -> None:
@@ -25474,3 +26673,49 @@ def test_anthropic_exposure_fingerprint_tracks_tool_surface_changes() -> None:
 
     assert before == same
     assert before != promoted
+
+
+class _ReasoningRecordingGuardrails(_RecordingGuardrails):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasoning_reports: list[dict[str, object]] = []
+
+    async def report_reasoning(self, **kwargs: object) -> ReasoningReportResult:
+        self.reasoning_reports.append(kwargs)
+        return ReasoningReportResult(ok=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_retry", [False, True])
+async def test_workflow_step_reports_full_input_once_as_user_message(is_retry: bool) -> None:
+    guardrails = _ReasoningRecordingGuardrails()
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+        second_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+    )
+    loop = _step_complete_test_loop(fake_llm)
+    loop.providers.guardrails = guardrails
+    ctx = _step_complete_test_context(_lifecycle_strategy_step())
+    description = "Prepare the weekly report. " + "x" * 3000
+    ctx.task_title = "Weekly report"
+    ctx.task_description = description
+    ctx.is_retry = is_retry
+
+    await loop.run_step(ctx)
+
+    user_messages = [event for event in guardrails.recorded_events if event.type == "user_message"]
+    if is_retry:
+        assert user_messages == []
+        assert guardrails.reasoning_reports == []
+        return
+    assert len(user_messages) == 1
+    assert user_messages[0].data["role"] == "user"
+    assert description in user_messages[0].data["content"]
+    assert guardrails.reasoning_reports == [
+        {
+            "session_id": "sess-step-complete-metadata",
+            "from_events": True,
+            "wait_for_intention": False,
+            "wait_timeout_ms": _BOOTSTRAP_INTENTION_WAIT_MS,
+        }
+    ]

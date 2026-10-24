@@ -1,28 +1,34 @@
 <script lang="ts">
+  import { WaitingActivity } from '$lib/complete-waiting';
+  import { conversationWorkspace } from '$lib/dashboard/conversation-workspace';
+  import { registerDashboardLauncher, type DashboardLaunchInput } from '$lib/dashboard/launcher';
+  import { workspaceOpenFailureMessage } from '$lib/dashboard/workspace-open-result';
+  import type { WorkspaceOpenResult } from '$lib/dashboard/workspace';
   import { onMount } from 'svelte';
   import Search from 'lucide-svelte/icons/search';
   import X from 'lucide-svelte/icons/x';
 
   import NewChatModal from '$lib/components/NewChatModal.svelte';
+  import { preferredNewChatAgentId } from '$lib/chat/new-chat-agent';
+  import InboxBell from '$lib/components/InboxBell.svelte';
   import AttentionActionDialog from '$lib/components/attention/AttentionActionDialog.svelte';
   import CreateTaskModal from '$lib/components/tasks/CreateTaskModal.svelte';
   import AgentQuickChatModal from '$lib/components/dashboard/AgentQuickChatModal.svelte';
   import ConversationsSection from '$lib/components/dashboard/ConversationsSection.svelte';
   import DashboardEntityModal from '$lib/components/dashboard/DashboardEntityModal.svelte';
-  import IssuesStrip from '$lib/components/dashboard/IssuesStrip.svelte';
+  import DashboardHealthStrip from '$lib/components/dashboard/DashboardHealthStrip.svelte';
   import TasksSection from '$lib/components/dashboard/TasksSection.svelte';
   import WorkspaceLayer from '$lib/components/dashboard/WorkspaceLayer.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { api, asApiError } from '$lib/api/client';
   import {
     defaultNewChatAgentId,
-    isDashboardConversationActive,
-    isDashboardConversationWaiting,
     isDashboardTopicConversation,
   } from '$lib/dashboard/dashboard';
   import { addToast } from '$lib/stores/toasts';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import { auth } from '$lib/stores/auth';
-  import { deriveGettingStartedSteps, isGettingStartedDismissed } from '$lib/getting-started';
+  import { shouldOfferOnboarding } from '$lib/getting-started';
   import {
     gettingStartedIssue,
     mergeDashboardIssues,
@@ -87,8 +93,7 @@
     ...providerNoticeIssues($workspaceHealth.health),
     ...gettingStartedIssue(Boolean(
       diagnostics
-      && !isGettingStartedDismissed()
-      && deriveGettingStartedSteps(diagnostics).some((step) => !step.done)
+      && shouldOfferOnboarding(diagnostics)
     )),
   ]));
 
@@ -110,6 +115,10 @@
   let schedulesError = $state<string | null>(null);
 
   let conversations = $state<Conversation[] | null>(null);
+  let waitingConversations = $state<Conversation[]>([]);
+  let waitingLoadError = $state<string | null>(null);
+  let waitingScopeKey = $state<string | null>(null);
+  const waitingActivity = new WaitingActivity();
   let workspaceConversationMetadata = $state<Record<string, Conversation>>({});
   const pendingConversationInitialLoads = new Set<string>();
   const pendingWorkspaceConversationPatches = new Map<string, {
@@ -126,6 +135,20 @@
   let conversationsCursor = $state<string | null>(null);
   let conversationsHasMore = $state(false);
   let conversationsAppendLoading = $state(false);
+
+  // Notice precedence ($lib/connectivity): sections hide load errors while the
+  // global connection banner applies, and everything that failed reloads once
+  // the connection is restored.
+  const net = useSectionConnectivity({
+    hasError: () => Boolean(
+      issuesError || agentsError || boardError || recentTasksError || schedulesError
+      || waitingLoadError || conversationsError || conversationsAppendError
+    ),
+    retry: () => refreshAll(),
+  });
+  const shown = (error: string | null): string | null => (net.hideErrors ? null : error);
+  // A section whose first load failed meanwhile shows its loading state.
+  const waiting = (error: string | null): boolean => net.hideErrors && Boolean(error);
   let conversationsScopeKey = $state('');
   let conversationLoadController: AbortController | null = null;
   let conversationAppendController: AbortController | null = null;
@@ -133,6 +156,7 @@
   let searchQuery = $state('');
   let selectedProjectId = $state('');
   let projects = $state<Project[]>([]);
+  let projectLoadGeneration = 0;
   let searchDebounce: ReturnType<typeof setTimeout> | null = null;
   let pendingSearchReset = false;
 
@@ -154,12 +178,17 @@
   let workspaceGateEnabled = $state(false);
   let workspaceGateCaptured = $state(false);
   let workspacePersistenceStarted = false;
+  let mounted = $state(false);
+  let workspaceOwner: string | null = null;
   // Default to the safe blocking-modal mode until the browser viewport is measured.
   let workspaceDevice = $state<'desktop' | 'tablet' | 'phone'>('phone');
   const conversationProjectionGate = new DashboardConversationProjectionGate();
   const readTracker = new DashboardConversationReadTracker({
     markRead: (conversationId) => api.conversations.markRead(conversationId),
     optimisticRead: (conversationId, readThrough) => {
+      waitingConversations = waitingConversations.map((item) => item.conversation_id === conversationId
+        ? { ...item, has_unread: false, ...(readThrough ? { last_read_at: readThrough } : {}) }
+        : item);
       if (!conversations) return;
       conversations = conversations.map((conversation) => (
         conversation.conversation_id === conversationId
@@ -226,20 +255,6 @@
   let newChatAgentProfileId = $state('');
   let creatingTask = $state(false);
   let createTaskDeps = $state<{ workflows: Workflow[]; projects: Project[]; skills: Skill[]; conversations: Conversation[] } | null>(null);
-  const waitingConversationCount = $derived(
-    conversations?.filter(isDashboardConversationWaiting).length ?? 0
-  );
-  const activeConversationCount = $derived(
-    conversations?.filter(
-      (conversation) =>
-        !isDashboardConversationWaiting(conversation) &&
-        isDashboardConversationActive(conversation)
-    ).length ?? 0
-  );
-  const waitingCount = $derived(
-    waitingConversationCount + (board?.columns?.paused?.total_count ?? 0)
-  );
-  const unreadConversationCount = $derived(conversations?.filter((conversation) => conversation.has_unread).length ?? 0);
 
   async function loadIssues(): Promise<void> {
     issuesLoading = true;
@@ -285,6 +300,11 @@
   ): Promise<void> {
     const generation = ++boardLoadGeneration;
     const requestScopeKey = `${searchQuery}\u0000${selectedProjectId}`;
+    if (waitingScopeKey !== requestScopeKey) {
+      waitingScopeKey = requestScopeKey;
+      waitingConversations = [];
+      waitingLoadError = null;
+    }
     boardLoadController?.abort();
     const controller = new AbortController();
     boardLoadController = controller;
@@ -446,6 +466,7 @@
       conversationLoadController = new AbortController();
       if (reset) {
         conversations = null;
+        waitingConversations = [];
         conversationsCursor = null;
         conversationsHasMore = false;
       }
@@ -457,6 +478,31 @@
     if (append) conversationsAppendLoading = true;
     else conversationsLoading = true;
     if (append) conversationsAppendError = null;
+    const isCurrent = () => (
+      !requestController?.signal.aborted
+      && requestScopeKey === `${searchQuery}\u0000${selectedProjectId}`
+      && (loadGeneration === null || conversationProjectionGate.isCurrent(loadGeneration))
+    );
+    // Waiting has its own completion boundary; a failed or slow history read
+    // must neither discard fresh unread rows nor suppress its freshness state.
+    if (!append) {
+      void api.conversations.waiting({
+        contextType: 'web',
+        projectId: selectedProjectId || null,
+        query: searchQuery || null,
+      }, {
+        signal: requestController?.signal, activity: waitingActivity,
+        scope: JSON.stringify([auth.getSnapshot().user?.email, requestScopeKey]),
+      }).then(items => {
+        if (!isCurrent()) return;
+        waitingConversations = items.filter(isDashboardTopicConversation)
+          .map(item => cacheConversationMetadata(item, metadataGeneration));
+        waitingLoadError = null;
+        if (observeOpenUnread) void readTracker.observe(waitingConversations);
+      }).catch(caught => {
+        if (isCurrent()) waitingLoadError = asApiError(caught).message;
+      });
+    }
     try {
       const [page, reconciledDetails] = await Promise.all([
         api.conversations.list(requestCursor, {
@@ -519,7 +565,7 @@
       conversationsHasMore = (retainedCursor ? retainedHasMore : page.has_more) && !repeatedCursor;
       conversationsScopeKey = requestScopeKey;
       conversationsError = null;
-      if (observeOpenUnread) void readTracker.observe(canonicalNext);
+      if (observeOpenUnread) void readTracker.observe([...canonicalNext, ...waitingConversations]);
     } catch (caught) {
       if (
         requestScopeKey !== `${searchQuery}\u0000${selectedProjectId}`
@@ -589,9 +635,27 @@
   }
 
   function changeProject(event: Event): void {
+    setProjectFilter((event.currentTarget as HTMLSelectElement).value);
+  }
+
+  function toggleProjectFilter(projectId: string): void {
+    setProjectFilter(selectedProjectId === projectId ? '' : projectId);
+  }
+
+  function setProjectFilter(projectId: string): void {
     invalidateRecentTaskAppend();
-    selectedProjectId = (event.currentTarget as HTMLSelectElement).value;
+    selectedProjectId = projectId;
     void Promise.allSettled([loadBoard(), loadConversations({ reset: true })]);
+  }
+
+  async function toggleConversationStar(conversation: Conversation): Promise<void> {
+    if (auth.getSnapshot().user?.role === 'viewer' || conversation.is_readonly_for_caller) return;
+    try {
+      await api.conversations.update(conversation.conversation_id, { starred: !conversation.starred_at });
+      await loadConversations({ reset: true });
+    } catch (error) {
+      addToast(error instanceof Error ? error.message : 'Could not update bookmark', 'error');
+    }
   }
 
   function cacheConversationMetadata(
@@ -649,6 +713,9 @@
     patch: DashboardRealtimeBatch['conversationPatches'][number],
   ): void {
     const generation = ++workspaceConversationGeneration;
+    waitingConversations = waitingConversations.map((item) => item.conversation_id === patch.conversation_id
+      ? { ...item, ...patch }
+      : item);
     const current = workspaceConversationMetadata[patch.conversation_id];
     const relevant = Boolean(
       current
@@ -714,12 +781,22 @@
     }
   }
 
+  async function loadProjects(): Promise<void> {
+    const generation = ++projectLoadGeneration;
+    try {
+      const items = await api.projects.list({ order_by_activity: true });
+      if (generation === projectLoadGeneration) projects = items;
+    } catch {
+      // Preserve the last list on transient failure; later refreshes retry.
+    }
+  }
+
   async function refreshAll(): Promise<void> {
     await Promise.allSettled([
       loadIssues(),
       loadDiagnostics(),
       loadAgents(),
-      api.projects.list().then((items) => { projects = items; }),
+      loadProjects(),
       loadBoard(),
       loadSchedules(),
       loadConversations(),
@@ -727,6 +804,7 @@
   }
 
   function flushRealtimeLoads(batch: DashboardRealtimeBatch): void {
+    if (batch.loads.has('conversations') || batch.loads.has('tasks')) void loadProjects();
     for (const patch of batch.conversationPatches) patchConversationMetadata(patch);
     if (batch.loads.has('conversations')) {
       const changedIds = new Set([
@@ -764,12 +842,35 @@
   }
 
   function showWorkspaceCap(limit: number): void {
+    reportWorkspaceOpen({ status: 'capped', limit });
+  }
+
+  function reportWorkspaceOpen(result: WorkspaceOpenResult): void {
+    if (result.status !== 'failed' && result.status !== 'capped') return;
     addToast(
-      `Workspace limit reached (${limit}). Close a window before opening another.`,
+      workspaceOpenFailureMessage(result),
       'error',
       4_000,
       'Could not open workspace window',
     );
+  }
+
+  async function launchWorkspace(input: DashboardLaunchInput): Promise<void> {
+    if (!mounted || !useWorkspaceWindows()) throw new Error('Dashboard workspace is unavailable.');
+    if (input.kind === 'conversation') conversationProjectionGate.invalidate();
+    const result = await workspaceManager.requestOpen({
+      kind: input.kind,
+      entityId: input.id,
+      title: input.title,
+      status: input.status,
+      agentId: input.agent_id,
+      canonicalHref: input.href,
+    });
+    if (input.kind === 'conversation') {
+      if (result.status === 'opened' || result.status === 'focused') readTracker.open(input.id);
+      else readTracker.close(input.id);
+    }
+    reportWorkspaceOpen(result);
   }
 
   function taskSummary(taskId: string): { title: string; status: string | null; agentId: string | null } {
@@ -791,18 +892,17 @@
         agentId: summary.agentId,
         canonicalHref: `/tasks/${taskId}`,
       });
-      if (result.status === 'capped') showWorkspaceCap(result.limit);
+      reportWorkspaceOpen(result);
       return;
     }
     selectedEntity = { kind: 'task', id: taskId };
   }
 
-  function openConversation(conversationId: string): void {
+  async function openConversation(conversationId: string): Promise<void> {
     conversationProjectionGate.invalidate();
-    readTracker.open(conversationId);
     if (useWorkspaceWindows()) {
       const conversation = conversations?.find((item) => item.conversation_id === conversationId);
-      const result = workspaceManager.open({
+      const result = await workspaceManager.requestOpen({
         kind: 'conversation',
         entityId: conversationId,
         title: conversation?.title ?? 'Conversation',
@@ -810,12 +910,15 @@
         agentId: conversation?.agent_id ?? null,
         canonicalHref: `/chat/${conversationId}`,
       });
-      if (result.status === 'capped') {
+      if (result.status === 'opened' || result.status === 'focused') {
+        readTracker.open(conversationId);
+      } else {
         readTracker.close(conversationId);
-        showWorkspaceCap(result.limit);
+        reportWorkspaceOpen(result);
       }
       return;
     }
+    readTracker.open(conversationId);
     selectedEntity = { kind: 'conversation', id: conversationId };
   }
 
@@ -831,7 +934,7 @@
         agentId: schedule.agent_id,
         canonicalHref: `/schedules/${schedule.schedule_id}`,
       });
-      if (result.status === 'capped') showWorkspaceCap(result.limit);
+      reportWorkspaceOpen(result);
       return;
     }
     selectedEntity = { kind: 'schedule', id: schedule.schedule_id };
@@ -852,8 +955,8 @@
           : `/chat/${action.source.conversation_id}`,
         ephemeral: true,
       });
-      if (result.status === 'capped') showWorkspaceCap(result.limit);
-      else attentionOrigins.set(result.key, { origin, fallback });
+      if (result.status === 'opened' || result.status === 'focused') attentionOrigins.set(result.key, { origin, fallback });
+      else reportWorkspaceOpen(result);
       return;
     }
     selectedAttentionOrigin = origin;
@@ -926,9 +1029,9 @@
     void refreshWorkspaceConversation(conversationId);
   }
 
-  function selectAgent(agent: Agent): void {
+  async function selectAgent(agent: Agent): Promise<void> {
     if (useWorkspaceWindows()) {
-      const result = workspaceManager.open({
+      const result = await workspaceManager.requestOpen({
         kind: 'agent',
         entityId: agent.agent_id,
         title: agent.display_name ?? agent.name,
@@ -936,7 +1039,7 @@
         agentId: agent.agent_id,
         canonicalHref: `/chat/new?agent=${encodeURIComponent(agent.agent_id)}`,
       });
-      if (result.status === 'capped') showWorkspaceCap(result.limit);
+      reportWorkspaceOpen(result);
       return;
     }
     selectedAgent = agent;
@@ -981,7 +1084,11 @@
   }
 
   function openNewChat(): void {
-    newChatAgentId = defaultNewChatAgentId(agents) ?? '';
+    const focusedKey = workspaceManager.focusedTopVisibleKey();
+    const focused = workspaceManager.snapshot().find((window) => window.key === focusedKey);
+    const focusedAgentId = focused?.kind === 'agent' ? focused.entityId
+      : focused?.agentId ?? conversations?.find((item) => item.conversation_id === focused?.entityId)?.agent_id;
+    newChatAgentId = preferredNewChatAgentId(agents ?? [], [focusedAgentId, newChatAgentId], defaultNewChatAgentId(agents) ?? undefined);
     newChatAgentProfileId = '';
     newChatError = '';
     showNewChatModal = true;
@@ -1029,6 +1136,8 @@
   });
 
   onMount(() => {
+    workspaceOwner = auth.getSnapshot().user?.email ?? null;
+    mounted = true;
     void loadUserPreferences(auth.getSnapshot().user?.email);
     const syncDevice = () => {
       const previousDevice = workspaceDevice;
@@ -1054,6 +1163,8 @@
     window.addEventListener('resize', syncDevice, { passive: true });
     const unsubscribe = subscribeDashboardRealtime(wsClient, flushRealtimeLoads);
     return () => {
+      mounted = false;
+      projectLoadGeneration += 1;
       boardLoadController?.abort();
       recentTaskAppendGate.invalidate();
       conversationLoadController?.abort();
@@ -1066,6 +1177,19 @@
   });
 
   $effect(() => {
+    if (!mounted || workspaceDevice === 'phone' || !useWorkspaceWindows()) return;
+    const owner = $auth.user?.email;
+    if (!owner || owner !== workspaceOwner) return;
+    return registerDashboardLauncher({
+      projectId: selectedProjectId || null,
+      open: async (input) => {
+        if (auth.getSnapshot().user?.email !== owner) throw new Error('Dashboard owner changed.');
+        await launchWorkspace(input);
+      },
+    });
+  });
+
+  $effect(() => {
     if (workspaceGateCaptured || !$userPreferencesReady) return;
     workspaceGateEnabled = $userPreferences.display.dashboard_workspace_windows;
     workspaceGateCaptured = true;
@@ -1075,12 +1199,16 @@
     if (!$userPreferencesReady || !workspaceGateEnabled) return;
     if (!workspaceGateEnabled || workspacePersistenceStarted || typeof window === 'undefined') return;
     workspacePersistenceStarted = true;
+    try {
+      conversationWorkspace.setOwner(auth.getSnapshot().user?.email ?? null, window.localStorage);
+    } catch { conversationWorkspace.setOwner(auth.getSnapshot().user?.email ?? null, null); }
     const storageKey = dashboardWorkspaceStorageKey(auth.getSnapshot().user?.email);
     try {
       workspaceManager.hydrate(window.localStorage.getItem(storageKey));
     } catch {
       // Ignore unavailable browser storage and keep an empty workspace.
     }
+    const stopProjection = conversationWorkspace.bind(workspaceManager, null, storageKey);
     const unsubscribePersistence = workspaceManager.subscribe((windows) => {
       try {
         window.localStorage.setItem(
@@ -1091,7 +1219,7 @@
         // Workspace persistence is best effort when browser storage is unavailable.
       }
     });
-    return unsubscribePersistence;
+    return () => { unsubscribePersistence(); stopProjection(); };
   });
 
   $effect(() => {
@@ -1114,44 +1242,37 @@
   class="mx-auto flex w-full min-w-0 max-w-[100rem] flex-col gap-4 px-3 py-3 sm:px-5 lg:px-6 md:h-full md:min-h-0"
   data-testid="control-center"
 >
-  <header class="shrink-0">
-    <div>
-      <h1 class="text-xl font-semibold text-white">Cognis</h1>
-      <p class="text-xs text-slate-400" data-testid="control-center-summary">
-        {board?.columns?.running?.total_count ?? 0} running · {activeConversationCount} active chats
-        {#if waitingCount > 0} · {waitingCount} waiting for you{/if}
-        {#if unreadConversationCount > 0} · {unreadConversationCount} unread{/if}
-      </p>
-    </div>
-  </header>
-
   <div class="shrink-0">
-    <IssuesStrip
+    <DashboardHealthStrip
+      {projects}
       issues={displayedIssues}
-      loading={issuesLoading}
-      error={issuesError}
+      loading={issuesLoading || waiting(issuesError)}
+      error={shown(issuesError)}
       onRetry={() => void refreshAll()}
       onDismiss={loadIssues}
+      onMonitorChange={() => void loadIssues()}
     />
   </div>
 
   <div class="flex shrink-0 items-center gap-2" data-testid="dashboard-search-filters">
+    <InboxBell />
     <div class="relative min-w-0 flex-1">
-      <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
+      <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-quiet" />
       <Input
         bind:value={searchInput}
+        find={{ dashboardPrimary: true }}
         class="pl-9 pr-9"
         placeholder="Search tasks and conversations"
         aria-label="Search tasks and conversations"
         oninput={scheduleSearch}
       />
       {#if searchInput}
-        <button type="button" aria-label="Clear dashboard search" class="absolute right-2 top-1.5 rounded-lg p-1 text-slate-500 hover:bg-slate-800 hover:text-white" onclick={clearSearch}>
+        <button type="button" aria-label="Clear dashboard search" class="absolute right-2 top-1.5 rounded-lg p-1 text-quiet hover:bg-raised hover:text-strong" onclick={clearSearch}>
           <X class="h-4 w-4" />
         </button>
       {/if}
     </div>
-    <select class="h-9 max-w-48 rounded-xl border border-slate-700 bg-slate-950 px-3 text-xs text-slate-200" aria-label="Filter dashboard by project" value={selectedProjectId} onchange={changeProject}>
+    <select class="h-9 max-w-48 rounded-xl border border-control-border bg-canvas px-3 text-xs text-foreground" aria-label="Filter dashboard by project" value={selectedProjectId} onchange={changeProject}>
       <option value="">All projects</option>
       {#each projects as project (project.project_id)}
         <option value={project.project_id}>{project.name}</option>
@@ -1165,12 +1286,13 @@
     data-testid="control-center-primary-grid"
   >
     <TasksSection
+      {projects} {selectedProjectId} onToggleProject={toggleProjectFilter}
       {board}
       {schedules}
       {agents}
-      loading={boardLoading}
-      error={boardError}
-      {schedulesError}
+      loading={boardLoading || waiting(boardError)}
+      error={shown(boardError)}
+      schedulesError={shown(schedulesError)}
       onOpenTask={openTask}
       onOpenSchedule={openSchedule}
       onOpenAttention={openAttention}
@@ -1179,17 +1301,21 @@
       onSchedulesRetry={() => void loadSchedules()}
       recentHasMore={board?.columns.done?.has_more ?? false}
       recentLoading={recentTasksLoading}
-      recentError={recentTasksError}
+      recentError={shown(recentTasksError)}
       onLoadMoreRecent={() => void loadMoreRecentTasks()}
     />
 
     <ConversationsSection
+      {projects} {selectedProjectId} onToggleProject={toggleProjectFilter} onToggleStar={$auth.user?.role !== 'viewer' ? toggleConversationStar : undefined}
       {conversations}
+      {waitingConversations}
+      waitingError={shown(waitingLoadError)}
+      waitingScope={waitingScopeKey ?? ''}
       {agents}
-      loading={conversationsLoading}
-      error={conversationsError}
-      {agentsLoading}
-      {agentsError}
+      loading={conversationsLoading || waiting(conversationsError)}
+      error={shown(conversationsError)}
+      agentsLoading={agentsLoading || waiting(agentsError)}
+      agentsError={shown(agentsError)}
       openConversationId={selectedEntity?.kind === 'conversation' ? selectedEntity.id : null}
       openConversationIds={openWorkspaceConversationIds}
       onOpenConversation={openConversation}
@@ -1200,7 +1326,7 @@
       onAgentsRetry={() => void loadAgents()}
       recentHasMore={conversationsHasMore}
       recentLoading={conversationsAppendLoading}
-      recentError={conversationsAppendError}
+      recentError={shown(conversationsAppendError)}
       onLoadMoreRecent={() => void loadConversations({ append: true })}
     />
   </div>
@@ -1221,7 +1347,7 @@
   />
 {/if}
 
-{#if workspaceGateEnabled && effectiveWorkspaceDevice() !== 'phone'}
+{#if workspaceGateEnabled}
   <WorkspaceLayer
     manager={workspaceManager}
     {agents}

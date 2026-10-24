@@ -2,19 +2,19 @@
   "schema_version": 1,
   "id": "compact-alert-dashboard",
   "title": "Compact alert operator",
-  "description": "Operational dashboard regression: long identifiers, hero dek, plain metrics, tables, statuses and checkpoint.",
+  "description": "Invented museum-simulator dashboard: long identifiers, hero dek, metrics, tables, statuses and checkpoint. All observations and dates are fictional.",
   "group": "Operations",
   "sort_key": 25,
   "visibility": ["gallery"],
-  "content": "# Alert operator\n\nZero unsuppressed. All active alerts have bounded coverage.",
+  "content": "# Museum simulator\n\nFictional training exercise. All simulated alerts have bounded coverage.",
   "payload": {
-    "title": "Alert Operator — hourly review",
+    "title": "Museum simulator — training review",
     "metadata": {"presentation": "dashboard", "canvas": "wide", "density": "compact"},
     "blocks": [
       {
         "type": "hero",
-        "title": "Zero unsuppressed — recurring relay errors re-contained",
-        "dek": "Hourly pass after a fifth rollout; the same self-healing signature was re-silenced. All other alerts remain stable under bounded silences.",
+        "title": "Zero unsuppressed — simulated exhibit sensors contained",
+        "dek": "Invented exercise after two simulator resets. Four sensor warnings are covered for the next training interval; no real monitoring system is represented.",
         "badges": [
           {"label": "unsuppressed = 0", "tone": "success"},
           {"label": "contained_stable", "tone": "info"},
@@ -22,36 +22,36 @@
         ]
       },
       {"type": "grid", "layout": "equal", "blocks": [
-        {"type": "metric", "label": "Active alerts", "value": "13"},
-        {"type": "metric", "label": "Suppressed", "value": "13"},
-        {"type": "metric", "label": "Inhibited", "value": "1"},
+         {"type": "metric", "label": "Active alerts", "value": "4"},
+         {"type": "metric", "label": "Suppressed", "value": "4"},
+         {"type": "metric", "label": "Inhibited", "value": "0"},
         {"type": "metric", "label": "Unsuppressed", "value": "0"}
       ]},
-      {"type": "section_header", "eyebrow": "This pass", "title": "Processed items", "subtitle": "Hourly trigger at 21:00 UTC"},
+       {"type": "section_header", "eyebrow": "This pass", "title": "Processed items", "subtitle": "Fictional exercise at 10:00 UTC"},
       {"type": "table", "title": "Processed this pass", "columns": ["Identity", "Classification", "Action", "Disposition"], "rows": [
-        {"Identity": "RelayPublishOrDropErrors relay-0 (cc39812a2d654d2d)", "Classification": "stable (19th+ window, 5th rollout)", "Action": "Bounded silence, expires 22:00 UTC", "Disposition": "bounded_silenced"},
-        {"Identity": "RelayPublishOrDropErrors relay-1 (31ec045c889d3dc4)", "Classification": "stable (19th+ window, 5th rollout)", "Action": "Bounded silence, expires 22:00 UTC", "Disposition": "bounded_silenced"}
+         {"Identity": "ExhibitTemperatureSimulatedWarning gallery-west (fixture-sensor-west-long-identifier)", "Classification": "stable (3 exercise intervals, 2 resets)", "Action": "Training coverage, expires 10:30 UTC", "Disposition": "bounded_silenced"},
+         {"Identity": "ExhibitHumiditySimulatedWarning gallery-east (fixture-sensor-east-long-identifier)", "Classification": "stable (3 exercise intervals, 2 resets)", "Action": "Training coverage, expires 10:30 UTC", "Disposition": "bounded_silenced"}
       ]},
       {"type": "section_header", "eyebrow": "Standing coverage", "title": "Reused silences", "subtitle": "No cadence due this pass"},
       {"type": "table", "columns": ["Item", "Silence", "Expiry / Review"], "rows": [
-        {"Item": "Dead sensor nodes + battery (7 identities)", "Silence": "Standing coverage", "Expiry / Review": "2026-11-20"},
-        {"Item": "LinkMarginLow (client + AP)", "Silence": "Paired coverage", "Expiry / Review": "review 2026-10-11 14:00 UTC"},
-        {"Item": "HostRequiresReboot", "Silence": "Maintenance coverage", "Expiry / Review": "review 2026-10-11 14:00 UTC"},
-        {"Item": "InventoryOwnerInvalid / SnapshotStale", "Silence": "Bounded application coverage", "Expiry / Review": "2026-09-16 04:00 UTC"},
-        {"Item": "HostOutOfDiskSpace (unowned, pre-existing)", "Silence": "Standing coverage", "Expiry / Review": "2026-11-26"}
+         {"Item": "Simulated ticket printer (one identity)", "Silence": "Exercise coverage", "Expiry / Review": "2030-06-03 10:30 UTC"},
+         {"Item": "Simulated exhibit label update", "Silence": "Paired training coverage", "Expiry / Review": "review 2030-06-03 10:15 UTC"},
+         {"Item": "Practice review row, inactive", "Silence": "Not required", "Expiry / Review": "review 2030-06-03 10:20 UTC"},
+         {"Item": "Practice inventory row, inactive", "Silence": "Not required", "Expiry / Review": "2030-06-03 10:25 UTC"},
+         {"Item": "Practice cleanup row, inactive", "Silence": "Not required", "Expiry / Review": "2030-06-03 10:30 UTC"}
       ]},
       {"type": "status_grid", "title": "Cluster and delivery health", "items": [
-        {"label": "API /readyz", "status": "ok", "tone": "success"},
-        {"label": "Nodes Ready", "status": "7/7", "tone": "success"},
-        {"label": "Notification routing", "status": "critical-only, unchanged", "tone": "success"},
-        {"label": "Deployment exceptions", "status": "only pre-existing applications OutOfSync + service Unknown quirk", "tone": "neutral"}
+         {"label": "Simulator readiness", "status": "ok", "tone": "success"},
+         {"label": "Exhibit models Ready", "status": "3/3", "tone": "success"},
+         {"label": "Notification routing", "status": "training inbox only", "tone": "success"},
+         {"label": "Exercise exceptions", "status": "one optional scenario not scheduled", "tone": "neutral"}
       ]},
-      {"type": "callout", "tone": "info", "title": "Non-blocking escalations (carried forward, not due for FYI)", "content": "Relay/inventory application defect family: 19th+ consecutive observation window, now spanning five CI-driven rollouts. Self-healing; root cause requires application engineering.\n\nCache maxmemory: nine occurrences over approximately 47 hours. Standing capacity recommendation is outside this operator's bounded remediation authority; it did not recur this pass."},
+       {"type": "callout", "tone": "info", "title": "Training notes (fictional)", "content": "A simulated exhibit sensor repeats its warning across three exercise intervals. The training operator may apply temporary coverage but cannot edit the simulator model.\n\nAn optional archive exercise is deferred to the next lesson. This narrative, its measurements, and its checkpoints are invented layout data."},
       {"type": "key_value", "title": "Checkpoint", "items": [
-        {"label": "Next review", "value": "2026-09-15T22:00:00Z (silence expiry)"},
-        {"label": "Next full review", "value": "2026-09-16T00:00:00Z"},
-        {"label": "Maintenance lock", "value": "idle, verified", "tone": "positive"},
-        {"label": "Owner", "value": "operator/sfire_d94aa121107c506b85299e4d6ca329c2"}
+         {"label": "Next review", "value": "2030-06-03T10:30:00Z (exercise expiry)"},
+         {"label": "Next full review", "value": "2030-06-03T11:00:00Z"},
+         {"label": "Maintenance lock", "value": "simulated idle", "tone": "positive"},
+         {"label": "Owner", "value": "training/museum-simulator-fixture-owner-long-identifier"}
       ]}
     ]
   }

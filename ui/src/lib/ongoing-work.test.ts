@@ -153,7 +153,7 @@ describe('currentCycleDelegations', () => {
 });
 
 describe('mergeCurrentCycleDelegations', () => {
-  it('uses richer cycle state for projected active delegates', () => {
+  it('keeps authoritative child TODOs over an unopened child timeline snapshot', () => {
     const projected: BackgroundWorkItem[] = [{
       kind: 'delegated_session',
       work_id: 'sess_1',
@@ -162,7 +162,7 @@ describe('mergeCurrentCycleDelegations', () => {
       title: 'Projected',
       agent_id: 'system:implement',
       status: 'active',
-      todos: [],
+      todos: [{ content: 'Verify slice', status: 'in_progress', priority: 'normal' }],
     }];
     const current = currentCycleDelegations(
       [delegation('sess_1', 1, 'running')],
@@ -172,10 +172,16 @@ describe('mergeCurrentCycleDelegations', () => {
     );
 
     expect(mergeCurrentCycleDelegations(projected, current)[0]).toMatchObject({
-      title: 'Task sess_1',
-      status: 'running',
-      todos: [{ content: 'Implement slice', status: 'in_progress' }],
+      title: 'Projected',
+      status: 'active',
+      todos: [{ content: 'Verify slice', status: 'in_progress' }],
     });
+    expect(mergeCurrentCycleDelegations([], current)).toEqual(current);
+    expect(mergeCurrentCycleDelegations([{ ...projected[0], todos: [] }], current)[0].todos)
+      .toEqual([]);
+    const settled = mergeCurrentCycleDelegations([{ ...projected[0], status: 'completed' }], current);
+    expect(settled[0].status).toBe('completed');
+    expect(settled.some(backgroundWorkItemIsRunning)).toBe(false);
   });
 });
 
@@ -328,6 +334,13 @@ describe('direct child background work', () => {
 });
 
 describe('backgroundWorkItemIsRunning', () => {
+  it('does not count a killed background command as running', () => {
+    expect(backgroundWorkItemIsRunning({
+      kind: 'background_command', work_id: 'shell-stopped',
+      controller_conversation_id: 'conv-root', title: 'Stopped preview',
+      agent_id: 'laforge', status: 'killed', todos: [],
+    })).toBe(false);
+  });
   const managed = (status: string): BackgroundWorkItem => ({
     kind: 'managed_conversation',
     work_id: 'mconv_1',

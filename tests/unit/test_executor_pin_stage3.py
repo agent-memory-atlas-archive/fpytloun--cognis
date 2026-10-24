@@ -350,7 +350,7 @@ async def test_missing_selector_waits_for_same_executor_until_reconnect(
         }
     )
     assert reconnected.active_executor_id == "missing"
-    assert clears == 1
+    assert clears == 0  # Runtime inventory admission, not transport readiness, clears recovery.
     assert cas_args == []
     failed = await ensure_active_executor_pin(
         **common, active_executor_unavailable_since=base, now=base + timedelta(seconds=16)

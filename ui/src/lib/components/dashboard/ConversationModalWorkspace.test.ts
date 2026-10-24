@@ -120,8 +120,8 @@ describe('ConversationModalWorkspace inspector', () => {
     expect(screen.getByTestId('dashboard-conversation-chat')).toBeInTheDocument();
     const mobileInspector = screen.getByTestId('dashboard-conversation-inspector-conversation-mobile-mobile');
     expect(mobileInspector).toBeInTheDocument();
-    expect(mobileInspector).toHaveClass('inset-0', 'isolate', 'w-full', 'bg-slate-950');
-    expect(mobileInspector).not.toHaveClass('bg-slate-950/98');
+    expect(mobileInspector).toHaveClass('inset-0', 'isolate', 'w-full', 'bg-canvas');
+    expect(mobileInspector).not.toHaveClass('bg-canvas/98');
     await waitFor(() => expect(document.activeElement).toBe(mobileInspector));
     expect(screen.getByTestId('dashboard-conversation-chat')).toHaveAttribute('aria-hidden', 'true');
 

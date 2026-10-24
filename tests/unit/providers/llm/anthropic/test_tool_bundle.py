@@ -680,6 +680,8 @@ def test_write_deliverable_object_union_compiles_for_anthropic() -> None:
         "outputs",
         "payload",
         "payload_artifact",
+        "project_id",
+        "supersedes",
         "title",
     }
     assert "strict" not in bundle.wire_tools[0]

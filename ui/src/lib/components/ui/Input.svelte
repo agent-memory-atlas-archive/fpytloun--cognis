@@ -2,6 +2,7 @@
   import type { HTMLInputAttributes } from 'svelte/elements';
 
   import { cn } from '$lib/utils';
+  import { findTarget, type FindOptions } from '$lib/find';
 
   /**
    * Input primitive. Mobile font-size is 16px to prevent iOS Safari from zooming
@@ -16,6 +17,8 @@
     class: className = '',
     disabled = false,
     name,
+    element = $bindable<HTMLInputElement | null>(null),
+    find = false,
     ...rest
   } = $props<{
     type?: string;
@@ -24,12 +27,16 @@
     class?: string;
     disabled?: boolean;
     name?: string;
+    element?: HTMLInputElement | null;
+    find?: boolean | FindOptions;
   } & HTMLInputAttributes>();
 </script>
 
 <input
+  bind:this={element}
+  use:findTarget={find}
   class={cn(
-    'w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 text-base text-slate-100 placeholder:text-slate-500 min-h-[44px] py-2.5 md:min-h-[36px] md:py-2 md:text-sm',
+    'w-full rounded-xl border border-control-border bg-inset px-3 text-base text-foreground placeholder:text-quiet focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent min-h-[44px] py-2.5 md:min-h-[36px] md:py-2 md:text-sm',
     className
   )}
   {type}

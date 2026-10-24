@@ -20,7 +20,7 @@
   <Popover text={label} placement="top">
       <button
         type="button"
-        class="inline-flex h-5 w-5 items-center justify-center rounded-full text-emerald-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300/60"
+        class="inline-flex h-5 w-5 items-center justify-center rounded-full text-success focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
          aria-label={label}
          title={label}
          data-testid="workstream-todo-progress"

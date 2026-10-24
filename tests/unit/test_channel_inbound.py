@@ -694,15 +694,15 @@ async def test_channel_inbound_keeps_matrix_system_message_in_thread() -> None:
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
     pipeline._try_command_dispatch = AsyncMock(  # type: ignore[method-assign]
-        return_value=CommandResult(type="system_message", text="Mode: build\nExecutor: maitrea")
+        return_value=CommandResult(type="system_message", text="Mode: build\nExecutor: exec-linux")
     )
 
     message = InboundMessage(
         channel_type="matrix",
         account_id="acct-1",
         message_id="msg-1",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         content="/build",
         thread_id="$thread-root",
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
@@ -721,7 +721,7 @@ async def test_channel_inbound_keeps_matrix_system_message_in_thread() -> None:
     turn_scheduler.submit_turn.assert_not_called()
     adapter.send_message.assert_awaited_once()
     outbound = adapter.send_message.await_args.args[0]
-    assert outbound.content == "```text\nMode: build\nExecutor: maitrea\n```"
+    assert outbound.content == "```text\nMode: build\nExecutor: exec-linux\n```"
     assert outbound.reply_to_id == "msg-1"
     assert outbound.thread_id == "$thread-root"
 
@@ -741,8 +741,8 @@ async def test_channel_inbound_keeps_error_message_in_thread() -> None:
         channel_type="matrix",
         account_id="acct-1",
         message_id="msg-1",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         content="hello",
         thread_id="$thread-root",
         timestamp=datetime.now(UTC),
@@ -784,7 +784,9 @@ async def test_channel_inbound_formats_signal_system_message_as_italic_monospace
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
     pipeline._try_command_dispatch = AsyncMock(  # type: ignore[method-assign]
-        return_value=CommandResult(type="system_message", text="Mode: default\nExecutor: maitrea")
+        return_value=CommandResult(
+            type="system_message", text="Mode: default\nExecutor: exec-linux"
+        )
     )
 
     message = InboundMessage(
@@ -810,7 +812,7 @@ async def test_channel_inbound_formats_signal_system_message_as_italic_monospace
     turn_scheduler.submit_turn.assert_not_called()
     adapter.send_message.assert_awaited_once()
     outbound = adapter.send_message.await_args.args[0]
-    assert outbound.content == "*`Mode: default`\n`Executor: maitrea`*"
+    assert outbound.content == "*`Mode: default`\n`Executor: exec-linux`*"
     assert outbound.reply_to_id == "msg-1"
 
 
@@ -937,8 +939,8 @@ async def test_channel_inbound_threads_mode_uses_message_as_thread_root() -> Non
         channel_type="matrix",
         account_id="acct-1",
         message_id="$root",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="hello",
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
@@ -981,8 +983,8 @@ def test_channel_inbound_allows_unmentioned_matrix_thread_candidate_for_mention_
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="follow up",
         thread_id="$root",
@@ -1021,8 +1023,8 @@ async def test_channel_inbound_pairing_policy_does_not_challenge_unmentioned_thr
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="follow up",
         thread_id="$root",
@@ -1063,8 +1065,8 @@ async def test_channel_inbound_resolves_unmentioned_matrix_thread_candidate_only
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="follow up",
         thread_id="$root",
@@ -1087,7 +1089,7 @@ async def test_channel_inbound_resolves_unmentioned_matrix_thread_candidate_only
     pipeline._latest_conversation_for_context.assert_awaited_once_with(
         user_email="user@example.com",
         agent_id="agent-1",
-        context_ref="matrix:acct-1:!room:fpy.cz:$root",
+        context_ref="matrix:acct-1:!room:matrix.example.com:$root",
     )
     pipeline._session_manager.create_conversation_with_root_session.assert_not_called()
 
@@ -1108,8 +1110,8 @@ async def test_channel_inbound_drops_unknown_unmentioned_matrix_thread_candidate
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="follow up",
         thread_id="$unknown",
@@ -1151,10 +1153,10 @@ async def test_channel_inbound_creates_conversation_for_mentioned_matrix_thread(
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
-        content="hello @bot:fpy.cz",
+        content="hello @bot:matrix.example.com",
         thread_id="$user-thread",
         was_mentioned=True,
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
@@ -1220,8 +1222,8 @@ async def test_channel_inbound_matrix_thread_source_ref_forks_original_backing_s
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@user:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@user:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="direct",
         content="start from this thread",
         thread_id="$root",
@@ -1304,8 +1306,8 @@ async def test_channel_inbound_matrix_thread_unverified_source_ref_uses_tail_mat
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@user:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@user:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="direct",
         content="start from this thread",
         thread_id="$root",
@@ -1376,8 +1378,8 @@ async def test_channel_inbound_matrix_thread_walks_back_to_older_backing_session
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@user:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@user:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="direct",
         content="start from this thread",
         thread_id="$root",
@@ -1444,8 +1446,8 @@ async def test_channel_inbound_matrix_thread_lookup_budget_exhaustion_falls_back
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@user:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@user:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="direct",
         content="start from this thread",
         thread_id="$root",
@@ -1532,8 +1534,8 @@ async def test_channel_inbound_matrix_thread_missing_source_stream_submits_fresh
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@user:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@user:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="direct",
         content="start from this thread",
         thread_id="$root",
@@ -1586,8 +1588,8 @@ async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> N
         channel_type="matrix",
         account_id="acct-1",
         message_id="$reply",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         chat_type="group",
         content="continuation",
         thread_id="$root",
@@ -1596,7 +1598,7 @@ async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> N
             "_sender_verified_owner": True,
             "fresh_thread_context": True,
             "thread_root": {
-                "sender": "@filip:fpy.cz",
+                "sender": "@alice:matrix.example.com",
                 "body": "original message",
                 "timestamp": "2026-08-01T10:00:00Z",
             },
@@ -1619,7 +1621,7 @@ async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> N
     contextual_messages = turn_scheduler.submit_turn.await_args.kwargs["contextual_messages"]
     assert contextual_messages[0]["content"] == "original message"
     assert contextual_messages[0]["intention_eligible"] is False
-    assert contextual_messages[0]["message_metadata"]["sender"] == "@filip:fpy.cz"
+    assert contextual_messages[0]["message_metadata"]["sender"] == "@alice:matrix.example.com"
 
 
 @pytest.mark.asyncio
@@ -1703,11 +1705,13 @@ async def test_channel_inbound_submits_matrix_image_as_attachment() -> None:
         channel_type="matrix",
         account_id="acct-1",
         message_id="msg-1",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         content="",
         media=[
-            MediaAttachment(url="mxc://fpy.cz/media", mime_type="image/png", filename="obrazek.png")
+            MediaAttachment(
+                url="mxc://matrix.example.com/media", mime_type="image/png", filename="obrazek.png"
+            )
         ],
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
     )
@@ -1755,11 +1759,13 @@ async def test_channel_inbound_uses_placeholder_when_matrix_image_normalization_
         channel_type="matrix",
         account_id="acct-1",
         message_id="msg-1",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         content="",
         media=[
-            MediaAttachment(url="mxc://fpy.cz/media", mime_type="image/png", filename="obrazek.png")
+            MediaAttachment(
+                url="mxc://matrix.example.com/media", mime_type="image/png", filename="obrazek.png"
+            )
         ],
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
     )
@@ -1946,12 +1952,12 @@ async def test_channel_inbound_sanitizes_voice_attachment_filename(
         channel_type="matrix",
         account_id="matrix-1",
         message_id="msg-1",
-        sender_id="@filip:fpy.cz",
-        chat_id="!room:fpy.cz",
+        sender_id="@alice:matrix.example.com",
+        chat_id="!room:matrix.example.com",
         content="",
         media=[
             MediaAttachment(
-                url="mxc://fpy.cz/media",
+                url="mxc://matrix.example.com/media",
                 mime_type="audio/ogg",
                 filename="Voice message.ogg",
             )
@@ -2429,7 +2435,7 @@ async def test_channel_turn_observer_records_outbound_delivery_mapping() -> None
     observer = ChannelTurnObserver(
         channel_type="matrix",
         account_id="acct-1",
-        chat_id="!room:fpy.cz",
+        chat_id="!room:matrix.example.com",
         thread_id="$root",
         conversation_id="conv-1",
         turn_scheduler=turn_scheduler,

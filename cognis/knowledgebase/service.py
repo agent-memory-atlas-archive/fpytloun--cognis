@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis import json_codec as json
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.inbox import InboxService, stage_share_notification
 from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.knowledgebase.access import (
     KnowledgebaseAccessContext,
@@ -32,6 +33,7 @@ from cognis.knowledgebase.access import (
 from cognis.knowledgebase.extraction import (
     available_supported_types,
     extract_artifact_bytes_bounded,
+    image_mime_type,
     supports_artifact_type,
 )
 from cognis.knowledgebase.vector import SPARSE_ALGORITHM, sparse_vector_from_text
@@ -85,6 +87,7 @@ from cognis.store.queries import (
     enqueue_knowledgebase_artifact_reindex,
     enqueue_knowledgebase_reindex,
     enqueue_retry_knowledgebase_job,
+    get_active_knowledgebase_grant,
     get_artifact_record,
     get_deleted_knowledgebase_for_owner,
     get_knowledgebase_artifact,
@@ -100,6 +103,7 @@ from cognis.store.queries import (
     list_knowledgebase_grants,
     list_knowledgebase_jobs,
     list_knowledgebase_share_candidates,
+    lock_knowledgebase_share_transition,
     resolve_knowledgebase_ingest_conflict,
     revoke_knowledgebase_grant,
     update_knowledgebase,
@@ -643,8 +647,10 @@ class KnowledgebaseService:
         max_chunks_per_artifact: int = 2000,
         chunk_target_tokens: int = 800,
         chunk_overlap_tokens: int = 100,
+        inbox_service: InboxService | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._inbox_service = inbox_service
         self._artifact_store = artifact_store
         self._llm = llm
         self._vector_backend = vector_backend
@@ -900,6 +906,15 @@ class KnowledgebaseService:
         self.require_enabled()
         await self._require_index_ready()
         async with self._session_factory() as session:
+            artifact = await get_artifact_record(session, artifact_id)
+            if (
+                artifact is not None
+                and artifact.owner_email == owner_email
+                and not supports_artifact_type(
+                    filename=artifact.filename, mime_type=artifact.mime_type
+                )
+            ):
+                raise KnowledgebaseRequestError("unsupported document type")
             row = await attach_artifact_to_knowledgebase(
                 session,
                 owner_email=owner_email,
@@ -934,7 +949,12 @@ class KnowledgebaseService:
     ) -> builtins.list[KnowledgebaseArtifactModel] | None:
         self.require_enabled()
         async with self._session_factory() as session:
-            kb = await self._resolve_direct_document_access(
+            resolver = (
+                self._resolve_owner_read_access
+                if access_context is not None and access_context.agent_id is not None
+                else self._resolve_direct_document_access
+            )
+            kb = await resolver(
                 session,
                 owner_email=owner_email,
                 knowledgebase_id=knowledgebase_id,
@@ -944,6 +964,25 @@ class KnowledgebaseService:
                 return None
             rows = await list_knowledgebase_artifacts(session, knowledgebase_id=knowledgebase_id)
             return [kb_artifact_model(row) for row in rows]
+
+    async def _resolve_owner_read_access(
+        self,
+        session: Any,
+        *,
+        owner_email: str,
+        knowledgebase_id: str,
+        access_context: KnowledgebaseAccessContext | None,
+    ) -> KnowledgebaseRow | None:
+        """Owner operational reads retain live agent assignment and grant boundaries."""
+        context = access_context or KnowledgebaseAccessContext(actor_email=owner_email)
+        if context.actor_email != owner_email:
+            return None
+        resolved = await resolve_knowledgebase_access(
+            session, knowledgebase_id=knowledgebase_id, context=context, mode="view"
+        )
+        if resolved is None or not resolved.is_owner:
+            return None
+        return resolved.knowledgebase
 
     async def _resolve_direct_document_access(
         self,
@@ -1038,6 +1077,11 @@ class KnowledgebaseService:
             user = await get_user(session, payload.user_email)
             if user is None or not user.is_active or user.role == "system":
                 raise KnowledgebaseRequestError("share recipient is unavailable")
+            if not await lock_knowledgebase_share_transition(
+                session, knowledgebase_id=knowledgebase_id
+            ):
+                return None
+            existing = await get_active_knowledgebase_grant(session, knowledgebase_id, user.email)
             row = await upsert_knowledgebase_grant(
                 session,
                 knowledgebase_id=knowledgebase_id,
@@ -1045,8 +1089,21 @@ class KnowledgebaseService:
                 granted_by=owner_email,
                 note=payload.note,
             )
+            notice = (
+                stage_share_notification(
+                    session,
+                    recipient=user.email,
+                    actor=owner_email,
+                    resource_type="knowledgebase",
+                    resource_id=knowledgebase_id,
+                    resource_name=resolved.knowledgebase.name,
+                    change="shared",
+                )
+                if existing is None
+                else None
+            )
             await session.commit()
-            return KnowledgebaseShareModel(
+            result = KnowledgebaseShareModel(
                 grant_id=row.grant_id,
                 user_email=user.email,
                 user_name=user.name,
@@ -1054,6 +1111,9 @@ class KnowledgebaseService:
                 granted_at=row.granted_at,
                 note=row.note,
             )
+        if self._inbox_service is not None:
+            await self._inbox_service.publish(notice)
+        return result
 
     async def revoke_share(
         self, *, owner_email: str, knowledgebase_id: str, user_email: str
@@ -1073,8 +1133,23 @@ class KnowledgebaseService:
                 knowledgebase_id=knowledgebase_id,
                 grantee_user_email=user_email,
             )
+            notice = (
+                stage_share_notification(
+                    session,
+                    recipient=user_email,
+                    actor=owner_email,
+                    resource_type="knowledgebase",
+                    resource_id=knowledgebase_id,
+                    resource_name=resolved.knowledgebase.name,
+                    change="revoked",
+                )
+                if revoked
+                else None
+            )
             await session.commit()
-            return revoked
+        if self._inbox_service is not None:
+            await self._inbox_service.publish(notice)
+        return revoked
 
     async def _artifact_record_exists(self, artifact_id: str) -> bool:
         async with self._session_factory() as session:
@@ -1243,6 +1318,32 @@ class KnowledgebaseService:
                 return None
             if artifact.size_bytes > _MAX_DOCUMENT_READ_BYTES:
                 raise KnowledgebaseRequestError("document exceeds content reader size limit")
+            if content_mode == "extracted" and image_mime_type(
+                filename=artifact.filename, mime_type=artifact.mime_type
+            ):
+                chunks = await list_knowledgebase_chunks(
+                    session,
+                    knowledgebase_id=knowledgebase_id,
+                    kb_artifact_id=kb_artifact_id,
+                    generation=attachment.active_generation,
+                )
+                if not chunks:
+                    raise KnowledgebaseRequestError(
+                        "image extraction is not indexed or its generation changed; retry the read"
+                    )
+                # Read published evidence, not a new (potentially different) vision result.
+                chunks.sort(key=lambda chunk: chunk.chunk_index)
+                return KnowledgebaseDocumentContent(
+                    kb_artifact_id=kb_artifact_id,
+                    artifact_id=artifact.artifact_id,
+                    source_path=attachment.source_path,
+                    content_mode=content_mode,
+                    mime_type=artifact.mime_type,
+                    text="\n\n".join(chunk.text for chunk in chunks),
+                    size_bytes=artifact.size_bytes,
+                    extraction_method=chunks[0].locator.get("extraction_method"),
+                    diagnostics={"image_analysis": chunks[0].locator.get("image_analysis", {})},
+                )
         content, stored_mime = await self._artifact_store.async_load(
             artifact.namespace, artifact.object_id, artifact.filename
         )
@@ -1631,14 +1732,12 @@ class KnowledgebaseService:
     ) -> builtins.list[KnowledgebaseIndexJobModel] | None:
         self.require_enabled()
         context = access_context or KnowledgebaseAccessContext(actor_email=owner_email)
-        if context.agent_id is not None or context.actor_email != owner_email:
-            return None
         async with self._session_factory() as session:
-            resolved = await resolve_knowledgebase_access(
+            resolved = await self._resolve_owner_read_access(
                 session,
+                owner_email=owner_email,
                 knowledgebase_id=knowledgebase_id,
-                context=context,
-                mode="manage",
+                access_context=context,
             )
             if resolved is None:
                 if context.agent_id is not None or context.actor_email != owner_email:
@@ -1739,14 +1838,12 @@ class KnowledgebaseService:
     ) -> KnowledgebaseDiagnostics | None:
         self.require_enabled()
         context = access_context or KnowledgebaseAccessContext(actor_email=owner_email)
-        if context.agent_id is not None or context.actor_email != owner_email:
-            return None
         async with self._session_factory() as session:
-            resolved = await resolve_knowledgebase_access(
+            resolved = await self._resolve_owner_read_access(
                 session,
+                owner_email=owner_email,
                 knowledgebase_id=knowledgebase_id,
-                context=context,
-                mode="manage",
+                access_context=context,
             )
             if resolved is None:
                 return None
@@ -2245,37 +2342,47 @@ class KnowledgebaseService:
             ):
                 warnings.append("source_hash_mismatch")
             context_text = chunk.text
-            if self._artifact_store is None:
-                warnings.append("artifact_store_unavailable")
-            else:
-                try:
-                    content, _ = await self._artifact_store.async_load(
-                        artifact.namespace, artifact.object_id, artifact.filename
-                    )
-                    document = await extract_artifact_bytes_bounded(
-                        content, filename=artifact.filename, mime_type=artifact.mime_type
-                    )
-                    full_text = "\n".join(span.text for span in document.spans)
-                    char_start = chunk.locator.get("char_start")
-                    char_end = chunk.locator.get("char_end")
-                    if isinstance(char_start, int) and isinstance(char_end, int):
-                        start = max(0, char_start - before_chars)
-                        end = min(len(full_text), char_end + after_chars)
+            if chunk.locator.get("image_analysis"):
+                # Vision evidence is generated once by the indexer. Never rerun a model
+                # on a citation read or pretend the generated text is original bytes.
+                return KnowledgebaseSourceContextResponse(
+                    chunk_id=chunk.chunk_id,
+                    artifact_id=chunk.artifact_id,
+                    text=chunk.text,
+                    locator=chunk.locator,
+                    warnings=[*warnings, "vision_derived_evidence_verify_original"],
+                )
+        if self._artifact_store is None:
+            warnings.append("artifact_store_unavailable")
+        else:
+            try:
+                content, _ = await self._artifact_store.async_load(
+                    artifact.namespace, artifact.object_id, artifact.filename
+                )
+                document = await extract_artifact_bytes_bounded(
+                    content, filename=artifact.filename, mime_type=artifact.mime_type
+                )
+                full_text = "\n".join(span.text for span in document.spans)
+                char_start = chunk.locator.get("char_start")
+                char_end = chunk.locator.get("char_end")
+                if isinstance(char_start, int) and isinstance(char_end, int):
+                    start = max(0, char_start - before_chars)
+                    end = min(len(full_text), char_end + after_chars)
+                    context_text = full_text[start:end]
+                else:
+                    needle_index = full_text.find(chunk.text)
+                    if needle_index >= 0:
+                        start = max(0, needle_index - before_chars)
+                        end = min(len(full_text), needle_index + len(chunk.text) + after_chars)
                         context_text = full_text[start:end]
                     else:
-                        needle_index = full_text.find(chunk.text)
-                        if needle_index >= 0:
-                            start = max(0, needle_index - before_chars)
-                            end = min(len(full_text), needle_index + len(chunk.text) + after_chars)
-                            context_text = full_text[start:end]
-                        else:
-                            warnings.append("source_locator_unresolved")
-                except Exception as exc:
-                    warnings.append(f"source_context_extract_failed:{type(exc).__name__}")
-            return KnowledgebaseSourceContextResponse(
-                chunk_id=chunk.chunk_id,
-                artifact_id=chunk.artifact_id,
-                text=context_text,
-                locator=chunk.locator,
-                warnings=warnings,
-            )
+                        warnings.append("source_locator_unresolved")
+            except Exception as exc:
+                warnings.append(f"source_context_extract_failed:{type(exc).__name__}")
+        return KnowledgebaseSourceContextResponse(
+            chunk_id=chunk.chunk_id,
+            artifact_id=chunk.artifact_id,
+            text=context_text,
+            locator=chunk.locator,
+            warnings=warnings,
+        )

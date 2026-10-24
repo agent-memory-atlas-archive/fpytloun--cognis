@@ -12,7 +12,12 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from cognis import __version__
-from cognis.api.common import api_exception, require_admin
+from cognis.api.common import (
+    api_exception,
+    forbid_mutation_for_viewer,
+    require_admin,
+    require_current_user,
+)
 from cognis.api.models import (
     ClientDiscoveryCapabilities,
     ClientDiscoveryPaths,
@@ -21,12 +26,15 @@ from cognis.api.models import (
     ClientDiscoveryResponse,
     ClientDiscoveryServer,
     HealthResponse,
+    OnboardingStateRequest,
+    OnboardingStateResponse,
     ResolveAmbiguousDirectTurnRequest,
     ResolveAmbiguousDirectTurnResponse,
     StaleDirectTurnResponse,
     SystemDiagnosticsResponse,
 )
 from cognis.core.controller_runtime import ControllerLifecycleState
+from cognis.core.onboarding import ONBOARDING_STATE_KEY, configuration_readiness
 from cognis.core.trusted_evidence import TRUSTED_EVIDENCE_POLICY_VERSION
 from cognis.store.database import check_connection
 from cognis.store.direct_turns import (
@@ -34,7 +42,12 @@ from cognis.store.direct_turns import (
     DirectTurnRecoverySnapshot,
     DirectTurnStore,
 )
-from cognis.store.queries import list_agents, list_llm_providers
+from cognis.store.queries import (
+    get_user_ui_state_value,
+    list_agent_readiness_snapshots,
+    list_llm_providers,
+    upsert_user_ui_state,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -328,22 +341,47 @@ async def pwa_reset() -> HTMLResponse:
     )
 
 
+@router.get("/api/v1/onboarding", response_model=OnboardingStateResponse)
+async def onboarding_state(request: Request) -> OnboardingStateResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        value = await get_user_ui_state_value(session, user.email, ONBOARDING_STATE_KEY)
+    return OnboardingStateResponse.model_validate(value or {})
+
+
+@router.put("/api/v1/onboarding", response_model=OnboardingStateResponse)
+async def update_onboarding_state(
+    request: Request, payload: OnboardingStateRequest
+) -> OnboardingStateResponse:
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+    async with request.app.state.session_factory() as session:
+        await upsert_user_ui_state(
+            session, user.email, ONBOARDING_STATE_KEY, payload.model_dump(mode="json")
+        )
+        await session.commit()
+    return OnboardingStateResponse(status=payload.status)
+
+
 @router.get("/api/v1/system/diagnostics", response_model=SystemDiagnosticsResponse)
 async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
     require_admin(request)
+    user = require_current_user(request)
     config = request.app.state.config
     provider_health = await request.app.state.providers.health()
     async with request.app.state.session_factory() as session:
-        agents = await list_agents(session)
-        providers = await list_llm_providers(session)
-        from cognis.store.queries import list_executors
+        agents = await list_agent_readiness_snapshots(session, user.email)
+        providers = await list_llm_providers(session, acting_user_email=user.email)
 
-        all_executors = await list_executors(session, defer_observed_tools=True)
-        executor_has_tools = any(
-            (executor.enabled_tools and len(executor.enabled_tools) > 0)
-            or (executor.enabled_tool_groups and len(executor.enabled_tool_groups) > 0)
-            for executor in all_executors
-        )
+    readiness = await configuration_readiness(
+        request.app.state.session_factory,
+        request.app.state.providers.llm,
+        user.email,
+        agents=agents,
+    )
+    services_ready = all(
+        provider_health[key].status == "healthy" for key in ("memory", "guardrails")
+    )
 
     provider_test_results: dict[str, Any] = getattr(request.app.state, "provider_test_results", {})
     provider_rows = []
@@ -367,9 +405,10 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
             "mnemory_reachable": provider_health["memory"].status == "healthy",
             "intaris_reachable": provider_health["guardrails"].status == "healthy",
             "llm_provider_configured": len(providers) > 0,
-            "executor_tools_configured": executor_has_tools,
-            "agent_created": len(agents) > 0,
-            "chat_ready": len(providers) > 0 and len(agents) > 0,
+            **readiness,
+            "chat_ready": services_ready
+            and readiness["companion_routes_configured"]
+            and readiness["agent_ready"],
         },
         ui={
             "enabled": bool(config.serve_ui),

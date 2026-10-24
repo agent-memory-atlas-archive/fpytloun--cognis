@@ -1,12 +1,4 @@
-import hljs from 'highlight.js/lib/common';
-
-const ESC_MAP: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&#39;',
-};
+import { COMMON_HIGHLIGHT_LANGUAGES, deferredHighlightSpan, escapeCodeHtml } from './lazy-highlight';
 
 const extensionLanguages: Record<string, string> = {
   bash: 'bash',
@@ -40,13 +32,9 @@ const filenameFallbackLanguages: Record<string, string> = {
   makefile: 'bash',
 };
 
-function escapeHtml(input: string): string {
-  return input.replace(/[&<>"']/g, (ch) => ESC_MAP[ch] ?? ch);
-}
-
 function availableLanguage(language: string | null): string | null {
   if (!language) return null;
-  return hljs.getLanguage(language) ? language : null;
+  return COMMON_HIGHLIGHT_LANGUAGES.has(language) ? language : null;
 }
 
 export function pathFromToolArguments(args: Record<string, unknown> | null | undefined): string | null {
@@ -68,14 +56,11 @@ export function inferLanguageFromPath(path: string | null | undefined): string |
   return availableLanguage(extensionLanguages[ext] ?? null);
 }
 
+/** Escaped output; known languages are highlighted lazily when visible. */
 export function highlightToolOutput(text: string, language: string | null | undefined): string {
   const available = availableLanguage(language ?? null);
-  if (!available) return escapeHtml(text);
-  try {
-    return hljs.highlight(text, { language: available, ignoreIllegals: true }).value;
-  } catch {
-    return escapeHtml(text);
-  }
+  if (!available || available === 'plaintext') return escapeCodeHtml(text);
+  return deferredHighlightSpan(text, available);
 }
 
 export function isReadToolName(toolName: string): boolean {

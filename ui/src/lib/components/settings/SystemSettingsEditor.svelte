@@ -5,6 +5,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
+  import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import {
     groupSystemSettings,
     parseSettingDraft,
@@ -32,6 +33,8 @@
   let errors = $state<Record<string, string>>({});
   let busyKeys = $state<string[]>([]);
   let refreshError = $state('');
+  // Hidden while the global connection banner applies; refresh on restore.
+  const net = useSectionConnectivity({ hasError: () => Boolean(refreshError), retry: () => refreshSettings() });
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let mutationVersion = 0;
   let refreshRequestId = 0;
@@ -188,25 +191,25 @@
 <div class="space-y-5" data-testid="system-settings-editor">
   <div class="flex flex-wrap items-end justify-between gap-3">
     <div>
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Runtime configuration</p>
-      <h2 class="mt-1 text-xl font-semibold text-white">System settings</h2>
-      <p class="mt-2 max-w-3xl text-sm text-slate-400">
+      <p class="text-xs uppercase tracking-[0.25em] text-muted">Runtime configuration</p>
+      <h2 class="mt-1 text-xl font-semibold text-strong">System settings</h2>
+      <p class="mt-2 max-w-3xl text-sm text-muted">
         Changes are applied per setting. Unsaved rows remain intact while values refresh in the background.
       </p>
     </div>
-    {#if refreshError}
-      <p class="text-sm text-amber-300" role="status">Automatic refresh failed: {refreshError}</p>
+    {#if refreshError && !net.hideErrors}
+      <p class="text-sm text-warning" role="status">Automatic refresh failed: {refreshError}</p>
     {/if}
   </div>
 
   {#each groups as category (category.name)}
     <Card class="p-4 sm:p-5">
-      <h3 class="text-lg font-semibold capitalize text-white">{category.name}</h3>
+      <h3 class="text-lg font-semibold capitalize text-strong">{category.name}</h3>
       <div class="mt-4 space-y-5">
         {#each category.sections as section (`${category.name}:${section.name}`)}
           <section aria-labelledby={sectionId(category.name, section.name)} class="space-y-3">
-            <div class="border-b border-slate-800 pb-2">
-              <h4 id={sectionId(category.name, section.name)} class="text-sm font-semibold text-slate-200">{section.name}</h4>
+            <div class="border-b border-separator pb-2">
+              <h4 id={sectionId(category.name, section.name)} class="text-sm font-semibold text-foreground">{section.name}</h4>
             </div>
             <div class="grid gap-3 xl:grid-cols-2">
               {#each section.items as setting (setting.key)}
@@ -229,6 +232,6 @@
   {/each}
 
   {#if groups.length === 0}
-    <Card class="p-6 text-center text-sm text-slate-400">No system settings are available.</Card>
+    <Card class="p-6 text-center text-sm text-muted">No system settings are available.</Card>
   {/if}
 </div>

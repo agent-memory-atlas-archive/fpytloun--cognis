@@ -3,6 +3,29 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
 import ToolCallBlock from './ToolCallBlock.svelte';
+import CompactionCard from './CompactionCard.svelte';
+
+it.each(['classic', 'paper'])('keeps skipped compaction neutral in %s dark', (family) => {
+  const target = document.createElement('div');
+  target.dataset.themeFamily = family;
+  target.dataset.resolvedTheme = 'dark';
+  document.body.append(target);
+  const view = render(CompactionCard, {
+    target,
+    props: { item: {
+      id: 'skipped-compaction', kind: 'compaction', status: 'skipped',
+      summaryPreview: '', method: 'llm', turnsCompacted: 0, timestamp: null,
+    } },
+  });
+  const article = target.querySelector('article')!;
+  expect(article.classList.contains('compaction-info')).toBe(false);
+  expect(article.classList.contains('compaction-error')).toBe(false);
+  for (const neutral of ['border-control-border', 'bg-surface/70', 'text-secondary']) {
+    expect(article.classList.contains(neutral)).toBe(true);
+  }
+  view.unmount();
+  target.remove();
+});
 
 vi.mock('$lib/syntax/json', async (importOriginal) => {
   const actual = await importOriginal<typeof import('$lib/syntax/json')>();

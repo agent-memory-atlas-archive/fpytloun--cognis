@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
+import type { ChatV2ApiClient } from '$lib/chat-v2/api';
 import type {
   ChatRealtimeFrame,
   ChatSnapshot,
@@ -128,6 +129,48 @@ class ResizeObserverMock {
 }
 
 describe('ScopedChatV2Timeline history backfill', () => {
+  it('advances empty initial history without an animation frame and stops at a repeated cursor', async () => {
+    const originalRaf = globalThis.requestAnimationFrame;
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+    const api = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(scope, [], 'empty-before-1')),
+      sync: vi.fn(),
+      timeline: vi.fn()
+        .mockResolvedValueOnce(backfill(scope, [], 'empty-before-2'))
+        .mockResolvedValueOnce(backfill(scope, [], 'empty-before-2')),
+    };
+    try {
+      render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
+      await screen.findByText('Earlier history could not be advanced.');
+      expect(api.timeline).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText('Loading timeline…')).toBeNull();
+      expect(screen.queryByText('Loading earlier timeline history.')).toBeNull();
+    } finally {
+      vi.stubGlobal('requestAnimationFrame', originalRaf);
+    }
+  });
+
+  it('keeps typed critical event-store failures actionable while the WebSocket is degraded', async () => {
+    const { ChatV2ApiError } = await import('$lib/chat-v2/api');
+    window.dispatchEvent(new Event('offline'));
+    const api = {
+      snapshot: vi.fn().mockRejectedValue(new ChatV2ApiError('Critical fixture event store failure', {
+        code: 'event_store_unavailable', status: 503, details: { recoverable: true },
+      })),
+      sync: vi.fn(), timeline: vi.fn(),
+    };
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
+    try {
+      expect(await screen.findByRole('alert')).toHaveTextContent('Critical fixture event store failure');
+      expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled();
+      expect(screen.queryByText('Loading timeline…')).toBeNull();
+      expect(api.snapshot).toHaveBeenCalledTimes(1);
+    } finally {
+      view.unmount();
+      window.dispatchEvent(new Event('online'));
+    }
+  });
+
   it('renders queued messages and hides Following for editable composers', async () => {
     const scope: TimelineScope = {
       key: 'conversation:conversation-queue',
@@ -215,7 +258,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('scoped-queued-message-queue-boundary')).toBeNull();
     });
-    expect(screen.getByText('queued plan')).toBeInTheDocument();
+    expect(await screen.findByText('queued plan')).toBeInTheDocument();
   });
 
   it('does not automatically backfill editable history and signals one successful load', async () => {
@@ -358,7 +401,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     await fireEvent.wheel(viewport, { deltaY: -20 });
 
     await screen.findByText('message 0');
-    expect(viewport.scrollTop).toBe(100);
+    await waitFor(() => expect(viewport.scrollTop).toBe(100));
   });
 
   it('loads one page for each distinct editable top-edge encounter', async () => {
@@ -382,6 +425,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await screen.findByText('message 0');
     expect(api.timeline).toHaveBeenCalledOnce();
+    await waitFor(() => expect(screen.queryByText('Loading earlier timeline history.')).toBeNull());
 
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
@@ -420,7 +464,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       sync: vi.fn(),
       timeline: vi.fn(),
     };
-    render(ScopedChatV2Timeline, {
+    const view = render(ScopedChatV2Timeline, {
       scope,
       api,
       realtime: channel,
@@ -456,8 +500,14 @@ describe('ScopedChatV2Timeline history backfill', () => {
     await fireEvent.scroll(viewport);
     const pausedTop = viewport.scrollTop;
     expect(screen.getByRole('button', { name: 'Resume live follow' })).toBeVisible();
+    const row = screen.getByText('delayed resize row');
+    await view.rerender({ scope: { ...scope }, api, realtime: channel, hasEditableComposer: true });
+    expect(screen.getByTestId('scoped-timeline-viewport')).toBe(viewport);
+    expect(screen.getByText('delayed resize row')).toBe(row);
+    expect(screen.getByRole('button', { name: 'Resume live follow' })).toBeVisible();
     ResizeObserverMock.instances.forEach((observer) => observer.emit());
     expect(viewport.scrollTop).toBe(pausedTop);
+    expect(api.snapshot).toHaveBeenCalledOnce();
   });
 
   it('loads when a scrollbar scroll reaches the top', async () => {
@@ -475,6 +525,30 @@ describe('ScopedChatV2Timeline history backfill', () => {
 
     await waitFor(() => expect(api.timeline).toHaveBeenCalledWith(scope, timelineOptions('before-1')));
     expect(screen.getByText('message 0')).toBeTruthy();
+  });
+
+  it('resumes follow for a submitted message but not restored outbox messages', async () => {
+    const api = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(scope, Array.from({ length: 8 }, (_, index) => message(index + 1)), null)),
+      sync: vi.fn(),
+      timeline: vi.fn(),
+    };
+    const { component } = render(ScopedChatV2Timeline, {
+      scope, api, realtime: realtime(), hasEditableComposer: true,
+    });
+    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    await screen.findByText('message 8');
+    viewport.scrollTop = 200;
+    await fireEvent.wheel(viewport, { deltaY: -100 });
+    await fireEvent.scroll(viewport);
+    expect(screen.getByRole('button', { name: 'Resume live follow' })).toBeVisible();
+    component.stageOptimisticMessage({ scopeKey: scope.key, content: 'Restored draft', clientMessageId: 'restored-draft' });
+    await screen.findByText('Restored draft');
+    expect(screen.getByRole('button', { name: 'Resume live follow' })).toBeVisible();
+    component.stageOptimisticMessage({ scopeKey: scope.key, content: 'New submission', clientMessageId: 'submitted-draft', follow: true });
+    await screen.findByText('New submission');
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Resume live follow' })).not.toBeInTheDocument());
+    expect(viewport.scrollTop).toBe(viewport.scrollHeight);
   });
 
   it.each([
@@ -764,6 +838,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Refresh timeline' }));
     resolveRefresh?.(snapshot(scope, [11, 12, 13, 14].map((item) => message(item)), 'before-refresh'));
     await screen.findByText('message 14');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh timeline' })).toBeEnabled());
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await screen.findByText('refreshed older row');
@@ -809,6 +884,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
 
     resolveRefresh?.(snapshot(scope, [11, 12, 13, 14].map((item) => message(item)), 'before-refresh'));
     await screen.findByText('message 14');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh timeline' })).toBeEnabled());
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await screen.findByText('post-refresh older row');
@@ -874,6 +950,90 @@ describe('ScopedChatV2Timeline history backfill', () => {
     resolveSnapshot?.(snapshot(scope, [message(1, 'late snapshot row')], null));
     await Promise.resolve();
     expect(screen.queryByText('late snapshot row')).toBeNull();
+  });
+
+  it('never acquires realtime after unmount when the cached view resolves late', async () => {
+    const { TimelineController } = await import('$lib/chat-v2/timeline-controller.svelte');
+    let resolveCache: (() => void) | undefined;
+    const spy = vi.spyOn(TimelineController.prototype, 'hydrate').mockReturnValue(
+      new Promise((resolve) => { resolveCache = resolve; }),
+    );
+    const api = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(scope, [message(1)], null)),
+      sync: vi.fn(),
+      timeline: vi.fn(),
+    };
+    const channel = realtime();
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: channel });
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+
+    view.unmount();
+    resolveCache?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(api.snapshot).not.toHaveBeenCalled();
+    expect(channel.acquireChatV2).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('opens from a cached view with a cursor sync instead of a snapshot', async () => {
+    const { TimelineController } = await import('$lib/chat-v2/timeline-controller.svelte');
+    const { ChatV2Store } = await import('$lib/chat-v2/store.svelte');
+    const seeded = new ChatV2Store();
+    seeded.replaceFromSnapshotIfUnchanged(snapshot(scope, [message(1, 'cached row')], null), seeded.refreshWatermark());
+    const spy = vi.spyOn(TimelineController.prototype, 'hydrate').mockImplementation(async function (this: InstanceType<typeof TimelineController>) {
+      this.store.restoreState(seeded.serializeState());
+    });
+    const api = {
+      snapshot: vi.fn(),
+      sync: vi.fn().mockResolvedValue({
+        schema_version: 2,
+        projection_version: 'test',
+        cursor_before: `cursor:${scope.key}`,
+        cursor_after: `cursor:${scope.key}`,
+        has_more: false,
+        ops: [],
+      }),
+      timeline: vi.fn(),
+    };
+    const channel = realtime();
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: channel });
+
+    expect(await screen.findByText('cached row')).toBeTruthy();
+    await waitFor(() => expect(api.sync).toHaveBeenCalled());
+    expect(channel.acquireChatV2).toHaveBeenCalledTimes(1);
+    view.unmount();
+    expect(channel.releaseChatV2).toHaveBeenCalledWith(scope.key);
+    spy.mockRestore();
+  });
+
+  it('keeps compact cached reconciliation out of the timeline layout', async () => {
+    const { TimelineController } = await import('$lib/chat-v2/timeline-controller.svelte');
+    const { ChatV2Store } = await import('$lib/chat-v2/store.svelte');
+    const seeded = new ChatV2Store();
+    seeded.replaceFromSnapshotIfUnchanged(snapshot(scope, [message(1, 'quiet cached row')], null), seeded.refreshWatermark());
+    const spy = vi.spyOn(TimelineController.prototype, 'hydrate').mockImplementation(async function (this: InstanceType<typeof TimelineController>) {
+      this.store.restoreState(seeded.serializeState());
+    });
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const api = { snapshot: vi.fn(), timeline: vi.fn(), sync: vi.fn<ChatV2ApiClient['sync']>(async () => {
+      await gate;
+      return { schema_version: 2, projection_version: 'test', scope, cursor_before: `cursor:${scope.key}`,
+        cursor_after: `cursor:${scope.key}:quiet`, conversation_id: scope.conversation_id!, reset_required: false,
+        server_time: '', has_more: false, ops: [] };
+    }) };
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), compact: true });
+    try {
+      await waitFor(() => expect(api.sync).toHaveBeenCalled());
+      expect(document.querySelector(`[data-cursor="cursor:${scope.key}"][data-freshness="reconciling"]`)).toBeTruthy();
+      expect(screen.queryByTestId('scoped-timeline-status-row')).toBeNull();
+      expect(screen.queryByText('Refreshing…')).toBeNull();
+      finish();
+      await screen.findByText('quiet cached row');
+      await waitFor(() => expect(document.querySelector(`[data-cursor="cursor:${scope.key}:quiet"]`)).toBeTruthy());
+      expect(screen.queryByTestId('scoped-timeline-status-row')).toBeNull();
+    } finally { finish(); view.unmount(); spy.mockRestore(); }
   });
 
   it('shows a recoverable snapshot error and succeeds on retry', async () => {

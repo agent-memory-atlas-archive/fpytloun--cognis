@@ -13,13 +13,19 @@ from cognis.core.artifact_inputs import safe_attachment_metadata
 from cognis.core.conversation_search import join_session_matches
 from cognis.core.historical_tool_output import source_session_authority
 from cognis.core.long_lived_chat import is_long_lived_chat_context
+from cognis.core.project_conversation_access import (
+    readable_project_conversation,
+    require_project_agent,
+)
 from cognis.core.session_cache import CachedEvent
 from cognis.models.search import SearchRequestFilters, SearchSessionsRequest
 from cognis.models.session import ConversationContext, SessionModel
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolCapability, ToolSource
 from cognis.runtime_context import scoped_runtime_context
+from cognis.store.project_queries import list_project_conversations
 from cognis.store.queries import (
+    get_agent,
     get_conversation,
     get_session_row,
     get_setting_value,
@@ -71,7 +77,7 @@ LIST_CONVERSATIONS_TOOL = _tool(
 
 SEARCH_CONVERSATIONS_TOOL = _tool(
     "search_conversations",
-    "Search your conversations by reasoning, intention, and summary content. Reasoning hits are the most precise.",
+    "Search your conversations by reasoning, intention, and summary content. With the active project_id, search project conversation titles and recent durable messages, including other members' shared history. Project search is bounded lexical search; follow next_cursor and use read_conversation_messages for older history. Private reasoning and tools are never shared.",
     {
         "q": {"type": "string"},
         "agent_id": {"type": "string"},
@@ -92,10 +98,24 @@ SEARCH_CONVERSATIONS_TOOL = _tool(
     },
     ["q"],
 )
+LIST_PROJECT_CONVERSATIONS_TOOL = _tool(
+    "list_project_conversations",
+    "List shared conversation metadata in the active project. Requires an assigned active agent "
+    "and project membership. Excludes private, deleted, and managed chats. Use returned IDs "
+    "with read_conversation_messages; shared reads exclude reasoning and tool events.",
+    properties={
+        "project_id": {"type": "string"},
+        "agent_id": {"type": "string", "description": "Optional author agent filter."},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+        "cursor": {"type": "string", "description": "Cursor returned by this tool."},
+    },
+    required=["project_id"],
+)
 
 READ_CONVERSATION_MESSAGES_TOOL = _tool(
     "read_conversation_messages",
-    "Read messages from one owned conversation with anchor-based pagination. "
+    "Read messages from an owned conversation or a shared conversation in the active project "
+    "with anchor-based pagination. Shared reads exclude reasoning and tool events. "
     "Opt into tool_call/tool_result kinds for compact metadata and historical references only. "
     "Use read_tool_output with the reference for content. Defaults to the current conversation.",
     {
@@ -156,6 +176,7 @@ SUMMARIZE_CONVERSATION_TOOL = _tool(
 def conversation_tools() -> list[ToolDefinition]:
     return [
         LIST_CONVERSATIONS_TOOL,
+        LIST_PROJECT_CONVERSATIONS_TOOL,
         SEARCH_CONVERSATIONS_TOOL,
         READ_CONVERSATION_MESSAGES_TOOL,
         SUMMARIZE_CONVERSATION_TOOL,
@@ -393,6 +414,60 @@ def build_conversation_tool_handlers(
     intaris: Any,
     compaction_strategy: Any | None = None,
 ) -> dict[str, Any]:
+    async def list_project_conversations_handler(
+        arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, Any]:
+        from cognis.api.project_pagination import decode_project_cursor, encode_project_cursor
+
+        actor = _user(context)
+        project_id = str(arguments["project_id"])
+        access = context.runtime_metadata.get("runtime_access") or {}
+        scope = [
+            "list_project_conversations",
+            actor,
+            project_id,
+            access.get("agent_id"),
+            arguments.get("agent_id"),
+        ]
+        before = decode_project_cursor(arguments.get("cursor"), scope)
+        limit = min(max(int(arguments.get("limit") or 25), 1), 100)
+        async with session_factory() as session:
+            await require_project_agent(
+                session, actor=actor, project_id=project_id, runtime_access=access
+            )
+            rows = await list_project_conversations(
+                session,
+                project_id,
+                viewer_email=actor,
+                agent_id=arguments.get("agent_id"),
+                limit=limit + 1,
+                before=before,
+                shared_only=True,
+            )
+        page = rows[:limit]
+        return {
+            "project_id": project_id,
+            "items": [
+                {
+                    "conversation_id": row.conversation_id,
+                    "title": row.title,
+                    "agent_id": row.agent_id,
+                    "visibility": row.visibility,
+                    "status": row.status,
+                    "last_message_at": row.last_message_at.isoformat()
+                    if row.last_message_at
+                    else None,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in page
+            ],
+            "next_cursor": encode_project_cursor(
+                scope, page[-1].last_message_at or page[-1].created_at, page[-1].conversation_id
+            )
+            if len(rows) > limit
+            else None,
+        }
+
     async def list_conversations_handler(
         arguments: dict[str, Any], context: ToolExecutionContext
     ) -> dict[str, Any]:
@@ -433,9 +508,155 @@ def build_conversation_tool_handlers(
             ),
         }
 
+    async def search_project_history(
+        arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, Any]:
+        """Bounded durable-message search, never cross-user reasoning indexes."""
+        actor = _user(context)
+        project_id = str(arguments["project_id"])
+        query = str(arguments.get("q") or "").strip()
+        if not query:
+            raise ValueError("q is required")
+        from_ts = _parse_iso_datetime(arguments.get("from_ts"), "from_ts")
+        to_ts = _parse_iso_datetime(arguments.get("to_ts"), "to_ts")
+        scope = [
+            actor,
+            project_id,
+            query,
+            arguments.get("agent_id"),
+            arguments.get("context_type"),
+            arguments.get("from_ts"),
+            arguments.get("to_ts"),
+        ]
+        before = None
+        if arguments.get("cursor"):
+            from cognis.api.project_pagination import decode_project_cursor
+
+            before = decode_project_cursor(str(arguments["cursor"]), scope)
+        async with session_factory() as session:
+            await require_project_agent(
+                session,
+                actor=actor,
+                project_id=project_id,
+                runtime_access=context.runtime_metadata.get("runtime_access"),
+            )
+            rows = await list_project_conversations(
+                session,
+                project_id,
+                viewer_email=actor,
+                limit=11,
+                before=before,
+                agent_id=arguments.get("agent_id"),
+            )
+        matches: list[dict[str, Any]] = []
+        for row in rows[:10]:
+            if arguments.get("context_type") and row.context_type != arguments["context_type"]:
+                continue
+            # Re-authorize through the ordinary reader before fetching every history.
+            try:
+                history = await read_conversation_messages_handler(
+                    {
+                        "conversation_id": row.conversation_id,
+                        "limit": 100,
+                        "anchor": {"kind": "latest"},
+                        "include_content_truncation": False,
+                    },
+                    context,
+                )
+            except ValueError:
+                continue
+            hits = []
+            for event in history["events"]:
+                text = event.get("content")
+                if not isinstance(text, str) or query.casefold() not in text.casefold():
+                    continue
+                timestamp = _parse_iso_datetime(event.get("ts"), "timestamp")
+                if from_ts and (not timestamp or timestamp < from_ts):
+                    continue
+                if to_ts and (not timestamp or timestamp > to_ts):
+                    continue
+                index = text.casefold().find(query.casefold())
+                hits.append(
+                    {
+                        "kind": event["kind"],
+                        "snippet": text[max(0, index - 120) : index + 500],
+                        "anchor": {
+                            "kind": "around",
+                            "session_id": event["session_id"],
+                            "seq": event["seq"],
+                        },
+                    }
+                )
+            activity_at = row.last_message_at or row.created_at
+            if activity_at.tzinfo is None:
+                activity_at = activity_at.replace(tzinfo=UTC)
+            title_in_range = (not from_ts or activity_at >= from_ts) and (
+                not to_ts or activity_at <= to_ts
+            )
+            if hits or (title_in_range and query.casefold() in (row.title or "").casefold()):
+                matches.append(
+                    {
+                        "conversation_id": row.conversation_id,
+                        "title": row.title,
+                        "is_readonly": row.user_email != actor,
+                        "matches": hits[:5],
+                    }
+                )
+        # Fresh project access at output time; individual readers also recheck visibility.
+        async with session_factory() as session:
+            await require_project_agent(
+                session,
+                actor=actor,
+                project_id=project_id,
+                runtime_access=context.runtime_metadata.get("runtime_access"),
+            )
+            visible = []
+            for match in matches:
+                current = await get_conversation(session, match["conversation_id"])
+                if (
+                    current
+                    and current.status != "deleted"
+                    and current.user_email == actor
+                    and current.project_id == project_id
+                ):
+                    visible.append(match)
+                else:
+                    try:
+                        await readable_project_conversation(
+                            session,
+                            actor=actor,
+                            conversation_id=match["conversation_id"],
+                            runtime_access=context.runtime_metadata.get("runtime_access"),
+                        )
+                        visible.append(match)
+                    except ValueError:
+                        pass
+        next_cursor = None
+        if len(rows) > 10:
+            from cognis.api.project_pagination import encode_project_cursor
+
+            last = rows[9]
+            next_cursor = encode_project_cursor(
+                scope, last.last_message_at or last.created_at, last.conversation_id
+            )
+        return {
+            "matches": visible,
+            "next_cursor": next_cursor,
+            "backend": {"mode_used": "lexical", "scope": "project_durable_messages"},
+            "coverage": "Ten conversations per page; latest 100 messages each. Follow next_cursor and read message history for older content.",
+        }
+
     async def search_conversations_handler(
         arguments: dict[str, Any], context: ToolExecutionContext
     ) -> dict[str, Any]:
+        project_id = arguments.get("project_id")
+        runtime_access = context.runtime_metadata.get("runtime_access")
+        if (
+            project_id
+            and isinstance(runtime_access, dict)
+            and runtime_access.get("project_id") == project_id
+        ):
+            return await search_project_history(arguments, context)
         user_email = _user(context)
         q = str(arguments.get("q") or "").strip()
         if not q:
@@ -501,12 +722,20 @@ def build_conversation_tool_handlers(
         anchor: dict[str, Any] = raw_anchor if isinstance(raw_anchor, dict) else {}
         async with session_factory() as session:
             conversation = await get_conversation(session, conversation_id)
-            if (
-                conversation is None
-                or conversation.user_email != user_email
-                or conversation.status == "deleted"
-            ):
+            if conversation is None or conversation.status == "deleted":
                 raise ValueError("Conversation not found")
+            shared_reader = conversation.user_email != user_email
+            if shared_reader:
+                conversation = await readable_project_conversation(
+                    session,
+                    actor=user_email,
+                    conversation_id=conversation_id,
+                    runtime_access=context.runtime_metadata.get("runtime_access"),
+                )
+                if tool_history:
+                    raise ValueError(
+                        "Shared project conversations expose messages only, not tool history"
+                    )
             session_rows = await list_conversation_sessions(session, conversation_id)
         if not session_rows:
             return {
@@ -553,7 +782,26 @@ def build_conversation_tool_handlers(
         history_gaps: list[dict[str, Any]] = []
 
         async def read_row(row: Any, **kwargs: Any) -> Any:
-            if tool_history:
+            if shared_reader:
+                async with session_factory() as session:
+                    await readable_project_conversation(
+                        session,
+                        actor=user_email,
+                        conversation_id=conversation_id,
+                        runtime_access=context.runtime_metadata.get("runtime_access"),
+                    )
+                    source_agent = await get_agent(session, row.agent_id)
+                    if source_agent is None:
+                        raise ValueError("Source agent unavailable")
+                with scoped_runtime_context(
+                    user_email=conversation.user_email,
+                    agent_id=row.agent_id,
+                    agent_owner_email=source_agent.owner_email,
+                ):
+                    result = await intaris.read_events(
+                        row.intaris_session_id or row.session_id, **kwargs
+                    )
+            elif tool_history:
                 authority = await source_session_authority(
                     AgentRegistry(session_factory), row, user_email=user_email
                 )
@@ -731,7 +979,9 @@ def build_conversation_tool_handlers(
                     "ts": item.timestamp,
                     "content": content,
                     "content_truncated": truncated,
-                    "attachments": safe_attachment_metadata(event_data.get("attachments")),
+                    "attachments": []
+                    if shared_reader
+                    else safe_attachment_metadata(event_data.get("attachments")),
                     "anchor": f"{session_id}:{seq_value}"
                     if session_id and seq_value is not None
                     else None,
@@ -739,6 +989,14 @@ def build_conversation_tool_handlers(
             )
         first_event = response_events[0] if response_events else None
         last_event = response_events[-1] if response_events else None
+        if shared_reader:
+            async with session_factory() as session:
+                await readable_project_conversation(
+                    session,
+                    actor=user_email,
+                    conversation_id=conversation_id,
+                    runtime_access=context.runtime_metadata.get("runtime_access"),
+                )
         return {
             "conversation_id": conversation_id,
             "events": response_events,
@@ -886,6 +1144,7 @@ def build_conversation_tool_handlers(
 
     return {
         "list_conversations": list_conversations_handler,
+        "list_project_conversations": list_project_conversations_handler,
         "search_conversations": search_conversations_handler,
         "read_conversation_messages": read_conversation_messages_handler,
         "summarize_conversation": summarize_conversation_handler,

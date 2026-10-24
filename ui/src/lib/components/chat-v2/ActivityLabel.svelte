@@ -1,0 +1,35 @@
+<script lang="ts">
+  let { label, active = false } = $props<{ label: string; active?: boolean }>();
+</script>
+
+<span class:running-label={active}>{label}</span>
+
+<style>
+  @supports (background-clip: text) {
+    .running-label {
+      background: linear-gradient(
+        90deg,
+        color-mix(in srgb, currentColor 40%, transparent) 30%,
+        currentColor 50%,
+        color-mix(in srgb, currentColor 40%, transparent) 70%
+      );
+      background-size: 250% 100%;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: activity-sweep var(--chat-motion-activity, 1.6s) linear infinite;
+    }
+  }
+
+  @keyframes activity-sweep {
+    from { background-position: 100% 0; }
+    to { background-position: 0% 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce), (forced-colors: active) {
+    .running-label {
+      animation: none;
+      background: none;
+      -webkit-text-fill-color: currentColor;
+    }
+  }
+</style>

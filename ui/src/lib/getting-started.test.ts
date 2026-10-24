@@ -1,49 +1,24 @@
-import { beforeEach, describe, expect, it } from 'vitest';
-
-import { deriveGettingStartedSteps, isGettingStartedDismissed, setGettingStartedDismissed } from '$lib/getting-started';
+import { describe, expect, it } from 'vitest';
+import { deriveGettingStartedSteps, shouldOfferOnboarding } from '$lib/getting-started';
 import type { SystemDiagnostics } from '$lib/types/api';
 
-describe('getting started helpers', () => {
-  const storage = new Map<string, string>();
-  const diagnostics: SystemDiagnostics = {
-    readiness: {
-      mnemory_reachable: true,
-      intaris_reachable: true,
-      llm_provider_configured: false,
-      agent_created: false,
-      chat_ready: false
-    },
-    ui: {},
-    database: {},
-    config: {},
-    providers: [],
-    agents: {},
-    key_fingerprint: null
-  };
-
-  beforeEach(() => {
-    storage.clear();
-    Object.defineProperty(window, 'localStorage', {
-      value: {
-        getItem: (key: string) => storage.get(key) ?? null,
-        setItem: (key: string, value: string) => storage.set(key, value),
-        removeItem: (key: string) => storage.delete(key)
-      },
-      configurable: true
-    });
-  });
-
-  it('derives pending steps from diagnostics readiness', () => {
+const diagnostics: SystemDiagnostics = {
+  readiness: { mnemory_reachable: true, intaris_reachable: true, onboarding_pending: true },
+  ui: {}, database: {}, config: {}, providers: [], agents: {}, key_fingerprint: null
+};
+describe('first-run checklist', () => {
+  it('requires models, companion routes, and executor before agent creation', () => {
     const steps = deriveGettingStartedSteps(diagnostics);
-    expect(steps[0]?.done).toBe(true);
-    expect(steps[1]?.done).toBe(false);
+    expect(steps[0].done).toBe(true);
+    expect(steps.find((step) => step.id === 'routing')?.done).toBe(false);
+    expect(steps.findIndex((step) => step.id === 'executor')).toBeLessThan(steps.findIndex((step) => step.id === 'agents'));
   });
-
-  it('stores dismissed state in localStorage', () => {
-    expect(isGettingStartedDismissed()).toBe(false);
-    setGettingStartedDismissed(true);
-    expect(isGettingStartedDismissed()).toBe(true);
-    setGettingStartedDismissed(false);
-    expect(isGettingStartedDismissed()).toBe(false);
+  it('never resurfaces terminal server-side state after configuration degrades', () => {
+    expect(shouldOfferOnboarding(diagnostics)).toBe(true);
+    expect(shouldOfferOnboarding({ ...diagnostics, readiness: { onboarding_pending: false, chat_ready: false } })).toBe(false);
+    expect(shouldOfferOnboarding({ ...diagnostics, readiness: { onboarding_pending: true, chat_ready: true } })).toBe(false);
+  });
+  it('does not offer setup before server state is known', () => {
+    expect(shouldOfferOnboarding({ ...diagnostics, readiness: {} })).toBe(false);
   });
 });

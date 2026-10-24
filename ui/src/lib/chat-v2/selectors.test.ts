@@ -10,10 +10,11 @@ import {
   selectPendingInputItem,
   selectPendingInputToolCall,
   selectPinnedTransientNotice,
-  selectQueuedCount
+  selectQueuedCount,
+  selectRenderableTimeline
 } from './selectors';
 import { emptyChatV2State, type ChatV2ClientState } from './sync-engine';
-import type { RuntimeOverlaySnapshot, TimelineItem, ToolCallTimelineItem } from './types';
+import type { ErrorTimelineItem, MessageTimelineItem, RuntimeOverlaySnapshot, TimelineItem, ToolCallTimelineItem } from './types';
 
 function state(overrides: Partial<ChatV2ClientState> = {}): ChatV2ClientState {
   return { ...emptyChatV2State(), ...overrides };
@@ -50,6 +51,42 @@ describe('runtime selectors', () => {
     expect(selectNeedsRecovery(state({ syncStatus: 'ready' }))).toBe(false);
     expect(selectQueuedCount(state({ queue: { messages: [], queued_count: 3 } }))).toBe(3);
     expect(selectQueuedCount(state())).toBe(0);
+  });
+});
+
+describe('failed-turn presentation', () => {
+  const modelError: MessageTimelineItem = {
+    id: 'system:model-error', kind: 'message', sort_key: '1', source_refs: [],
+    stable: true, message_id: 'model-error',
+    turn_id: 'turn-1', role: 'system', content: 'Reasoning timed out.',
+    attachments: [], partial: false, notice_kind: 'model_error', notice_scope: 'failed_turn',
+  };
+  const turnError: ErrorTimelineItem = {
+    id: 'error:turn-1', kind: 'error', sort_key: '2', source_refs: [],
+    stable: true,
+    turn_id: 'turn-1', level: 'error', title: 'Turn failed',
+    error_code: 'step_failed', recoverable: true,
+  };
+
+  it('renders one failure card regardless of event arrival order or stability', () => {
+    for (const stable of [true, false]) {
+      const error = { ...turnError, stable };
+      expect(selectRenderableTimeline([modelError, error])).toEqual([modelError]);
+      expect(selectRenderableTimeline([error, modelError])).toEqual([modelError]);
+    }
+  });
+
+  it('preserves standalone, uncorrelated and unrelated failures', () => {
+    expect(selectRenderableTimeline([turnError])).toEqual([turnError]);
+    for (const error of [
+      { ...turnError, turn_id: 'turn-2' },
+      { ...turnError, turn_id: null },
+      { ...turnError, error_code: 'executor_unavailable' },
+    ]) {
+      expect(selectRenderableTimeline([modelError, error])).toEqual([modelError, error]);
+    }
+    expect(selectRenderableTimeline([{ ...modelError, notice_resolved: true }, turnError]))
+      .toEqual([turnError]);
   });
 });
 

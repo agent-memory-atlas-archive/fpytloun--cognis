@@ -235,6 +235,97 @@ def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path
         assert detail_response.json()["last_run_status"] == "running"
 
 
+def test_human_evaluation_round_trip_and_schedule_template(monkeypatch, tmp_path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def seed() -> None:
+            async with app.state.session_factory() as db:
+                await create_user(
+                    db,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    db,
+                    agent_id="agent-evaluation",
+                    owner_email="owner@example.com",
+                    name="Evaluation agent",
+                    capabilities={"intaris_evaluation": "strict"},
+                )
+                await create_user(
+                    db,
+                    email="other@example.com",
+                    name="Other",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await db.commit()
+
+        asyncio.run(seed())
+        headers = _auth_headers(app, email="owner@example.com")
+        updated = client.put(
+            "/api/v1/agents/agent-evaluation",
+            headers=headers,
+            json={"capabilities": {"memory_backend": "none"}},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["capabilities"]["intaris_evaluation"] == "strict"
+        invalid = client.put(
+            "/api/v1/agents/agent-evaluation",
+            headers=headers,
+            json={"capabilities": {"intaris_evaluation": None}},
+        )
+        assert invalid.status_code == 400
+        denied = client.put(
+            "/api/v1/agents/agent-evaluation",
+            headers=_auth_headers(app, email="other@example.com", role="admin"),
+            json={"capabilities": {"intaris_evaluation": "legacy"}},
+        )
+        assert denied.status_code in (403, 404)
+        created = client.post(
+            "/api/v1/schedules",
+            headers=headers,
+            json={
+                "name": "Evaluation canary",
+                "agent_id": "agent-evaluation",
+                "schedule_type": "cron",
+                "cron_expr": "0 9 * * *",
+                "enabled": False,
+                "task_template": {
+                    "title": "Canary",
+                    "session_policy": {
+                        "intaris_evaluation": "balanced",
+                        "deny_policies": ["No push"],
+                    },
+                },
+            },
+        )
+        assert created.status_code == 201
+        schedule_id = created.json()["schedule_id"]
+        assert created.json()["session_policy"]["intaris_evaluation"] == "balanced"
+        retained = client.put(
+            f"/api/v1/schedules/{schedule_id}", headers=headers, json={"name": "Renamed"}
+        )
+        assert retained.status_code == 200
+        assert retained.json()["session_policy"]["intaris_evaluation"] == "balanced"
+        cleared = client.put(
+            f"/api/v1/schedules/{schedule_id}",
+            headers=headers,
+            json={"session_policy": {"intaris_evaluation": None, "deny_policies": ["No push"]}},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["session_policy"].get("intaris_evaluation") is None
+        invalid_template = client.put(
+            f"/api/v1/schedules/{schedule_id}",
+            headers=headers,
+            json={"task_template": {"session_policy": {"intaris_evaluation": "invalid-mode"}}},
+        )
+        assert invalid_template.status_code == 422
+
+
 def test_schedule_create_rejects_other_user_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app

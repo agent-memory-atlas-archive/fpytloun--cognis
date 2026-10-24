@@ -84,7 +84,7 @@ async def test_discover_models_uses_executor_local_ollama_probe(
 async def test_discover_models_rejects_non_ollama_executor_probe() -> None:
     handler = InferenceHandler()
 
-    with pytest.raises(ValueError, match="supports Ollama only"):
+    with pytest.raises(ValueError, match="unsupported for this preset"):
         await handler.discover_models(
             preset="openai",
             base_url="https://api.openai.com",
@@ -703,13 +703,15 @@ async def test_generate_translates_responses_tools_shape(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_event_type", ["response.failed", "error"])
 async def test_stream_complete_returns_error_for_failed_responses_event(
     monkeypatch: pytest.MonkeyPatch,
+    failure_event_type: str,
 ) -> None:
     handler = InferenceHandler()
 
     async def fake_stream():
-        yield {"type": "response.failed", "error": {"message": "bridge failed"}}
+        yield {"type": failure_event_type, "error": {"message": "bridge failed"}}
 
     async def fake_aresponses(**_: object):
         return fake_stream()
@@ -725,6 +727,11 @@ async def test_stream_complete_returns_error_for_failed_responses_event(
         )
     ]
 
+    if failure_event_type == "error":
+        assert len(chunks) == 2
+        assert chunks[0]["provider_event_type"] == "error"
+        assert not chunks[0].get("content")
+        chunks = chunks[1:]
     assert chunks == [
         {
             "done": True,
@@ -732,8 +739,8 @@ async def test_stream_complete_returns_error_for_failed_responses_event(
             "response_error": {
                 "category": "other",
                 "message": "bridge failed",
-                "provider_event": "response.failed",
-                "details": {"event_type": "response.failed", "message": "bridge failed"},
+                "provider_event": failure_event_type,
+                "details": {"event_type": failure_event_type, "message": "bridge failed"},
             },
             "finish_reason": "error",
         }

@@ -12,13 +12,13 @@
   >
     {#snippet header()}
       <div>
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Confirmation required</p>
-        <h2 class="mt-3 text-xl font-semibold text-white" id="confirm-title">{$confirmStore.title}</h2>
+        <p class="text-sm uppercase tracking-[0.25em] text-muted">Confirmation required</p>
+        <h2 class="mt-3 text-xl font-semibold text-strong" id="confirm-title">{$confirmStore.title}</h2>
       </div>
     {/snippet}
 
     {#snippet children()}
-      <p class="text-sm leading-6 text-slate-300">{$confirmStore.message}</p>
+      <p class="text-sm leading-6 text-secondary">{$confirmStore.message}</p>
     {/snippet}
 
     {#snippet footer()}

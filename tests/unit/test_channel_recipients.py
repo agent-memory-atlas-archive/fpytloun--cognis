@@ -329,7 +329,7 @@ async def test_canonical_signal_recipient_does_not_require_local_adapter(tmp_pat
             user_email="owner@example.com",
             recipient=ChannelRecipient(
                 channel_type="signal",
-                address="+420728720962",
+                address="+447700900124",
                 address_kind="signal_e164",
                 chat_kind="direct",
                 allow_resolution=True,
@@ -670,7 +670,7 @@ async def test_recipient_artifact_delivery_survives_restart_grant_and_promotes_o
             assert intent is not None
             assert intent.authorized_artifacts_json
             assert intent.authorized_artifacts_json[0]["_delivery_authorization"]["scope"] == (
-                "conversation"
+                "agent"
             )
             assert (
                 intent.authorized_artifacts_json[0]["_delivery_authorization"][

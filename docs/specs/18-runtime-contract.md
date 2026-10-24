@@ -244,6 +244,56 @@ class RuntimeAdapter(Protocol):
 - each event has a stable `event_id` or monotonic `seq`
 - terminal outcomes must be explicit, not inferred from silence
 
+### Prospective idle hooks
+
+`HookRuntime` owns idle matching, not session status. Each hook assignment persists
+an `activated_at` boundary in Cognis metadata. First enable and disabled-to-enabled
+transitions establish it in the configuration transaction; duplicate enabled writes,
+parameter changes, and definition edits preserve it. A missing boundary fails closed.
+An enabled PUT repairs a missing boundary at the current time rather than preserving NULL.
+The caller owns commit; updates lock an existing assignment until commit, and local
+configuration notification follows commit. No external I/O occurs under that lock.
+
+An idle occurrence qualifies only when its canonical foreground admission's
+`created_at` is strictly later than that assignment's activation. Existing and new
+conversations use the same rule. Old admissions completing after activation,
+automation, absorbed admissions, and legacy `last_message_at` alone cannot qualify.
+The latest foreground occurrence, idle duration, and running/queued foreground
+checks still govern matching. Configuration refresh and recovery filter candidates
+to the latest unhandled foreground occurrence; a run in any status marks that
+assignment/occurrence handled. One global configuration job coalesces notifications
+with one rerun bit, pages at most 100 IDs, and matches serially. All hook job admission
+is capped at 16 per controller; overflow relies on durable recovery rather than
+creating waiting tasks. Matching rechecks each assignment before
+history reads or snapshot creation. Restart cannot manufacture historical eligibility.
+
+Recovery owns a runtime-local keyset cursor across timed-out/cancelled scans. It
+advances only after each candidate finishes, retries an incomplete candidate, and
+resets on exhaustion or runtime restart. Configuration scans have independent local
+cursors and cannot mutate recovery progress. No database state or locks are added.
+
+Hook snapshot and lifecycle event-append idempotency keys must start with the actual
+target Intaris session ID plus `:` (`intaris_session_id` when present, otherwise the
+local session ID). Their run/status suffixes remain stable across retries. This is
+distinct from direct-turn admission idempotency, whose key remains the hook run ID.
+
+Alembic and idempotent bootstrap seed preexisting assignments once at rollout, install
+server defaults for old writers omitting the column, and repair only NULL boundaries.
+SQLite's default rounds its millisecond clock up to avoid backdating activation;
+PostgreSQL uses `clock_timestamp()`, not transaction-start time. The prospective
+execution guarantee requires replacement of every old hook runtime: schema rollout
+cannot make an old binary enforce new eligibility policy.
+
+Unadmitted preparing/pending/dispatching idle runs are rechecked. Dispatch locks the
+assignment with a no-op write on both SQLite and PostgreSQL, validates activation,
+and CAS-claims the run in that transaction. Claim is the linearization boundary;
+later configuration changes do not revoke it. No external I/O occurs under the lock.
+Recovery first reconciles durable child/task admissions, including ambiguous child
+outcomes, without resubmitting or reading source history. Already-admitted work
+retains normal scheduler ownership, cancellation, and idempotent recovery. No session
+state is changed to implement hook eligibility. See the
+[agent hooks guide](../guide/agent-hooks.md) for user-facing semantics.
+
 ## Event Model
 
 Runtimes emit low-level events. Cognis consumes these and produces normalized

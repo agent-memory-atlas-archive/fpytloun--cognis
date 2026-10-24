@@ -192,6 +192,46 @@ On invocation:
 
 The tool result is intentionally small: the full content is **not** echoed back to the model. This keeps history compact and stops long deliverables from dominating context after rejection.
 
+### Revisions (`supersedes`)
+
+`version` counts drafts inside one owner scope (a step run, or a direct-chat
+turn). A *revision* is a separate concept: an independent deliverable that
+replaces an earlier deliverable as the next state of the same document.
+
+- Every operation accepts an optional `supersedes: "dlv_<32 hex>"`.
+- The target must pass the same access rule as reading a `dlv_` reference
+  (`cognis.core.content_refs.authorize_deliverable_access`): owned task outputs,
+  owner-published direct-chat deliverables, or managed-descendant deliverables
+  that the caller controls.
+- The target must be live (`buffered`, `approved`, or `delivered`) and must not
+  have a live successor. History is linear. A rejected target returns
+  `supersedes_not_active`, and a stale target returns `supersedes_not_latest`.
+  Both include `latest_deliverable_id` and `latest_revision`.
+- The new row stores `lineage_id` (the first revision's ID), `revision`
+  (target + 1), and `supersedes_deliverable_id`. It inherits the target title
+  when it has no title of its own. The target row and its payload are kept.
+- The partial unique index `uq_deliverables_live_supersedes` on
+  `supersedes_deliverable_id` for live rows is the concurrency guard. A
+  concurrent losing write returns `supersedes_not_latest`.
+- A draft replacement inside the same step run keeps the replaced draft's
+  lineage position, whether the call repeats the original `supersedes` target or
+  omits it. Replaced drafts still become `superseded` and their payloads are
+  still deleted.
+- Rejecting a revision makes the previous revision the head again.
+
+Read surfaces:
+
+- `GET /api/v1/deliverables/{id}` and the step-run deliverable detail endpoint
+  add `lineage_id`, `revision`, `supersedes_deliverable_id`,
+  `latest_deliverable_id`, `latest_revision`, `revision_count`, and `is_latest`.
+- `GET /api/v1/deliverables/{id}/revisions` lists live revisions (metadata only)
+  for the owning user, newest first.
+- Artifact discovery (`artifact_search`, `artifact_list_recent`) hides a
+  deliverable that has a live successor. Exact `dlv_` reads still work.
+- The direct-chat `assistant_deliverable` event carries `lineage_id` and
+  `revision`. Work records use the lineage as the deliverable identity, so
+  Work lists and counts show one entry per lineage.
+
 ### Error shapes
 
 Teach-back rejections follow the project-wide rejection shape (`{status:"rejected", reason, message, received}`):

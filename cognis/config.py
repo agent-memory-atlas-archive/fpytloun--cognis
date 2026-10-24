@@ -262,6 +262,7 @@ class CognisConfig:
 
     # Test-only control-plane routes
     e2e_mode: bool = False
+    inference_credential_dir: Path | None = None
 
     # Canonical Chat v2 event cache
     event_cache_ttl_seconds: int = 60 * 60
@@ -313,6 +314,11 @@ def load_config() -> CognisConfig:
     public_intaris_ui_url = os.environ.get("PUBLIC_INTARIS_UI_URL", intaris_url).rstrip("/")
 
     config = CognisConfig(
+        inference_credential_dir=(
+            _expand_path(os.environ["COGNIS_INFERENCE_CREDENTIAL_DIR"])
+            if os.environ.get("COGNIS_INFERENCE_CREDENTIAL_DIR")
+            else None
+        ),
         data_dir=data_dir,
         host=os.environ.get("COGNIS_HOST", "0.0.0.0"),
         port=int(os.environ.get("COGNIS_PORT", "8080")),
@@ -473,8 +479,10 @@ def load_config() -> CognisConfig:
         tool_output_s3_region=os.environ.get("COGNIS_TOOL_OUTPUT_S3_REGION", ""),
         tool_output_ttl_hours=int(os.environ.get("COGNIS_TOOL_OUTPUT_TTL_HOURS", "168")),
         tool_output_max_size_mb=int(os.environ.get("COGNIS_TOOL_OUTPUT_MAX_SIZE_MB", "500")),
-        initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
-        initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
+        # Compose represents unset optional credentials as empty strings.
+        # Preserve nonempty passwords verbatim; only absence disables seeding.
+        initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL") or None,
+        initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD") or None,
         default_memory_backend=os.environ.get("COGNIS_DEFAULT_MEMORY_BACKEND", "mnemory"),
         default_guardrails_backend=os.environ.get("COGNIS_DEFAULT_GUARDRAILS_BACKEND", "intaris"),
         trusted_evidence_enabled=_bool_env("COGNIS_TRUSTED_EVIDENCE_ENABLED", False),
@@ -638,7 +646,7 @@ ENV_TEMPLATE = """\
 
 # MCP OAuth refresh (controller-owned, wall-clock bounded)
 # COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS=30
-# COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS={"mcp-gws.fpy.cz:443":["192.168.33.208/32"]}
+# COGNIS_MCP_OAUTH_TRUSTED_DESTINATIONS={"oauth-gateway.example.test:443":["10.73.5.19/32"]}
 
 # LSP diagnostics (auto-detect language servers for edit feedback)
 # COGNIS_LSP_ENABLED=true

@@ -8,6 +8,8 @@
   import UserInteractionMessage from '$lib/components/UserInteractionMessage.svelte';
   import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
   import TimelineActivityNotice from '$lib/components/timeline/TimelineActivityNotice.svelte';
+  import RateLimitProviderSwitch from '$lib/components/chat/RateLimitProviderSwitch.svelte';
+  import type { CommandV2Response } from '$lib/chat-v2/types';
   import type { AssistantDeliverableTimelineItem, MessageTimelineItem, SystemMessageTimelineItem, TimelineItem, ToolCallTimelineItem, UserInteractionTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineScope } from '$lib/chat-v2/types';
   import type { Agent } from '$lib/types/api';
@@ -22,7 +24,8 @@
     getToolCall = () => null,
     onViewSession,
     pinnedTransient = false,
-    scope
+    scope,
+    providerRecovery
   } = $props<{
     item: TimelineItem;
     agent?: Agent | null;
@@ -34,6 +37,7 @@
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
     pinnedTransient?: boolean;
     scope?: TimelineScope | undefined;
+    providerRecovery?: { conversationId: string; turnId: string; onResponse: (response: CommandV2Response) => Promise<void> };
   }>();
 
   // A message is "unsettled" (and thus animates on entry) when it is actively
@@ -147,11 +151,11 @@
   </div>
 {:else if item.kind === 'system_message'}
   {#if item.noticeKind === 'managed_takeover'}
-    <div class="mx-auto max-w-xl rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-center text-xs text-sky-100 shadow-card">
+    <div class="mx-auto max-w-xl rounded-2xl border border-info-border bg-info-subtle px-4 py-3 text-center text-xs text-info shadow-card">
       <p class="font-medium">{item.text}</p>
       {#if item.followUpConversationId}
         <a
-          class="mt-2 inline-flex items-center justify-center rounded-full border border-sky-300/30 bg-slate-950/30 px-3 py-1 font-medium text-sky-100 transition hover:border-sky-200/60 hover:text-white"
+          class="mt-2 inline-flex items-center justify-center rounded-full border border-control-border bg-surface px-3 py-1 font-medium text-accent transition hover:border-accent hover:text-accent-hover"
           href={`/chat/${item.followUpConversationId}`}
         >
           Open follow-up conversation
@@ -174,13 +178,27 @@
       details={item.text}
       tone="error"
       code={item.reasonClass}
-    />
+    >
+      {#snippet action()}
+        {#if providerRecovery && item.turnId === providerRecovery.turnId && item.providerId && item.model}
+          <RateLimitProviderSwitch
+            conversationId={providerRecovery.conversationId}
+            turnId={providerRecovery.turnId}
+            providerId={item.providerId}
+            model={item.model}
+            onResponse={providerRecovery.onResponse}
+          />
+        {/if}
+      {/snippet}
+    </TimelineActivityNotice>
   {:else if item.noticeKind === 'model_recovery'}
     <TimelineActivityNotice
       title={item.noticeScope === 'continuation' ? 'Continuing from saved work' : 'Model recovered'}
       text={item.text}
       details={item.text}
     />
+  {:else if item.noticeKind === 'tool_moved_to_background'}
+    <TimelineActivityNotice title="Moved to background" text={item.text} details={item.text} />
   {:else if item.noticeKind === 'turn_initiated'}
     <TimelineActivityNotice title="Turn initiated" text={item.text} details={item.text} />
   {:else}

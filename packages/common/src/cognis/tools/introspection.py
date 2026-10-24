@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from jsonschema import Draft7Validator, SchemaError
 
+from cognis import json_codec
 from cognis.models.tool import (
     ToolDefinition,
     derive_native_input_schema,
     finalize_tool_descriptor,
+    native_tool_classification_error,
     stable_tool_id,
     tool_display_name,
     tool_input_schema,
@@ -20,6 +25,51 @@ from cognis.tools.native_validation import (
     registered_native_validator_ids,
     validate_native_operation_domains,
 )
+
+_REGISTRATION_AUDIT_LIMIT = 512
+_registration_audits: OrderedDict[bytes, None] = OrderedDict()
+_registration_audit_lock = threading.Lock()
+
+
+def _registration_audit_key(tool: ToolDefinition) -> bytes | None:
+    """Fingerprint all mutable contract fields, never just its declared hash."""
+    try:
+        payload = tool.model_dump_json(round_trip=True).encode("utf-8")
+        # JSON-coercible Python values (tuple, integer mapping keys, bytes, ...)
+        # must not alias valid JSON contracts in the reuse cache.
+        if json_codec.decode(payload) != tool.model_dump(mode="python"):
+            return None
+        digest = hashlib.sha256(payload)
+        digest.update(json_codec.encode(sorted(registered_native_validator_ids())))
+    except (TypeError, ValueError, OverflowError):
+        # Uncacheable definitions still receive the normal authoritative audit.
+        return None
+    return digest.digest()
+
+
+def audit_tool_registration(tool: ToolDefinition) -> list[str]:
+    """Reuse successful content-identical audits; never cache runtime authorization.
+
+    Only fixed-size digests are retained. Explicit descriptor/domain audits and
+    call validation remain uncached. In-place edits and validator-catalog changes
+    invalidate reuse even when the declared descriptor hash was not refreshed.
+    """
+    if tool.source.type not in {"builtin", "controller", "executor"}:
+        return []
+    key = _registration_audit_key(tool)
+    if key is not None:
+        with _registration_audit_lock:
+            if key in _registration_audits:
+                _registration_audits.move_to_end(key)
+                return []
+    failures = audit_tool_descriptors([tool])
+    if not failures and key is not None and _registration_audit_key(tool) == key:
+        with _registration_audit_lock:
+            _registration_audits[key] = None
+            _registration_audits.move_to_end(key)
+            while len(_registration_audits) > _REGISTRATION_AUDIT_LIMIT:
+                _registration_audits.popitem(last=False)
+    return failures
 
 
 def resolve_available_tool(
@@ -175,7 +225,7 @@ def validate_available_tool_call(
             "errors": ["<root>: arguments must be a JSON object"],
         }
     errors = _schema_errors(tool_input_schema(tool), arguments)
-    operation = _selected_operation(tool, arguments)
+    operation = selected_native_operation(tool, arguments)
     if operation is not None:
         errors.extend(_schema_errors(operation.input_schema, arguments))
     errors = list(dict.fromkeys(errors))
@@ -202,7 +252,7 @@ async def validate_available_tool_call_with_context(
     if not isinstance(arguments, dict):
         return result
     tool = resolve_available_tool(tools, identifier)
-    operation = _selected_operation(tool, arguments) if tool is not None else None
+    operation = selected_native_operation(tool, arguments) if tool is not None else None
     if operation is None or tool is None or not tool.native_operations:
         return result
     if not result.get("valid") and "write_deliverable.rich" not in operation.validator_ids:
@@ -273,6 +323,9 @@ def audit_tool_descriptors(tools: list[ToolDefinition]) -> list[str]:
     for tool in tools:
         if tool.source.type not in {"builtin", "controller", "executor"}:
             continue
+        classification_error = native_tool_classification_error(tool)
+        if classification_error is not None:
+            failures.append(f"{tool.name}: {classification_error}")
         if tool.descriptor is None:
             failures.append(f"{tool.name}: missing descriptor")
             continue
@@ -351,7 +404,8 @@ async def audit_native_tool_domains(
     return failures
 
 
-def _selected_operation(tool: ToolDefinition, arguments: dict[str, Any]) -> Any | None:
+def selected_native_operation(tool: ToolDefinition, arguments: dict[str, Any]) -> Any | None:
+    """Select the canonical operation used by validation and runtime projections."""
     if tool.descriptor is None:
         return None
     selected = arguments.get("action")

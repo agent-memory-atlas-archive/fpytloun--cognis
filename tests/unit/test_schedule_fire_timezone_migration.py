@@ -18,7 +18,11 @@ def _config(database_path: Path) -> Config:
 def test_schedule_fire_timezone_migration_is_linear_head() -> None:
     script = ScriptDirectory.from_config(_config(Path("/tmp/unused-cognis.db")))
 
-    assert script.get_heads() == ["151_task_escalation_timeout"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert "146_schedule_fire_timezone" in {
+        revision.revision for revision in script.walk_revisions("base", heads[0])
+    }
     revision = script.get_revision("146_schedule_fire_timezone")
     assert revision is not None
     assert revision.down_revision == "145_notification_attention_state"

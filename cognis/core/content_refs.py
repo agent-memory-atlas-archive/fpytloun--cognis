@@ -14,11 +14,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.content_projects import ContentAccess, content_project_ids
+from cognis.models.deliverable import DeliverableRevisionError
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
-from cognis.store.models import AuditLog, Conversation, DeliverableRow, StepRun, Task
+from cognis.store.models import AuditLog, DeliverableRow, StepRun, Task
 from cognis.store.queries import (
-    get_artifact_record,
-    get_conversation,
     get_deliverable,
     get_managed_conversation_ancestry,
     get_managed_conversation_link_for_target,
@@ -118,6 +118,209 @@ def deliverable_filename(deliverable: DeliverableRow) -> str:
     return filename
 
 
+@dataclass(frozen=True)
+class DeliverableAccess:
+    """Authorization facts for one deliverable and accessor."""
+
+    owner_email: str
+    creator_agent_id: str | None
+    task: Task | None
+    access_audit_details: dict[str, Any] | None = None
+
+
+async def authorize_deliverable_access(
+    session: AsyncSession,
+    deliverable: DeliverableRow,
+    user_email: str | None,
+    *,
+    scope_task_id: str | None = None,
+    accessor_conversation_id: str | None = None,
+    accessor_agent_id: str | None = None,
+    accessor_session_id: str | None = None,
+) -> DeliverableAccess | None:
+    """Authorize deliverable access without loading its payload.
+
+    This is the single access rule for reading a ``dlv_`` reference and for
+    choosing it as a ``supersedes`` revision target.
+    """
+
+    from cognis.core.artifact_access import content_read_predicate
+
+    if not user_email:
+        return None
+    if deliverable.owner_email != user_email:
+        # Another person's revision is readable only through project access.
+        if not await _project_document_accessible(
+            session,
+            deliverable.project_id,
+            user_email=user_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+            access="read",
+        ):
+            return None
+        task = (
+            await task_for_step_run(session, deliverable.step_run_id)
+            if deliverable.step_run_id is not None
+            else None
+        )
+        if scope_task_id is not None and (task is None or task.task_id != scope_task_id):
+            return None
+        return DeliverableAccess(
+            owner_email=str(deliverable.owner_email or ""),
+            creator_agent_id=deliverable.owner_agent_id,
+            task=task,
+        )
+    if accessor_agent_id or accessor_conversation_id:
+        predicate = await content_read_predicate(
+            session,
+            owner_email=user_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+            model=DeliverableRow,
+        )
+        if not await session.scalar(
+            select(DeliverableRow.deliverable_id).where(
+                DeliverableRow.deliverable_id == deliverable.deliverable_id, predicate
+            )
+        ):
+            return None
+    task = (
+        await task_for_step_run(session, deliverable.step_run_id)
+        if deliverable.step_run_id is not None
+        else None
+    )
+    if scope_task_id is not None and (task is None or task.task_id != scope_task_id):
+        return None
+    audit = None
+    if deliverable.conversation_id and accessor_conversation_id and accessor_agent_id:
+        link = await get_managed_conversation_link_for_target(
+            session, deliverable.conversation_id, user_email=user_email
+        )
+        if link is not None:
+            try:
+                ancestry = await get_managed_conversation_ancestry(
+                    session, link, user_email=user_email
+                )
+            except ValueError:
+                ancestry = []
+            controlling = next(
+                (
+                    item
+                    for item in ancestry
+                    if item.controller_conversation_id == accessor_conversation_id
+                    and item.controller_agent_id == accessor_agent_id
+                ),
+                None,
+            )
+            if controlling is not None:
+                audit = {
+                    "deliverable_id": deliverable.deliverable_id,
+                    "creator_agent_id": deliverable.owner_agent_id,
+                    "creator_conversation_id": deliverable.conversation_id,
+                    "creator_control_link_id": link.link_id,
+                    "owner_email": user_email,
+                    "accessor_agent_id": accessor_agent_id,
+                    "accessor_conversation_id": accessor_conversation_id,
+                    "control_link_id": controlling.link_id,
+                    "managed_descendant_depth": link.depth - controlling.depth + 1,
+                }
+    return DeliverableAccess(
+        owner_email=user_email,
+        creator_agent_id=deliverable.owner_agent_id,
+        task=task,
+        access_audit_details=audit,
+    )
+
+
+async def _project_document_accessible(
+    session: AsyncSession,
+    project_id: str | None,
+    *,
+    user_email: str,
+    agent_id: str | None,
+    conversation_id: str | None,
+    session_id: str | None,
+    access: ContentAccess,
+) -> bool:
+    if not project_id or not agent_id:
+        return False
+    return project_id in await content_project_ids(
+        session,
+        user_email=user_email,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        access=access,
+    )
+
+
+async def authorize_supersedes_target(
+    session: AsyncSession,
+    deliverable_id: str,
+    *,
+    user_email: str | None,
+    accessor_conversation_id: str | None,
+    accessor_agent_id: str | None,
+    accessor_session_id: str | None = None,
+    lock: bool = False,
+) -> DeliverableRow:
+    """Return a revision target the accessor may revise, or raise a correctable error.
+
+    A private document is revised only by the agent that owns it. A project
+    document is revised by any agent session with write access to its project.
+    With ``lock`` the target row is locked first, so the decision holds until
+    the caller's transaction commits.
+    """
+
+    if lock:
+        deliverable = await session.scalar(
+            select(DeliverableRow)
+            .where(DeliverableRow.deliverable_id == deliverable_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    else:
+        deliverable = await get_deliverable(session, deliverable_id)
+    if (
+        deliverable is not None
+        and user_email
+        and await _project_document_accessible(
+            session,
+            deliverable.project_id,
+            user_email=user_email,
+            agent_id=accessor_agent_id,
+            conversation_id=accessor_conversation_id,
+            session_id=accessor_session_id,
+            access="write",
+        )
+    ):
+        return deliverable
+    if (
+        deliverable is None
+        # Project documents are revised only through project write access.
+        or deliverable.project_id
+        or deliverable.owner_agent_id != accessor_agent_id
+        or (
+            await authorize_deliverable_access(
+                session,
+                deliverable,
+                user_email,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
+            )
+            is None
+        )
+    ):
+        raise DeliverableRevisionError(
+            "supersedes_not_found",
+            "The deliverable to supersede was not found or is not accessible.",
+        )
+    return deliverable
+
+
 async def get_accessible_deliverable_ref(
     session: AsyncSession,
     artifact_store: Any,
@@ -127,6 +330,7 @@ async def get_accessible_deliverable_ref(
     scope_task_id: str | None = None,
     accessor_conversation_id: str | None = None,
     accessor_agent_id: str | None = None,
+    accessor_session_id: str | None = None,
 ) -> DeliverableContentRef | None:
     """Resolve and authorize a deliverable virtual content ref.
 
@@ -139,80 +343,17 @@ async def get_accessible_deliverable_ref(
     deliverable = await get_deliverable(session, deliverable_id)
     if deliverable is None:
         return None
-    task: Task | None = None
-    owner_email: str
-    creator_agent_id: str | None
-    if deliverable.step_run_id is not None:
-        task = await task_for_step_run(session, deliverable.step_run_id)
-        if (
-            task is None
-            or task.created_by != user_email
-            or (scope_task_id is not None and task.task_id != scope_task_id)
-        ):
-            return None
-        owner_email = task.created_by
-        creator_agent_id = None
-    else:
-        if scope_task_id is not None or not deliverable.conversation_id:
-            return None
-        creator = await get_conversation(session, deliverable.conversation_id)
-        if creator is None or creator.user_email != user_email:
-            return None
-        published = await get_artifact_record(session, deliverable.deliverable_id)
-        owner_published = (
-            published is not None
-            and published.owner_email == user_email
-            and published.conversation_id is None
-            and published.status != "deleted"
-            and published.deleted_at is None
-            and published.purpose == "conversation_deliverable"
-        )
-        owner_email = creator.user_email
-        creator_agent_id = creator.agent_id
-        access_audit_details = None
-        if not owner_published:
-            if not accessor_conversation_id or not accessor_agent_id:
-                return None
-            accessor = await get_conversation(session, accessor_conversation_id)
-            if (
-                accessor is None
-                or accessor.user_email != user_email
-                or accessor.agent_id != accessor_agent_id
-            ):
-                return None
-            link = await get_managed_conversation_link_for_target(
-                session, creator.conversation_id, user_email=user_email
-            )
-            if link is None or link.depth > 2 or link.target_agent_id != creator.agent_id:
-                return None
-            try:
-                ancestry = await get_managed_conversation_ancestry(
-                    session, link, user_email=user_email
-                )
-            except ValueError:
-                return None
-            controlling_link = next(
-                (
-                    item
-                    for item in ancestry
-                    if item.controller_conversation_id == accessor_conversation_id
-                    and item.controller_agent_id == accessor_agent_id
-                ),
-                None,
-            )
-            if controlling_link is None:
-                return None
-            access_audit_details = {
-                "deliverable_id": deliverable.deliverable_id,
-                "creator_agent_id": creator.agent_id,
-                "creator_conversation_id": creator.conversation_id,
-                "creator_control_link_id": link.link_id,
-                "owner_email": creator.user_email,
-                "accessor_agent_id": accessor_agent_id,
-                "accessor_conversation_id": accessor_conversation_id,
-                "control_link_id": controlling_link.link_id,
-                "managed_descendant_depth": int(link.depth) - int(controlling_link.depth) + 1,
-            }
+    access = await authorize_deliverable_access(
+        session,
+        deliverable,
+        user_email,
+        scope_task_id=scope_task_id,
+        accessor_conversation_id=accessor_conversation_id,
+        accessor_agent_id=accessor_agent_id,
+        accessor_session_id=accessor_session_id,
+    )
+    if access is None:
+        return None
     try:
         await hydrate_deliverable_payload(deliverable, artifact_store)
     except FileNotFoundError:
@@ -220,13 +361,13 @@ async def get_accessible_deliverable_ref(
     content_bytes = deliverable.content.encode("utf-8")
     return DeliverableContentRef(
         deliverable=deliverable,
-        owner_email=owner_email,
-        creator_agent_id=creator_agent_id,
-        task=task,
+        owner_email=access.owner_email,
+        creator_agent_id=access.creator_agent_id,
+        task=access.task,
         filename=deliverable_filename(deliverable),
         mime_type=deliverable_mime_type(deliverable.format),
         content_bytes=content_bytes,
-        access_audit_details=access_audit_details if deliverable.step_run_id is None else None,
+        access_audit_details=access.access_audit_details,
     )
 
 
@@ -241,21 +382,12 @@ async def get_deliverable_ref_unscoped(
     if deliverable is None:
         return None
     task: Task | None = None
-    creator: Conversation | None = None
+    owner_email = deliverable.owner_email
+    creator_agent_id = deliverable.owner_agent_id
+    if not owner_email:
+        return None
     if deliverable.step_run_id is not None:
         task = await task_for_step_run(session, deliverable.step_run_id)
-        if task is None:
-            return None
-        owner_email = task.created_by
-        creator_agent_id = None
-    elif deliverable.conversation_id is not None:
-        creator = await get_conversation(session, deliverable.conversation_id)
-        if creator is None:
-            return None
-        owner_email = creator.user_email
-        creator_agent_id = creator.agent_id
-    else:
-        return None
     try:
         await hydrate_deliverable_payload(deliverable, artifact_store)
     except FileNotFoundError:

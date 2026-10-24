@@ -577,6 +577,9 @@ async def test_edit_rejects_bound_content_and_preserves_frozen_evidence_decision
                 "metadata": {TRUSTED_EVIDENCE_ADMISSION_KEY: positive},
             },
         )
+        from cognis.store.direct_turns import direct_turn_content_is_editable
+
+        assert direct_turn_content_is_editable(admission.request) is False
         with pytest.raises(ValueError, match="content and attachments are immutable"):
             await harness.store.edit(
                 admission.request.request_id,
@@ -1086,6 +1089,321 @@ async def test_fenced_channel_delivery_is_idempotent_and_reply_anchored(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("absorbed", [False, True])
+@pytest.mark.parametrize("terminal_error", [False, True])
+async def test_immediate_progress_uses_shared_outbox_on_adapter_owner(
+    tmp_path: Path, absorbed: bool, terminal_error: bool
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from cognis.channels.delivery import ChannelDeliveryService
+    from cognis.channels.source_delivery import pending_sources, progress_delivery_id
+    from cognis.core.events import Event, EventBus, EventType
+    from cognis.core.turn_scheduler import TurnScheduler
+    from cognis.models.channel import ChannelCapabilities
+    from cognis.store.queries import (
+        create_or_get_channel_delivery_outbox,
+        create_session,
+        ensure_follow_up_result_delivery,
+        get_channel_delivery_outbox,
+    )
+
+    harness = await _harness(tmp_path)
+    try:
+        async with harness.session_factory() as db:
+            source_session = await create_session(
+                db, conversation_id="conv-a", user_email="user@example.com", agent_id="agent-1"
+            )
+            await db.commit()
+        descriptor = ChannelDeliveryDescriptor(
+            channel_type="matrix",
+            account_id="account-a",
+            chat_id="room-a",
+        )
+        admission = await harness.store.admit(
+            conversation_id="conv-a",
+            session_id=source_session.session_id,
+            agent_id="agent-1",
+            user_id="user@example.com",
+            idempotency_scope="matrix:account-a:room-a",
+            idempotency_key="immediate-message",
+            payload={
+                "schema_version": 1,
+                "content": "request",
+                "attachments": [],
+                "channel_delivery": None if absorbed else descriptor.model_dump(mode="json"),
+                "metadata": (
+                    {"system_initiated": True}
+                    if absorbed
+                    else {"channel_assistant_delivery_mode": "immediate"}
+                ),
+            },
+        )
+        request = admission.request
+        lease = await _lease(harness, controller_id="controller-b", incarnation_id="boot-b")
+        assert await harness.store.claim(
+            request.request_id, lease=lease, controller_id="controller-b", incarnation_id="boot-b"
+        )
+        if absorbed:
+            participant = await harness.store.admit(
+                conversation_id="conv-a",
+                session_id=source_session.session_id,
+                agent_id="agent-1",
+                user_id="user@example.com",
+                idempotency_scope="matrix:account-a:room-a",
+                idempotency_key="participant",
+                payload={
+                    "schema_version": 1,
+                    "content": "Continue here.",
+                    "attachments": [],
+                    "channel_delivery": descriptor.model_dump(mode="json"),
+                    "metadata": {"channel_assistant_delivery_mode": "immediate"},
+                },
+            )
+            assert await harness.store.begin_absorb(
+                participant.request.request_id,
+                lease=lease,
+                controller_id="controller-b",
+                incarnation_id="boot-b",
+                absorbed_by_turn_id=request.turn_id,
+            )
+            # Uncommitted absorption must not change the effective route.
+            assert await harness.store.effective_channel_delivery(request.request_id) == (
+                None,
+                None,
+            )
+            assert await harness.store.mark_absorbed(participant.request.request_id, lease=lease)
+        # A fresh store instance resolves adoption without any runtime control cache.
+        recovered_store = DirectTurnStore(harness.session_factory)
+        assert await recovered_store.effective_channel_delivery(request.request_id) == (
+            descriptor,
+            "immediate",
+        )
+        unchanged = await harness.store.get(request.request_id)
+        assert unchanged.payload == admission.request.payload
+        adapter = SimpleNamespace(
+            capabilities=ChannelCapabilities(supports_idempotent_send=True),
+            send_message=AsyncMock(return_value="$progress"),
+        )
+        owner_manager = SimpleNamespace(
+            owns_account=lambda _: True,
+            find_adapter_for_channel=lambda *args: (adapter, object()),
+        )
+        cluster = SimpleNamespace(publish=AsyncMock())
+        worker_delivery = ChannelDeliveryService(
+            session_factory=harness.session_factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: SimpleNamespace(owns_account=lambda _: False),
+            cluster_signals=cluster,
+        )
+        owner_delivery = ChannelDeliveryService(
+            session_factory=harness.session_factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: owner_manager,
+        )
+        events = [
+            {
+                "type": "lifecycle",
+                "seq": 1,
+                "data": {
+                    "event": "channel_source_delivery",
+                    "state": "tracking",
+                    "turn_id": request.turn_id,
+                },
+            },
+            {
+                "type": "assistant_message",
+                "seq": 2,
+                "data": {"turn_id": request.turn_id, "content": "Checking now."},
+            },
+        ]
+        stream = SimpleNamespace(
+            read_events=AsyncMock(return_value=SimpleNamespace(events=events, has_more=False))
+        )
+        scheduler = object.__new__(TurnScheduler)
+        scheduler._durable_request_by_conversation = {"conv-a": request.request_id}
+        scheduler._durable_fences = {
+            request.request_id: SimpleNamespace(lease=lease, assert_current=AsyncMock())
+        }
+        scheduler._direct_turn_store = recovered_store
+        scheduler._channel_delivery = worker_delivery
+        scheduler.channel_pending_sources = lambda *args, **kwargs: pending_sources(
+            stream,
+            [source_session.session_id],
+            request.turn_id,
+            is_queued=worker_delivery.source_is_queued,
+            **kwargs,
+        )
+        scheduler._reset_active_stream = AsyncMock()
+        scheduler._bump_assistant_phase_for_tool = lambda *args: 0
+        scheduler._effective_turn_cycle_for_tool = lambda *args: 0
+        scheduler._record_active_tool_arguments = AsyncMock()
+        scheduler._iter_observers = lambda *args, **kwargs: []
+        on_tool_call = scheduler._build_callbacks(
+            "conv-a", source_session.session_id, request.turn_id, request.turn_id
+        )[2]
+        await on_tool_call("read", "call-read", {})
+        adapter.send_message.assert_not_awaited()
+        _, sources = await pending_sources(stream, [source_session.session_id], request.turn_id)
+        delivery_id = progress_delivery_id(sources[0])
+        async with harness.session_factory() as db:
+            progress = await get_channel_delivery_outbox(db, delivery_id)
+        assert progress is not None and progress.status == "pending"
+        signal = cluster.publish.await_args
+        assert signal.kwargs["scope"].direct_request_id == request.request_id
+        assert signal.kwargs["revision"] == progress.delivery_id
+        await owner_delivery._event_bus.publish(
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={"kind": signal.args[0]},
+            )
+        )
+        assert owner_delivery._retry_wakeup.is_set()
+        await owner_delivery.recover_pending_deliveries()
+        assert adapter.send_message.await_args.args[0].content == "Checking now."
+        await scheduler._deliver_durable_channel_progress("conv-a")
+        await owner_delivery.recover_pending_deliveries()
+        adapter.send_message.assert_awaited_once()
+        assert await scheduler.channel_pending_sources(
+            "conv-a", source_session.session_id, request.turn_id
+        ) == ("", [])
+        async with harness.session_factory() as db:
+            await create_or_get_channel_delivery_outbox(
+                db,
+                delivery_id="grace-follow-up",
+                user_email="user@example.com",
+                conversation_id="conv-a",
+                session_id=source_session.session_id,
+                source_type="follow_up",
+                source_id="scheduled-notification",
+                channel_type="matrix",
+                account_id="account-a",
+                chat_id="room-a",
+                thread_id=None,
+                fallback_text="Notification.",
+            )
+            await db.commit()
+        events.append(
+            {
+                "type": "assistant_message",
+                "seq": 3,
+                "data": {"turn_id": request.turn_id, "content": "Done.", "turn_cycle_index": 1},
+            }
+        )
+        await scheduler._persist_direct_turn_terminal_delivery(
+            request_id=request.request_id,
+            lease=lease,
+            descriptor=None,
+            content="Failed." if terminal_error else "Done.",
+            attachments=None,
+            error=terminal_error,
+        )
+        terminal_id = f"direct-turn:{request.request_id}:{'error' if terminal_error else 'final'}"
+        if not terminal_error:
+            # The scheduler persists the follow-up result before the event handler.
+            # Both must reuse the already queued terminal row, not create another.
+            async with harness.session_factory() as db:
+                row = await ensure_follow_up_result_delivery(
+                    db,
+                    grace_delivery_id="grace-follow-up",
+                    conversation_id="conv-a",
+                    session_id=source_session.session_id,
+                    turn_id=request.turn_id,
+                    final_content="Done.",
+                    attachments=None,
+                    deliverable_id=None,
+                )
+                assert row.delivery_id == terminal_id
+                await db.commit()
+        completed = Event(
+            type=EventType.TURN_COMPLETED,
+            data={
+                "conversation_id": "conv-a",
+                "session_id": source_session.session_id,
+                "turn_id": request.turn_id,
+                "delivery_id": "grace-follow-up",
+                "channel_deliverable": True,
+                "final_content": "Done.",
+            },
+        )
+        if terminal_error:
+            failed = Event(type=EventType.TURN_ERROR, data=completed.data)
+            await owner_delivery._handle_turn_error_event(failed)
+            await owner_delivery._handle_turn_error_event(failed)
+        else:
+            await owner_delivery._handle_turn_completed_event(completed)
+            await owner_delivery._handle_turn_completed_event(completed)
+        await owner_delivery.recover_pending_deliveries()
+        assert [call.args[0].content for call in adapter.send_message.await_args_list] == [
+            "Checking now.",
+            "Done.\n\nFailed." if terminal_error else "Done.",
+        ]
+        async with harness.session_factory() as db:
+            grace = await get_channel_delivery_outbox(db, "grace-follow-up")
+            assert grace.status == "suppressed"
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_effective_channel_route_uses_absorbed_admission_order(tmp_path: Path) -> None:
+    from sqlalchemy import update
+
+    from cognis.store.models import DirectTurnRequestRow
+
+    harness = await _harness(tmp_path)
+    try:
+        active = (await _admit(harness, key="active", content="Start")).request
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            active.request_id, lease=lease, controller_id="controller-a", incarnation_id="boot-a"
+        )
+        absorbed_rows = []
+        for anchor, mode in (("first-anchor", "concatenated"), ("last-anchor", "immediate")):
+            descriptor = ChannelDeliveryDescriptor(
+                channel_type="matrix", account_id="account-a", chat_id="room-a", reply_to_id=anchor
+            )
+            admitted = await harness.store.admit(
+                conversation_id="conv-a",
+                session_id=active.session_id,
+                agent_id="agent-1",
+                user_id="user@example.com",
+                idempotency_scope="matrix:account-a:room-a",
+                idempotency_key=anchor,
+                payload={
+                    "schema_version": 1,
+                    "content": anchor,
+                    "attachments": [],
+                    "channel_delivery": descriptor.model_dump(mode="json"),
+                    "metadata": {"channel_assistant_delivery_mode": mode},
+                },
+            )
+            absorbed_rows.append(admitted.request)
+            assert await harness.store.begin_absorb(
+                admitted.request.request_id,
+                lease=lease,
+                controller_id="controller-a",
+                incarnation_id="boot-a",
+                absorbed_by_turn_id=active.turn_id,
+            )
+            assert await harness.store.mark_absorbed(admitted.request.request_id, lease=lease)
+        # Timestamps can tie; admission_order, not random request IDs, is authoritative.
+        async with harness.session_factory() as db:
+            await db.execute(
+                update(DirectTurnRequestRow)
+                .where(DirectTurnRequestRow.request_id.in_([r.request_id for r in absorbed_rows]))
+                .values(created_at=active.created_at)
+            )
+            await db.commit()
+        assert await DirectTurnStore(harness.session_factory).effective_channel_delivery(
+            active.request_id
+        ) == (descriptor, "immediate")
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_cancel_survives_queued_to_claim_race(
     tmp_path: Path,
 ) -> None:
@@ -1234,10 +1552,30 @@ async def test_admission_rejects_invalid_or_mismatched_payload_versions(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_attachment_urls_are_transient_and_refreshed_after_recovery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shared_agent", [False, True])
+async def test_attachment_urls_are_transient_and_refreshed_after_recovery(
+    tmp_path: Path, shared_agent: bool
+) -> None:
     harness = await _harness(tmp_path)
     try:
         async with harness.session_factory() as session:
+            if shared_agent:
+                from cognis.store.models import Agent, AgentGrantRow
+
+                await create_user(
+                    session, "agent-owner@example.com", "Agent owner", password_hash="test-hash"
+                )
+                agent = await session.get(Agent, "agent-1")
+                assert agent is not None
+                agent.owner_email = "agent-owner@example.com"
+                session.add(
+                    AgentGrantRow(
+                        grant_id="grant-shared-agent",
+                        agent_id=agent.agent_id,
+                        grantee_user_email="user@example.com",
+                        granted_by=agent.owner_email,
+                    )
+                )
             session.add(
                 ArtifactRecordRow(
                     artifact_id="art_input",
@@ -1424,10 +1762,24 @@ async def test_attachment_urls_are_transient_and_refreshed_after_recovery(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_attachment_materialization_enforces_conversation_scope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("same_agent", [False, True])
+async def test_attachment_materialization_enforces_agent_scope(
+    tmp_path: Path, same_agent: bool
+) -> None:
     harness = await _harness(tmp_path)
     try:
         async with harness.session_factory() as session:
+            await create_agent(
+                session, agent_id="agent-other", owner_email="user@example.com", name="Other"
+            )
+            source = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1" if same_agent else "agent-other",
+                context_type="web",
+                context_ref=None,
+                context_data={},
+            )
             session.add(
                 ArtifactRecordRow(
                     artifact_id="art_sibling",
@@ -1435,7 +1787,8 @@ async def test_attachment_materialization_enforces_conversation_scope(tmp_path: 
                     object_id="obj_sibling",
                     filename="sibling.pdf",
                     owner_email="user@example.com",
-                    conversation_id="conv-b",
+                    owner_agent_id="agent-1" if same_agent else "agent-other",
+                    conversation_id=source.conversation_id,
                     purpose="chat_input",
                     kind="pdf",
                     mime_type="application/pdf",
@@ -1492,12 +1845,19 @@ async def test_attachment_materialization_enforces_conversation_scope(tmp_path: 
                 del namespace, object_id, filename, ttl_seconds, mode, expires_at
                 return "https://files.invalid/forbidden"
 
-        with pytest.raises(PermanentDirectTurnPayloadError, match="Attachment access denied"):
-            await harness.store.materialize_claimed_payload(
+        if same_agent:
+            assert await harness.store.materialize_claimed_payload(
                 admitted.request.request_id,
                 lease=lease,
                 artifact_store=ArtifactStore(),
             )
+        else:
+            with pytest.raises(PermanentDirectTurnPayloadError, match="Attachment access denied"):
+                await harness.store.materialize_claimed_payload(
+                    admitted.request.request_id,
+                    lease=lease,
+                    artifact_store=ArtifactStore(),
+                )
     finally:
         await harness.engine.dispose()
 
@@ -1510,7 +1870,7 @@ async def test_attachment_materialization_enforces_conversation_scope(tmp_path: 
             "attached",
             datetime.now(UTC) - timedelta(minutes=1),
             None,
-            "Attachment is expired",
+            "Attachment access denied",
         ),
         (
             "deleted",
@@ -1795,6 +2155,77 @@ async def test_runtime_authority_retains_terminal_fence_without_authorizing_work
         assert authority_row is not None
         assert authority_row.fencing_token == lease.fencing_token
         assert await harness.store.mark_running(admitted.request.request_id, lease=lease) is None
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+async def test_runtime_authority_survives_absorption_retry_and_stop(
+    tmp_path: Path, retry: bool
+) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        first = (await _admit(harness, key="authority-head", content="first")).request
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            first.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            session_id="sess-1",
+        )
+        second = (await _admit(harness, key="authority-absorbed", content="second")).request
+        assert await harness.store.begin_absorb(
+            second.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            absorbed_by_turn_id=first.turn_id,
+        )
+        assert await harness.store.mark_absorbed(second.request_id, lease=lease)
+        if retry:
+            assert await harness.store.settle_transient_failure(
+                first.request_id,
+                lease=lease,
+                outcome={
+                    "phase": "user_appended",
+                    "retry_target": {
+                        "scope": "provider_model",
+                        "runtime_revision": 0,
+                        "provider_id": "anthropic",
+                        "model": "claude-fable-5-1",
+                    },
+                },
+                retry_after_seconds=60,
+            )
+            waiting = await harness.store.get_conversation_runtime_authority_row("conv-a")
+            assert waiting is not None
+            assert waiting.request_id == first.request_id
+            assert waiting.status == DirectTurnStatus.RECOVERABLE.value
+            assert await harness.store.expedite_provider_retry(
+                "conv-a", session_id="sess-1", previous_runtime_revision=0
+            )
+            assert await harness.leases.release(lease)
+            lease = await _lease(harness, controller_id="controller-b", incarnation_id="boot-b")
+            assert await harness.store.claim(
+                first.request_id,
+                lease=lease,
+                controller_id="controller-b",
+                incarnation_id="boot-b",
+            )
+        assert await harness.store.request_cancel(first.request_id)
+        assert await harness.store.mark_terminal(
+            first.request_id, lease=lease, status=DirectTurnStatus.CANCELLED
+        )
+        # An unclaimed queued cancellation must not hide the last execution fence.
+        third = (await _admit(harness, key="authority-unclaimed", content="third")).request
+        assert await harness.store.request_cancel(third.request_id)
+        terminal = await harness.store.get_conversation_runtime_authority_row("conv-a")
+        assert terminal is not None
+        assert terminal.request_id == first.request_id
+        assert terminal.status == DirectTurnStatus.CANCELLED.value
+        assert terminal.fencing_token == lease.fencing_token
     finally:
         await harness.engine.dispose()
 

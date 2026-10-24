@@ -217,7 +217,7 @@ async def list_workflows_for_user(
     """List workflows visible to the user."""
 
     return list(
-        await workflow_registry.list_all(
+        await workflow_registry.list_for_management(
             owner_email=owner_email,
             include_disabled=True,
             include_ephemeral=include_ephemeral,
@@ -236,6 +236,18 @@ async def get_workflow_for_user(
     if workflow is None:
         return None
     if workflow.is_system or workflow.owner_email in {owner_email, None}:
+        return workflow
+    return None
+
+
+async def get_workflow_for_management(
+    *, workflow_registry: Any, workflow_id: str, owner_email: str
+) -> Any | None:
+    """Read a definition administratively without granting execution eligibility."""
+    workflow = await workflow_registry.get_for_management(
+        workflow_id, owner_email=owner_email, include_disabled=True
+    )
+    if workflow is not None and (workflow.is_system or workflow.owner_email in {owner_email, None}):
         return workflow
     return None
 
@@ -295,6 +307,7 @@ async def update_user_workflow(
     owner_email: str,
     payload: dict[str, Any],
     allow_ephemeral: bool = False,
+    agent_composed: bool = False,
 ) -> Any:
     """Update a user-owned workflow after validation and active-run checks."""
 
@@ -346,6 +359,23 @@ async def update_user_workflow(
         )
         if not ok:
             raise ValueError("Workflow update failed")
+        if agent_composed:
+            from sqlalchemy import update
+
+            from cognis.store.models import Schedule, Task
+
+            # Demotion and replacement commit together. A saved owner schedule
+            # does not approve future agent-authored replacement definitions.
+            await session.execute(
+                update(Schedule)
+                .where(Schedule.workflow_id == workflow_id)
+                .values(creation_origin="agent_composed")
+            )
+            await session.execute(
+                update(Task)
+                .where(Task.workflow_id == workflow_id)
+                .values(creation_origin="agent_composed")
+            )
         await session.commit()
         await session.refresh(row)
         return row

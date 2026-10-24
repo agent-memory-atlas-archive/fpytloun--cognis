@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
+from cognis.api.models import ArtifactRevisionsResponse, ArtifactRevisionSummary
 from cognis.artifacts import preview as artifact_preview
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.content_refs import (
@@ -21,17 +24,58 @@ from cognis.core.content_refs import (
     get_deliverable_ref_unscoped,
     is_deliverable_ref,
 )
+from cognis.core.deliverable_links import (
+    DeliverableShareUnavailable,
+    signed_deliverable_view_link,
+)
+from cognis.core.project_access import can_project_read_artifact
 from cognis.models.artifact import ArtifactKind
 from cognis.rendering.deliverables import DeliverableRenderError, render_standalone_shell
 from cognis.store.queries import (
     create_artifact_record,
+    get_artifact_lineage_summary,
     get_artifact_record,
     get_skill_asset_by_artifact_object,
+    list_artifact_lineage,
 )
 
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
 
 ArtifactURLMode = Literal["download", "view"]
+
+
+class ArtifactShareRequest(BaseModel):
+    agent_id: str
+    action: Literal["grant", "revoke"]
+
+
+@router.post("/{artifact_id}/share")
+async def share_artifact(
+    artifact_id: str, body: ArtifactShareRequest, request: Request
+) -> dict[str, str]:
+    """The human owner may also share legacy publications with unknown agent provenance."""
+    from cognis.api.common import require_session_user
+
+    user = require_session_user(request)
+    forbid_mutation_for_viewer(request)
+    from cognis.core.artifact_sharing import set_artifact_share
+
+    async with request.app.state.session_factory() as session:
+        try:
+            await set_artifact_share(
+                session,
+                owner_email=user.email,
+                owner_agent_id=None,
+                content_ref=artifact_id,
+                grantee_agent_id=body.agent_id,
+                revoke=body.action == "revoke",
+            )
+        except ValueError:
+            raise api_exception(404, "not_found", "Artifact or recipient not found") from None
+        await session.commit()
+    return {"status": "updated"}
+
+
 TEXT_PREVIEW_MAX_BYTES = artifact_preview.TEXT_PREVIEW_MAX_BYTES
 ARTIFACT_VIEWER_CSP = (
     "sandbox allow-scripts allow-same-origin allow-downloads; default-src 'none'; "
@@ -233,6 +277,58 @@ async def upload_artifact(
     }
 
 
+async def _project_reader_may_read(request: Request, row: Any, user_email: str) -> bool:
+    async with request.app.state.session_factory() as session:
+        return await can_project_read_artifact(session, row, user_email)
+
+
+@router.get("/{artifact_id}/revisions", response_model=ArtifactRevisionsResponse)
+async def artifact_revisions(request: Request, artifact_id: str) -> ArtifactRevisionsResponse:
+    """List live revisions of an artifact document that the current user may read.
+
+    Only metadata is returned; each revision is opened by its own exact ID.
+    """
+
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_artifact_record(session, artifact_id)
+        if (
+            row is None
+            or row.status == "deleted"
+            or _is_expired(row)
+            or not await _person_may_read_artifact(session, row, user.email)
+        ):
+            raise api_exception(404, "not_found", "Artifact not found")
+        summary = await get_artifact_lineage_summary(session, row)
+        revisions = [
+            ArtifactRevisionSummary(
+                artifact_id=item.artifact_id,
+                revision=int(item.revision or 1),
+                filename=item.filename,
+                mime_type=item.mime_type,
+                size_bytes=int(item.size_bytes or 0),
+                owner_email=item.owner_email,
+                project_id=item.project_id,
+                created_at=item.created_at,
+                is_latest=item.artifact_id == summary.latest_artifact_id,
+            )
+            for item in await list_artifact_lineage(session, summary.lineage_id)
+            if await _person_may_read_artifact(session, item, user.email)
+        ]
+    return ArtifactRevisionsResponse(
+        lineage_id=summary.lineage_id,
+        latest_artifact_id=summary.latest_artifact_id,
+        latest_revision=summary.latest_revision,
+        revisions=revisions,
+    )
+
+
+async def _person_may_read_artifact(session: Any, row: Any, user_email: str) -> bool:
+    return row.owner_email == user_email or await can_project_read_artifact(
+        session, row, user_email
+    )
+
+
 @router.get("/{artifact_id}/signed-url")
 async def get_signed_url(
     request: Request,
@@ -276,7 +372,11 @@ async def get_signed_url(
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired(row):
         raise api_exception(404, "not_found", "Artifact not found")
-    if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
+    if (
+        row.owner_email
+        and row.owner_email != user.email
+        and not await _project_reader_may_read(request, row, user.email)
+    ):
         raise api_exception(404, "not_found", "Artifact not found")
     if mode == "view":
         _assert_view_allowed(row.filename, row.mime_type)
@@ -320,7 +420,11 @@ async def get_text_preview(request: Request, artifact_id: str) -> dict[str, obje
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired(row):
         raise api_exception(404, "not_found", "Artifact not found")
-    if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
+    if (
+        row.owner_email
+        and row.owner_email != user.email
+        and not await _project_reader_may_read(request, row, user.email)
+    ):
         raise api_exception(404, "not_found", "Artifact not found")
     content, content_type = await artifact_store.async_load(
         row.namespace, row.object_id, row.filename
@@ -389,18 +493,46 @@ async def _serve_signed_deliverable(
         sig=sig,
         mode=mode,
     ):
+        if (
+            mode == "view"
+            and exp < int(time.time())
+            and (request.cookies.get("cognis_session") or request.headers.get("Authorization"))
+            and artifact_store.verify_signed_request(
+                "deliverables",
+                deliverable_id,
+                filename,
+                exp=exp,
+                sig=sig,
+                mode="view",
+                allow_expired=True,
+            )
+        ):
+            return RedirectResponse(
+                f"/api/v1/deliverables/{quote(deliverable_id, safe='')}/view?expired_link=true",
+                status_code=307,
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
     async with request.app.state.session_factory() as session:
         ref = await get_deliverable_ref_unscoped(session, artifact_store, deliverable_id)
     if ref is None or ref.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
     if mode == "view":
-        return _artifact_viewer_response(
-            artifact_id=deliverable_id,
-            filename=ref.filename,
-            content_type=ref.mime_type,
-            content=ref.content_bytes,
-            standalone_url=str(request.url),
+        # Preserve the canonical payload, media and exports without renewing
+        # the already verified deliverable-view capability.
+        try:
+            link = signed_deliverable_view_link(
+                artifact_store,
+                deliverable_id,
+                base_url=str(request.base_url).rstrip("/"),
+                expires_at=exp,
+            )
+        except DeliverableShareUnavailable as exc:
+            raise api_exception(403, "forbidden", str(exc)) from exc
+        return RedirectResponse(
+            url=link.url.removeprefix(str(request.base_url).rstrip("/")),
+            status_code=307,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
         )
     headers = _artifact_response_headers(
         filename=ref.filename,
@@ -476,7 +608,13 @@ async def _serve_signed_artifact(
                 artifact_object_id=object_id,
                 filename=filename,
             )
-        row = artifact_row or skill_asset_row
+        row: object = artifact_row or skill_asset_row
+        if row is None and namespace == "avatars" and filename == "image":
+            from cognis.core.avatar_access import get_current_agent_avatar_reference
+
+            # The signature is the access capability, issued only after agent-use
+            # authorization. Recheck the current link and storage ownership.
+            row = await get_current_agent_avatar_reference(session, artifact_store, object_id)
     if row is None:
         raise api_exception(404, "not_found", "Artifact not found")
     if getattr(row, "status", None) == "deleted" or _is_expired(row):
@@ -491,8 +629,34 @@ async def _serve_signed_artifact(
         and getattr(row, "artifact_object_id", None) != object_id
     ):
         raise api_exception(404, "not_found", "Artifact not found")
-    if row.filename != filename:
+    if getattr(row, "filename", None) != filename:
         raise api_exception(404, "not_found", "Artifact not found")
+    if getattr(row, "mime_type", "").startswith("video/"):
+        from cognis.artifacts.ranges import parse_byte_range
+
+        size_bytes = getattr(row, "size_bytes", None)
+        mime_type = getattr(row, "mime_type", "")
+        if not isinstance(size_bytes, int):
+            raise api_exception(404, "not_found", "Artifact not found")
+        try:
+            start, end, partial = parse_byte_range(request.headers.get("range"), size_bytes)
+        except ValueError:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size_bytes}"})
+        headers = _artifact_response_headers(
+            filename=filename,
+            content_type=mime_type,
+            content_length=end - start + 1,
+            mode=mode,
+        )
+        headers["Accept-Ranges"] = "bytes"
+        if partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{size_bytes}"
+        return StreamingResponse(
+            artifact_store.async_read_range(namespace, object_id, filename, start, end),
+            media_type=mime_type,
+            status_code=206 if partial else 200,
+            headers=headers,
+        )
     content, content_type = await artifact_store.async_load(namespace, object_id, filename)
     if mode == "view":
         return _artifact_viewer_response(

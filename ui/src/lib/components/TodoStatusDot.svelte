@@ -15,12 +15,12 @@
   const inProgress = $derived(['in_progress', 'active', 'running'].includes(normalized));
   const colorClass = $derived(
     ['completed', 'complete', 'done'].includes(normalized)
-      ? 'bg-emerald-400'
+      ? 'bg-success'
       : ['cancelled', 'canceled'].includes(normalized)
-        ? 'bg-slate-600'
+        ? 'bg-muted'
         : inProgress
-          ? 'bg-sky-400'
-          : 'bg-slate-400'
+          ? 'bg-info'
+          : 'bg-muted'
   );
   const label = $derived(normalized.replaceAll('_', ' ') || 'pending');
 </script>

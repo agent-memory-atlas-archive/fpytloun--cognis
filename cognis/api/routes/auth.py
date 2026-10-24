@@ -571,7 +571,11 @@ async def refresh(
             browser_session = await get_browser_session_by_token(session, raw_token)
             if browser_session is None or browser_session.revoked_at is not None:
                 raise HTTPException(status_code=401, detail="Invalid browser session")
-            if browser_session.expires_at <= datetime.now(UTC):
+            expires_at = browser_session.expires_at
+            # SQLite returns timezone-naive values for DateTime(timezone=True).
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= datetime.now(UTC):
                 raise HTTPException(status_code=401, detail="Browser session expired")
             user = await get_user(session, browser_session.user_email)
         else:

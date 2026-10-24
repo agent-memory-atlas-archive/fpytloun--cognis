@@ -95,3 +95,59 @@ async def test_persist_command_system_notice_returns_false_when_recording_fails(
     )
 
     assert persisted is False
+
+
+@pytest.mark.asyncio
+async def test_profile_audit_remains_independent_of_history_reads() -> None:
+    events: list[SimpleNamespace] = []
+
+    async def append(session: object, recorded: list[object], result: object) -> None:
+        event = recorded[0]
+        events.append(SimpleNamespace(type=event.type, data=event.data))
+
+    guardrails = SimpleNamespace(
+        record_events=AsyncMock(return_value=SimpleNamespace(ok=True, count=1))
+    )
+    cache = SimpleNamespace(
+        refresh=AsyncMock(side_effect=RuntimeError("history unavailable")),
+        append_recorded_events=append,
+    )
+    results = []
+    for profile in ["worker", "critical", "smart"]:
+        result = CommandResult(
+            type="system_message",
+            text=f"Selected {profile}",
+            data={"command": "/profile", "resolved_agent_profile_id": profile},
+        )
+        assert await persist_command_system_notice(
+            conversation_id="conv-1",
+            result=result,
+            providers=SimpleNamespace(guardrails=guardrails),
+            session_cache=cache,
+            session=SimpleNamespace(session_id="sess-1"),
+            agent=SimpleNamespace(agent_id="agent-1"),
+            user_email="owner@example.com",
+        )
+        results.append(result)
+    assert len({result.data["notice_id"] for result in results}) == 3
+    cache.refresh.assert_not_awaited()
+    assert (
+        len({call.kwargs["idempotency_key"] for call in guardrails.record_events.await_args_list})
+        == 3
+    )
+    events.append(SimpleNamespace(type="user_message", data={"content": "go", "turn_id": "turn-1"}))
+    next_result = CommandResult(
+        type="system_message",
+        text="Selected worker",
+        data={"command": "/profile", "resolved_agent_profile_id": "worker"},
+    )
+    assert await persist_command_system_notice(
+        conversation_id="conv-1",
+        result=next_result,
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1"),
+        user_email="owner@example.com",
+    )
+    assert next_result.data["notice_id"] != results[0].data["notice_id"]

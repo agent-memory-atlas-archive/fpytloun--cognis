@@ -106,12 +106,12 @@
   {#snippet header()}
     <div class="flex min-h-11 items-center justify-between gap-3">
       <div class="min-w-0">
-        <p class="text-[10px] font-semibold uppercase tracking-[0.22em] text-amber-300">Action required</p>
-        <h1 class="truncate text-base font-semibold text-white">{title}</h1>
+        <p class="text-[10px] font-semibold uppercase tracking-[0.22em] text-warning">Action required</p>
+        <h1 class="truncate text-base font-semibold text-strong">{title}</h1>
       </div>
       <button
         type="button"
-        class="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-xl border border-slate-700 bg-slate-950 text-slate-200"
+        class="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-xl border border-control-border bg-canvas text-foreground"
         aria-label={`Close ${title}`}
         data-testid="attention-dialog-close"
         onclick={dismiss}

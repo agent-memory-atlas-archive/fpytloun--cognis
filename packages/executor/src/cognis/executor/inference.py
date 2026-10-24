@@ -15,7 +15,13 @@ from cognis.executor.inference_types import CognisInferenceRequest, image_genera
 from cognis.executor.providers.llm.ollama import discover_ollama_models
 from cognis.logging import get_logger
 from cognis.models.config import ImageInput
+from cognis.providers.llm.bedrock import discover_bedrock_models
 from cognis.providers.llm.errors import build_mid_stream_error_chunk
+from cognis.providers.llm.hosted import (
+    PROVIDER_BASES,
+    discover_hosted_models,
+    is_openrouter_catalog,
+)
 
 logger = get_logger(__name__)
 
@@ -109,16 +115,24 @@ class InferenceHandler:
         preset: str,
         base_url: str,
         api_key: str = "",
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Discover executor-local provider models.
-
-        This is deliberately narrower than a generic HTTP probe.  For now it
-        supports only Ollama's read-only ``/api/tags`` and ``/api/show``
-        metadata endpoints from the executor host perspective.
-        """
-
+        """Discover read-only catalogs from the configured runtime location."""
+        if preset == "bedrock":
+            config = aws_config or {}
+            return await discover_bedrock_models(
+                region=config.get("aws_region_name"), profile=config.get("aws_profile_name")
+            )
+        if preset in PROVIDER_BASES or is_openrouter_catalog(preset, base_url):
+            async with httpx.AsyncClient(timeout=15) as client:
+                return await discover_hosted_models(
+                    client,
+                    preset=preset if preset in PROVIDER_BASES else "openrouter",
+                    base_url=base_url,
+                    api_key=api_key,
+                )
         if preset.strip().lower() != "ollama":
-            raise ValueError("Executor-side model discovery currently supports Ollama only")
+            raise ValueError("Executor-side model discovery unsupported for this preset")
         return await discover_ollama_models(base_url=base_url, api_key=api_key, logger=logger)
 
     async def image_generate(
@@ -136,7 +150,11 @@ class InferenceHandler:
         request_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """Generate an image through LiteLLM on the executor side."""
-        gen_kwargs: dict[str, Any] = {}
+        gen_kwargs: dict[str, Any] = {
+            "timeout": request_kwargs.get("timeout", 120),
+            "num_retries": 0,
+            "max_retries": 0,
+        }
         if request_kwargs.get("api_key"):
             gen_kwargs["api_key"] = request_kwargs["api_key"]
         if request_kwargs.get("api_base"):

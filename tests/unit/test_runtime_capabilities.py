@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.api import executor_ws
-from cognis.api.routes import executors as executor_routes
+from cognis.core.executor_management import _executor_to_response
 from cognis.executor.runner import ExecutorRunner
 from cognis.executor.runtime_capability_probe import collect_runtime_capabilities
 from cognis.models.runtime_capabilities import (
@@ -169,7 +169,7 @@ def test_api_response_has_observed_tools_and_typed_capabilities() -> None:
         created_at=None,
         updated_at=None,
     )
-    response = executor_routes._executor_to_response(row)
+    response = _executor_to_response(row)
     assert response.observed_tools == [{"name": "read"}]
     assert isinstance(response.observed_capabilities, RuntimeCapabilityReport)
 

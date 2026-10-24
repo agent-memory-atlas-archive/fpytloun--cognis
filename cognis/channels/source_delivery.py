@@ -7,6 +7,8 @@ Only committed assistant events from explicitly tracked turns are eligible.
 from __future__ import annotations
 
 import hashlib
+import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from cognis.models.session import SessionEvent, next_event_page_after_seq
@@ -23,7 +25,12 @@ async def record_state(guardrails: Any, session_id: str, **data: Any) -> None:
 
 
 async def pending_sources(
-    guardrails: Any, session_ids: list[str], turn_id: str
+    guardrails: Any,
+    session_ids: list[str],
+    turn_id: str,
+    *,
+    is_queued: Callable[[dict[str, Any]], Awaitable[bool]] | None = None,
+    first_only: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     messages: dict[tuple[str, str, int, int], tuple[int | None, str]] = {}
     excluded: dict[tuple[str, str, int, int], int] = {}
@@ -102,17 +109,27 @@ async def pending_sources(
                 raise RuntimeError("Channel source changed after a partial send")
             if start >= len(content):
                 continue
+            ref = {
+                "session_id": session_id,
+                "turn_id": message_turn,
+                "phase": phase,
+                "cycle": cycle,
+                "seq": seq,
+                "start": start,
+                "end": len(content),
+                "prefix_hash": hashlib.sha256(content.encode()).hexdigest(),
+            }
+            if is_queued is not None and await is_queued(ref):
+                continue
             content_parts.append(content[start:])
-            refs.append(
-                {
-                    "session_id": session_id,
-                    "turn_id": message_turn,
-                    "phase": phase,
-                    "cycle": cycle,
-                    "seq": seq,
-                    "start": start,
-                    "end": len(content),
-                    "prefix_hash": hashlib.sha256(content.encode()).hexdigest(),
-                }
-            )
+            refs.append(ref)
+            if first_only:
+                return content_parts[0], refs
     return "\n\n".join(content_parts), refs
+
+
+def progress_delivery_id(source: dict[str, Any]) -> str:
+    """Identify one immutable committed source range across controller retries."""
+    identity = {key: value for key, value in source.items() if key != "seq"}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return f"channel-progress:{digest}"

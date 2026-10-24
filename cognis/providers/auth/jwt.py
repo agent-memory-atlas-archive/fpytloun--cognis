@@ -102,6 +102,67 @@ class JWTAuthProvider:
             payload["aow"] = agent_owner_email
         return self._sign(payload, self.token_ttl_seconds)
 
+    def sign_workflow_step_jwt(
+        self,
+        subject: str,
+        agent_id: str,
+        *,
+        session_id: str,
+        governing_execution_id: str,
+        governing_snapshot_id: str,
+        declaration_digest: str,
+    ) -> str:
+        """Mint a 60-second, Intaris-only controller declaration capability."""
+        claims = {
+            "sub": subject,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "governing_execution_id": governing_execution_id,
+            "governing_snapshot_id": governing_snapshot_id,
+            "declaration_digest": declaration_digest,
+        }
+        if any(not isinstance(value, str) or not value.strip() for value in claims.values()):
+            raise ValueError("Controller declaration bindings must be nonempty")
+        return self._sign(
+            {
+                **claims,
+                "aud": ["intaris"],
+                "typ": "controller",
+                "capabilities": ["intaris:controller_context"],
+                "nbf": int(datetime.now(UTC).timestamp()),
+            },
+            60,
+        )
+
+    def sign_process_scope_jwt(
+        self,
+        subject: str,
+        agent_id: str,
+        *,
+        session_id: str,
+        process_scope_digest: str,
+        workflow_claims: dict[str, str] | None = None,
+    ) -> str:
+        claims = {
+            "sub": subject,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "process_scope_digest": process_scope_digest,
+        }
+        if any(not isinstance(value, str) or not value.strip() for value in claims.values()):
+            raise ValueError("Process lifecycle bindings must be nonempty")
+        return self._sign(
+            {
+                **(workflow_claims or {}),
+                **claims,
+                "aud": ["intaris"],
+                "typ": "controller",
+                "capabilities": ["intaris:controller_context", "intaris:process_lifecycle"],
+                "nbf": int(datetime.now(UTC).timestamp()),
+            },
+            60,
+        )
+
     def sign_evidence_jwt(
         self,
         body: EvidenceBody,
@@ -175,6 +236,42 @@ class JWTAuthProvider:
         }
         claims["aow"] = owner
         return jwt.encode(claims, self._private_key, algorithm="ES256", headers={"kid": self._kid})
+
+    def sign_inference_companion_token(self, service: str, token_version: int) -> str:
+        """Mint an installation credential, revocable through its persisted version.
+
+        Like executor credentials, these do not expire. They are confined to
+        inference and must never authenticate a human or companion API.
+        """
+        if service not in {"intaris", "mnemory"}:
+            raise ValueError("Unsupported inference companion")
+        return self._sign(
+            {
+                "sub": service,
+                "aud": ["cognis-inference"],
+                "typ": "inference_companion",
+                "itv": token_version,
+            },
+            None,
+        )
+
+    def verify_inference_companion_token(self, token: str) -> dict[str, Any]:
+        """Verify signature, audience, issuer and the route-confined token type."""
+        claims = jwt.decode(
+            token,
+            self._public_key,
+            algorithms=["ES256"],
+            audience="cognis-inference",
+            issuer="cognis",
+        )
+        if (
+            claims.get("typ") != "inference_companion"
+            or claims.get("sub") not in {"intaris", "mnemory"}
+            or type(claims.get("itv")) is not int
+            or claims.get("jti") in self._revoked_jtis
+        ):
+            raise JWTError("Invalid inference companion token")
+        return claims
 
     def sign_executor_token(
         self,

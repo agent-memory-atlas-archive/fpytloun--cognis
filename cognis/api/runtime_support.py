@@ -36,9 +36,11 @@ from cognis.core.executor_recovery import (
     EXECUTOR_RECOVERY_WINDOW_SECONDS,
     ExecutorRecoveryTimeout,
     begin_executor_recovery,
+    clear_executor_recovery,
 )
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.core.runtime import (
+    ExecutorConfigurationError,
     ExecutorEnvironmentSnapshot,
     ResolvedStepRuntime,
     TransientExecutorUnavailable,
@@ -60,6 +62,7 @@ from cognis.models.tool import (
 )
 from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
 from cognis.providers.base import ImageGenerationProvider
+from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.runtime_context import (
     RuntimeAccessContext,
     current_effective_working_directory,
@@ -90,11 +93,16 @@ from cognis.tools.builtin.skill_management import (
     skill_management_tools,
 )
 from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
+from cognis.tools.builtin.system_management import (
+    SYSTEM_MANAGEMENT_TOOLS,
+    system_management_tools,
+)
 from cognis.tools.builtin.task_continuation import (
     build_task_continuation_tool_handlers,
     task_continuation_tools,
 )
 from cognis.tools.builtin.tool_output import tool_output_tools
+from cognis.tools.builtin.video import video_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -162,7 +170,7 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return max(1, parsed)
 
 
-DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents", "manage_mcp"})
+DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents", "manage_mcp"}) | SYSTEM_MANAGEMENT_TOOLS
 
 INTARIS_MCP_FALLBACKS = Counter(
     "cognis_intaris_mcp_fallbacks_total",
@@ -496,6 +504,24 @@ async def _ensure_observed_tools_loaded(session: Any, row: Any) -> None:
         await session.refresh(row, attribute_names=["observed_tools"])
 
 
+async def _execution_project_id(
+    session: Any, *, conversation_id: str | None, task_id: str | None
+) -> str | None:
+    """Return the stored project of the task or conversation being executed."""
+
+    from cognis.store.queries import get_conversation, get_task
+
+    if task_id:
+        task = await get_task(session, task_id)
+        if task is not None:
+            return task.project_id
+    if conversation_id:
+        conversation = await get_conversation(session, conversation_id)
+        if conversation is not None:
+            return conversation.project_id
+    return None
+
+
 async def _resolve_eligible_executor_config(
     providers: Any,
     agent: AgentDefinition,
@@ -509,6 +535,7 @@ async def _resolve_eligible_executor_config(
     conversation_active_executor_source: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     """Resolve the only executor eligible for an agent execution.
 
@@ -538,8 +565,8 @@ async def _resolve_eligible_executor_config(
         raise RuntimeError("Session factory unavailable; cannot resolve executor")
 
     from cognis.core.executor_pool import pick_initial_active, resolve_executor_pool
+    from cognis.core.project_access import resolve_agent_use_grant
     from cognis.store.queries import (
-        get_active_agent_grant,
         get_conversation,
         get_executor_row,
         get_task,
@@ -553,6 +580,8 @@ async def _resolve_eligible_executor_config(
         session: Any, executor_id: str, *, source: str
     ) -> str:
         """Idempotently persist the initial active executor on conversation+task."""
+        if read_only:
+            return executor_id
 
         try:
             if (
@@ -600,7 +629,18 @@ async def _resolve_eligible_executor_config(
 
     async with session_factory() as session:
         if user_email != agent.owner_email:
-            grant = await get_active_agent_grant(session, agent.agent_id, user_email)
+            grant = await resolve_agent_use_grant(
+                session,
+                agent_id=agent.agent_id,
+                user_email=user_email,
+                project_id=await _execution_project_id(
+                    session, conversation_id=conversation_id, task_id=task_id
+                ),
+            )
+            if grant is None and not bool(getattr(agent, "is_system", False)):
+                # Fail closed: revoked shares and project memberships must not
+                # keep routing work (e.g. scheduled tasks) to this agent.
+                raise RuntimeError(f"Agent '{agent.agent_id}' is not accessible to this user")
             if grant is not None:
                 executor_scope = normalize_executor_scope(str(getattr(grant, "executor_scope", "")))
                 if executor_scope == "owner_executor":
@@ -631,7 +671,10 @@ async def _resolve_eligible_executor_config(
             and selector is not None
             and not (isinstance(selector, dict) and selector)
         ):
-            raise RuntimeError("Agent executor_selector must be a non-empty object")
+            raise ExecutorConfigurationError(
+                "Agent executor_selector must be a non-empty object. "
+                "Configure an executor on the agent page before retrying."
+            )
 
         # Stage 36: conversation-level active executor pin overrides primary
         # binding. The pin must point at an executor that is currently
@@ -647,7 +690,7 @@ async def _resolve_eligible_executor_config(
                 policy=policy,
             )
             lifecycle = None
-            if conversation_id or task_id:
+            if (conversation_id or task_id) and not read_only:
                 settings = await load_executor_pin_lifecycle_settings(session_factory)
                 lifecycle = await ensure_active_executor_pin(
                     session_factory=session_factory,
@@ -788,8 +831,9 @@ async def _resolve_eligible_executor_config(
 
         if not explicit_id and not selector:
             if not allow_default:
-                raise RuntimeError(
-                    "Agent must explicitly configure executor_id or executor_selector"
+                raise ExecutorConfigurationError(
+                    "Agent must explicitly configure executor_id or executor_selector. "
+                    "Configure an executor on the agent page before retrying."
                 )
             # Only the selected default needs its tool catalog; skip decoding
             # every candidate's multi-megabyte ``observed_tools`` column.
@@ -905,6 +949,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
         *memory_tools(),
         *agent_management_tools(),
         *mcp_management_tools(),
+        *system_management_tools(),
         *conversation_tools(),
         *project_tools(),
         *channel_tools(),
@@ -912,6 +957,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
         *task_continuation_tools(),
         *tool_output_tools(),
         *image_tools(),
+        *video_tools(),
         *skill_management_tools(),
         *schedule_tools(),
         *executor_tool_definitions(),
@@ -1064,6 +1110,7 @@ _TASK_CONTROL_EXACT_READ_TOOLS = frozenset(
         "artifact_read",
         "artifact_get_metadata",
         "artifact_get_url",
+        "artifact_get_content",
         "artifact_list_recent",
         "artifact_search",
         "read_task_deliverable",
@@ -1095,24 +1142,38 @@ def task_control_tool_allowed(tool: ToolDefinition) -> bool:
 async def enrich_image_tool_model_descriptions(
     tools: list[ToolDefinition],
     image_generation_provider: ImageGenerationProvider | None,
+    acting_user_email: str | None = None,
 ) -> list[ToolDefinition]:
     """Annotate image tools with configured image-generation models."""
 
     if image_generation_provider is None:
         return tools
+    if not any(tool.name in {"image_generate", "image_edit"} for tool in tools):
+        return tools
+    default_model = None
     try:
-        default_model = await image_generation_provider.resolve_model(task_type="image_generation")  # type: ignore[attr-defined]
-        models = await image_generation_provider.list_models()  # type: ignore[attr-defined]
+        model_id, provider_id = await image_generation_provider.resolve_model_target(  # type: ignore[attr-defined]
+            task_type="image_generation", acting_user_email=acting_user_email
+        )
+        if provider_id:
+            default_model = f"{provider_id}/{model_id}"
+    except Exception:
+        logger.debug("No available default image model", exc_info=True)
+    try:
+        models = await image_generation_provider.list_models(  # type: ignore[attr-defined]
+            acting_user_email=acting_user_email
+        )
     except Exception:
         logger.debug("Failed to enrich image tool model descriptions", exc_info=True)
         return tools
 
     image_models = sorted(
         {
-            str(model.get("model_id"))
+            f"{model['provider_id']}/{model['model_id']}"
             for model in models
             if isinstance(model, dict)
             and isinstance(model.get("model_id"), str)
+            and isinstance(model.get("provider_id"), str)
             and (
                 model.get("supports_image_generation") is True
                 or _looks_like_image_model_id(str(model.get("model_id")))
@@ -1199,6 +1260,8 @@ def _build_handler_map(
     channel_binding_lookup: Any | None = None,
     channel_manager_ref: Any | None = None,
     recipient_service: Any | None = None,
+    artifact_store: Any | None = None,
+    project_management_service: Any | None = None,
 ) -> dict[str, Any]:
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
@@ -1211,7 +1274,9 @@ def _build_handler_map(
                 compaction_strategy,
             )
         )
-    handlers.update(build_project_tool_handlers(session_factory))
+    handlers.update(
+        build_project_tool_handlers(session_factory, management_service=project_management_service)
+    )
     if channel_target_ref_secret:
         handlers.update(
             build_channel_tool_handlers(
@@ -1224,7 +1289,9 @@ def _build_handler_map(
         )
     if knowledgebase_service is not None:
         handlers.update(build_knowledgebase_tool_handlers(knowledgebase_service))
-    handlers.update(build_task_continuation_tool_handlers(session_factory))
+    handlers.update(
+        build_task_continuation_tool_handlers(session_factory, artifact_store=artifact_store)
+    )
     handlers.update(build_datetime_tool_handlers())
     if is_executor_type_available("in_process"):
         try:
@@ -1355,6 +1422,7 @@ def build_step_runtime_factory(
     session_factory: Any,
     artifact_store: Any | None = None,
     knowledgebase_service: Any | None = None,
+    project_management_service: Any | None = None,
 ) -> RuntimeFactory:
     """Create a per-step runtime factory.
 
@@ -1377,11 +1445,12 @@ def build_step_runtime_factory(
         execution_fence: Any | None = None,
         _executor_pin_fallback_notice: dict[str, Any] | None = None,
         _executor_pin_fallback_retried: bool = False,
+        prepare_only: bool = False,
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
         dispatcher = getattr(providers, "executor_pin_notice_dispatcher", None)
-        if dispatcher is not None:
+        if dispatcher is not None and not prepare_only:
             await dispatcher.dispatch_pending(limit=50)
         session_factory_for_policy = getattr(providers, "_session_factory", None) or session_factory
         policy = (
@@ -1464,6 +1533,7 @@ def build_step_runtime_factory(
             conversation_active_executor_source=conversation_active_executor_source,
             conversation_id=conversation_id,
             task_id=task_id,
+            read_only=prepare_only,
         )
         _executor_pin_fallback_notice = None
 
@@ -1526,6 +1596,7 @@ def build_step_runtime_factory(
         agent_tools = await enrich_image_tool_model_descriptions(
             agent_tools,
             getattr(providers, "image_generation", None),
+            acting_user_email=user_email,
         )
 
         # Add dynamic web tool definitions based on available backends
@@ -1713,6 +1784,33 @@ def build_step_runtime_factory(
                 hard_bound=hard_bound_executor,
             )
 
+        if prepare_only:
+            # Use the same inventory merger, but never construct handlers, spawn
+            # executors, drain notices, or recover/mutate the source executor pin.
+            merged = await _merge_remote_runtime_inventory(
+                remote_tools_data=executor_config.get("observed_tools") or [],
+                agent_tools=agent_tools,
+                providers=providers,
+                agent=tool_agent,
+                disabled_categories=disabled_categories,
+                disabled_tools=disabled_tools,
+                disabled_mcp_servers=disabled_mcp_servers,
+            )
+            prepared_registry = ToolRegistry()
+            for definition in merged.tools:
+                prepared_registry.register(RegisteredTool(definition=definition))
+            return ResolvedStepRuntime(
+                tool_registry=prepared_registry,
+                executor_connection=None,
+                cleanup=noop_cleanup,
+                executor_environment=ExecutorEnvironmentSnapshot.unavailable(
+                    executor_type=resolved_type,
+                    source="inference_preparation",
+                ),
+                executor_pool=executor_pool_obj,
+                active_executor_id=executor_config.get("executor_id"),
+            )
+
         # Remote executors advertise executor-assigned MCP tools through tool.list.
         # In-process execution is only allowed for the explicitly selected
         # executor row; legacy agent-local MCP config is intentionally ignored
@@ -1761,6 +1859,8 @@ def build_step_runtime_factory(
                 getattr(providers, "channel_binding_lookup", None),
                 getattr(providers, "channel_manager_ref", None),
                 getattr(providers, "recipient_resolution_service", None),
+                artifact_store=artifact_store,
+                project_management_service=project_management_service,
             )
             handle = await providers.executor.spawn(
                 ExecutorConfig(
@@ -1826,6 +1926,28 @@ def build_step_runtime_factory(
             )
             if conn is not None and runtime_ready:
                 try:
+                    remote_tools = await conn.list_tools()
+                except ExecutorDeliveryError as exc:
+                    # Terminal RPC/protocol failures are not reconnect failures.
+                    # The short transport recovery timeout, however, must not
+                    # replace the longer durable runtime admission deadline.
+                    if (
+                        exc.delivery_state == DeliveryState.TERMINAL
+                        and exc.code != "executor_recovery_timeout"
+                    ):
+                        raise
+                    raise TransientExecutorUnavailable(
+                        f"Selected executor '{executor_id}' failed while listing tools",
+                        executor_id=executor_id,
+                    ) from exc
+                except TimeoutError as exc:
+                    # Inventory discovery is read-only. Reuse admission recovery
+                    # to re-resolve the same executor after transport/owner churn.
+                    raise TransientExecutorUnavailable(
+                        f"Selected executor '{executor_id}' failed while listing tools",
+                        executor_id=executor_id,
+                    ) from exc
+                try:
                     disabled_categories = (
                         set(tool_agent.tools.get("disabled_categories") or [])
                         if isinstance(tool_agent.tools, dict)
@@ -1842,7 +1964,6 @@ def build_step_runtime_factory(
                         else set()
                     )
 
-                    remote_tools = await conn.list_tools()
                     merge_result = await _merge_remote_runtime_inventory(
                         remote_tools_data=remote_tools,
                         agent_tools=agent_tools,
@@ -1866,11 +1987,34 @@ def build_step_runtime_factory(
                         getattr(providers, "channel_binding_lookup", None),
                         getattr(providers, "channel_manager_ref", None),
                         getattr(providers, "recipient_resolution_service", None),
+                        artifact_store=artifact_store,
+                        project_management_service=project_management_service,
                     )
                     remote_registry = _build_remote_runtime_registry(
                         merge_result.tools,
                         handler_map,
                     )
+
+                    async def rebuild_tool_registry(connection: Any) -> ToolRegistry:
+                        # Keep controller-owned scope and filters; replace, never union,
+                        # the executor-advertised inventory.
+                        replacement = await _merge_remote_runtime_inventory(
+                            remote_tools_data=await connection.list_tools(),
+                            agent_tools=agent_tools,
+                            providers=providers,
+                            agent=tool_agent,
+                            disabled_categories=disabled_categories,
+                            disabled_tools=disabled_tools,
+                            disabled_mcp_servers=disabled_mcp_servers,
+                        )
+                        if getattr(access_context, "control_surface", None) == "task_control":
+                            replacement.tools = [
+                                tool
+                                for tool in replacement.tools
+                                if task_control_tool_allowed(tool)
+                            ]
+                        return _build_remote_runtime_registry(replacement.tools, handler_map)
+
                     for warning in merge_result.warnings:
                         logger.warning(
                             "Remote runtime inventory warning",
@@ -1927,8 +2071,9 @@ def build_step_runtime_factory(
                             if (current := ws_provider.get_connection(target_id)) is not None
                         ]
 
-                    return ResolvedStepRuntime(
+                    runtime = ResolvedStepRuntime(
                         tool_registry=remote_registry,
+                        rebuild_tool_registry=rebuild_tool_registry,
                         executor_connection=conn,
                         cleanup=_terminal_browser_cleanup(
                             browser_cleanup_connections,
@@ -1963,6 +2108,15 @@ def build_step_runtime_factory(
                         executor_pool=executor_pool_obj,
                         active_executor_id=executor_id,
                     )
+                    if conversation_active_executor_unavailable_since is not None:
+                        await clear_executor_recovery(
+                            session_factory,
+                            conversation_id=conversation_id,
+                            task_id=task_id,
+                            executor_id=executor_id,
+                            notice_dispatcher=dispatcher,
+                        )
+                    return runtime
                 except Exception as exc:
                     message = f"Selected executor '{executor_id}' failed while listing tools"
                     logger.warning(
@@ -2033,6 +2187,7 @@ def build_step_runtime_factory(
                 conversation_id=conversation_id,
                 task_id=task_id,
                 executor_id=executor_id,
+                notice_dispatcher=getattr(providers, "executor_pin_notice_dispatcher", None),
             )
             remaining = window.remaining_seconds()
             # Use the DB-authoritative remaining duration, then account for

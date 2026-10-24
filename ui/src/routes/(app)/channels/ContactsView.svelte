@@ -15,24 +15,24 @@
 
 <div class="grid gap-6 lg:grid-cols-[0.85fr_1.15fr]">
   <Card class="p-5">
-    <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Verified senders</p>
-    <h2 class="mt-1 text-lg font-semibold text-white">Manual override</h2>
-    <p class="mt-1 text-sm text-slate-400">Use this advanced flow only when you already know the external sender ID and want to bypass pairing.</p>
+    <p class="text-xs uppercase tracking-[0.24em] text-quiet">Verified senders</p>
+    <h2 class="mt-1 text-lg font-semibold text-strong">Manual override</h2>
+    <p class="mt-1 text-sm text-muted">Use this advanced flow only when you already know the external sender ID and want to bypass pairing.</p>
 
     <div class="mt-5 grid gap-4">
-      <label class="grid gap-2 text-sm text-slate-300">
+      <label class="grid gap-2 text-sm text-secondary">
         Channel type
-        <select bind:value={contactForm.channel_type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+        <select bind:value={contactForm.channel_type} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
           {#each channelTypes as meta}
             <option value={meta.channel_type}>{meta.label}</option>
           {/each}
         </select>
       </label>
-      <label class="grid gap-2 text-sm text-slate-300">
+      <label class="grid gap-2 text-sm text-secondary">
         Sender ID
         <Input bind:value={contactForm.sender_id} placeholder="Phone number, platform user ID, chat user handle, ..." />
       </label>
-      <label class="grid gap-2 text-sm text-slate-300">
+      <label class="grid gap-2 text-sm text-secondary">
         Display name
         <Input bind:value={contactForm.display_name} placeholder="Optional friendly label" />
       </label>
@@ -46,19 +46,19 @@
 
   <div class="space-y-4">
     {#if contacts.length === 0}
-      <Card class="p-6 text-sm text-slate-300">No verified senders yet. Pair a remote sender or add one manually.</Card>
+      <Card class="p-6 text-sm text-secondary">No verified senders yet. Pair a remote sender or add one manually.</Card>
     {/if}
     {#each contacts as contact (contact.contact_id)}
       <Card class="p-5">
         <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <div class="flex flex-wrap items-center gap-2">
-              <h2 class="text-lg font-semibold text-white">{contact.display_name || contact.sender_id}</h2>
-              <span class="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-300">verified</span>
-              <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{contact.channel_type}</span>
+              <h2 class="text-lg font-semibold text-strong">{contact.display_name || contact.sender_id}</h2>
+              <span class="rounded-full border border-success-border bg-success-subtle px-3 py-1 text-xs text-success">verified</span>
+              <span class="rounded-full border border-control-border px-3 py-1 text-xs text-secondary">{contact.channel_type}</span>
             </div>
-            <p class="mt-2 text-sm text-slate-400">Sender ID: {contact.sender_id}</p>
-            <p class="text-sm text-slate-400">Linked to your Cognis account</p>
+            <p class="mt-2 text-sm text-muted">Sender ID: {contact.sender_id}</p>
+            <p class="text-sm text-muted">Linked to your Cognis account</p>
           </div>
         </div>
       </Card>

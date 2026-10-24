@@ -208,25 +208,7 @@ async function waitForControllerChange(targetVersion: string | null): Promise<bo
   });
 }
 
-async function clearCognisServiceWorkerCaches(): Promise<void> {
-  if (typeof window === 'undefined' || !('caches' in window)) return;
-  const names = await window.caches.keys();
-  await Promise.all(
-    names
-      .filter((name) => name.startsWith('cognis-'))
-      .map((name) => window.caches.delete(name)),
-  );
-}
 
-async function resetCognisServiceWorker(registration: ServiceWorkerRegistration | null): Promise<void> {
-  try {
-    await registration?.unregister();
-  } catch {
-    // Cache reset and reload are still useful if unregister fails.
-  }
-  await clearCognisServiceWorkerCaches();
-  setWaitingUpdateWorker(null);
-}
 
 function installPromptEligiblePath(pathname: string): boolean {
   return pathname === '/getting-started' || pathname === '/login' || pathname === '/setup';
@@ -365,13 +347,42 @@ export async function registerServiceWorker(): Promise<void> {
       scope: '/'
     });
     observeServiceWorkerRegistration(registration);
-    void registration.update().catch(() => {
-      // Browser update checks are best-effort; registration itself succeeded.
-    });
+    checkForServiceWorkerUpdate(registration, true);
+    installServiceWorkerUpdateTriggers(registration);
   } catch (error) {
     // Service worker registration failures are non-fatal.
     console.warn('[pwa] Service worker registration failed', error);
   }
+}
+
+// An installed PWA is resumed from the background far more often than it is
+// relaunched, so checking only at page load left phones on old builds for
+// days. Check again when the app returns to the foreground and periodically.
+const UPDATE_CHECK_MIN_INTERVAL_MS = 60_000;
+const UPDATE_CHECK_PERIOD_MS = 30 * 60_000;
+let lastUpdateCheckAt = 0;
+let updateTriggersInstalled = false;
+
+function checkForServiceWorkerUpdate(registration: ServiceWorkerRegistration, force = false): void {
+  const now = Date.now();
+  if (!force && now - lastUpdateCheckAt < UPDATE_CHECK_MIN_INTERVAL_MS) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  lastUpdateCheckAt = now;
+  void registration.update().catch(() => {
+    // Update checks are best-effort; the next trigger retries.
+  });
+}
+
+function installServiceWorkerUpdateTriggers(registration: ServiceWorkerRegistration): void {
+  if (updateTriggersInstalled || typeof document === 'undefined') return;
+  updateTriggersInstalled = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForServiceWorkerUpdate(registration);
+  });
+  window.addEventListener('online', () => checkForServiceWorkerUpdate(registration));
+  window.setInterval(() => {
+    if (document.visibilityState === 'visible') checkForServiceWorkerUpdate(registration);
+  }, UPDATE_CHECK_PERIOD_MS);
 }
 
 export async function applyUpdate(reloadPage?: () => void): Promise<void> {
@@ -399,17 +410,10 @@ export async function applyUpdate(reloadPage?: () => void): Promise<void> {
       // Fall through to activation timeout handling below.
     }
 
-    const activated = await activation;
-    if (!activated) {
-      try {
-        registration = await navigator.serviceWorker.getRegistration?.() ?? registration;
-      } catch {
-        // Keep the previous registration reference for best-effort reset.
-      }
-      if (registration?.waiting) {
-        await resetCognisServiceWorker(registration);
-      }
-    }
+    // Never unregister the service worker to force an update: that also
+    // destroys the device's Web Push subscription. A worker that has not
+    // taken over yet activates on the next load.
+    await activation;
   }
 
   (reloadPage ?? (() => window.location.reload()))();

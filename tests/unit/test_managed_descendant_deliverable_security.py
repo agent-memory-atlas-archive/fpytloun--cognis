@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from cognis.core.tool_router import ToolRouter
 from cognis.models.tool import (
     NativeToolDefinition as ToolDefinition,
 )
 from cognis.models.tool import Permission, ToolCall, ToolResult, ToolSource
-from cognis.store.models import Agent, ManagedConversationLink
+from cognis.store.models import Agent, ArtifactGrantRow, ManagedConversationLink
 from cognis.store.queries import create_conversation, create_deliverable
 from cognis.tools.builtin.artifact_tools import handle_artifact_tool
 from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
@@ -172,6 +172,12 @@ async def _prepare_case(factory, case: _AccessCase) -> None:
                 title="Over-depth result",
                 artifact_store=factory.artifact_store,
             )
+        # Test malformed provenance without an entitlement already issued while
+        # the lineage was valid. Durable output grants intentionally survive
+        # source deletion or later link changes.
+        await session.execute(
+            delete(ArtifactGrantRow).where(ArtifactGrantRow.content_ref == case.deliverable_id)
+        )
         await session.commit()
 
 

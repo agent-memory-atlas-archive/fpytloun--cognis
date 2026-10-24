@@ -1,8 +1,13 @@
-@import 'highlight.js/styles/github-dark.css';
+@import './lib/theme/tokens.css';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+html[data-native-surface="rail"], html[data-native-surface="rail"] body {
+  background: transparent !important;
+  overflow: hidden;
+}
 
 @layer utilities {
   .touch-target-compact {
@@ -37,13 +42,18 @@
 }
 
 :root {
-  color-scheme: dark;
+  --chat-motion-activity: 1.6s;
+  --chat-motion-stream: 320ms;
+  --chat-motion-disclosure: 180ms;
+  --chat-motion-state: 240ms;
   --app-viewport-height: 100dvh;
   --app-viewport-offset-top: 0px;
   --app-visual-viewport-offset-top: 0px;
   --app-safe-area-top: env(safe-area-inset-top, 0px);
+  /* Raw bottom inset for full-screen overlays; app chrome uses
+     --app-bottom-comfort-inset. Components must not read env() directly. */
+  --app-safe-area-bottom: env(safe-area-inset-bottom, 0px);
   --app-bottom-inset: 0px;
-  --app-chrome-bg: #07111a;
   --app-bottom-chrome-bg: var(--app-chrome-bg);
   /* Browser/desktop fallback. Installed display modes override this below with
      a larger optical gutter that keeps controls inside rounded screen edges. */
@@ -60,13 +70,21 @@
   --app-overlay-inner-bottom: max(var(--app-overlay-gap), var(--app-bottom-control-inset));
   --app-overlay-inner-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
   --app-overlay-inner-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
-  --theme-void: #020617;
-  --theme-obsidian: #07111a;
-  --theme-ink: #122a35;
-  --theme-line: #1f3540;
-  --theme-accent: #38bdf8;
-  --theme-accent-strong: #0284c7;
-  --theme-accent-soft: #06b6d4;
+}
+
+/* Animate each component's own palette; status must not replace category colors. */
+.chat-state-handoff {
+  transition: color var(--chat-motion-state) ease,
+    border-color var(--chat-motion-state) ease,
+    background-color var(--chat-motion-state) ease;
+}
+.chat-disclosure-chevron {
+  transition: transform var(--chat-motion-disclosure) cubic-bezier(.2,.7,.2,1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-state-handoff, .chat-disclosure-chevron {
+    transition: none;
+  }
 }
 
 @media (display-mode: standalone), (display-mode: fullscreen) {
@@ -97,24 +115,17 @@ html {
   background: var(--app-chrome-bg);
 }
 
-/*
- * The layout was authored at the desktop 16px root. Users reported the
- * UI felt a step too large on both iPad and iPhone — ie. every page
- * needed exactly one Cmd- to feel comfortable. Drop the root font to
- * 15px across all breakpoints so every `rem`-based Tailwind size
- * scales down ~6%. Tap targets stay above the 36-40px threshold
- * because buttons use explicit `h-*`/`w-*` utilities, not rem heights.
- * 15px body is still comfortably above Apple's readable-text floor.
- */
+/* Compact, text-heavy application baseline. Chat body text has the same
+   explicit size so text-sm utilities do not shrink it a second time. */
 html {
-  font-size: 15px;
+  font-size: 14px;
 }
 
 /*
  * iOS Safari auto-zooms the viewport whenever a focused text input has
- * a computed font-size below 16px. Our 15px root + frequent `text-sm`
- * (14px) usage tripped that on iPhone PWAs — the whole page magnified
- * and shifted sideways as soon as the keyboard opened. Force a 16px
+ * a computed font-size below 16px. Compact text-entry controls otherwise
+ * trip that on iPhone PWAs — the whole page magnifies
+ * and shifts sideways as soon as the keyboard opens. Force a 16px
  * minimum on text-entry controls on touch pointers so the focus never
  * triggers the zoom; desktop (fine pointer) keeps the designed sizes
  * because auto-zoom is not a concern there.
@@ -150,7 +161,7 @@ body,
  * sheets) are the only things that can move.
  */
 body {
-  @apply bg-slate-950 text-slate-100 antialiased;
+  @apply bg-canvas text-foreground antialiased;
   position: fixed;
   inset: 0;
   width: 100%;
@@ -174,53 +185,56 @@ body {
 }
 
 .skip-link {
-  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl px-4 py-2 font-medium text-slate-950 shadow-card focus:not-sr-only;
+  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl px-4 py-2 font-medium text-on-accent shadow-card focus:not-sr-only;
   background: var(--theme-accent);
 }
 
 a {
   @apply transition-colors;
-  color: #38bdf8;
+  color: var(--link-fg, rgb(var(--color-accent)));
 }
 
 a:hover {
-  color: #bae6fd;
+  color: var(--link-hover-fg, rgb(var(--color-accent-hover)));
 }
 
 /* JSON syntax highlighting for tool-call input/output blocks. Colours
    stay close to the assistant bubble palette so highlighted payloads
    read as part of the conversation, not a separate dev tool. */
-.json-key { @apply text-sky-300; }
-.json-string { @apply text-emerald-300; }
-.json-number { @apply text-sky-200; }
-.json-boolean { @apply text-cyan-300; }
-.json-null { @apply text-cyan-300 italic; }
-.json-punct { @apply text-slate-500; }
+.json-key { @apply text-syntax-keyword; }
+.json-string { @apply text-syntax-string; }
+.json-number { color: var(--json-number-fg, rgb(var(--color-syntax-number))); }
+.json-boolean { color: var(--json-literal-fg, rgb(var(--color-syntax-keyword))); }
+.json-null { color: var(--json-literal-fg, rgb(var(--color-syntax-keyword))); font-style: italic; }
+.json-punct { @apply text-syntax-punctuation; }
 
 /* highlight.js classes for read tool output and markdown code blocks. */
 .hljs-keyword,
 .hljs-selector-tag,
-.hljs-built_in { @apply text-sky-300; }
+.hljs-built_in { @apply text-syntax-keyword; }
 .hljs-string,
 .hljs-attr,
-.hljs-symbol { @apply text-emerald-300; }
+.hljs-symbol { @apply text-syntax-string; }
 .hljs-number,
-.hljs-literal { @apply text-cyan-300; }
-.hljs-comment { @apply text-slate-500 italic; }
+.hljs-literal { @apply text-syntax-number; }
+.hljs-comment { @apply text-syntax-comment italic; }
 .hljs-title,
 .hljs-name,
-.hljs-function { @apply text-sky-200; }
+.hljs-function { @apply text-syntax-title; }
 .hljs-variable,
-.hljs-params { @apply text-slate-200; }
+.hljs-params { color: var(--syntax-variable-fg, rgb(var(--color-foreground))); }
 .hljs-punctuation,
-.hljs-operator { @apply text-slate-500; }
+.hljs-operator { @apply text-syntax-punctuation; }
+.hljs { color: rgb(var(--color-foreground)); background: rgb(var(--color-inset)); }
+.hljs-addition { color: rgb(var(--color-success)); }
+.hljs-deletion { color: rgb(var(--color-danger)); }
 
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  @apply outline-none ring-2 ring-sky-300 ring-offset-2 ring-offset-slate-950;
+  @apply outline-none ring-2 ring-accent ring-offset-2 ring-offset-canvas;
 }
 
 ::-webkit-scrollbar {
@@ -229,15 +243,64 @@ textarea:focus-visible,
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply rounded-full bg-slate-700;
+  @apply rounded-full bg-control-border;
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-slate-900/60;
+  @apply bg-inset/60;
 }
 
 .chat-markdown {
   overflow-wrap: anywhere;
+  font-size: var(--chat-message-font-size);
+}
+
+.chat-markdown code { font-size: 14px; }
+.request-prose { font-size: var(--chat-message-font-size); line-height: 1.6; }
+.compaction-card, .recap-paint { border-width: var(--tool-group-border, 1px); }
+.recap-paint {
+  background: var(--recap-bg, rgb(var(--color-surface)));
+  border-color: var(--recap-border, rgb(var(--color-blue-border)));
+}
+.primitive-button:focus-visible { --tw-ring-color: var(--primitive-focus, rgb(var(--color-accent))); }
+
+@media (forced-colors: none) {
+  [data-theme-family='paper'] { scrollbar-width: thin; }
+  [data-theme-family='paper'] ::-webkit-scrollbar { width: 6px; height: 6px; }
+  [data-theme-family='paper'] ::-webkit-scrollbar-thumb { background: rgb(var(--color-muted) / .55); }
+  [data-theme-family='paper'] ::-webkit-scrollbar-track { background: transparent; }
+}
+
+/* Bubble pairs are separate from action accents. Utilities may still supply
+   explicit plan/build edge colors without fighting component specificity. */
+@layer components {
+  .primitive-card {
+    background: var(--primitive-card-bg, rgb(var(--color-surface)));
+    border-color: var(--primitive-card-border, rgb(var(--color-separator) / .8));
+  }
+  .primitive-badge {
+    background: var(--primitive-badge-bg, rgb(var(--color-inset) / .8));
+    color: var(--primitive-badge-fg, rgb(var(--color-foreground)));
+  }
+  .primitive-danger {
+    background: var(--primitive-danger-bg, rgb(var(--color-danger)));
+    color: var(--primitive-danger-fg, rgb(var(--color-on-accent)));
+  }
+  .primitive-danger:hover { background: var(--primitive-danger-hover, rgb(var(--color-danger))); }
+  .primitive-secondary:hover, .primitive-ghost:hover {
+    background: var(--primitive-control-hover, rgb(var(--color-inset)));
+  }
+  .primitive-ghost:hover { color: var(--primitive-ghost-hover-fg, rgb(var(--color-foreground))); }
+  .chat-message-user {
+    background: var(--message-user-bg);
+    color: var(--message-user-fg);
+    border-color: var(--message-user-border);
+  }
+  .chat-message-assistant {
+    background: var(--message-assistant-bg);
+    color: var(--message-assistant-fg);
+    border-color: var(--message-assistant-border);
+  }
 }
 
 .chat-markdown pre {
@@ -251,48 +314,50 @@ textarea:focus-visible,
 }
 
 .chat-markdown :not(pre) > code {
-  border: 1px solid rgb(51 65 85 / 0.55);
+  border: 1px solid rgb(var(--color-separator));
   border-radius: 0.375rem;
-  background: rgb(15 23 42 / 0.75);
+  background: rgb(var(--color-inset));
   padding: 0.08rem 0.28rem;
-  color: rgb(186 230 253);
+  color: var(--inline-code-fg, rgb(var(--color-accent)));
 }
 
 .chat-markdown strong {
-  color: rgb(248 250 252);
+  color: var(--prose-strong-fg, rgb(var(--color-foreground)));
   font-weight: 700;
 }
 
 .chat-markdown em {
-  color: rgb(226 232 240);
+  color: var(--prose-emphasis-fg, rgb(var(--color-foreground)));
   font-style: italic;
 }
 
-/* Code blocks inside the outgoing (sky-tinted) bubble use a deeper sky
- * tone so the contrast holds without falling back to a slate slab that
- * would clash with the bubble's blue. */
+/* The bubble owns its fill/foreground pair; outgoing prose must not assume
+ * that every bubble uses the primary accent. Code blocks keep their own surface. */
+.chat-markdown.prose-user {
+  color: inherit;
+}
 .chat-markdown.prose-user :is(p, li, ul, ol, strong, em, blockquote) {
-  color: rgb(248 250 252);
+  color: inherit;
 }
 
 .chat-markdown.prose-user li::marker {
-  color: rgb(248 250 252);
+  color: currentColor;
 }
 
 .chat-markdown.prose-user a {
-  color: rgb(224 242 254);
+  color: var(--user-link-fg, inherit);
   text-decoration: underline;
 }
 
 .chat-markdown.prose-user :not(pre) > code {
-  border-color: rgb(125 211 252 / 0.45);
-  background: rgb(8 47 73 / 0.65);
-  color: rgb(240 249 255);
+  border-color: currentColor;
+  background: transparent;
+  color: var(--user-inline-code-fg, inherit);
 }
 
 .chat-markdown.prose-user pre {
-  background: rgb(8 47 73 / 0.85);
-  color: rgb(224 242 254);
+  background: rgb(var(--color-surface));
+  color: var(--user-code-fg, rgb(var(--color-foreground)));
 }
 
 .chat-markdown.prose-user pre code {
@@ -371,7 +436,7 @@ textarea:focus-visible,
   aspect-ratio: 16 / 9;
   overflow: hidden;
   border-radius: 0.75rem;
-  background: rgb(2 6 23);
+  background: rgb(var(--color-canvas));
 }
 
 .markdown-youtube-embed iframe {
@@ -388,22 +453,22 @@ textarea:focus-visible,
   justify-content: center;
   width: 1.5rem;
   height: 1.5rem;
-  border: 1px solid rgb(51 65 85 / 0.5);
+  border: 1px solid rgb(var(--color-separator));
   border-radius: 0.375rem;
-  background: rgb(2 6 23 / 0.75);
-  color: rgb(100 116 139);
+  background: rgb(var(--color-surface) / 0.95);
+  color: var(--quiet-control-fg, rgb(var(--color-muted)));
   transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
 }
 
 .copy-icon-button:hover {
-  border-color: rgb(71 85 105);
-  background: rgb(15 23 42);
-  color: rgb(203 213 225);
+  border-color: rgb(var(--color-control-border));
+  background: rgb(var(--color-surface-hover));
+  color: rgb(var(--color-foreground));
 }
 
 .copy-icon-button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgb(100 116 139 / 0.7);
+  box-shadow: 0 0 0 2px rgb(var(--color-accent));
 }
 
 .copy-icon-button svg {
@@ -619,11 +684,7 @@ textarea:focus-visible,
   /* Keep decorative blue highlights inside the app viewport only. Body/html
      stay flat gray so any iOS keyboard or rounded-corner exposure is not blue. */
   background-color: var(--app-chrome-bg);
-  background-image:
-    linear-gradient(180deg, var(--app-chrome-bg) 0px, var(--app-chrome-bg) 64px, rgb(7 17 26 / 0) 160px),
-    radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.12), transparent 32%),
-    radial-gradient(circle at 88% 8%, rgb(6 182 212 / 0.08), transparent 30%),
-    linear-gradient(180deg, var(--theme-obsidian) 0%, var(--theme-void) 54%, #0f1719 100%);
+  background-image: linear-gradient(180deg, var(--app-chrome-bg), rgb(var(--color-canvas)) 54%);
   touch-action: pan-y;
 }
 
@@ -711,7 +772,7 @@ textarea:focus-visible,
   padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
   padding-top: max(1.5rem, calc(var(--app-safe-area-top) + 0.75rem));
   padding-bottom: 1.5rem;
-  background: #07111a;
+  background: var(--app-chrome-bg);
 }
 
 .app-fullscreen-safe--compact {

@@ -26,6 +26,7 @@ from cognis.api.chat_v2.request_metrics import (
 from cognis.api.chat_v2.schemas import (
     ActivityOverviewDetail,
     ActivityOverviewResponse,
+    BackgroundToolCallV2Response,
     CancelTurnV2Response,
     ChatSnapshot,
     ChatSyncResponse,
@@ -37,6 +38,8 @@ from cognis.api.chat_v2.schemas import (
     ForkAssistantMessageV2Response,
     QueueMutationResponse,
     QueueUpdateV2Request,
+    RetryProviderOption,
+    RetryProviderOptionsResponse,
     RetryTurnV2Response,
     SendMessageV2Request,
     SendMessageV2Response,
@@ -87,7 +90,7 @@ from cognis.api.chat_v2.work_graph import (
 )
 from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.chat_v2.work_overview_metrics import WORK_OVERVIEW_METRICS
-from cognis.api.chat_v2.work_projection import build_work_projection
+from cognis.api.chat_v2.work_projection import build_work_projection, work_deliverable_lineage_key
 from cognis.api.chat_v2.work_repository import (
     WorkCursorError,
     enrich_workstream_lifecycle,
@@ -103,11 +106,14 @@ from cognis.api.common import (
     require_session_user,
 )
 from cognis.api.models import ToolOutputChunkResponse, ToolOutputPageResponse
+from cognis.core import turn_latency
 from cognis.core.attachment_utils import hydrate_attachment_refs
 from cognis.core.chat_modes import parse_chat_mode_directive
 from cognis.core.command_notices import persist_command_system_notice
 from cognis.core.commands import is_system_slash_command_message
 from cognis.core.historical_tool_output import tool_event_storage_id
+from cognis.core.project_access import can_read_conversation
+from cognis.core.tool_backgrounding import ToolBackgroundError, ToolBackgroundErrorCode
 from cognis.core.trusted_evidence import authenticated_direct_user_origin
 from cognis.core.turn_scheduler import TurnError
 from cognis.core.user_message_overflow import TextArtifact, normalize_user_message_content
@@ -143,6 +149,56 @@ WORK_PAGE_MAX_LIMIT = 100
 WORK_REQUEST_MAX_SECONDS = 20.0
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
 _CLIENT_PERFORMANCE_BODY_MAX_BYTES = 256
+
+
+@router.get(
+    "/conversations/{conversation_id}/retry-provider-options",
+    response_model=RetryProviderOptionsResponse,
+)
+async def get_retry_provider_options(
+    request: Request,
+    conversation_id: str,
+    turn_id: str | None = None,
+    provider_id: str | None = None,
+    model: str | None = None,
+) -> RetryProviderOptionsResponse:
+    """Read same-model recovery choices using existing conversation ownership."""
+    from cognis.core.retry_provider_options import (
+        resolve_retry_provider_context,
+        retry_provider_options,
+    )
+
+    context = await _load_read_context(request, conversation_id, author_only=True)
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+
+    async def load_failures() -> list[dict[str, Any]]:
+        snapshot = await build_chat_snapshot_coordinated(request.app, context)
+        return [item.model_dump() for item in snapshot.timeline.items if item.kind == "message"]
+
+    active_turn = await resolve_retry_provider_context(
+        session_factory=request.app.state.session_factory,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        provider_id=provider_id,
+        model=model,
+        load_failures=load_failures,
+    )
+    if active_turn is None:
+        return RetryProviderOptionsResponse()
+    options = await retry_provider_options(
+        session_factory=request.app.state.session_factory,
+        llm=request.app.state.providers.llm,
+        monitor=getattr(request.app.state, "provider_monitor", None),
+        user_email=user.email,
+        active_turn=active_turn,
+    )
+    return RetryProviderOptionsResponse(
+        turn_id=active_turn.get("turn_id") if active_turn else None,
+        provider_id=active_turn.get("provider_id") if active_turn else None,
+        model=active_turn.get("model") if active_turn else None,
+        options=[RetryProviderOption.model_validate(option) for option in options],
+    )
 
 
 async def _scoped_tool_output_page(
@@ -458,7 +514,7 @@ async def chat_v2_conversation_work(
     """Project persisted mutation evidence for the conversation's current window."""
 
     _set_work_response_headers(response)
-    context = await _load_read_context(request, conversation_id)
+    context = await _load_read_context(request, conversation_id, author_only=True)
     return await _build_work_graph_projection(
         request,
         context,
@@ -484,7 +540,9 @@ async def chat_v2_conversation_activity_overview(
 ) -> ActivityOverviewResponse:
     _set_work_response_headers(response)
     return await _build_activity_overview(
-        request, await _load_read_context(request, conversation_id), detail=detail
+        request,
+        await _load_read_context(request, conversation_id, author_only=True),
+        detail=detail,
     )
 
 
@@ -643,6 +701,7 @@ async def chat_v2_send_message(
 ) -> SendMessageV2Response:
     """Submit a normal Chat v2 user message with durable idempotency."""
 
+    prepare_started = monotonic()
     user, row = await _require_mutable_conversation(request, conversation_id)
     chat_mode_directive = parse_chat_mode_directive(payload.content)
     if is_system_slash_command_message(payload.content) or (
@@ -689,10 +748,13 @@ async def chat_v2_send_message(
     attachments = [*payload.attachments, *generated_attachments]
     turn_scheduler = request.app.state.turn_scheduler
     durable_admission: AdmissionResult | None = None
+    admitted_at: float | None = None
 
     async def _observe_durable_admission(admission: AdmissionResult) -> None:
-        nonlocal durable_admission
+        nonlocal durable_admission, admitted_at
         durable_admission = admission
+        admitted_at = monotonic()
+        turn_latency.observe("submit_to_admission", admitted_at - submit_started)
 
     try:
         await _mark_attachments_attached(request, row, user.email, attachments)
@@ -710,18 +772,21 @@ async def chat_v2_send_message(
         raise api_exception(
             409, "attachment_unavailable", "Attachment is no longer available; upload it again."
         ) from None
-    error = await turn_scheduler.submit_turn(
-        conversation_id,
-        normalized.content,
-        user_email=user.email,
-        admission_origin=authenticated_direct_user_origin(),
-        attachments=[item.model_dump(mode="json") for item in attachments],
-        client_message_id=payload.client_message_id,
-        one_shot_chat_mode=payload.chat_mode,
-        idempotency_scope=f"chat-v2:{conversation_id}:{user.email}",
-        idempotency_key=client_txn_id,
-        durable_admission_observer=_observe_durable_admission,
-    )
+    submit_started = monotonic()
+    turn_latency.observe("request_prepare", submit_started - prepare_started)
+    with turn_latency.measure("submit_total"):
+        error = await turn_scheduler.submit_turn(
+            conversation_id,
+            normalized.content,
+            user_email=user.email,
+            admission_origin=authenticated_direct_user_origin(),
+            attachments=[item.model_dump(mode="json") for item in attachments],
+            client_message_id=payload.client_message_id,
+            one_shot_chat_mode=payload.chat_mode,
+            idempotency_scope=f"chat-v2:{conversation_id}:{user.email}",
+            idempotency_key=client_txn_id,
+            durable_admission_observer=_observe_durable_admission,
+        )
     if error is not None:
         await _complete_transaction(
             request,
@@ -766,6 +831,8 @@ async def chat_v2_send_message(
     tx_row = await _complete_transaction(
         request, tx_row.transaction_id, status=result_status, result=result
     )
+    if admitted_at is not None:
+        turn_latency.observe("admission_to_receipt", monotonic() - admitted_at)
     return _send_response_from_transaction(tx_row, duplicate=False)
 
 
@@ -1204,6 +1271,51 @@ async def chat_v2_cancel_turn(
     return _cancel_response_from_transaction(tx_row, duplicate=False)
 
 
+_TOOL_BACKGROUND_ERROR_STATUS: dict[ToolBackgroundErrorCode, int] = {
+    ToolBackgroundErrorCode.NO_ACTIVE_TURN: 409,
+    ToolBackgroundErrorCode.UNKNOWN_CALL: 404,
+    ToolBackgroundErrorCode.UNSUPPORTED_TOOL: 409,
+    ToolBackgroundErrorCode.NOT_BACKGROUNDABLE: 409,
+    ToolBackgroundErrorCode.EXECUTOR_UNAVAILABLE: 503,
+    ToolBackgroundErrorCode.EXECUTOR_UNSUPPORTED: 409,
+}
+
+
+@router.post(
+    "/conversations/{conversation_id}/tool-calls/{call_id}/background",
+    response_model=BackgroundToolCallV2Response,
+)
+async def chat_v2_background_tool_call(
+    request: Request,
+    conversation_id: str,
+    call_id: str,
+) -> BackgroundToolCallV2Response:
+    """Move a running foreground tool call of the active turn into the background."""
+
+    await _require_mutable_conversation(request, conversation_id)
+    service = getattr(request.app.state, "tool_backgrounding", None)
+    if service is None:
+        raise api_exception(503, "unavailable", "Tool backgrounding is not available")
+    try:
+        result = await service.request_background(
+            conversation_id=conversation_id,
+            call_id=call_id,
+        )
+    except ToolBackgroundError as exc:
+        raise api_exception(
+            _TOOL_BACKGROUND_ERROR_STATUS.get(exc.code, 409),
+            exc.code.value,
+            str(exc),
+        ) from exc
+    return BackgroundToolCallV2Response(
+        conversation_id=conversation_id,
+        call_id=result.call_id,
+        tool_name=result.tool_name,
+        status="already_requested" if result.already_requested else "requested",
+        server_time=_server_time(),
+    )
+
+
 @router.post(
     "/conversations/{conversation_id}/turns/{turn_id}/retry",
     response_model=RetryTurnV2Response,
@@ -1444,13 +1556,48 @@ async def chat_v2_update_queued_message(
     return _queue_response_from_transaction(tx_row, duplicate=False)
 
 
-async def _load_read_context(request: Request, conversation_id: str) -> ConversationSnapshotContext:
+async def _load_read_context(
+    request: Request, conversation_id: str, *, author_only: bool = False
+) -> ConversationSnapshotContext:
+    """Load a read context for the author or an authorized project reader.
+
+    ``author_only`` routes (Work graph, activity overview) traverse managed
+    descendants and other owner-scoped work, so project readers get 404.
+    """
+
     user = require_current_user(request)
+    authority = (
+        user.email
+        if author_only
+        else await _conversation_read_authority(request, conversation_id, user.email)
+    )
     return await load_conversation_snapshot_context(
         request.app,
-        user_email=user.email,
+        user_email=authority,
         conversation_id=conversation_id,
+        shared_reader=authority != user.email,
     )
+
+
+async def _conversation_read_authority(
+    request: Request, conversation_id: str, caller_email: str
+) -> str:
+    """Return the identity whose authority reads a conversation's history.
+
+    Authors read as themselves. Project readers of a project-visible
+    conversation read as the author, because session history belongs to the
+    author; the caller authorization happens here before any read.
+    """
+
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        if row is None or getattr(row, "status", None) == "deleted":
+            raise api_exception(404, "not_found", "Conversation not found")
+        if row.user_email == caller_email:
+            return caller_email
+        if not await can_read_conversation(session, row, caller_email):
+            raise api_exception(404, "not_found", "Conversation not found")
+        return str(row.user_email)
 
 
 async def _build_scoped_snapshot(
@@ -1919,7 +2066,7 @@ async def _require_mutable_conversation(request: Request, conversation_id: str) 
         agent = await get_agent(session, row.agent_id)
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
-    await check_agent_access(request, agent, required="use")
+    await check_agent_access(request, agent, required="use", project_id=row.project_id)
     if row.status == "archived":
         raise api_exception(409, "conflict", "Conversation is not active")
     if row.context_type in _MANAGED_CONVERSATION_CONTEXT_TYPES:
@@ -2561,7 +2708,8 @@ async def _build_work_graph_projection_with_stages(
                     WorkRecordRow.materializer_version == WORK_MATERIALIZER_VERSION,
                     WorkRecordRow.is_evidence.is_(True),
                     WorkRecordRow.category == "deliverables",
-                    WorkRecordRow.entity_id == primary_row.deliverable_id,
+                    WorkRecordRow.entity_id
+                    == (primary_row.lineage_id or primary_row.deliverable_id),
                     *((WorkRecordRow.occurred_at >= from_time,) if from_time is not None else ()),
                     *((WorkRecordRow.occurred_at < to_time,) if to_time is not None else ()),
                 )
@@ -2606,6 +2754,8 @@ async def _build_work_graph_projection_with_stages(
         )
         primary = WorkDeliverable(
             deliverable_id=primary_row.deliverable_id,
+            lineage_id=primary_row.lineage_id,
+            revision=primary_row.revision,
             sort_key="",
             format=primary_row.format,
             title=primary_row.title,
@@ -2620,7 +2770,7 @@ async def _build_work_graph_projection_with_stages(
             deliverables = [
                 item
                 for item in projection.deliverables
-                if item.deliverable_id != primary.deliverable_id
+                if work_deliverable_lineage_key(item) != work_deliverable_lineage_key(primary)
             ]
             projection = projection.model_copy(
                 update={

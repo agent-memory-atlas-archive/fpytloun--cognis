@@ -13,6 +13,10 @@ from cognis.core.content_refs import (
 )
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolSource
+from cognis.store.deliverable_storage import (
+    DeliverablePayloadIntegrityError,
+    DeliverableStoreUnavailable,
+)
 from cognis.store.queries import get_task, list_step_runs_for_task
 from cognis.tools.registry import ToolExecutionContext
 
@@ -99,6 +103,8 @@ def _deliverable_accessor(context: ToolExecutionContext) -> tuple[str | None, st
 
 def build_task_continuation_tool_handlers(
     session_factory: async_sessionmaker[AsyncSession],
+    *,
+    artifact_store: Any | None = None,
 ) -> dict[str, Any]:
     """Build runtime handlers for task continuation tools."""
 
@@ -111,23 +117,27 @@ def build_task_continuation_tool_handlers(
         deliverable_id = str(arguments.get("deliverable_id") or "").strip()
         if not user_email or not deliverable_id:
             return {"ok": False, "error": "missing_user_or_deliverable_id"}
-        artifact_store = None
+        controller_store = artifact_store
         if context.shared_runtime_metadata is not None:
-            artifact_store = context.shared_runtime_metadata.get("artifact_store")
-        artifact_store = artifact_store or context.runtime_metadata.get("artifact_store")
+            controller_store = controller_store or context.shared_runtime_metadata.get(
+                "artifact_store"
+            )
+        controller_store = controller_store or context.runtime_metadata.get("artifact_store")
         async with session_factory() as session:
             try:
                 ref = await get_accessible_deliverable_ref(
                     session,
-                    artifact_store,
+                    controller_store,
                     deliverable_id,
                     user_email,
                     scope_task_id=scope_task_id,
                     accessor_conversation_id=accessor_conversation_id,
                     accessor_agent_id=accessor_agent_id,
                 )
-            except ValueError:
+            except DeliverableStoreUnavailable:
                 return {"ok": False, "error": "artifact_store_unavailable"}
+            except DeliverablePayloadIntegrityError:
+                return {"ok": False, "error": "deliverable_integrity_error"}
             if ref is None:
                 return {"ok": False, "error": "not_found"}
             deliverable = ref.deliverable

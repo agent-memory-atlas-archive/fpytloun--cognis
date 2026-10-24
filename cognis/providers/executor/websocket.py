@@ -50,6 +50,11 @@ from cognis.tools.executor.lsp.runtime import (
     LSPStatusReport,
     build_lsp_unavailable_report,
 )
+from cognis.tools.registry import (
+    TOOL_BACKGROUND_RPC_TIMEOUT_SECONDS,
+    ToolBackgroundRequestOutcome,
+    parse_tool_background_rpc_result,
+)
 
 _logger = get_logger(__name__)
 
@@ -903,6 +908,18 @@ class WebSocketExecutorConnection:
                 extra={"extra_data": {"executor_id": self.executor_id, "call_id": call_id}},
             )
 
+    async def request_background(
+        self, call_id: str, *, timeout: float = TOOL_BACKGROUND_RPC_TIMEOUT_SECONDS
+    ) -> ToolBackgroundRequestOutcome:
+        """Ask the executor to move a running tool call into a background job.
+
+        Executors that predate ``tool.background`` ignore unknown methods, so
+        callers observe a ``TimeoutError`` rather than an RPC error.
+        """
+
+        result = await self.rpc_call("tool.background", {"call_id": call_id}, timeout=timeout)
+        return parse_tool_background_rpc_result(result)
+
     async def cancel_inference(self, request_id: str) -> None:
         try:
             await self.rpc_call(
@@ -1064,6 +1081,7 @@ class WebSocketExecutorConnection:
         api_key: str = "",
         provider_id: str | None = None,
         owner_email: str | None = None,
+        aws_config: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Discover provider models from the executor host perspective."""
 
@@ -1075,6 +1093,7 @@ class WebSocketExecutorConnection:
                 "api_key": api_key,
                 "provider_id": provider_id,
                 "owner_email": owner_email,
+                **({"aws_config": aws_config} if aws_config else {}),
             },
             timeout=30.0,
         )
@@ -1148,11 +1167,14 @@ class WebSocketExecutorConnection:
 
     async def background_shell_status(self, *, include_completed: bool = False) -> dict[str, Any]:
         """Fetch background shell status from a remote executor."""
-        return await self.rpc_call(
+        from cognis.providers.executor.shell_status import bind_shell_status
+
+        result = await self.rpc_call(
             "shell.background_status",
             {"include_completed": include_completed},
             timeout=10.0,
         )
+        return bind_shell_status(result, self.executor_id)
 
     async def oauth_loopback_start(
         self,
@@ -1188,6 +1210,21 @@ class WebSocketExecutorConnection:
 
     async def _receive_loop(self) -> None:
         """Read messages from the WebSocket and dispatch them."""
+        try:
+            while self._connected:
+                if not await self._receive_frame():
+                    break
+        finally:
+            self._connected = False
+            await self._terminate_pending("Executor disconnected")
+
+    async def _receive_frame(self) -> bool:
+        """Scope payloads and dispatch closures to one frame, never an idle wait.
+
+        A handled frame returns before another receive. The inner loop preserves
+        the ownership-loss/disconnect break boundary. Pending futures and dispatch
+        tasks retain their own payloads for as long as their consumers need them.
+        """
         try:
             while self._connected:
                 try:
@@ -1228,8 +1265,10 @@ class WebSocketExecutorConnection:
                         response_id: str = response_id,
                         response: dict[str, Any] = data,
                     ) -> None:
-                        future = self._pending.pop(response_id)
-                        if not future.done():
+                        # The ownership fence can yield while timeout/cancellation
+                        # removes this waiter. A late response must not close the socket.
+                        future = self._pending.pop(response_id, None)
+                        if future is not None and not future.done():
                             if "error" in response:
                                 err = response["error"]
                                 future.set_exception(
@@ -1245,7 +1284,7 @@ class WebSocketExecutorConnection:
                     if not await self._apply_owned_effect(resolve_response):
                         await self._close_for_ownership_loss()
                         break
-                    continue
+                    return True
 
                 # JSON-RPC notification (has "method" but no "id", or id is
                 # not in pending — treat as notification)
@@ -1310,7 +1349,7 @@ class WebSocketExecutorConnection:
                                     self.cancel_call(call_id),
                                     name=f"executor-tool-progress-overflow-{call_id}",
                                 )
-                            continue
+                            return True
                         stream = params.get("stream")
                         progress_task = self._track_notification_task(
                             self._dispatch_callback(
@@ -1436,7 +1475,7 @@ class WebSocketExecutorConnection:
                     ):
                         completion = _normalize_local_model_completion(params)
                         if completion is None:
-                            continue
+                            return True
                         operation_id = str(completion["operation_id"])
                         if operation_id:
                             self._pending_local_model_progress.pop(operation_id, None)
@@ -1462,8 +1501,9 @@ class WebSocketExecutorConnection:
                             }
                         },
                     )
+                return True
         except asyncio.CancelledError:
-            pass
+            return False
         except Exception as exc:
             self._close_error_type = type(exc).__name__
             _logger.warning(
@@ -1476,9 +1516,7 @@ class WebSocketExecutorConnection:
                 },
                 exc_info=True,
             )
-        finally:
-            self._connected = False
-            await self._terminate_pending("Executor disconnected")
+        return False
 
     # ------------------------------------------------------------------
     # Channel adapter callback registration
@@ -2046,6 +2084,39 @@ class WebSocketExecutorProvider:
                     )
                 ).all()
             )
+            remote_leases = [
+                lease
+                for lease in leases
+                if lease.owner_id != self._cluster_runtime.owner_id
+                and self.get_local_connection(
+                    lease.resource_key.removeprefix("executor_connection:")
+                )
+                is None
+            ]
+            controllers = (
+                await self._cluster_directory.get_ready_many(
+                    {lease.owner_id for lease in remote_leases}
+                )
+                if remote_leases
+                else {}
+            )
+            executor_ids = {
+                lease.resource_key.removeprefix("executor_connection:")
+                for lease in remote_leases
+                if lease.owner_id in controllers and controllers[lease.owner_id].internal_url
+            }
+            executor_rows = (
+                {
+                    row.executor_id: row
+                    for row in await session.scalars(
+                        select(ExecutorRow)
+                        .where(ExecutorRow.executor_id.in_(executor_ids))
+                        .options(executor_observed_tools_deferred())
+                    )
+                }
+                if executor_ids
+                else {}
+            )
             for lease in leases:
                 executor_id = lease.resource_key.removeprefix("executor_connection:")
                 if self.get_local_connection(executor_id) is not None:
@@ -2085,14 +2156,10 @@ class WebSocketExecutorProvider:
                             self._missing_self_owned_connections.pop(executor_id, None)
                     continue
                 self._missing_self_owned_connections.pop(executor_id, None)
-                controller = await self._cluster_directory.get_ready(lease.owner_id)
+                controller = controllers.get(lease.owner_id)
                 if controller is None or not controller.internal_url:
                     continue
-                row = await session.get(
-                    ExecutorRow,
-                    executor_id,
-                    options=[executor_observed_tools_deferred()],
-                )
+                row = executor_rows.get(executor_id)
                 if row is None or row.status != "active":
                     continue
                 capabilities = ExecutorCapabilities.model_validate(

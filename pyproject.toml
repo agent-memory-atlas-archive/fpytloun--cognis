@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.17.1"
+version = "0.18.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
-license = { text = "TBD" }
+license = { text = "BUSL-1.1" }
 requires-python = ">=3.12"
 authors = [
     { name = "Filip Pytloun", email = "filip@pytloun.cz" },
@@ -19,6 +19,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "boto3>=1.34.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "httpx>=0.27.0",
@@ -60,7 +61,7 @@ dependencies = [
     "psutil>=6.1.0",
     "youtube-transcript-api>=1.2.0",
     "pyotp>=2.9.0",
-    "cognis-common==0.17.1",
+    "cognis-common==0.18.0",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +78,7 @@ dev = [
     "types-psutil>=7.2.2.20260827",
     "types-jsonschema>=4.26.0.20260518",
     "boto3-stubs[s3]>=1.43.83",
+    "towncrier>=25.8,<26",
 ]
 postgres = [
     "asyncpg>=0.29.0",
@@ -105,9 +107,17 @@ members = ["packages/common", "packages/executor"]
 cognis-common = { workspace = true }
 
 [tool.hatch.build.targets.sdist]
+exclude = [
+    "/docs/development/macos-0.18.0-integration-qualification.md",
+    "/docs/development/release-0.18.0-qualification.md",
+    "/docs/development/resource-audit-qualification.md",
+    "/docs/development/attachment-idb-diagnostic-checkpoint.md",
+    "/docs/development/attachment-idb-integrated-gates.md",
+]
 include = [
     "/LICENSE",
     "/README.md",
+    "/CHANGELOG.md",
     "/build.py",
     "/cognis/**/*",
     "/ui/**/*",
@@ -178,3 +188,52 @@ ignore_missing_imports = true
 dev = [
     "pytest-xdist>=3.8.0",
 ]
+
+[tool.towncrier]
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+template = "changelog.d/template.md.jinja"
+start_string = "<!-- towncrier release notes start -->\n"
+title_format = "## [{version}] - {project_date}"
+underlines = ["", "", ""]
+issue_format = ""
+ignore = ["README.md", "template.md.jinja"]
+wrap = false
+
+[[tool.towncrier.type]]
+directory = "added"
+name = "Added"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "changed"
+name = "Changed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "fixed"
+name = "Fixed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "security"
+name = "Security"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "deprecated"
+name = "Deprecated"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "removed"
+name = "Removed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "upgrade"
+name = "Upgrade notes"
+showcontent = true
+
+[tool.cognis.changelog]
+next_version = "0.18.1"

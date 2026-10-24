@@ -7,6 +7,8 @@ import csv
 import io
 import re
 import sys
+import tomllib
+from email.parser import Parser
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -14,6 +16,7 @@ COMMON_ALLOWED_PREFIXES = (
     "cognis/__init__.py",
     "cognis/json_codec.py",
     "cognis/json_stream.py",
+    "cognis/guardrails_redaction.py",
     "cognis/logging.py",
     "cognis/mcp_runtime.py",
     "cognis/ownership.py",
@@ -31,7 +34,14 @@ COMMON_ALLOWED_PREFIXES = (
     "cognis/models/",
     "cognis/providers/llm/anthropic/",
     "cognis/providers/llm/errors.py",
+    "cognis/providers/llm/bedrock.py",
+    "cognis/providers/llm/cache_policy.py",
+    "cognis/providers/llm/hosted.py",
+    "cognis/providers/llm/image_config.py",
+    "cognis/providers/llm/systemone.py",
     "cognis/providers/llm/terminal.py",
+    "cognis/providers/video.py",
+    "cognis/providers/video_media.py",
     "cognis/rendering/rich_visuals.py",
     "cognis/tools/argument_normalization.py",
     "cognis/tools/argument_aliases.py",
@@ -185,12 +195,16 @@ def assert_split(common: Path, controller: Path, executor: Path) -> None:
     common_metadata = metadata(common)
     controller_metadata = metadata(controller)
     executor_metadata = metadata(executor)
-    if "Version: 0.17.1" not in common_metadata:
-        raise AssertionError("common metadata does not report version 0.17.1")
-    if "Version: 0.17.1" not in controller_metadata:
-        raise AssertionError("controller metadata does not report version 0.17.1")
-    if "Version: 0.17.1" not in executor_metadata:
-        raise AssertionError("executor metadata does not report version 0.17.1")
+    expected_version = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]["version"]
+    for name, text in (
+        ("common", common_metadata),
+        ("controller", controller_metadata),
+        ("executor", executor_metadata),
+    ):
+        if Parser().parsestr(text)["Version"] != expected_version:
+            raise AssertionError(f"{name} metadata does not report version {expected_version}")
     if _requires(controller_metadata) != [
         item for item in _requires(controller_metadata) if item != "cognis-executor"
     ]:

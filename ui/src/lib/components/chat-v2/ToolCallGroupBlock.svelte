@@ -1,5 +1,7 @@
 <script lang="ts">
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
+  import ActivityLabel from './ActivityLabel.svelte';
+  import { chatDisclosure } from '$lib/chat-v2/motion';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
@@ -10,6 +12,7 @@
 
   let {
     row,
+    active = row.summary.status === 'running',
     agent = null,
     compact = false,
     searchQuery = '',
@@ -20,6 +23,7 @@
     scope
   } = $props<{
     row: ToolGroupRow;
+    active?: boolean;
     agent?: Agent | null;
     compact?: boolean;
     searchQuery?: string;
@@ -85,45 +89,46 @@
     return formatDurationMs(ms);
   });
 
-  const displayLabel = $derived(row.summary.status === 'running' ? row.summary.label.replace(/…$/, '') : row.summary.label);
-  const animatedDots = $derived(['.', '..', '...'][Math.floor(liveNow / 450) % 3]);
-
 </script>
 
 <div class="group relative my-0.5" data-kind="tool_group" data-tool-group-kind={row.summary.kind} data-tool-group-status={row.summary.status}>
   <button
     type="button"
     onclick={() => (expanded = !expanded)}
-    class={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-slate-500/5 focus:outline-none ${row.summary.accentClass}`}
+    class={`chat-state-handoff flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm hover:bg-surface-hover focus-visible:outline-accent ${row.summary.accentClass}`}
+    data-motion-state={row.summary.status}
     aria-expanded={expanded}
   >
     <ActivityGroupIcon
       icon={row.summary.icon}
-      class="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-75 {row.summary.status === 'running' ? 'animate-pulse' : ''}"
+      class="mt-0.5 h-3.5 w-3.5 shrink-0 opacity-75"
     />
-    <span class="min-w-0 flex-1 truncate font-medium">
-      {displayLabel}{#if row.summary.status === 'running'}<span class="inline-block min-w-[1.5em] text-left">{animatedDots}</span>{/if}
+    <span class="tool-group-label min-w-0 flex-1 truncate font-medium">
+      <ActivityLabel label={row.summary.label} {active} />
     </span>
     {#if row.summary.editStats && (row.summary.editStats.additions > 0 || row.summary.editStats.deletions > 0)}
-      <span class="shrink-0 text-xs tabular-nums text-slate-500">
+      <span class="shrink-0 text-xs tabular-nums text-quiet">
         {row.summary.editStats.fileCount} {row.summary.editStats.fileCount === 1 ? 'file' : 'files'}
-        <span class="text-slate-600">(</span><span class="text-emerald-400">+{row.summary.editStats.additions}</span><span class="text-slate-600">/</span><span class="text-rose-400">-{row.summary.editStats.deletions}</span><span class="text-slate-600">)</span>
+        <span class="text-quiet">(</span><span class="text-success">+{row.summary.editStats.additions}</span><span class="text-quiet">/</span><span class="text-danger">-{row.summary.editStats.deletions}</span><span class="text-quiet">)</span>
       </span>
     {:else}
-      <span class="shrink-0 text-xs tabular-nums text-slate-500">
+      <span class="shrink-0 text-xs tabular-nums text-quiet">
         {row.summary.detailLabel}
       </span>
     {/if}
     {#if durationLabel}
-      <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
+      <span class="shrink-0 text-xs tabular-nums text-quiet">{durationLabel}</span>
     {/if}
     <ChevronDown
-      class="h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform duration-150 ease-out {expanded ? 'rotate-180' : ''}"
+      class="chat-disclosure-chevron h-3.5 w-3.5 shrink-0 text-quiet {expanded ? 'rotate-180' : ''}"
     />
   </button>
 
   {#if expanded}
-    <div class="mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-slate-700/60 bg-slate-950/20 px-2 py-2">
+    <div transition:chatDisclosure
+      onoutrostart={(event) => { event.currentTarget.inert = true; }}
+      onintrostart={(event) => { event.currentTarget.inert = false; }}
+      class="tool-group-content mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-separator/50 px-2 py-2">
       {#each row.items as item (item.id)}
         {@const searchMatched = searchMatchedIds.has(item.id)}
         <ChatV2TimelineItemRenderer
@@ -141,3 +146,11 @@
     </div>
   {/if}
 </div>
+
+<style>
+  .tool-group-label { color: var(--tool-group-label-fg, inherit); }
+  .tool-group-content {
+    border-width: var(--tool-group-border, 1px);
+    background: var(--tool-group-background, rgb(var(--color-inset) / .2));
+  }
+</style>

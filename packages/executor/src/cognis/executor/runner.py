@@ -88,6 +88,7 @@ from cognis.tools.executor.shell import (
     notify_pending_background_shell_completions,
     set_background_shell_completion_callback,
 )
+from cognis.tools.registry import ToolBackgroundControl, ToolBackgroundRequestOutcome
 
 logger = logging.getLogger("cognis.executor.runner")
 
@@ -159,6 +160,7 @@ _LOCAL_INFERENCE_START_METHODS = {
     "llm.complete",
     "llm.discover_models",
     "llm.image_generate",
+    "llm.video",
     "llm.transcribe",
     "llm.synthesize",
     "local_model.show",
@@ -515,6 +517,7 @@ class ExecutorRunner:
         self._call_records: dict[str, dict[str, Any]] = {}
         self._terminal_call_records: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
+        self._background_controls: dict[str, ToolBackgroundControl] = {}
         # Tool executions outlive one websocket so an unstable network cannot
         # destroy work in progress. Results are retained briefly so the
         # controller can fetch them after reconnecting to this same process.
@@ -926,6 +929,10 @@ class ExecutorRunner:
                     **({"owner_ws": ws} if replay_owner else {}),
                     msg_id=msg_id,
                 )
+            elif method == "executor.mcp.retry":
+                self._create_background_handler_task(
+                    self._handle_mcp_retry(ws, msg_id, params), method, msg_id=msg_id
+                )
             elif method == "tool.list":
                 logger.debug("Received tool.list request")
                 if replay_owner:
@@ -938,6 +945,12 @@ class ExecutorRunner:
                     )
                 else:
                     await self._handle_tool_list(ws, msg_id)
+            elif method == "skill.assets.prepare":
+                self._create_background_handler_task(
+                    self._handle_skill_assets_prepare(ws, msg_id, params),
+                    method,
+                    msg_id=msg_id,
+                )
             elif method == "tool.result_fetch":
                 if replay_owner:
                     self._create_replay_safe_handler_task(
@@ -1015,6 +1028,27 @@ class ExecutorRunner:
                         ws,
                         msg_id,
                         {"call_id": call_id, "cancelled": cancelled},
+                    )
+            elif method == "tool.background":
+                call_id = params.get("call_id")
+                control = (
+                    self._background_controls.get(str(call_id)) if call_id is not None else None
+                )
+                outcome = (
+                    control.request()
+                    if control is not None
+                    else ToolBackgroundRequestOutcome.UNKNOWN_CALL
+                )
+                logger.debug("Received tool.background: %s -> %s", call_id, outcome.value)
+                if msg_id is not None:
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {
+                            "call_id": call_id,
+                            "accepted": outcome is ToolBackgroundRequestOutcome.ACCEPTED,
+                            "outcome": outcome.value,
+                        },
                     )
             elif method == "browser.session_terminal":
                 self._create_background_handler_task(
@@ -1108,6 +1142,12 @@ class ExecutorRunner:
                 self._create_background_handler_task(
                     self._handle_local_model_operation_cancel(ws, msg_id, params),
                     "local_model.operation.cancel",
+                    msg_id=msg_id,
+                )
+            elif method == "llm.video":
+                self._create_background_handler_task(
+                    self._handle_video(ws, msg_id, params),
+                    "llm.video",
                     msg_id=msg_id,
                 )
             elif method == "llm.image_generate":
@@ -1223,7 +1263,22 @@ class ExecutorRunner:
                 self._running = False
                 break
             else:
-                logger.debug("Received unknown method: %s", method)
+                # Reply so a newer controller fails fast against an older
+                # executor instead of waiting for its RPC timeout.
+                if not isinstance(method, str) or not method:
+                    logger.debug("Received frame without RPC method")
+                    continue
+                logger.warning(
+                    "Received unsupported RPC method",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+                await self._send_rpc_error(
+                    ws,
+                    msg_id,
+                    -32601,
+                    f"Method not found: {method}",
+                    data={"method": method},
+                )
         if self._running:
             logger.warning("Controller websocket closed, leaving message loop")
         else:
@@ -1906,6 +1961,101 @@ class ExecutorRunner:
         if retired_clients:
             await self._close_clients(retired_clients, suppress_cancelled=True)
 
+    async def _handle_mcp_retry(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
+        """Stage failed MCP servers without blocking the message loop or healthy tools."""
+        version = params.get("config_version")
+        clients: dict[str, MCPClient] = {}
+        async with self._runtime_config_lock:
+            if version != self._config_version or self._runtime_state not in {"active", "degraded"}:
+                await self._send_rpc_result(ws, msg_id, {"state": "superseded"})
+                return
+            failed_ids = {
+                item["server_id"]
+                for item in self._runtime_metadata.get("mcp_servers", [])
+                if item.get("status") == "failed"
+                and not item.get("authorization_required")
+                and item.get("timed_out")
+            }
+            servers = [
+                MCPServerConfig.model_validate(item)
+                for item in params.get("mcp_servers", [])
+                if item.get("server_id") in failed_ids
+            ]
+        try:
+            async with asyncio.timeout(90.0):
+                clients, tools, statuses, warnings = await self._prepare_mcp_runtime(
+                    servers, dict(params.get("secrets") or {})
+                )
+            async with self._runtime_config_lock:
+                if version != self._config_version or self._runtime_state not in {
+                    "active",
+                    "degraded",
+                }:
+                    await self._send_rpc_result(ws, msg_id, {"state": "superseded"})
+                    return
+                # Another credential reload may have recovered this server while
+                # preparation was in flight. Never replace an active client.
+                if any(key in self._mcp_clients for key in clients):
+                    await self._send_rpc_result(ws, msg_id, {"state": "superseded"})
+                    return
+                self._mcp_clients.update(clients)
+                clients = {}
+                self._configured_tool_definitions.extend(tools)
+                for tool in tools:
+                    self._tool_handlers[tool.name] = self._build_mcp_handler(tool)
+                retried_ids = {server.server_id for server in servers}
+                failed_warnings = {
+                    f"MCP server {item['name']} failed during {item.get('phase')}."
+                    for item in self._runtime_metadata.get("mcp_servers", [])
+                    if item.get("server_id") in retried_ids
+                }
+                self._runtime_metadata["mcp_servers"] = [
+                    item
+                    for item in self._runtime_metadata.get("mcp_servers", [])
+                    if item.get("server_id") not in retried_ids
+                ] + statuses
+                previous_warnings = self._runtime_metadata.get("warnings", [])
+                self._runtime_metadata["warnings"] = [
+                    warning for warning in previous_warnings if warning not in failed_warnings
+                ] + warnings
+                self._runtime_state = "degraded" if self._runtime_metadata["warnings"] else "active"
+                report = self._capability_report
+                self._capability_report = (
+                    report.model_copy(
+                        update={
+                            "observed_tools": [
+                                tool.name for tool in self._configured_tool_definitions
+                            ],
+                            "observed_at": datetime.now(UTC).isoformat(),
+                        }
+                    )
+                    if report is not None
+                    else collect_runtime_capabilities(
+                        observed_tools=self._configured_tool_definitions,
+                        runtime_metadata=self._runtime_metadata,
+                    )
+                )
+                self._runtime_metadata["observed_capabilities"] = (
+                    self._capability_report.model_dump(mode="json")
+                )
+                await self._send_rpc_result(
+                    ws,
+                    msg_id,
+                    {
+                        "state": "applied",
+                        "runtime_state": self._runtime_state,
+                        "applied_version": self._config_version,
+                        "observed_tools": [
+                            tool.model_dump(mode="json")
+                            for tool in self._configured_tool_definitions
+                        ],
+                        "runtime_metadata": self._public_runtime_metadata(),
+                    },
+                )
+        finally:
+            if clients:
+                await self._close_clients(clients, suppress_cancelled=True)
+
     async def _handle_mcp_credential_reload_unlocked(
         self,
         ws: Any,
@@ -2090,6 +2240,7 @@ class ExecutorRunner:
                     recipe,
                     asset_manifest,
                     secrets,
+                    manifest,
                 )
 
     def _build_skill_recipe_handler(
@@ -2097,6 +2248,7 @@ class ExecutorRunner:
         recipe: dict[str, Any],
         asset_manifest: list[dict[str, Any]],
         secrets: dict[str, str],
+        skill_manifest: dict[str, Any],
     ) -> Any:
         """Build a handler closure for a skill tool recipe."""
         import asyncio
@@ -2128,6 +2280,7 @@ class ExecutorRunner:
 
                     async def _run() -> str:
                         proc: asyncio.subprocess.Process | None = None
+                        prepared_bundle = []
                         async with httpx.AsyncClient(timeout=recipe_timeout) as client:
                             for asset in asset_manifest:
                                 filename = asset.get("filename", "")
@@ -2148,6 +2301,15 @@ class ExecutorRunner:
                                     if actual_hash != expected_hash:
                                         return f"Asset hash mismatch for {filename}"
                                 asset_path.write_bytes(content)
+                                import base64
+
+                                prepared_bundle.append(
+                                    {
+                                        **asset,
+                                        "content_b64": base64.b64encode(content).decode(),
+                                        "size_bytes": len(content),
+                                    }
+                                )
 
                         env = dict(os.environ)
                         env.update(recipe_env)
@@ -2167,7 +2329,28 @@ class ExecutorRunner:
                             if not script_path.exists():
                                 return f"Script not found: {entry}"
                             script_path.chmod(0o755)
-                            cmd = [str(script_path), *recipe_args]
+                            # Older controller manifests lack owner scoping. Preserve their
+                            # existing recipe execution during rolling upgrades.
+                            if script_path.suffix == ".py" and skill_manifest.get("owner_email"):
+                                from cognis.executor.skill_assets import prepare_skill_assets
+
+                                prepared = await prepare_skill_assets(
+                                    {
+                                        "owner_email": skill_manifest["owner_email"],
+                                        "skill_id": skill_manifest["skill_id"],
+                                        "version_id": skill_manifest["version_id"],
+                                        "assets": prepared_bundle,
+                                    }
+                                )
+                                environment = prepared["python_environment"]
+                                if not environment["ready"]:
+                                    return (
+                                        "Python environment incomplete; assets might not be "
+                                        f"runnable: {environment.get('error')}"
+                                    )
+                                cmd = [environment["python_path"], str(script_path), *recipe_args]
+                            else:
+                                cmd = [str(script_path), *recipe_args]
                         elif mode == "command":
                             cmd = [entry, *recipe_args]
                         else:
@@ -2223,6 +2406,23 @@ class ExecutorRunner:
             include_completed=bool(params.get("include_completed", False)),
         )
         await self._send_rpc_result(ws, msg_id, {"shells": statuses})
+
+    async def _handle_skill_assets_prepare(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        from cognis.executor.skill_assets import prepare_skill_assets
+
+        try:
+            result = await prepare_skill_assets(params)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32602,
+                f"Skill asset preparation failed: {type(exc).__name__}: {exc}",
+            )
+            return
+        await self._send_rpc_result(ws, msg_id, result)
 
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
         if msg_id is None:
@@ -2396,6 +2596,9 @@ class ExecutorRunner:
                             )
 
                 ctx.output_chunk_callback = _send_tool_chunk
+                background_control = ToolBackgroundControl()
+                ctx.background_control = background_control
+                self._background_controls[str(call_id)] = background_control
 
                 async def _invoke() -> Any:
                     return await handler(tool_call.arguments, ctx)
@@ -2482,6 +2685,7 @@ class ExecutorRunner:
                     "attachments": result.attachments,
                 }
             self._active_calls.pop(call_id, None)
+            self._background_controls.pop(str(call_id), None)
             self._settle_call(str(call_id), terminal_state, result=result_payload)
 
         if result_payload is None:
@@ -2540,6 +2744,24 @@ class ExecutorRunner:
             return
 
         request_id = params.get("request_id", msg_id or uuid.uuid4().hex)
+        if params.get("stream") is False:
+            try:
+                response = await self._inference_handler.generate(
+                    model=str(params.get("model", "")),
+                    messages=list(params.get("messages", [])),
+                    request_kwargs=dict(params.get("request_kwargs") or {}),
+                    request_id=str(request_id),
+                    backend=params.get("backend"),
+                    provider_id=params.get("provider_id"),
+                    owner_email=params.get("owner_email"),
+                    backend_metadata=params.get("backend_metadata"),
+                )
+            except Exception as exc:
+                from cognis.providers.llm.errors import build_mid_stream_error_chunk
+
+                response = build_mid_stream_error_chunk(exc)
+            await self._send_rpc_result(ws, msg_id, json_safe_inference_payload(response))
+            return
         if msg_id is not None:
             await self._send_rpc_result(ws, msg_id, {"status": "streaming"})
 
@@ -2570,6 +2792,7 @@ class ExecutorRunner:
                     "finish_reason": safe_chunk.get("finish_reason", "stop"),
                     "response_status": safe_chunk.get("response_status", "completed"),
                     "error": safe_chunk.get("error"),
+                    "response_error": safe_chunk.get("response_error"),
                     "backend_metadata": safe_chunk.get("backend_metadata"),
                 }
                 incomplete_details = response_incomplete_details(
@@ -2637,6 +2860,7 @@ class ExecutorRunner:
                 preset=str(params.get("preset", "")),
                 base_url=str(params.get("base_url", "")),
                 api_key=str(params.get("api_key") or ""),
+                **({"aws_config": params["aws_config"]} if params.get("aws_config") else {}),
             )
             safe_models = json_safe_inference_payload(models)
             await self._send_rpc_result(
@@ -2819,6 +3043,19 @@ class ExecutorRunner:
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
             await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_video(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
+        from cognis.executor.video import video_rpc
+
+        try:
+            if self._inference_handler is None:
+                raise ValueError("Inference handler unavailable")
+            await self._send_rpc_result(ws, msg_id, await video_rpc(params))
+        except Exception:
+            # No prompts, credential values, upstream bodies, or transfer tokens in RPC errors.
+            await self._send_rpc_error(
+                ws, msg_id, -32000, "Video operation failed; submission may be uncertain"
+            )
 
     async def _handle_llm_image_generate(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -3315,6 +3552,8 @@ class ExecutorRunner:
                 continue
             except BaseException as exc:
                 if _should_reraise_isolated_exception(exc):
+                    await self._close_failed_mcp_client(client, server.name)
+                    await self._close_clients(clients, suppress_cancelled=True)
                     raise
                 logger.warning(
                     "MCP: server %s failed with isolated initialization error: %s",

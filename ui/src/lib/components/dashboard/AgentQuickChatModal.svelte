@@ -86,12 +86,12 @@
 >
     <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="agent-quick-chat-modal-body">
       {#if loading}
-        <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-sm text-slate-400">
+        <div class="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-sm text-muted">
           <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} class="h-10 w-10" />
           <p>Opening…</p>
         </div>
       {:else if error}
-        <div class="m-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100" role="alert">
+        <div class="m-4 rounded-xl border border-danger-border bg-danger-subtle p-4 text-sm text-danger" role="alert">
           <p>{error}</p>
           <Button class="mt-3" size="sm" variant="secondary" onclick={() => void resolve()}>Try again</Button>
         </div>

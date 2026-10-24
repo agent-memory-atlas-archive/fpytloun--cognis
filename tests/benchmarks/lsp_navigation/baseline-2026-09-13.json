@@ -1,5 +1,6 @@
 {
-  "repo": "/home/riker/src/cognis-wt/lsp-code-intelligence",
+  "repo": null,
+  "provenance_note": "Historical reference measurements are unchanged; the author-local path is omitted. This is not a measurement of the public release candidate.",
   "rows": [
     {
       "task": "def:PreparedClient",

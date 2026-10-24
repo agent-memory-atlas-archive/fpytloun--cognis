@@ -68,30 +68,30 @@
 <div
   class={[
     'rounded-2xl border p-4 transition',
-    setting.is_overridden ? 'border-amber-500/40 bg-amber-500/[0.06]' : 'border-slate-800 bg-slate-950/60',
-    dirty ? 'ring-1 ring-sky-500/35' : ''
+    setting.is_overridden ? 'border-warning-border bg-warning-subtle' : 'border-separator bg-canvas/60',
+    dirty ? 'ring-1 ring-accent/35' : ''
   ]}
   data-setting-key={setting.key}
 >
   <div class="flex items-start justify-between gap-3">
     <div class="min-w-0">
       <div class="flex flex-wrap items-center gap-2">
-        <span class="font-medium text-white">{setting.label || setting.key}</span>
+        <span class="font-medium text-strong">{setting.label || setting.key}</span>
         {#if setting.is_overridden}
-          <Badge class="border-amber-500/40 bg-amber-500/15 text-amber-200">Customized</Badge>
+          <Badge class="border-warning-border bg-warning-subtle text-warning">Customized</Badge>
         {/if}
         {#if dirty}
-          <Badge class="border-sky-500/40 bg-sky-500/15 text-sky-200">Unsaved</Badge>
+          <Badge class="border-accent/40 bg-accent-subtle text-accent">Unsaved</Badge>
         {/if}
       </div>
       {#if setting.description}
-        <p class="mt-1 line-clamp-2 text-sm text-slate-400">{setting.description}</p>
+        <p class="mt-1 line-clamp-2 text-sm text-muted">{setting.description}</p>
       {/if}
     </div>
     <Tooltip text={settingInfoText(setting)} placement="left">
       <button
         type="button"
-        class="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-slate-400 transition hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 md:h-9 md:w-9"
+        class="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-muted transition hover:bg-raised hover:text-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent md:h-9 md:w-9"
         aria-label={`Information about ${setting.label || setting.key}`}
         aria-describedby={`setting-info-${setting.key}`}
       >
@@ -103,11 +103,11 @@
 
   <div class="mt-4">
     {#if kind === 'boolean'}
-      <label class="inline-flex min-h-11 cursor-pointer items-center gap-3 text-sm text-slate-200" for={`setting-${setting.key}`}>
+      <label class="inline-flex min-h-11 cursor-pointer items-center gap-3 text-sm text-foreground" for={`setting-${setting.key}`}>
         <input
           id={`setting-${setting.key}`}
           type="checkbox"
-          class="h-5 w-5 rounded border-slate-600 bg-slate-900 text-sky-500 focus:ring-sky-400"
+          class="h-5 w-5 rounded border-control-border bg-surface text-accent focus:ring-accent"
           checked={draft === 'true'}
           disabled={disabled || busy}
           aria-label={setting.label || setting.key}
@@ -122,7 +122,7 @@
         disabled={disabled || busy}
         aria-label={setting.label || setting.key}
         onchange={updateEnum}
-        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 text-base text-slate-100 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/30 md:min-h-9 md:text-sm"
+        class="min-h-11 w-full rounded-xl border border-control-border bg-canvas/80 px-3 text-base text-foreground focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30 md:min-h-9 md:text-sm"
       >
         {#each setting.options ?? [] as option}
           <option value={settingOptionValue(option)}>{settingOptionLabel(option)}</option>
@@ -143,7 +143,7 @@
           aria-invalid={Boolean(error)}
           aria-describedby={error ? `setting-error-${setting.key}` : undefined}
         />
-        {#if setting.unit}<span class="shrink-0 text-sm text-slate-400">{setting.unit}</span>{/if}
+        {#if setting.unit}<span class="shrink-0 text-sm text-muted">{setting.unit}</span>{/if}
       </div>
     {:else if kind === 'string'}
       <Input
@@ -189,17 +189,17 @@
         oninput={(event) => onchange(event.currentTarget.value)}
         aria-invalid={Boolean(error)}
         aria-describedby={error ? `setting-error-${setting.key}` : undefined}
-        class="min-h-36 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2.5 font-mono text-base text-slate-100 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/30 md:text-sm"
+        class="min-h-36 w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2.5 font-mono text-base text-foreground focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/30 md:text-sm"
       ></textarea>
     {/if}
   </div>
 
   {#if error}
-    <p id={`setting-error-${setting.key}`} class="mt-2 text-sm text-rose-300" role="alert">{error}</p>
+    <p id={`setting-error-${setting.key}`} class="mt-2 text-sm text-danger" role="alert">{error}</p>
   {/if}
 
-  <div class="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-3">
-    <div class="text-xs text-slate-500">
+  <div class="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-separator/80 pt-3">
+    <div class="text-xs text-quiet">
       {#if setting.updated_by}
         Last changed by {setting.updated_by}
       {:else}

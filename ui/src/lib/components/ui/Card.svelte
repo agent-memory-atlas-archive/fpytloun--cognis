@@ -6,6 +6,6 @@
   let { class: className = '', children } = $props<{ class?: string; children?: Snippet }>();
 </script>
 
-<div class={cn('rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur', className)}>
+<div class={cn('primitive-card rounded-3xl border shadow-card', className)}>
   {@render children?.()}
 </div>

@@ -196,6 +196,10 @@ class StepProfileRegistry:
         async with self._session_factory() as session:
             raw = await get_setting_value(session, STEP_PROFILE_OVERRIDES_SETTING_KEY, {})
             raw_custom = await get_setting_value(session, STEP_PROFILE_CUSTOM_SETTING_KEY, {})
+        self.load_configuration(raw, raw_custom)
+
+    def load_configuration(self, raw: Any, raw_custom: Any) -> None:
+        """Load one caller-owned authoritative snapshot without reading storage."""
         if not isinstance(raw, dict):
             raw = {}
         validated: dict[str, dict[str, Any]] = {}

@@ -37,24 +37,24 @@
   }
 </script>
 
-<Sheet {open} {onClose} side="center" label={kb ? 'Edit knowledgebase' : 'Create knowledgebase'} dismissible={!busy}>
+<Sheet {open} {onClose} side="center" label={kb ? 'Edit knowledgebase' : 'Create knowledgebase'} dismissible={!busy} backdropDismissible={name === (kb?.name ?? '') && description === (kb?.description ?? '')}>
   {#snippet header()}
-    <h2 class="text-lg font-semibold text-white">{kb ? 'Edit knowledgebase' : 'New knowledgebase'}</h2>
-    <p class="mt-1 text-sm text-slate-400">
+    <h2 class="text-lg font-semibold text-strong">{kb ? 'Edit knowledgebase' : 'New knowledgebase'}</h2>
+    <p class="mt-1 text-sm text-muted">
       {kb ? 'Update the name and description.' : 'Give it a name. You can add documents right after.'}
     </p>
   {/snippet}
 
   {#snippet children()}
     <form class="flex flex-col gap-4" onsubmit={submit}>
-      <label class="flex flex-col gap-1.5 text-sm text-slate-300">
+      <label class="flex flex-col gap-1.5 text-sm text-secondary">
         Name
         <Input bind:value={name} placeholder="e.g. Product docs" required maxlength={200} data-testid="kb-form-name" />
       </label>
-      <label class="flex flex-col gap-1.5 text-sm text-slate-300">
-        Description <span class="text-slate-500">(optional)</span>
+      <label class="flex flex-col gap-1.5 text-sm text-secondary">
+        Description <span class="text-quiet">(optional)</span>
         <textarea
-          class="min-h-[88px] w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-500"
+          class="min-h-[88px] w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2.5 text-sm text-foreground placeholder:text-quiet"
           bind:value={description}
           placeholder="What is this knowledgebase for?"
           data-testid="kb-form-description"
@@ -62,7 +62,7 @@
       </label>
 
       {#if error}
-        <p class="rounded-xl border border-rose-800/60 bg-rose-950/50 px-3 py-2 text-sm text-rose-300" role="alert">{error}</p>
+        <p class="rounded-xl border border-danger-border bg-danger-subtle px-3 py-2 text-sm text-danger" role="alert">{error}</p>
       {/if}
 
       <div class="mt-2 flex justify-end gap-3">

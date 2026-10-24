@@ -8,16 +8,20 @@ Storage layout: {namespace}/{object_id}/{filename}
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Protocol, runtime_checkable
 from urllib.parse import quote
 
 from cognis import json_codec as json
@@ -95,6 +99,14 @@ def sanitize_artifact_filename(filename: str | None, *, default: str = "attachme
     return sanitized
 
 
+class ArtifactReadStream(Protocol):
+    """Minimal read contract for filesystem files and S3 response bodies."""
+
+    def read(self, size: int = -1, /) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
 @runtime_checkable
 class ArtifactBackend(Protocol):
     """Protocol for artifact storage backends.
@@ -121,6 +133,21 @@ class ArtifactBackend(Protocol):
     ) -> ArtifactMetadata | None:
         """Load artifact metadata without content."""
         ...
+
+    def save_file(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        source: BinaryIO,
+        size: int,
+        content_type: str,
+        owner_email: str | None,
+    ) -> None: ...
+
+    def open_range(
+        self, namespace: str, object_id: str, filename: str, start: int, end: int
+    ) -> ArtifactReadStream: ...
 
     def delete(self, namespace: str, object_id: str, filename: str) -> None: ...
 
@@ -193,6 +220,38 @@ class FilesystemArtifactBackend:
         meta = self.load_metadata(namespace, object_id, filename)
         content_type = meta.content_type if meta else "application/octet-stream"
         return content, content_type
+
+    def save_file(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        source: BinaryIO,
+        size: int,
+        content_type: str,
+        owner_email: str | None,
+    ) -> None:
+        path = self._resolve_path(namespace, object_id, filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as staging:
+            staging_path = Path(staging.name)
+            try:
+                shutil.copyfileobj(source, staging, 256 * 1024)
+                staging.flush()
+                os.fsync(staging.fileno())
+                staging.close()
+                staging_path.replace(path)
+            finally:
+                staging_path.unlink(missing_ok=True)
+        meta = ArtifactMetadata(content_type=content_type, size=size, owner_email=owner_email)
+        self._metadata_path(namespace, object_id).write_text(json.dumps(meta.to_dict()))
+
+    def open_range(
+        self, namespace: str, object_id: str, filename: str, start: int, end: int
+    ) -> ArtifactReadStream:
+        source = self._resolve_path(namespace, object_id, filename).open("rb")
+        source.seek(start)
+        return source
 
     def load_metadata(
         self, namespace: str, object_id: str, filename: str
@@ -324,6 +383,39 @@ class S3ArtifactBackend:
         except self._client.exceptions.NoSuchKey:
             raise FileNotFoundError(f"Artifact not found: {key}") from None
 
+    def save_file(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        source: BinaryIO,
+        size: int,
+        content_type: str,
+        owner_email: str | None,
+    ) -> None:
+        self._client.upload_fileobj(
+            source,
+            self._bucket,
+            self._key(namespace, object_id, filename),
+            ExtraArgs={"ContentType": content_type},
+        )
+        meta = ArtifactMetadata(content_type=content_type, size=size, owner_email=owner_email)
+        self._client.put_object(
+            Bucket=self._bucket,
+            Key=self._meta_key(namespace, object_id),
+            Body=json.dumps(meta.to_dict()).encode(),
+            ContentType="application/json",
+        )
+
+    def open_range(
+        self, namespace: str, object_id: str, filename: str, start: int, end: int
+    ) -> ArtifactReadStream:
+        return self._client.get_object(
+            Bucket=self._bucket,
+            Key=self._key(namespace, object_id, filename),
+            Range=f"bytes={start}-{end}",
+        )["Body"]
+
     def load_metadata(
         self, namespace: str, object_id: str, filename: str
     ) -> ArtifactMetadata | None:
@@ -391,6 +483,11 @@ class ArtifactStore:
             self._backend = FilesystemArtifactBackend(Path(config.path))
         else:
             raise ValueError(f"Unsupported artifact backend: {config.backend}")
+
+    @property
+    def base_url(self) -> str:
+        """Public controller origin used for scoped media transfer callbacks."""
+        return self._config.base_url
 
     @property
     def signed_url_ttl_seconds(self) -> int:
@@ -529,8 +626,9 @@ class ArtifactStore:
         exp: int,
         sig: str,
         mode: str = "download",
+        allow_expired: bool = False,
     ) -> bool:
-        if exp < int(time.time()):
+        if not allow_expired and exp < int(time.time()):
             return False
         if not self._config.signing_secret:
             return False
@@ -562,6 +660,68 @@ class ArtifactStore:
         import asyncio
 
         return await asyncio.to_thread(self.load, namespace, object_id, filename)
+
+    async def async_save_stream(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        content: AsyncIterator[bytes],
+        content_type: str,
+        owner_email: str,
+        *,
+        max_bytes: int,
+    ) -> tuple[int, str]:
+        """Bounded-memory staging and backend publication of a media stream."""
+        total = 0
+        digest = hashlib.sha256()
+        source = await asyncio.to_thread(tempfile.TemporaryFile)
+        try:
+            async for chunk in content:
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("Artifact exceeds its authorized transfer limit")
+                digest.update(chunk)
+                await asyncio.to_thread(source.write, chunk)
+            if not total:
+                raise ValueError("Empty artifact stream")
+            await asyncio.to_thread(source.seek, 0)
+            await asyncio.to_thread(
+                self._backend.save_file,
+                namespace,
+                object_id,
+                filename,
+                source,
+                total,
+                content_type,
+                owner_email,
+            )
+            return total, digest.hexdigest()
+        finally:
+            await asyncio.to_thread(source.close)
+
+    async def async_read_range(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        start: int,
+        end: int,
+    ) -> AsyncIterator[bytes]:
+        """Stream an inclusive byte range without loading the whole object."""
+        source = await asyncio.to_thread(
+            self._backend.open_range, namespace, object_id, filename, start, end
+        )
+        remaining = end - start + 1
+        try:
+            while remaining > 0:
+                chunk = await asyncio.to_thread(source.read, min(256 * 1024, remaining))
+                if not chunk:
+                    raise OSError("Artifact truncated during streaming")
+                remaining -= len(chunk)
+                yield chunk
+        finally:
+            await asyncio.to_thread(source.close)
 
     async def async_load_metadata(
         self, namespace: str, object_id: str, filename: str

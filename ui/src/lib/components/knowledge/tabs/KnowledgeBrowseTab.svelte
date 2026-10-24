@@ -31,6 +31,7 @@
 
   let treeQuery = $state('');
   let expanded = $state(new Set<string>());
+  let expansionInitialized = $state(false);
   let selected = $state<DocumentTreeFile | null>(null);
   let mobileReaderOpen = $state(false);
   let contentLoading = $state(false);
@@ -45,7 +46,9 @@
   const visibleTree = $derived<DocumentTreeNode[]>(filterTree(built.tree, treeQuery));
 
   $effect(() => {
-    if (built.tree.length > 0 && expanded.size === 0) {
+    if (built.tree.length > 0 && !expansionInitialized) {
+      // An empty expansion set is valid for flat trees and collapsed folders.
+      expansionInitialized = true;
       expanded = new Set(collectFolderPaths(built.tree));
     }
   });
@@ -115,39 +118,39 @@
 </script>
 
 <div class="flex h-[calc(100vh-260px)] min-h-[420px] gap-4">
-  <div class="flex w-full flex-col rounded-2xl border border-slate-800/80 bg-slate-900/60 md:w-72 md:shrink-0">
-    <div class="border-b border-slate-800/80 p-3">
+  <div class="flex w-full flex-col rounded-2xl border border-separator/80 bg-surface/60 md:w-72 md:shrink-0">
+    <div class="border-b border-separator/80 p-3">
       <div class="relative">
-        <Search class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
-        <Input bind:value={treeQuery} placeholder="Filter documents…" class="pl-9" data-testid="knowledge-tree-filter" />
+        <Search class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-quiet" />
+        <Input find bind:value={treeQuery} placeholder="Filter documents…" class="pl-9" data-testid="knowledge-tree-filter" />
       </div>
     </div>
     <div class="min-h-0 flex-1 overflow-y-auto p-2">
       {#if documents.length === 0}
-        <div class="flex flex-col items-center gap-2 px-4 py-10 text-center text-sm text-slate-400">
-          <Library class="h-6 w-6 text-slate-600" />
+        <div class="flex flex-col items-center gap-2 px-4 py-10 text-center text-sm text-muted">
+          <Library class="h-6 w-6 text-quiet" />
           <p>No documents yet. Add some from the Documents tab.</p>
         </div>
       {:else if visibleTree.length === 0}
-        <p class="px-3 py-6 text-center text-sm text-slate-400">No documents match "{treeQuery}".</p>
+        <p class="px-3 py-6 text-center text-sm text-muted">No documents match "{treeQuery}".</p>
       {:else}
         <DocumentTree nodes={visibleTree} selectedPath={selected?.path ?? null} {expanded} onSelect={selectFile} onToggle={toggleFolder} />
       {/if}
     </div>
   </div>
 
-  <div class="hidden min-h-0 flex-1 overflow-hidden rounded-2xl border border-slate-800/80 bg-slate-900/60 md:block">
+  <div class="hidden min-h-0 flex-1 overflow-hidden rounded-2xl border border-separator/80 bg-surface/60 md:block">
     {#if selected}
       <DocumentReader doc={selected.document} loading={contentLoading} error={contentError} {content} {downloadUrl}
         onDownload={null} knowledgebaseId={kb.knowledgebase_id} {documents} metadataSchema={kb.metadata_schema}
         requestedFragment={selectedDocumentFragment} {onOpenDocument} />
     {:else if missingDocument}
-      <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-amber-300" role="status">
-        <Library class="h-8 w-8 text-amber-500" /><p>The requested document is no longer available.</p>
+      <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-warning" role="status">
+        <Library class="h-8 w-8 text-warning" /><p>The requested document is no longer available.</p>
       </div>
     {:else}
-      <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-400">
-        <Library class="h-8 w-8 text-slate-600" />
+      <div class="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-muted">
+        <Library class="h-8 w-8 text-quiet" />
         <p>Select a document to preview it here.</p>
       </div>
     {/if}

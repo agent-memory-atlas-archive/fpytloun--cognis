@@ -19,7 +19,7 @@ _str_encoder = msgspec.json.Encoder(enc_hook=str)
 _deterministic_str_encoder = msgspec.json.Encoder(order="deterministic", enc_hook=str)
 
 
-def encode(value: Any) -> bytes:
+def encode(value: Any, *, sort_keys: bool = False) -> bytes:
     """Encode compact UTF-8 JSON bytes without changing stdlib semantics."""
 
     if _requires_stdlib(value):
@@ -27,8 +27,10 @@ def encode(value: Any) -> bytes:
             value,
             ensure_ascii=False,
             separators=(",", ":"),
+            sort_keys=sort_keys,
         ).encode("utf-8")
-    return _encoder.encode(value)
+    encoder = _deterministic_encoder if sort_keys else _encoder
+    return encoder.encode(value)
 
 
 def encode_text(value: Any) -> str:

@@ -31,7 +31,7 @@
       headingIndex += 1;
       const nestedAnchor = typeof descriptor?.anchor === 'string' ? descriptor.anchor : '';
       const id = nestedAnchor ? ` id="${nestedAnchor}" tabindex="-1"` : '';
-      const nestedLevel = [3, 4].includes(Number(descriptor?.level)) ? Number(descriptor?.level) : 3;
+      const nestedLevel = [2, 3, 4].includes(Number(descriptor?.level)) ? Number(descriptor?.level) : 3;
       return `<h${nestedLevel}${id}>${inner}</h${nestedLevel}>`;
     });
     const withLinks = content.replace(/href="#([^"]+)"/gi, (match, fragment) => {

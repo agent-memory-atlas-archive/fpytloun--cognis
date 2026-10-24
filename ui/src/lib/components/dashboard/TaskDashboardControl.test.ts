@@ -144,6 +144,7 @@ describe('TaskDashboardControl', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
 
     await waitFor(() => expect(gateResponse).toHaveBeenCalledWith('task-1', {
+      pause_id: 'pause-1',
       step_name: 'review',
       action: 'continue',
       feedback: null

@@ -159,6 +159,105 @@ def _clear_chat_v2_read_caches() -> None:
     sync_module.clear_chat_v2_read_caches()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_cap", [1, 2, None])
+@pytest.mark.parametrize("with_tool_pair", [False, True])
+async def test_continuation_suffix_window_hydrates_all_prior_segments(
+    page_cap: int | None,
+    with_tool_pair: bool,
+) -> None:
+    events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-segmented",
+            seq=index + 1 + (2 if with_tool_pair else 0),
+            type="assistant_message" if index % 2 == 0 else "developer_message",
+            data={
+                "content": f"segment-{index}" if index % 2 == 0 else "continue",
+                "turn_id": "turn-segmented",
+                "message_id": "turn-segmented",
+                "assistant_phase_index": 0,
+                "content_is_delta": index > 0,
+            },
+        )
+        for index in range(7)
+    ]
+    if with_tool_pair:
+        events = [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-segmented",
+                seq=1,
+                type="tool_call",
+                data={"call_id": "call-segmented-read", "name": "read", "arguments": {}},
+            ),
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-segmented",
+                seq=2,
+                type="tool_result",
+                data={"call_id": "call-segmented-read", "result": "read complete"},
+            ),
+            *events,
+        ]
+    store = FakeEventStore({"sess-segmented": events}, page_cap=page_cap)
+    refs = [
+        ConversationSessionRef(
+            session_id="sess-segmented",
+            event_store_session_id="sess-segmented",
+            ordinal=0,
+        )
+    ]
+    hydrated = await sync_module._hydrate_window_pairings(
+        [events[1], events[-1]] if with_tool_pair else [events[-1]],
+        session_refs=refs,
+        event_store=store,
+        lookback_limit=2,
+    )
+    assert [event.seq for event in hydrated] == (
+        [1, 2, 3, 5, 7, 9] if with_tool_pair else [1, 3, 5, 7]
+    )
+    window = sync_module._project_window(hydrated)
+    messages = [item for item in window.items if item.kind == "message"]
+    assert len(messages) == 1
+    assert messages[0].content == "segment-0segment-2segment-4segment-6"
+    assert len(window.items) == (2 if with_tool_pair else 1)
+    assert len(store.calls) >= 3
+
+
+@pytest.mark.asyncio
+async def test_multiple_orphan_continuations_do_not_duplicate_in_window_segments() -> None:
+    events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-two-phases",
+            seq=index + 1,
+            type="assistant_message",
+            data={
+                "turn_id": "turn-two-phases",
+                "message_id": "turn-two-phases",
+                "assistant_phase_index": index % 2,
+                "content": str(index),
+                "content_is_delta": index >= 2,
+            },
+        )
+        for index in range(6)
+    ]
+    hydrated = await sync_module._hydrate_window_pairings(
+        events[-2:],
+        session_refs=[
+            ConversationSessionRef(
+                session_id="sess-two-phases",
+                event_store_session_id="sess-two-phases",
+                ordinal=0,
+            )
+        ],
+        event_store=FakeEventStore({"sess-two-phases": events}),
+    )
+    assert [event.seq for event in hydrated] == list(range(1, 7))
+    assert [item.content for item in sync_module._project_window(hydrated).items] == ["024", "135"]
+
+
 def test_projection_cache_key_contains_only_opaque_authority_token() -> None:
     authority_token = "f" * 64
     ref = ConversationSessionRef(

@@ -13,6 +13,15 @@ logger = get_logger(__name__)
 PERSISTED_COMMAND_NOTICE_COMMANDS = frozenset({"/profile", "/model", "/thinking", "/fast", "/yolo"})
 
 
+def is_profile_switch_notice(data: dict[str, Any]) -> bool:
+    """Recognize successful profile mutations, not queries or errors."""
+    return (
+        data.get("command") == "/profile"
+        and isinstance(data.get("resolved_agent_profile_id"), str)
+        and data.get("event") == "system_notice"
+    )
+
+
 async def persist_command_system_notice(
     *,
     conversation_id: str,

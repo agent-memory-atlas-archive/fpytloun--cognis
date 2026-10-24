@@ -23,6 +23,7 @@ from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.runtime_capabilities import RuntimeCapabilityReport
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import SessionPolicy, WorkflowState
+from cognis.providers.llm.monitoring import MonitoringOptions
 
 InteractionModeOverride = Literal["none", "explicit_gates", "step_requests"]
 
@@ -48,11 +49,13 @@ DashboardIssueKind = Literal[
     "mcp_auth_fault",
     "schedule_failed",
     "schedule_auto_disabled",
+    "provider_health",
+    "provider_quota",
 ]
 
 
 class DashboardIssueResource(BaseModel):
-    type: Literal["executor", "mcp_server", "schedule"]
+    type: Literal["executor", "mcp_server", "schedule", "llm_provider"]
     id: str
     label: str
 
@@ -68,6 +71,8 @@ class DashboardIssue(BaseModel):
     action_url: str
     action_label: str = "View"
     dismiss_token: str | None = None
+    task_id: str | None = None
+    task_retry_available: bool = False
 
 
 class DashboardIssueDismissRequest(BaseModel):
@@ -86,6 +91,27 @@ class DashboardIssuesResponse(BaseModel):
     generated_at: datetime
     issues: list[DashboardIssue]
     summary: DashboardIssuesSummary
+
+
+class NavigationChatGroup(BaseModel):
+    """Count of conversations with identical attention inputs."""
+
+    active_session_status: str | None = None
+    active_session_completion_reason: str | None = None
+    session_observed: bool = False
+    has_unread: bool = False
+    is_active: bool = False
+    pending_notification_types: list[str] = Field(default_factory=list)
+    count: int = Field(ge=0)
+
+
+class NavigationSummaryResponse(BaseModel):
+    """Complete owner-scoped navigation counts, independent of page limits."""
+
+    chat_groups: list[NavigationChatGroup]
+    dashboard: DashboardIssuesSummary
+    schedules: int = Field(ge=0)
+    tasks: int = Field(ge=0)
 
 
 class CursorPage[T](BaseModel):
@@ -303,9 +329,13 @@ class UserDisplayPreferences(BaseModel):
     model_config = {"extra": "forbid"}
 
     theme: Literal["system", "dark", "light"] = "system"
+    theme_family: Literal["porcelain", "classic", "gruvbox", "paper"] = "classic"
     language: str = "auto"
     dashboard_workspace_windows: bool = True
+    pinned_agents_collapsed: bool = True
+    pinned_agents_order_by_activity: bool = True
     conversation_sidebar_sections: bool = True
+    conversation_project_badge: Literal["name", "icon", "monochrome", "hidden"] = "name"
     conversation_sidebar_dense: bool = False
 
     @field_validator("language")
@@ -332,7 +362,7 @@ class UserChatPreferences(BaseModel):
     group_tool_calls: bool = True
     keep_assistant_messages_separate: bool = False
     show_internal_tool_calls: bool = False
-    auto_recap: bool = False
+    auto_recap: bool = True
 
 
 class UserNotificationPreferences(BaseModel):
@@ -429,6 +459,15 @@ class ClientDiscoveryResponse(BaseModel):
     server: ClientDiscoveryServer
     paths: ClientDiscoveryPaths
     capabilities: ClientDiscoveryCapabilities
+
+
+class OnboardingStateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    status: Literal["completed", "dismissed"]
+
+
+class OnboardingStateResponse(BaseModel):
+    status: Literal["pending", "completed", "dismissed"] = "pending"
 
 
 class SystemDiagnosticsResponse(BaseModel):
@@ -534,17 +573,46 @@ class ConversationOpenRequest(BaseModel):
     candidate_conversations: list[ConversationOpenCandidate] = Field(default_factory=list)
 
 
+ResourceVisibility = Literal["project", "private"]
+
+
+class HandoffLinkRequest(BaseModel):
+    """References only; handoff content remains owned by Intaris."""
+
+    source_session_id: str
+    source_event_seq: int = Field(ge=1)
+    recipient_conversation_id: str
+
+
+class HandoffLinkResponse(BaseModel):
+    ok: bool
+
+
 class ConversationCreateRequest(BaseModel):
     agent_id: str
     agent_profile_id: str | None = None
     title: str | None = None
-    project_id: str | None = None
+    project_id: str | None = Field(
+        default=None,
+        description=(
+            "Explicit project for a topic conversation. When omitted, the agent's default "
+            "project applies if the caller may use it."
+        ),
+    )
+    visibility: ResourceVisibility | None = Field(
+        default=None,
+        description="Visibility inside a shared project. Defaults to `project`.",
+    )
     context: ConversationContextModel = Field(default_factory=ConversationContextModel)
 
 
 class ConversationUpdateRequest(BaseModel):
     title: str | None = None
-    project_id: str | None = None
+    project_id: str | None = Field(
+        default=None,
+        description="Set to a project ID to assign, or explicitly to null to clear.",
+    )
+    visibility: ResourceVisibility | None = None
     archived: bool | None = None
     starred_at: datetime | None = None
 
@@ -640,11 +708,21 @@ class AttentionActionDetail(AttentionActionSummary):
 
 
 class ConversationResponse(BaseModel):
+    project_icon: str | None = None
+    project_name: str | None = None
+    project_color: str | None = None
+    project_avatar_url: str | None = None
+    agent_display_name: str | None = None
+    agent_avatar_url: str | None = None
+    can_continue: bool = False
     conversation_id: str
     user_email: str
     agent_id: str
     agent_profile_id: str | None = None
     project_id: str | None = None
+    visibility: str = "private"
+    is_readonly_for_caller: bool = False
+    project_assignable: bool = True
     title: str | None = None
     title_source: str = "unset"
     context: ConversationContextModel
@@ -852,12 +930,113 @@ class ProjectSourceResponse(BaseModel):
     updated_at: datetime | None = None
 
 
+ProjectRoleValue = Literal["viewer", "member", "manager"]
+
+
 class ProjectGrantCreateRequest(BaseModel):
     grantee_type: Literal["user", "group"] = "user"
     grantee_user_email: str | None = None
     grantee_group_id: str | None = None
-    permission: Literal["use"] = "use"
+    permission: Literal["viewer", "member", "manager", "use"] = Field(
+        default="member",
+        description="Project role. `use` is accepted as the legacy name of `member`.",
+    )
     note: str | None = None
+
+
+class ProjectGrantUpdateRequest(BaseModel):
+    permission: ProjectRoleValue
+
+
+class ProjectLeaveRequest(BaseModel):
+    make_private: bool = Field(
+        default=False,
+        description="Make the caller's conversations and tasks in the project private first.",
+    )
+
+
+class ProjectAgentUpsertRequest(BaseModel):
+    is_default: bool | None = None
+    executor_scope: Literal["owner_executor", "grantee_executor"] | None = None
+
+
+class ProjectAgentResponse(BaseModel):
+    project_id: str
+    agent_id: str
+    agent_name: str
+    agent_display_name: str | None = None
+    agent_description: str | None = None
+    agent_avatar_url: str | None = None
+    agent_owner_email: str
+    is_default: bool = False
+    executor_scope: str = "owner_executor"
+    added_by: str
+    is_owned_by_caller: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AgentProjectAssignmentResponse(BaseModel):
+    project_id: str
+    project_name: str
+    project_avatar_url: str | None = None
+    project_status: str = "active"
+    is_default: bool = False
+    executor_scope: str = "owner_executor"
+    caller_role: str | None = None
+
+
+class ProjectTaskSummaryResponse(BaseModel):
+    task_id: str
+    title: str | None = None
+    status: str
+    agent_id: str | None = None
+    workflow_id: str | None = None
+    created_by: str
+    visibility: str = "private"
+    is_readonly_for_caller: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    priority: int = 0
+    source_type: str = "manual"
+    source_ref: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    result_summary: str | None = None
+
+
+class ProjectDeliverableItem(BaseModel):
+    deliverable_id: str
+    title: str | None = None
+    format: str = "markdown"
+    status: str
+    conversation_id: str | None = None
+    task_id: str | None = None
+    step_run_id: str | None = None
+    is_readonly_for_caller: bool = True
+    content_preview: str | None = None
+    created_at: datetime | None = None
+    lineage_id: str | None = None
+    revision: int = 1
+
+
+class ProjectArtifactItem(BaseModel):
+    artifact_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int = 0
+    kind: str = "file"
+    purpose: str
+    conversation_id: str | None = None
+    owner_email: str | None = None
+    created_at: datetime | None = None
+    lineage_id: str | None = None
+    revision: int = 1
+
+
+class ProjectActivityResponse(BaseModel):
+    deliverables: list[ProjectDeliverableItem] = Field(default_factory=list)
+    artifacts: list[ProjectArtifactItem] = Field(default_factory=list)
 
 
 class ProjectGrantResponse(BaseModel):
@@ -866,7 +1045,7 @@ class ProjectGrantResponse(BaseModel):
     grantee_type: str = "user"
     grantee_user_email: str | None = None
     grantee_group_id: str | None = None
-    permission: str = "use"
+    permission: str = "member"
     granted_by: str
     granted_at: datetime | None = None
     revoked_at: datetime | None = None
@@ -887,6 +1066,10 @@ class ProjectUpdateRequest(BaseModel):
     name: str | None = None
     description: str | None = None
     instructions: str | None = None
+    instructions_mode: Literal["replace", "append"] = Field(
+        default="replace",
+        description="`append` adds `instructions` as a new paragraph instead of replacing them.",
+    )
     default_workflow_id: str | None = None
     avatar_image_id: str | None = None
     avatar_url: str | None = None
@@ -895,6 +1078,7 @@ class ProjectUpdateRequest(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    color: str = "#38bdf8"
     project_id: str
     owner_email: str
     name: str
@@ -909,9 +1093,11 @@ class ProjectResponse(BaseModel):
     workflow_ids: list[str] = Field(default_factory=list)
     active_schedule_count: int = 0
     grants: list[ProjectGrantResponse] = Field(default_factory=list)
+    agents: list[ProjectAgentResponse] = Field(default_factory=list)
     is_shared_with_me: bool = False
     shared_by_email: str | None = None
     granted_permission: str | None = None
+    caller_role: str | None = None
     is_readonly_for_caller: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -968,6 +1154,7 @@ class RuntimeSelectionResponse(BaseModel):
 
 
 class IntarisSessionDetailResponse(BaseModel):
+    inference_target: dict[str, Any] | None = None
     session_id: str
     intaris_session_id: str
     title: str | None = None
@@ -1093,6 +1280,10 @@ class AgentResponse(BaseModel):
     granted_permission: str | None = None
     executor_scope: str | None = None
     is_readonly_for_caller: bool = False
+    shared_via_project_ids: list[str] = Field(
+        default_factory=list,
+        description="Projects through which the caller may use this agent; usable only there.",
+    )
     sync_metadata: dict[str, Any] | None = None
     status: str
     created_at: datetime | None = None
@@ -1129,11 +1320,43 @@ class BackgroundWorkItemResponse(BaseModel):
     todos: list[BackgroundWorkTodoResponse] = Field(default_factory=list)
 
 
+class BackgroundCommandDetailResponse(BaseModel):
+    shell_id: str
+    executor_id: str
+    session_id: str | None = None
+    command: str
+    cwd: str | None = None
+    pid: int | None = None
+    status: str
+    runtime_seconds: float = 0
+    idle_seconds: float = 0
+    exit_code: int | None = None
+    output_tail: str = ""
+    output_chars: int = 0
+    trimmed_chars: int = 0
+
+
 class BackgroundWorkProjectionResponse(BaseModel):
     items: list[BackgroundWorkItemResponse] = Field(default_factory=list)
     active_count: int = 0
     truncated: bool = False
     generated_at: datetime
+
+
+class WaitingConversationPage(BaseModel):
+    """Fresh Waiting candidates; incomplete activity must not imply idle."""
+
+    conversations: CursorPage[ConversationResponse]
+    active_conversation_ids: list[str] = Field(default_factory=list)
+    activity_complete: bool = True
+
+
+class BackgroundWorkReadResponse(BaseModel):
+    """Authorized work summaries without conversation-history discovery."""
+
+    background_work: BackgroundWorkProjectionResponse
+    background_work_changed: bool = True
+    agent_direct_chats: list[AgentDirectChatResponse] = Field(default_factory=list)
 
 
 class SidebarProjectionResponse(BaseModel):
@@ -1225,6 +1448,13 @@ class LLMProviderRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
 
+    @field_validator("config")
+    @classmethod
+    def validate_monitoring(cls, config: dict[str, Any]) -> dict[str, Any]:
+        if "monitoring" in config:
+            MonitoringOptions.model_validate(config["monitoring"])
+        return config
+
 
 class LLMProviderUpdateRequest(BaseModel):
     display_name: str | None = None
@@ -1233,6 +1463,13 @@ class LLMProviderUpdateRequest(BaseModel):
     owner_scope: str | None = None
     config: dict[str, Any] | None = None
     status: str | None = None
+
+    @field_validator("config")
+    @classmethod
+    def validate_monitoring(cls, config: dict[str, Any] | None) -> dict[str, Any] | None:
+        if config is not None and "monitoring" in config:
+            MonitoringOptions.model_validate(config["monitoring"])
+        return config
 
 
 class LLMProviderResponse(BaseModel):
@@ -1318,12 +1555,48 @@ class ProviderUsageResponse(BaseModel):
 CodexUsageResponse = ProviderUsageResponse
 
 
+class ProviderMonitorResponse(BaseModel):
+    """One shared, freshness-aware provider observation."""
+
+    provider_id: str
+    display_name: str
+    monitoring: MonitoringOptions
+    health_status: str = "unknown"
+    health_detail: str = "Not checked"
+    health_checked_at: datetime | None = None
+    checked_at: datetime | None = None
+    next_refresh_at: datetime | None = None
+    usage: ProviderUsageResponse | None = None
+    error: str | None = None
+    alert_severity: Literal["warning", "critical"] | None = None
+    stale: bool = True
+
+
 class ModelRoutingEntry(BaseModel):
     model: str | None = None
     reasoning_effort: str | None = None
 
 
-class ModelRoutingResponse(BaseModel):
+class CompanionRoutingEntries(BaseModel):
+    companion_lite: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    companion_smart: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    companion_embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    intaris_evaluation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    intaris_judge: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    intaris_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    intaris_analysis_deep: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    intaris_embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    mnemory_extraction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    mnemory_retrieval: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    mnemory_consolidation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    mnemory_maintenance: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    mnemory_embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+
+
+class ModelRoutingResponse(CompanionRoutingEntries):
+    video_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    video_editing: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    video_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
@@ -1335,7 +1608,10 @@ class ModelRoutingResponse(BaseModel):
     embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
-class ModelRoutingUpdateRequest(BaseModel):
+class ModelRoutingUpdateRequest(CompanionRoutingEntries):
+    video_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    video_editing: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    video_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
@@ -1359,6 +1635,7 @@ class EnrichModelsPreviewRequest(BaseModel):
     model_ids: list[str] = Field(max_length=50)
     preset: str = ""
     base_url: str = ""
+    catalog_provider: str | None = None
     api_key: str | None = None
     secret_name: str | None = None
     env_var: str | None = None
@@ -1802,6 +2079,13 @@ class DeliverableResponse(BaseModel):
     turn_id: str | None = None
     version: int
     attempt_number: int = 1
+    lineage_id: str | None = None
+    revision: int = 1
+    supersedes_deliverable_id: str | None = None
+    latest_deliverable_id: str | None = None
+    latest_revision: int | None = None
+    revision_count: int | None = None
+    is_latest: bool | None = None
     content: str
     format: str = "markdown"
     title: str | None = None
@@ -1815,6 +2099,52 @@ class DeliverableResponse(BaseModel):
     evaluator_feedback: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class DeliverableRevisionSummary(BaseModel):
+    """One live revision in a deliverable lineage."""
+
+    deliverable_id: str
+    revision: int
+    title: str | None = None
+    format: str = "markdown"
+    status: str
+    step_run_id: str | None = None
+    task_id: str | None = None
+    conversation_id: str | None = None
+    created_at: datetime | None = None
+    is_latest: bool = False
+
+
+class DeliverableRevisionsResponse(BaseModel):
+    """Live revision history for the lineage of one deliverable."""
+
+    lineage_id: str
+    latest_deliverable_id: str
+    revisions: list[DeliverableRevisionSummary] = Field(default_factory=list)
+
+
+class ArtifactRevisionSummary(BaseModel):
+    """One live revision in an artifact lineage."""
+
+    artifact_id: str
+    revision: int
+    filename: str
+    mime_type: str
+    size_bytes: int = 0
+    owner_email: str | None = None
+    project_id: str | None = None
+    created_at: datetime | None = None
+    is_latest: bool = False
+
+
+class ArtifactRevisionsResponse(BaseModel):
+    """Live revision history of the lineage of one artifact, newest first."""
+
+    lineage_id: str
+    latest_artifact_id: str
+    latest_revision: int
+    revisions: list[ArtifactRevisionSummary] = Field(default_factory=list)
 
 
 class ChannelPairingRequestResponse(BaseModel):
@@ -1915,6 +2245,10 @@ class CreateScheduleRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
         self.task_template.pop("created_by_agent_id", None)
+        if "session_policy" in self.task_template:
+            self.task_template["session_policy"] = SessionPolicy.model_validate(
+                self.task_template["session_policy"] or {}
+            ).model_dump()
         if self.schedule_type == "cron" and not self.cron_expr:
             raise PydanticCustomError("missing_cron_expr", "cron_expr required for cron schedules")
         if self.schedule_type == "interval" and not self.interval_seconds:
@@ -1965,6 +2299,10 @@ class UpdateScheduleRequest(BaseModel):
     def _strip_reserved_task_template_fields(self) -> UpdateScheduleRequest:
         if self.task_template is not None:
             self.task_template.pop("created_by_agent_id", None)
+            if "session_policy" in self.task_template:
+                self.task_template["session_policy"] = SessionPolicy.model_validate(
+                    self.task_template["session_policy"] or {}
+                ).model_dump()
         return self
 
 
@@ -2011,6 +2349,8 @@ class ScheduleTriggerResponse(ScheduleResponse):
 
 
 class GateResponseRequest(BaseModel):
+    pause_id: str | None = None
+    expected_revision: int | None = None
     step_name: str | None = None
     action: str
     feedback: str | None = None
@@ -2476,6 +2816,20 @@ class IntarisMCPServerResponse(BaseModel):
     agent_pattern: str = "*"
 
 
+class WebSocketExecutorMonitorUpdate(BaseModel):
+    """Bounded runtime-only update for an authorized executor monitor viewer."""
+
+    type: Literal["executor_monitor_update"] = "executor_monitor_update"
+    executor_id: str
+    details_revision: str | None
+    status: str
+    runtime_state: str
+    desired_config_version: int
+    applied_config_version: int
+    last_observed_at: datetime | None
+    resource_snapshot: ExecutorResourceSnapshot | None
+
+
 class ExecutorConfigResponse(BaseModel):
     executor_id: str
     name: str
@@ -2610,6 +2964,7 @@ class MCPServerUpdateRequest(BaseModel):
 
 class QueuedMessageResponse(BaseModel):
     queue_id: str
+    can_edit: bool = False
     client_message_id: str | None = None
     content: str
     attachments: list[dict[str, Any]] = Field(default_factory=list)

@@ -21,6 +21,28 @@ it('retains an explicit capability disable even for a newly added model', async 
   expect(payload.config.models[0].supports_fast_mode).toBe(false);
 });
 
+it('round-trips an explicit restriction on imported metadata with configured provenance', async () => {
+  const model = {
+    ...defaultModelEntry('typesafe/jev-router'),
+    model_mode: 'systemone',
+    supports_tools: false,
+    provider_metadata: { field_sources: { model_mode: 'provider', supports_tools: 'provider' } }
+  };
+  const onsave = vi.fn();
+  render(ModelEditModal, { model, onclose: vi.fn(), onsave });
+  const toggle = screen.getByRole('checkbox', { name: 'Tools' });
+  await fireEvent.click(toggle);
+  await fireEvent.click(toggle);
+  await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  const form = createProviderForm();
+  form.models = [onsave.mock.calls[0][0]];
+  const payload = JSON.parse(JSON.stringify(providerFormToPayload(form)));
+  expect(payload.config.models[0].supports_tools).toBe(false);
+  expect(payload.config.models[0].provider_metadata.field_sources.supports_tools).toBe('configured');
+  expect(payload.config.models[0].provider_metadata.field_sources.model_mode).toBe('provider');
+  expect(model.provider_metadata.field_sources.supports_tools).toBe('provider');
+});
+
 it('resets a single field without rewriting independent context limits', async () => {
   const model = { ...defaultModelEntry('claude-opus-5'), max_context_window: 1000000 };
   const onsave = vi.fn();

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createMarkdownStreamer } from '$lib/markdown';
 
 import { isRenderableChatV2Item, toRenderItem, toRenderItems } from './render-adapter';
 import type {
@@ -35,6 +36,61 @@ function message(overrides: Partial<MessageTimelineItem> = {}): MessageTimelineI
     ...overrides
   };
 }
+
+describe('assistant text streaming state', () => {
+  it('distinguishes live arrival from paginated historical partial content', () => {
+    const live = toRenderItem(message({ stable: false, status: 'running', partial: true }));
+    const old = toRenderItem(message({ stable: true, status: 'cancelled', partial: true }));
+    if (live?.kind === 'message' && old?.kind === 'message') {
+      expect(live.arrivalEligible).toBe(true);
+      expect(old.arrivalEligible).toBe(false);
+    } else throw new Error('Expected message render models');
+  });
+  it('keeps preview formatting when typing is paused before Markdown closes', () => {
+    const streamer = createMarkdownStreamer();
+    const rendered = toRenderItem(message({
+      content: '**Yes—that is a', stable: false, partial: true, status: 'running', text_streaming: false
+    }), (content, _key, previewing) => previewing ? streamer.render(content) : streamer.finalize(content));
+    expect(rendered?.kind).toBe('message');
+    if (rendered?.kind === 'message') {
+      expect(rendered.streaming).toBe(false);
+      expect(rendered.html).toContain('<strong>Yes—that is a</strong>');
+      expect(rendered.html).not.toContain('**');
+    }
+  });
+  it.each(['complete', 'failed', 'cancelled'] as const)(
+    'does not show typing dots for %s partial content',
+    (status) => {
+      const item = toRenderItem(message({ stable: false, partial: true, status }));
+      expect(item?.kind).toBe('message');
+      if (item?.kind === 'message') {
+        expect(item.streaming).toBe(false);
+        expect(item.partial).toBe(true);
+      }
+    }
+  );
+
+  it('stops and resumes the same message without losing its content or phase', () => {
+    const source = message({
+      stable: false, status: 'running', partial: true, text_streaming: true,
+      assistant_phase_index: 3, turn_cycle_index: 2
+    });
+    const emitting = toRenderItem(source);
+    const preparing = toRenderItem({ ...source, text_streaming: false });
+    const resumed = toRenderItem({ ...source, content: source.content + ' More text.' });
+    expect(emitting?.kind).toBe('message');
+    expect(preparing?.kind).toBe('message');
+    expect(resumed?.kind).toBe('message');
+    if (emitting?.kind === 'message' && preparing?.kind === 'message' && resumed?.kind === 'message') {
+      expect(emitting.streaming).toBe(true);
+      expect(preparing.streaming).toBe(false);
+      expect(preparing.id).toBe(emitting.id);
+      expect(preparing.content).toBe(emitting.content);
+      expect(resumed.streaming).toBe(true);
+      expect(resumed.assistantPhaseIndex).toBe(emitting.assistantPhaseIndex);
+    }
+  });
+});
 
 function thinking(overrides: Partial<ThinkingTimelineItem> = {}): ThinkingTimelineItem {
   return {
@@ -236,7 +292,7 @@ describe('render-adapter', () => {
       expect(rendered?.attachments).toHaveLength(1);
     });
 
-    it('is streaming only when unstable and running/partial', () => {
+    it('is streaming only when unstable and actively running, not merely partial', () => {
       const stable = toRenderItem(message({ stable: true, status: 'running' }));
       expect(stable?.kind === 'message' && stable.streaming).toBe(false);
 
@@ -244,7 +300,7 @@ describe('render-adapter', () => {
       expect(running?.kind === 'message' && running.streaming).toBe(true);
 
       const partial = toRenderItem(message({ stable: false, partial: true, status: 'pending' }));
-      expect(partial?.kind === 'message' && partial.streaming).toBe(true);
+      expect(partial?.kind === 'message' && partial.streaming).toBe(false);
     });
 
     it('does not reuse markdown output for the same canonical id', () => {

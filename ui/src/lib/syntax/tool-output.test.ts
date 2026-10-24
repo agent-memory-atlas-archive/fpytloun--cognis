@@ -27,10 +27,10 @@ describe('tool output syntax helpers', () => {
     expect(html).not.toContain('<script>');
   });
 
-  it('highlights known-language output without emitting unsafe html', () => {
+  it('marks known-language output for deferred highlighting without unsafe html', () => {
     const html = highlightToolOutput('const value = "<script>";', 'typescript');
 
-    expect(html).toContain('hljs-');
+    expect(html).toContain('data-cognis-highlight="typescript"');
     expect(html).toContain('&lt;script&gt;');
     expect(html).not.toContain('<script>');
   });

@@ -3,21 +3,40 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import schema as sa_schema
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from cognis.core.events import EventBus, EventType
 from cognis.core.management import validate_workflow_definition
 from cognis.core.runtime import ResolvedStepRuntime, TransientExecutorUnavailable
+from cognis.core.session import SessionManager, _intaris_session_policy
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
 from cognis.core.workflow_rendering import MAX_DETERMINISTIC_JUMPS, WorkflowRenderer
 from cognis.models.agent import AgentDefinition
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
-from cognis.models.tool import NativeToolDefinition, ToolResult, ToolSource
-from cognis.models.workflow import StepDefinition, StepOutput, Workflow, WorkflowState
+from cognis.models.tool import EvaluationResult, NativeToolDefinition, ToolResult, ToolSource
+from cognis.models.workflow import (
+    StepDefinition,
+    StepOutput,
+    Workflow,
+    WorkflowState,
+    pin_effective_workflow,
+)
+from cognis.runtime_context import (
+    current_effective_working_directory,
+    current_executor_environment,
+    current_runtime_access_context,
+    current_workspace_root,
+    scoped_runtime_context,
+)
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base
 from cognis.store.queries import (
@@ -33,6 +52,223 @@ from cognis.store.queries import (
     update_task_workflow_state,
 )
 from cognis.tools.registry import RegisteredTool, ToolRegistry
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+async def artifact_workflow_database(tmp_path, request):
+    if request.param == "sqlite":
+        db_engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/artifact-workflow.db")
+        try:
+            yield db_engine
+        finally:
+            await db_engine.dispose()
+        return
+    url = os.getenv("COGNIS_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("COGNIS_TEST_POSTGRES_URL is not configured")
+    url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    schema = f"artifact_workflow_{uuid.uuid4().hex}"
+    admin = create_async_engine(url)
+    async with admin.begin() as connection:
+        await connection.execute(sa_schema.CreateSchema(schema))
+    db_engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    try:
+        yield db_engine
+    finally:
+        await db_engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(sa_schema.DropSchema(schema, cascade=True))
+        await admin.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_tool", ["artifact_write", "artifact_get_metadata"])
+async def test_artifact_tool_after_run_recovers_executor(
+    tmp_path, monkeypatch, final_tool, artifact_workflow_database
+) -> None:
+    from cognis.api import runtime_support
+    from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
+    from cognis.core.artifact_revisions import ContentActor, write_artifact_document
+    from cognis.core.executor_pin_notice_dispatch import ExecutorPinNoticeDispatcher
+    from cognis.store.models import Agent, ExecutorRecoveryNoticeRow
+    from cognis.store.project_queries import upsert_project_agent
+    from cognis.store.queries import create_deliverable, create_executor, create_project
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    db_engine, factory, engine, task, _ = await _engine_runtime(
+        tmp_path, database_engine=artifact_workflow_database
+    )
+    loop = engine._agent_loop
+    store = ArtifactStore(ArtifactStoreConfig(path=str(tmp_path / "artifacts")))
+    loop.artifact_store = store
+    manager = SessionManager(factory, engine._providers, SimpleNamespace(evict=AsyncMock()))
+    engine._providers.guardrails.create_session = AsyncMock()
+    engine._providers.guardrails.update_session_policy = AsyncMock()
+    engine._providers.guardrails.update_session_status = AsyncMock()
+    engine._session_manager = manager
+    engine._providers._session_factory = factory
+    connection = SimpleNamespace(
+        list_tools=AsyncMock(return_value=[]),
+        environment=AsyncMock(return_value=None),
+    )
+    ready = True
+
+    async def reconnect(*args, **kwargs):
+        nonlocal ready
+        ready = True
+        return connection
+
+    engine._providers.executor = SimpleNamespace(
+        websocket=SimpleNamespace(
+            get_ready_connection=lambda executor_id: connection if ready else None,
+            get_connection=lambda executor_id: connection,
+            get_handle_metadata=lambda executor_id: {},
+            notify_browser_session_terminal=AsyncMock(),
+            wait_for_connection=AsyncMock(side_effect=reconnect),
+        )
+    )
+    engine._providers.executor_pin_notice_dispatcher = ExecutorPinNoticeDispatcher(
+        session_factory=factory,
+        guardrails=engine._providers.guardrails,
+    )
+    async with factory() as db:
+        executor = await create_executor(
+            db,
+            name="Workflow",
+            owner_email=task.created_by,
+            executor_type="websocket",
+        )
+        executor.runtime_state = "active"
+        executor_id = executor.executor_id
+
+        agent = await db.get(Agent, task.agent_id)
+        agent.status = "active"
+        agent.execution = {"executor_id": executor_id}
+        project = await create_project(db, owner_email=task.created_by, name="Workflow")
+        task.project_id = project.project_id
+        row = await get_task(db, task.task_id)
+        row.project_id = project.project_id
+        await upsert_project_agent(
+            db,
+            project_id=project.project_id,
+            agent_id=task.agent_id,
+            added_by=task.created_by,
+            is_default=True,
+        )
+        await db.commit()
+    seed, _ = await write_artifact_document(
+        session_factory=factory,
+        artifact_store=store,
+        actor=ContentActor(task.created_by, task.agent_id, None, None),
+        project_id=task.project_id,
+        filename="state.json",
+        content=b'{"pending":null}',
+        mime_type="application/json",
+        kind="file",
+        purpose="workflow_checkpoint",
+    )
+
+    monkeypatch.setattr(
+        runtime_support,
+        "_resolve_web_config",
+        AsyncMock(return_value={"web_available_backends": [], "web_backend": "direct"}),
+    )
+    engine._step_runtime_factory = runtime_support.build_step_runtime_factory(
+        providers=engine._providers,
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=factory,
+        artifact_store=store,
+    )
+
+    async def dispatch(ctx, call):
+        return await handle_artifact_tool(
+            call.name,
+            call.arguments,
+            llm=None,
+            artifact_store=store,
+            session_factory=factory,
+            user_email=task.created_by,
+            runtime_metadata={
+                "agent_id": task.agent_id,
+                "session_id": ctx.session.session_id,
+                "conversation_id": ctx.conversation.conversation_id,
+            },
+        )
+
+    async def run(ctx, **kwargs):
+        nonlocal ready
+        ready = False
+        async with factory() as db:
+            dlv = await create_deliverable(
+                db,
+                step_run_id=ctx.step_run_id,
+                session_id=ctx.session.session_id,
+                content="Report",
+                artifact_store=store,
+            )
+            await db.commit()
+            return StepOutput(summary="Report", deliverable_id=dlv.deliverable_id)
+
+    loop.execute_controller_tool = dispatch
+    loop.run_step = AsyncMock(side_effect=run)
+    final_args = (
+        {
+            "filename": "state.json",
+            "content": '{"pending":false}',
+            "supersedes": "{{ steps.save_pending.outputs.artifact_id }}",
+        }
+        if final_tool == "artifact_write"
+        else {"artifact_id": "{{ steps.save_pending.outputs.artifact_id }}"}
+    )
+    workflow = Workflow(
+        workflow_id=f"wf_{uuid.uuid4().hex}",
+        name="Artifact checkpoint",
+        defaults={"evaluate": False},
+        steps=[
+            StepDefinition(
+                name="save_pending",
+                type="tool_call",
+                tool_call={
+                    "tool": "artifact_write",
+                    "allow_side_effects": True,
+                    "args": {
+                        "filename": "state.json",
+                        "content": '{"pending":true}',
+                        "project_id": task.project_id,
+                        "supersedes": seed.artifact_id,
+                    },
+                },
+            ),
+            StepDefinition(name="report", type="run", prompt="Report", input={"type": "null"}),
+            StepDefinition(
+                name="ack",
+                type="tool_call",
+                tool_call={
+                    "tool": final_tool,
+                    "allow_side_effects": True,
+                    "args": final_args,
+                },
+            ),
+        ],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+        for output in result.workflow_state.step_outputs.values():
+            assert not output.get("error"), output
+        assert result.status == TaskStatus.COMPLETED, result.workflow_state.step_outputs
+        ack = result.workflow_state.step_outputs["ack"]["outputs"]
+        assert ack["revision"] == (3 if final_tool == "artifact_write" else 2)
+        assert ack["project_id"] == task.project_id
+        engine._providers.executor.websocket.wait_for_connection.assert_awaited_once()
+        # The recovery window must be durable, not reset by a projection rollback.
+        async with factory() as db:
+            notices = list((await db.scalars(select(ExecutorRecoveryNoticeRow))).all())
+            assert {notice.recovered for notice in notices} == {False, True}
+            assert len({notice.unavailable_since for notice in notices}) == 1
+            assert all(notice.delivered_at for notice in notices)
+    finally:
+        await db_engine.dispose()
 
 
 class _DeterministicAgentLoop:
@@ -63,8 +299,9 @@ async def _engine_runtime(
     tmp_path: object,
     *,
     agent_loop: object | None = None,
+    database_engine: AsyncEngine | None = None,
 ) -> tuple[object, object, WorkflowEngine, TaskModel, EventBus]:
-    db_engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/deterministic.db")
+    db_engine = database_engine or create_engine(f"sqlite+aiosqlite:///{tmp_path}/deterministic.db")
     async with db_engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     session_factory = create_session_factory(db_engine)
@@ -108,7 +345,9 @@ async def _engine_runtime(
         agent_loop=agent_loop or _DeterministicAgentLoop(),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
-        session_manager=SimpleNamespace(mark_completed=AsyncMock()),
+        session_manager=SimpleNamespace(
+            mark_completed=AsyncMock(), refresh_intaris_session_policy=AsyncMock()
+        ),
         event_bus=event_bus,
         pause_waiter=SimpleNamespace(),
     )
@@ -122,6 +361,14 @@ async def _engine_runtime(
         delivery=TaskDelivery(mode="preferred_channel"),
         workflow_state=state,
     )
+    # Production TaskQueue pins the effective definition before engine entry.
+    execute = workflow_engine.execute_workflow
+
+    async def execute_pinned(task: TaskModel, workflow: Workflow, **kwargs: object) -> object:
+        pin_effective_workflow(task.workflow_state, workflow)
+        return await execute(task, workflow, **kwargs)
+
+    workflow_engine.execute_workflow = execute_pinned
     return db_engine, session_factory, workflow_engine, task, event_bus
 
 
@@ -155,6 +402,9 @@ def _mock_tool_runtime(
                     intaris_session_id="intaris-1",
                     parent_session_id=None,
                     delegation_mode=None,
+                    agent_id=agent.agent_id,
+                    user_email=agent.owner_email,
+                    conversation_id="conversation-1",
                 ),
                 False,
             )
@@ -162,6 +412,249 @@ def _mock_tool_runtime(
     )
     monkeypatch.setattr(engine, "_resolve_step_runtime", AsyncMock(return_value=runtime))
     return cleanup
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step_name", ["operate", "watch"])
+@pytest.mark.parametrize(
+    "outputs, expected", [({"notify": False}, False), ({"notify": True}, True), ({}, False)]
+)
+async def test_notify_default_through_step_output_context(
+    tmp_path: object, step_name: str, outputs: dict[str, object], expected: bool
+) -> None:
+    db_engine, _, engine, task, _ = await _engine_runtime(tmp_path)
+    try:
+        task.workflow_state.step_outputs[step_name] = StepOutput(
+            summary="Completed", outputs=outputs
+        ).model_dump(mode="json")
+        route = StepDefinition(
+            name="route",
+            type="condition",
+            condition={
+                "if": f"{{{{ steps.{step_name}.outputs.notify | default(false) == true }}}}",
+                "then": "complete_notify",
+                "else": "complete_silent",
+            },
+        )
+        workflow = Workflow(
+            workflow_id=f"wf_{uuid.uuid4().hex}",
+            name="Notify routing",
+            steps=[
+                route,
+                StepDefinition(
+                    name="complete_notify", type="complete", complete={"summary": "Notify"}
+                ),
+                StepDefinition(
+                    name="complete_silent", type="complete", complete={"summary": "Silent"}
+                ),
+            ],
+        )
+        context = engine._deterministic_render_context(task, task.workflow_state, workflow, route)
+        assert WorkflowRenderer().render_expression(route.condition.if_, context) is expected
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["approve", "deny", "error", "cancel"])
+async def test_tool_step_refreshes_policy_in_resolved_runtime_before_dispatch(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    loop = _DeterministicAgentLoop()
+    db_engine, factory, engine, task, _ = await _engine_runtime(tmp_path, agent_loop=loop)
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=NativeToolDefinition(
+                name="read",
+                description="Read",
+                parameters={"type": "object"},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+        )
+    )
+    cleanup = _mock_tool_runtime(engine, monkeypatch, registry)
+    runtime = engine._resolve_step_runtime.return_value
+    environment = SimpleNamespace(home="/home/operator", cwd="/home/operator", tmpdir="/tmp")
+    runtime.executor_environment = environment
+    runtime.active_executor_id = "executor-a"
+    session = engine._reuse_or_create_step_session.return_value[1]
+    workflow = Workflow(
+        workflow_id="wf-runtime-policy",
+        name="Runtime policy",
+        defaults={"session_policy": {"allow_policies": ["Read the authorized journal."]}},
+        steps=[StepDefinition(name="check", type="tool_call", tool_call={"tool": "read"})],
+    )
+    task.session_policy = {"deny_policies": ["Do not modify production."]}
+    order: list[str] = []
+    policy = {}
+    with scoped_runtime_context():
+        # A scheduled session can be created before an executor has been resolved.
+        tokens = [
+            (current_workspace_root, current_workspace_root.set(None)),
+            (current_effective_working_directory, current_effective_working_directory.set(None)),
+            (current_executor_environment, current_executor_environment.set(None)),
+        ]
+        try:
+            policy.update(_intaris_session_policy(None))
+        finally:
+            for variable, token in reversed(tokens):
+                variable.reset(token)
+    assert policy["allow_paths"] == ["/tmp/*", "/private/tmp/*", "/var/tmp/*"]
+
+    async def update_policy(intaris_id: str, **kwargs: object) -> None:
+        order.append("refresh")
+        assert intaris_id == session.intaris_session_id
+        assert current_executor_environment.get() is environment
+        assert current_workspace_root.get() == "/home/operator"
+        assert current_effective_working_directory.get() == "/home/operator"
+        access = current_runtime_access_context.get()
+        assert access is not None
+        assert access.session_id == session.session_id
+        assert access.task_id == task.task_id
+        assert access.step_name == "check"
+        policy.clear()
+        policy.update(kwargs["policy"])
+        assert policy["allow_policies"] == ["Read the authorized journal."]
+        assert policy["deny_policies"] == ["Do not modify production."]
+
+    engine._providers.guardrails.update_session_policy = AsyncMock(side_effect=update_policy)
+    manager = SessionManager(factory, engine._providers, SimpleNamespace())
+    original_refresh = manager.refresh_intaris_session_policy
+
+    async def refresh(actual_session: object) -> dict[str, object] | None:
+        assert actual_session is session
+        if outcome == "error":
+            order.append("refresh")
+            raise RuntimeError("Refresh failed")
+        if outcome == "cancel":
+            order.append("refresh")
+            raise asyncio.CancelledError
+        acknowledged_policy = await original_refresh(actual_session)
+        assert acknowledged_policy == policy
+        return acknowledged_policy
+
+    engine._session_manager.refresh_intaris_session_policy = AsyncMock(side_effect=refresh)
+
+    async def dispatch(ctx: object, call: object) -> ToolResult:
+        order.append("evaluate")
+        assert order == ["refresh", "evaluate"]
+        assert "/home/operator/*" in policy["allow_paths"]
+        assert not any(
+            "controller" in path or "secondary" in path for path in policy["allow_paths"]
+        )
+        assert ctx.active_executor_id == "executor-a"
+        assert current_runtime_access_context.get().session_id == session.session_id
+        if outcome == "deny":
+            return ToolResult(output="Guard denied", is_error=True)
+        order.append("execute")
+        loop.calls.append(call)
+        return ToolResult(output="Journal read")
+
+    monkeypatch.setattr(loop, "execute_controller_tool", dispatch)
+    try:
+        with scoped_runtime_context(
+            workspace_root="/srv/controller",
+            effective_working_directory="/srv/controller",
+            executor_environment=SimpleNamespace(home="/home/secondary", cwd="/home/secondary"),
+        ):
+            if outcome == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await engine.execute_workflow(task, workflow)
+            else:
+                result = await engine.execute_workflow(task, workflow)
+                assert result.status == (
+                    TaskStatus.COMPLETED if outcome == "approve" else TaskStatus.FAILED
+                )
+            assert current_workspace_root.get() == "/srv/controller"
+            assert current_effective_working_directory.get() == "/srv/controller"
+            assert current_executor_environment.get().home == "/home/secondary"
+        assert order == (
+            ["refresh", "evaluate", "execute"]
+            if outcome == "approve"
+            else ["refresh", "evaluate"]
+            if outcome == "deny"
+            else ["refresh"]
+        )
+        assert len(loop.calls) == (1 if outcome == "approve" else 0)
+        cleanup.assert_awaited_once()
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["legacy", "hybrid_v1"])
+async def test_deterministic_scope_uses_acknowledged_session_policy(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    from cognis.core.tool_router import ToolRouter
+    from cognis.models.session import SessionModel
+
+    loop = _DeterministicAgentLoop()
+    db_engine, _, engine, task, _ = await _engine_runtime(tmp_path, agent_loop=loop)
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=NativeToolDefinition(
+                name="read",
+                description="Read",
+                parameters={"type": "object"},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            )
+        )
+    )
+    _mock_tool_runtime(engine, monkeypatch, registry)
+    engine._session_manager.refresh_intaris_session_policy.return_value = {
+        "evaluation_policy_version": version
+    }
+    guardrails = AsyncMock()
+    guardrails.evaluate.return_value = EvaluationResult(decision="approve", call_id="eval_scope")
+    router = ToolRouter(guardrails)
+    executor = SimpleNamespace(
+        executor_id="executor-a", tool_execute=AsyncMock(return_value=ToolResult(output="Read"))
+    )
+
+    async def dispatch(ctx: object, call: object) -> ToolResult:
+        return await router.execute(
+            call,
+            session=SessionModel(
+                session_id=ctx.session.session_id,
+                intaris_session_id=ctx.session.intaris_session_id,
+                conversation_id=ctx.session.conversation_id,
+                user_email=ctx.session.user_email,
+                agent_id=ctx.session.agent_id,
+            ),
+            agent=ctx.agent,
+            registry=registry,
+            executor=executor,
+            workflow_step_scope=ctx.workflow_step_scope,
+            workflow_executor_id=executor.executor_id,
+        )
+
+    monkeypatch.setattr(loop, "execute_controller_tool", dispatch)
+    workflow = Workflow(
+        workflow_id="wf-policy-scope",
+        name="Policy scope",
+        steps=[StepDefinition(name="read", type="tool_call", tool_call={"tool": "read"})],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+        assert result.status == TaskStatus.COMPLETED
+        guardrails.evaluate.assert_awaited_once()
+        executor.tool_execute.assert_awaited_once()
+        binding = guardrails.evaluate.call_args.kwargs.get("workflow_binding")
+        if version == "legacy":
+            guardrails.declare_workflow_step.assert_not_awaited()
+            assert binding is None
+        else:
+            guardrails.declare_workflow_step.assert_awaited_once()
+            assert binding.declaration is guardrails.declare_workflow_step.call_args.args[0]
+    finally:
+        await db_engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1343,3 +1836,125 @@ async def test_transient_executor_unavailability_defers_deterministic_tool_step(
         assert rows[0].runtime_info["deterministic_substate"] == "rendering"
     finally:
         await db_engine.dispose()
+
+
+async def _run_reporting_tool_step(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    creation_origin: str | None,
+    fail_first_dispatch: bool = False,
+) -> tuple[list[object], AsyncMock]:
+    agent_loop = _DeterministicAgentLoop()
+    db_engine, session_factory, engine, task, _ = await _engine_runtime(
+        tmp_path, agent_loop=agent_loop
+    )
+    async with session_factory() as session:
+        row = await get_task(session, task.task_id)
+        assert row is not None
+        row.creation_origin = creation_origin
+        await session.commit()
+    task.creation_origin = creation_origin
+    task.source_type = "manual"
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=NativeToolDefinition(
+                name="read",
+                description="Read",
+                parameters={"type": "object"},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+        )
+    )
+    _mock_tool_runtime(engine, monkeypatch, registry)
+    report_reasoning = AsyncMock()
+    engine._providers.guardrails.report_reasoning = report_reasoning
+    dispatches = 0
+
+    async def dispatch(_ctx: object, _call: object) -> ToolResult:
+        nonlocal dispatches
+        dispatches += 1
+        if fail_first_dispatch and dispatches == 1:
+            raise TransientExecutorUnavailable(
+                "executor reconnecting", executor_id="executor-a", retry_after_seconds=1
+            )
+        return ToolResult(output="Journal read")
+
+    monkeypatch.setattr(agent_loop, "execute_controller_tool", dispatch)
+    workflow = Workflow(
+        workflow_id="wf-report",
+        name="Report",
+        steps=[
+            StepDefinition(
+                name="journal",
+                type="tool_call",
+                tool_call={"tool": "read", "args": {"path": "/srv/journal.md"}},
+            )
+        ],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+        if fail_first_dispatch:
+            assert result.status == TaskStatus.READY
+            async with session_factory() as session:
+                row = await get_task(session, task.task_id)
+                assert row is not None
+                row.status = "running"
+                await session.commit()
+            task.status = TaskStatus.RUNNING
+            result = await engine.execute_workflow(task, workflow)
+        assert result.status == TaskStatus.COMPLETED
+    finally:
+        await db_engine.dispose()
+    events = [
+        event
+        for call in engine._providers.guardrails.record_events.await_args_list
+        for event in call.kwargs["events"]
+        if event.type == "user_message"
+    ]
+    return events, report_reasoning
+
+
+@pytest.mark.asyncio
+async def test_owner_configured_tool_step_reports_rendered_step_as_user_message(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events, report_reasoning = await _run_reporting_tool_step(
+        tmp_path, monkeypatch, creation_origin="owner_configured"
+    )
+
+    assert len(events) == 1
+    assert events[0].data["role"] == "user"
+    assert events[0].data["content"] == (
+        'Workflow step journal: run read with {"path": "/srv/journal.md"}'
+    )
+    report_reasoning.assert_awaited_once_with(session_id="intaris-1", from_events=True)
+
+
+@pytest.mark.asyncio
+async def test_agent_composed_tool_step_reports_no_user_message(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events, report_reasoning = await _run_reporting_tool_step(
+        tmp_path, monkeypatch, creation_origin="agent_composed"
+    )
+
+    assert events == []
+    report_reasoning.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owner_configured_tool_step_retry_does_not_report_twice(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events, report_reasoning = await _run_reporting_tool_step(
+        tmp_path, monkeypatch, creation_origin="owner_configured", fail_first_dispatch=True
+    )
+
+    assert len(events) == 1
+    report_reasoning.assert_awaited_once()

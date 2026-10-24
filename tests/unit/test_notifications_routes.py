@@ -15,6 +15,8 @@ from cognis.store.queries import create_agent, create_conversation, create_user,
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
+    # HTTP tests isolate provider I/O; durable publication is exercised separately.
+    monkeypatch.setattr(NotificationService, "_record_question_answer", AsyncMock())  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
     return TestClient(create_app())
@@ -495,6 +497,9 @@ def test_direct_step_question_response_uses_persisted_questions_without_local_pa
 
         assert response.status_code == 200
         assert response.json()["decision"] == "continue"
+        published = client.app.state.notification_service._record_question_answer
+        published.assert_awaited_once()
+        assert published.await_args.kwargs["resolution_data"]["human_answer"] is True
 
 
 def test_direct_step_question_cancel_ignores_incomplete_response_payload(

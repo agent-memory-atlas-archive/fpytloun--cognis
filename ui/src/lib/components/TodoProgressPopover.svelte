@@ -37,9 +37,9 @@
   }
 
   function statusClass(status: string): string {
-    if (status === 'completed') return 'border-emerald-400/30 bg-emerald-400/10 text-emerald-100';
-    if (status === 'in_progress') return 'border-sky-400/30 bg-sky-400/10 text-sky-100';
-    return 'border-slate-700 bg-slate-800/70 text-slate-300';
+    if (status === 'completed') return 'border-success-border bg-success-subtle text-success';
+    if (status === 'in_progress') return 'border-info-border bg-info-subtle text-info';
+    return 'border-control-border bg-raised/70 text-secondary';
   }
 
   function updatePosition(): void {
@@ -111,7 +111,7 @@
 <span bind:this={root} class={`relative inline-flex ${className}`}>
   <button
     type="button"
-    class={`inline-flex ${dimensionClass} items-center justify-center rounded-full text-current transition hover:scale-110 focus:outline-none focus:ring-2 focus:ring-emerald-300/60 focus:ring-offset-2 focus:ring-offset-slate-950`}
+    class={`inline-flex ${dimensionClass} items-center justify-center rounded-full text-current transition hover:scale-110 focus:outline-none focus:ring-2 focus:ring-accent/60 focus:ring-offset-2 focus:ring-offset-canvas`}
     aria-label={`${label}: ${Math.round(progress.progress * 100)}% complete`}
     aria-expanded={open}
     title={statusTitle}
@@ -137,7 +137,7 @@
   {#if open}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
-      class="z-[2147483647] w-80 rounded-2xl border border-slate-700 bg-slate-950 p-3 text-left text-xs text-slate-200 shadow-2xl ring-1 ring-black/30"
+      class="z-[2147483647] w-80 rounded-2xl border border-control-border bg-elevated p-3 text-left text-xs text-foreground shadow-2xl ring-1 ring-scrim/30"
       style={panelStyle}
       role="dialog"
       tabindex="-1"
@@ -145,8 +145,8 @@
       onpointerdown={(event) => event.stopPropagation()}
     >
       <div class="mb-2 flex items-center justify-between gap-3">
-        <p class="font-semibold uppercase tracking-[0.2em] text-slate-400">Todos</p>
-        <span class="text-slate-500">{progress.completed}/{progress.total} done</span>
+        <p class="font-semibold uppercase tracking-[0.2em] text-muted">Todos</p>
+        <span class="text-quiet">{progress.completed}/{progress.total} done</span>
       </div>
       <div class="space-y-1.5">
         {#each visibleTodos as todo}

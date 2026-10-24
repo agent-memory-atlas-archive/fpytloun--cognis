@@ -27,6 +27,9 @@ const DEFAULT_STATE: TimelineViewportState = {
 export class TimelineViewportStateStore {
   private readonly states = new Map<string, TimelineViewportState>();
   private active: TimelineViewportTransition | null = null;
+  // Logical window ownership outlives DOM positioning, including child-view
+  // hiding and return RAFs. Only a new load/owner or teardown invalidates it.
+  private retainedWindow: { scopeKey: string; generation: number } | null = null;
 
   constructor(private readonly maxEntries = 32) {}
 
@@ -45,6 +48,7 @@ export class TimelineViewportStateStore {
   }
 
   begin(scopeKey: string, generation: number): TimelineViewportTransition {
+    this.invalidateWindow();
     const saved = this.states.get(scopeKey);
     if (saved) {
       this.states.delete(scopeKey);
@@ -75,7 +79,22 @@ export class TimelineViewportStateStore {
     return true;
   }
 
+  establishWindow(scopeKey: string, generation: number): boolean {
+    if (!this.isCurrent(scopeKey, generation) && !this.hasRetainedWindow(scopeKey, generation)) return false;
+    this.retainedWindow = { scopeKey, generation };
+    return true;
+  }
+
+  hasRetainedWindow(scopeKey: string, generation: number): boolean {
+    return this.retainedWindow?.scopeKey === scopeKey && this.retainedWindow.generation === generation;
+  }
+
+  invalidateWindow(): void {
+    this.retainedWindow = null;
+  }
+
   invalidate(): void {
     this.active = null;
+    this.invalidateWindow();
   }
 }

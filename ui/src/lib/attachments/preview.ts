@@ -23,14 +23,15 @@ function extension(filename: string): string {
   return filename.split('.').pop()?.toLowerCase() ?? '';
 }
 
-export type AttachmentPreviewKind = 'csv' | 'html' | 'markdown' | 'mermaid' | 'pdf' | 'text' | 'video';
+export type AttachmentPreviewKind = 'audio' | 'csv' | 'html' | 'markdown' | 'mermaid' | 'pdf' | 'text' | 'video';
 
-export function previewKind(attachment: AttachmentRef): AttachmentPreviewKind | null {
+export function previewKind(attachment: Pick<AttachmentRef, 'filename' | 'mime_type'>): AttachmentPreviewKind | null {
   const mimeType = attachment.mime_type?.split(';', 1)[0]?.trim().toLowerCase() ?? '';
   const ext = extension(attachment.filename);
   if (['text/html', 'application/xhtml+xml'].includes(mimeType) || ['html', 'htm'].includes(ext)) return 'html';
   if (mimeType === 'application/pdf' || ext === 'pdf') return 'pdf';
   if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
   if (['text/markdown', 'text/x-markdown'].includes(mimeType) || MARKDOWN_EXTENSIONS.has(ext)) return 'markdown';
   if (['text/vnd.mermaid', 'application/vnd.mermaid'].includes(mimeType) || MERMAID_EXTENSIONS.has(ext)) return 'mermaid';
   if (['text/csv', 'application/csv', 'text/tab-separated-values'].includes(mimeType) || TABLE_EXTENSIONS.has(ext)) return 'csv';

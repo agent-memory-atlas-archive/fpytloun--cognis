@@ -52,6 +52,9 @@ class PushSubscriptionResponse(BaseModel):
 
     subscription_id: str
     enabled: bool
+    # The push service permanently rejected this endpoint; the browser must
+    # unsubscribe and create a new subscription.
+    gone: bool = False
 
 
 class PushSubscriptionStatusResponse(BaseModel):
@@ -112,6 +115,7 @@ async def register_subscription(
     return PushSubscriptionResponse(
         subscription_id=subscription.subscription_id,
         enabled=subscription.enabled,
+        gone=subscription.gone,
     )
 
 

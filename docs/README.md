@@ -13,6 +13,7 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | [Architecture](guide/architecture.md) | Understand the cloud-native controller/executor split and companion services |
 | [Configuring Providers](guide/configuring-providers.md) | Add LLM providers, test them, and set model routing |
 | [Creating Agents](guide/creating-agents.md) | Define identity, tools, skills, executor placement, and workflow behavior |
+| [Agent Hooks](guide/agent-hooks.md) | Attach reminders and background actions to agent lifecycle events |
 | [How to Customize Your Harness](guide/customizing-your-harness.md) | Customize agent roles, profiles, coding guidance, and coordination conventions |
 | [Security and Privacy](guide/security-and-privacy.md) | Understand secrets, value refs, inference-provider privacy, guardrails, and executor boundaries |
 
@@ -21,6 +22,9 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | Document | Description |
 |---|---|
 | [Using Chat](guide/using-chat.md) | Streaming chat, tool calls, escalations, delegation, todos, and recovery |
+| [Chat Modes](guide/chat-modes.md) | Planning intent, explicit read-only restrictions, and Intaris compatibility |
+| [Approve One Specific Action](guide/actionable-approvals.md) | Resolve targeted approvals and understand retry ownership |
+| [Context Management](guide/context-management.md) | Prompt budgets, projection, compaction, and evidence preservation |
 | [Projects](guide/projects.md) | Project sources, workflow bindings, grants, project-aware tasks, and revision flows |
 | [Managing Tasks](guide/managing-tasks.md) | Task board, workflow runs, approvals, deliverables, revisions, and results delivery |
 | [Schedules](guide/schedules.md) | Recurring task creation and scheduled workflow execution |
@@ -37,6 +41,7 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | Document | Description |
 |---|---|
 | [Settings](guide/settings.md) | Configure providers, routing, secrets, executors, diagnostics, and users |
+| [Inference API](guide/inference-api.md) | OpenAI-compatible inference, reusable routes, credentials, and recovery |
 | [Executors](guide/executors.md) | Choose where tools run, configure browser automation, and route tools safely |
 | [macOS Executor Distribution](guide/macos-executor.md) | Install, configure, operate, upgrade, and develop the Homebrew macOS executor |
 | [Channels](guide/channels.md) | Connect external messaging platforms and understand pairing |
@@ -50,14 +55,19 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 When Cognis serves the bundled UI, these guides are also available directly inside the app:
 
 - `/docs`
+- `/docs/changelog` — What's new, release history, and changes between versions
 - `/docs/getting-started`
 - `/docs/local-compose`
 - `/docs/architecture`
 - `/docs/configuring-providers`
 - `/docs/creating-agents`
+- `/docs/agent-hooks`
 - `/docs/customizing-your-harness`
 - `/docs/security-and-privacy`
 - `/docs/using-chat`
+- `/docs/chat-modes`
+- `/docs/actionable-approvals`
+- `/docs/context-management`
 - `/docs/projects`
 - `/docs/managing-tasks`
 - `/docs/schedules`
@@ -69,6 +79,7 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 - `/docs/rich-deliverable-blocks-layout`
 - `/docs/rich-deliverable-blocks-data`
 - `/docs/settings`
+- `/docs/inference-api`
 - `/docs/executors`
 - `/docs/channels`
 - `/docs/deployment`
