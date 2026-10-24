@@ -107,7 +107,7 @@ def test_approval_and_uncertain_delivery_are_not_success():
     )
     incomplete = execution_outcome(
         ToolResult(output="", metadata={"shell_id": "s" * 200}),
-        executor_id="maitrea_riker",
+        executor_id="fixture-executor",
         native_shell=True,
     )
     assert incomplete["shell_id"] is None

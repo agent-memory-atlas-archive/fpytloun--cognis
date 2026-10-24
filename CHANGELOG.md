@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [0.18.1] - 2026-10-24
+
+### Highlights
+
+- **Cognis on your Mac.** Open agent chats from the menu bar, keep pinned conversations on your desktop, and review notifications or respond to simple tool approvals without returning to the main workspace.
+- **Reusable hooks for your agents.** Configure reminders, memory consolidation, and skill learning around agent activity. Customize bundled hooks in Tools and inspect their runs directly in chat.
+- **Continue elsewhere with `/handoff`.** Prepare a self-contained continuation brief—even during an active turn—then copy it or open a new-conversation draft.
+- **A Library for ongoing work.** Organize documents by project, inspect revisions, manage sharing, and favorite artifacts and deliverables.
+- **Make the workspace yours.** Choose Porcelain, Classic, Gruvbox, or Paper, each with Light, Dark, and System modes.
+- **Offline continuity.** Read cached PWA content, queue attachment uploads, and switch between cached chats faster.
+- **Find your work with Spotlight.** Search agents, conversations, projects, tasks, and Library documents with Command-K or Control-K.
+
+### Changed
+
+- The first published 0.18 distributions bring the macOS desktop companion, reusable agent hooks, in-app handoff, the Library, refreshed themes, offline continuity, and Spotlight project/session search. This release supersedes the unpublished 0.18.0 binary candidates; post-freeze upstream changes are reserved for a following release.
+- Retain the documented incomplete regression baseline. At the operator's request, further unit, contract, GUI/browser, and live-model tests are not rerun; these waivers are not passing qualification. Ad-hoc Mac distributions remain unnotarized, use normal app-icon/text notifications, and are not Developer ID releases.
+### Fixed
+
+- Find the exact reviewed macOS draft prerelease through the release-aware lookup before attaching immutable assets, retaining draft/prerelease checks and refusing asset replacement.
+### Security
+
+- Replace environment-specific presentation, executor, and workflow examples with coherent synthetic fixtures, preserving identity relationships, protocol syntax, canonical digests, and long-token layout pressure.
 ## [0.18.0] - 2026-10-24
 
 ### Highlights

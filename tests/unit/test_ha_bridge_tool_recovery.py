@@ -70,7 +70,7 @@ def _executor_registry() -> Any:
     return registry
 
 
-def _proxy(*, executor_id: str = "maitrea_riker", epoch: int = 236) -> Any:
+def _proxy(*, executor_id: str = "fixture-executor", epoch: int = 236) -> Any:
     return ForwardedExecutorConnection(
         executor_id=executor_id,
         capabilities=MagicMock(),
@@ -182,12 +182,12 @@ async def test_provider_invalidation_retires_and_stops_routing() -> None:
     pending.assembly = None
     connection._pending["in-flight"] = pending
 
-    provider._forwarded_by_executor["maitrea_riker"] = connection
-    provider._forwarded_connections[("maitrea_riker", "cognis-1", 236)] = connection
+    provider._forwarded_by_executor["fixture-executor"] = connection
+    provider._forwarded_connections[("fixture-executor", "cognis-1", 236)] = connection
 
-    await provider.invalidate_forwarded_connection("maitrea_riker", connection)
+    await provider.invalidate_forwarded_connection("fixture-executor", connection)
 
-    assert provider.get_connection("maitrea_riker") is None
+    assert provider.get_connection("fixture-executor") is None
     assert connection in provider._retiring_forwarded
     assert not in_flight.done()
     assert connection.retiring is True
@@ -195,7 +195,7 @@ async def test_provider_invalidation_retires_and_stops_routing() -> None:
     # A retired proxy is never eligible for a same-executor retry.
     assert (
         provider._connection_is_retry_eligible(
-            "maitrea_riker",
+            "fixture-executor",
             connection,
             failed_connection=None,
             delivery_state=DeliveryState.NOT_SENT,
@@ -291,7 +291,7 @@ class _BridgeFailingExecutor:
     """Forwarded proxy shape whose tool dispatch fails inside the bridge."""
 
     def __init__(self, error: ForwardedDeliveryError) -> None:
-        self.executor_id = "maitrea_riker"
+        self.executor_id = "fixture-executor"
         self.owner_id = "cognis-1"
         self.epoch = 236
         self._error = error
@@ -328,7 +328,7 @@ async def test_forwarded_delivery_failure_preserves_cause_and_retryability(
         ForwardedDeliveryError(
             "Bridge owner changed before physical send",
             delivery_state,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             owner_id="cognis-1",
             epoch=236,
             executor_instance_id="instance-a",
@@ -360,7 +360,7 @@ def test_bridge_failure_log_data_is_redaction_safe() -> None:
     from cognis.api.controller_ws import _bridge_failure_log_data
 
     data = _bridge_failure_log_data(
-        executor_id="maitrea_riker",
+        executor_id="fixture-executor",
         bridge_call_id="bridge-1",
         requester_owner_id="cognis-0",
         operation="tool",
@@ -896,7 +896,7 @@ def test_physical_delivery_failure_preserves_identity_without_raw_message() -> N
     error = ExecutorDeliveryError(
         "Executor connection replaced",
         DeliveryState.ACCEPTED_UNKNOWN,
-        executor_id="maitrea_riker",
+        executor_id="fixture-executor",
         executor_instance_id="instance-a",
     )
     metadata = error.metadata()

@@ -3779,7 +3779,11 @@ def test_visible_persisted_system_message_filter_allows_explicit_notices() -> No
 
 def test_visible_persisted_system_message_filter_rejects_internal_context() -> None:
     assert not is_visible_persisted_system_message(
-        {"content": ("Environment: - Executor: olorin (websocket) - Platform: unknown (unknown)")}
+        {
+            "content": (
+                "Environment: - Executor: fixture-mac (websocket) - Platform: unknown (unknown)"
+            )
+        }
     )
     assert not is_visible_persisted_system_message(
         {"content": "Additional tools may be available but hidden by the current step profile."}

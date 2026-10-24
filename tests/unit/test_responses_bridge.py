@@ -384,14 +384,14 @@ async def test_nested_management_arguments_survive_responses_stream(
     bridge, wrapper: str | None, terminal_snapshot: bool
 ) -> None:
     settings = {
-        "executor_id": "maitrea_riker",
+        "executor_id": "fixture-executor",
         "memory_backend": "mnemory",
         "memory_backend_options": {"mode": "full_auto"},
     }
-    envelope = {"action": "settings_update", "agent_id": "dobby", "settings": settings}
+    envelope = {"action": "settings_update", "agent_id": "fixture-agent", "settings": settings}
     expected = {"tool": "manage_agents", "arguments": envelope} if wrapper else envelope
     fragments = [
-        '{"action":"settings_update","agent_id":"dobby","settings":',
+        '{"action":"settings_update","agent_id":"fixture-agent","settings":',
         json.dumps(settings),
         "}",
     ]

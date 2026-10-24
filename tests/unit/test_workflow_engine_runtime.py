@@ -2364,8 +2364,8 @@ async def test_execute_workflow_defers_transient_executor_unavailable_then_succe
     )
     deferred: list[dict[str, object]] = []
     transient = TransientExecutorUnavailable(
-        "Selected executor 'olorin' is not connected or not ready",
-        executor_id="olorin",
+        "Selected executor 'fixture-mac' is not connected or not ready",
+        executor_id="fixture-mac",
         retry_after_seconds=5,
     )
 
@@ -2615,8 +2615,8 @@ async def test_execute_workflow_never_pauses_for_transient_executor_unavailable(
         ],
     )
     transient = TransientExecutorUnavailable(
-        "Selected executor 'olorin' is not connected or not ready",
-        executor_id="olorin",
+        "Selected executor 'fixture-mac' is not connected or not ready",
+        executor_id="fixture-mac",
         retry_after_seconds=5,
     )
 

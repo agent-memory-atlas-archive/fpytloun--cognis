@@ -12,7 +12,7 @@ from tests.unit.test_shell_target_evidence import row
 @pytest.fixture(params=[WebSocketExecutorConnection, ForwardedExecutorConnection])
 def connection(request):
     transport = object.__new__(request.param)
-    transport.executor_id = "maitrea_riker"
+    transport.executor_id = "fixture-executor"
     transport.rpc_call = AsyncMock()
     return transport
 
@@ -28,17 +28,17 @@ async def lookup(connection):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("local_id", ["remote", "maitrea_riker", "another-local-label"])
+@pytest.mark.parametrize("local_id", ["remote", "fixture-executor", "another-local-label"])
 async def test_real_transport_projects_connection_identity(connection, local_id):
     raw = {"shells": [row(executor_id=local_id)]}
     connection.rpc_call.return_value = raw
     snapshot = await connection.background_shell_status(include_completed=True)
-    assert snapshot["shells"][0]["executor_id"] == "maitrea_riker"
+    assert snapshot["shells"][0]["executor_id"] == "fixture-executor"
     assert snapshot["shells"][0]["reported_executor_id"] == local_id
     assert raw["shells"][0]["executor_id"] == local_id
     result = await lookup(connection)
     assert result["coverage"] == "complete"
-    assert result["executor_id"] == "maitrea_riker"
+    assert result["executor_id"] == "fixture-executor"
     assert result["target"]["call_id"] == "start_monitor"
     assert "output_tail" not in result["target"]
     assert connection.rpc_call.call_args.args == (
@@ -64,9 +64,9 @@ async def test_connection_identity_does_not_bypass_owner_checks(connection, fiel
 @pytest.mark.asyncio
 async def test_status_from_different_connection_cannot_claim_selected_executor(connection):
     connection.executor_id = "other_executor"
-    connection.rpc_call.return_value = {"shells": [row(executor_id="maitrea_riker")]}
+    connection.rpc_call.return_value = {"shells": [row(executor_id="fixture-executor")]}
     selected = SimpleNamespace(
-        executor_id="maitrea_riker",
+        executor_id="fixture-executor",
         background_shell_status=connection.background_shell_status,
     )
     result = await lookup(selected)

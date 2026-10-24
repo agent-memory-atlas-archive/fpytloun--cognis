@@ -169,7 +169,7 @@ async def test_recovery_notice_is_durable_idempotent_and_retried_after_restart(
         active = await create_session(session, "conv-a", "user@example.com", "agent-1")
         conversation = await get_conversation(session, "conv-a")
         conversation.active_session_id = active.session_id
-        conversation.active_executor_id = "maitrea_riker"
+        conversation.active_executor_id = "fixture-executor"
         await session.commit()
     keys = set()
     events = []
@@ -198,7 +198,7 @@ async def test_recovery_notice_is_durable_idempotent_and_retried_after_restart(
     kwargs = {
         "conversation_id": "conv-a",
         "task_id": None,
-        "executor_id": "maitrea_riker",
+        "executor_id": "fixture-executor",
         "notice_dispatcher": dispatcher,
     }
     try:
@@ -332,7 +332,7 @@ async def test_notice_io_does_not_extend_recovery_deadline(
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             notice_dispatcher=dispatcher,
         )
         assert window.remaining_seconds() == 880

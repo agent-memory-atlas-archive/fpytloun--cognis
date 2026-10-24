@@ -19,8 +19,8 @@ for (const width of [1440, 390]) {
       generated_at: new Date().toISOString(), summary: { total: 2, warning: 1, critical: 1, info: 0, truncated: false },
       issues: [
         { id: 'runtime-warning', severity: 'warning', kind: 'executor_degraded',
-          title: 'Maitrea (Riker) is degraded', detail: 'The executor reported a degraded runtime state.',
-          resource: { type: 'executor', id: 'maitrea', label: 'Maitrea (Riker)' },
+          title: 'Fixture Linux is degraded', detail: 'The executor reported a degraded runtime state.',
+          resource: { type: 'executor', id: 'fixture-linux', label: 'Fixture Linux' },
           observed_at: null, action_url: '/settings?tab=executors', action_label: 'View' },
         { id: 'quota-critical', severity: 'critical', kind: 'provider_quota',
           title: 'Codex usage limit reached', detail: 'Weekly usage is exhausted until the next reset.',

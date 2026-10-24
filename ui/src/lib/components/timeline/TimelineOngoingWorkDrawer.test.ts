@@ -10,14 +10,14 @@ vi.mock('$lib/api/client', () => ({ api: { conversations: mocks } }));
 
 function work(kind: BackgroundWorkItem['kind'], fields: Partial<BackgroundWorkItem> = {}): BackgroundWorkItem {
   return { kind, work_id: kind, controller_conversation_id: 'conv-root', title: kind,
-    agent_id: 'laforge', status: 'running', todos: [], ...fields };
+    agent_id: 'fixture-worker', status: 'running', todos: [], ...fields };
 }
 
 describe('Ongoing work navigation and details', () => {
   afterEach(cleanup);
   beforeEach(() => {
     mocks.backgroundCommand.mockReset().mockResolvedValue({
-      shell_id: 'shell-preview', executor_id: 'maitrea_riker', command: 'npm run dev',
+      shell_id: 'shell-preview', executor_id: 'fixture-executor', command: 'npm run dev',
       cwd: '/workspace/ui', pid: 123, status: 'running', runtime_seconds: 65,
       idle_seconds: 10, exit_code: null, output_tail: '<script>alert(1)</script>',
       output_chars: 30, trimmed_chars: 0,

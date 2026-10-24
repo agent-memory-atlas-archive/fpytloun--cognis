@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      skip_unit_tests:
+        description: Explicit unit/contract rerun waiver for an ad-hoc prerelease only
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,6 +43,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           MODE: ${{ inputs.mode }}
           SKIP_GUI_TESTS: ${{ inputs.skip_gui_tests }}
+          SKIP_UNIT_TESTS: ${{ inputs.skip_unit_tests }}
         run: |
           python3 - <<'PY'
           import os, re
@@ -47,6 +53,9 @@ jobs:
           skip_gui = os.environ.get("SKIP_GUI_TESTS", "false")
           assert skip_gui in {"true", "false"}
           assert not (mode == "release" and skip_gui == "true"), "Trusted releases require GUI acceptance"
+          skip_unit = os.environ.get("SKIP_UNIT_TESTS", "false")
+          assert skip_unit in {"true", "false"}
+          assert not (mode == "release" and skip_unit == "true"), "Trusted releases require unit/contract qualification"
           with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
               stream.write(f"tag={tag}\nmode={mode}\n")
           PY
@@ -99,15 +108,23 @@ jobs:
               stream.write(f"COGNIS_APP_VERSION={version}\n")
           PY
       - name: Build and validate before credentials are available
+        env:
+          SKIP_UNIT_TESTS: ${{ inputs.skip_unit_tests }}
         run: |
           set -euo pipefail
-          env -u COGNIS_PACKAGE_FLAVOR python3 -m unittest discover -s apps/apple/tests
+          if [ "$SKIP_UNIT_TESTS" != true ]; then
+            env -u COGNIS_PACKAGE_FLAVOR python3 -m unittest discover -s apps/apple/tests
+          fi
           brew install cairo
           DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix cairo)/lib"
           export DYLD_FALLBACK_LIBRARY_PATH
           # Signed mode builds ad-hoc first; credentials enter only after validation.
           COGNIS_SIGNING_MODE=adhoc bash apps/apple/build.sh
-          swift test --package-path apps/apple --filter CompanionContractTests
+          if [ "$SKIP_UNIT_TESTS" != true ]; then
+            swift test --package-path apps/apple --filter CompanionContractTests
+          else
+            printf '%s\n' 'Unit/contract reruns explicitly waived for this ad-hoc prerelease; not passing qualification.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Native GUI and browser acceptance
         if: ${{ !inputs.skip_gui_tests }}
         run: |
@@ -223,7 +240,7 @@ jobs:
           # Never create or publish a release here. Parent reviews the draft.
           found=false
           for _attempt in $(seq 1 40); do
-            if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.draft == true and .prerelease == true' 2>/dev/null | grep -qx true; then
+            if gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft,isPrerelease,tagName --jq '.isDraft == true and .isPrerelease == true and .tagName == env.RELEASE_TAG' 2>/dev/null | grep -qx true; then
               found=true
               break
             fi

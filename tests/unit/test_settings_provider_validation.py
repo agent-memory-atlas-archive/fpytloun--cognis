@@ -17,7 +17,7 @@ def test_executor_preview_validation_requires_single_selector() -> None:
             "executor",
             {
                 "preset": "ollama",
-                "executor_id": "olorin",
+                "executor_id": "fixture-mac",
                 "executor_labels": {"host": "mac"},
             },
         )

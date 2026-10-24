@@ -95,15 +95,16 @@ function fixtureTool(scope: TimelineScope, index: number, toolName: string, argu
   };
 }
 
-const LONG_TOKEN = `ERR_PERMISSION_DENIED:${'/var/lib/cognis/executors/maitrea/sessions/sess_5b92da9e5fcd46abbf58fa5d3a05ca99'.repeat(4)}`;
+// Synthetic segments preserve path depth and long-token wrapping pressure.
+const LONG_TOKEN = `ERR_PERMISSION_DENIED:${'/var/lib/cognis/executors/runner1/sessions/sess_00000000000000000000000000000001'.repeat(4)}`;
 
 /** Opt-in (`?layout-cases`) width and overflow cases; not part of the default stream. */
 function layoutCaseItems(scope: TimelineScope): TimelineItem[] {
-  const header = '| Station | Script SHA-256 | Probe | Sync started | Last failure | Status |';
-  const row = (index: number) => `| BI-${String(index).padStart(2, '0')} | 9f2c41d07a6be3e5c1d8a4b2f0e9c7d6 | absent | October 21 at 12:25 UTC | none after deployment | verified |`;
+  const header = '| Fixture | Sample digest | Probe | Fixture clock | Expected error | State |';
+  const row = (index: number) => `| FX-${String(index).padStart(2, '0')} | 00000000000000000000000000000001 | absent | January 1 at 00:00 UTC | none in this sample | synthetic |`;
   return [
     item(`${scope.key}:layout-assistant`, '0001:layout', [
-      'The deployment is verified across all stations. This paragraph is intentionally long so its line length shows the reading measure applied to assistant prose in every theme, while tables below may use the full width where the theme has no message bubble.',
+      'This synthetic dataset illustrates a group of fictional work items. This paragraph is intentionally long so its line length shows the reading measure applied to assistant prose in every theme, while tables below may use the full width where the theme has no message bubble.',
       '',
       [header, '| --- | --- | --- | --- | --- | --- |', ...Array.from({ length: 4 }, (_, index) => row(index + 1))].join('\n'),
     ].join('\n')),

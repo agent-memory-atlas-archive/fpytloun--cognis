@@ -51,16 +51,16 @@ def test_basic_concatenation_assembles_full_json() -> None:
 def test_nested_management_envelope_survives_fragmentation(wrapper: str | None) -> None:
     acc = StreamAccumulator()
     settings = {
-        "executor_id": "maitrea_riker",
+        "executor_id": "fixture-executor",
         "memory_backend": "mnemory",
         "memory_backend_options": {"mode": "full_auto"},
     }
-    envelope = {"action": "settings_update", "agent_id": "dobby", "settings": settings}
+    envelope = {"action": "settings_update", "agent_id": "fixture-agent", "settings": settings}
     if wrapper:
         _feed_tool_delta(acc, '{"tool":"manage_agents","arguments":', name=wrapper)
     _feed_tool_delta(
         acc,
-        '{"action":"settings_update","agent_id":"dobby","settings":',
+        '{"action":"settings_update","agent_id":"fixture-agent","settings":',
         name=wrapper or "manage_agents",
     )
     _feed_tool_delta(acc, json.dumps(settings), name=wrapper or "manage_agents")

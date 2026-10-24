@@ -326,7 +326,7 @@ async def test_new_turn_resets_outage_but_reclaim_and_blocked_claim_preserve_it(
     try:
         async with factory() as session:
             conversation = await get_conversation(session, "conv-a")
-            conversation.active_executor_id = "maitrea_riker"
+            conversation.active_executor_id = "fixture-executor"
             await session.commit()
         first = await _admit(store, "outage-first", "First turn")
         second = await _admit(store, "outage-second", "Next turn")
@@ -345,7 +345,7 @@ async def test_new_turn_resets_outage_but_reclaim_and_blocked_claim_preserve_it(
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=datetime.now(UTC) - timedelta(hours=1),
         )
         assert original.remaining_seconds() == 0
@@ -354,7 +354,7 @@ async def test_new_turn_resets_outage_but_reclaim_and_blocked_claim_preserve_it(
         reclaimed = await claim(first.request.request_id)
         assert reclaimed.attempt_count == 2
         preserved = await begin_executor_recovery(
-            factory, conversation_id="conv-a", task_id=None, executor_id="maitrea_riker"
+            factory, conversation_id="conv-a", task_id=None, executor_id="fixture-executor"
         )
         assert preserved.deadline == original.deadline
         assert await store.mark_terminal(
@@ -365,7 +365,7 @@ async def test_new_turn_resets_outage_but_reclaim_and_blocked_claim_preserve_it(
         )
         assert await claim(second.request.request_id)
         fresh = await begin_executor_recovery(
-            factory, conversation_id="conv-a", task_id=None, executor_id="maitrea_riker"
+            factory, conversation_id="conv-a", task_id=None, executor_id="fixture-executor"
         )
         assert fresh.unavailable_since > original.deadline
         assert fresh.remaining_seconds() > 890
@@ -383,7 +383,7 @@ async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: 
             await set_conversation_active_executor(
                 session,
                 "conv-a",
-                "maitrea_riker",
+                "fixture-executor",
                 source="explicit_primary",
             )
             await session.commit()
@@ -392,14 +392,14 @@ async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: 
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=first_observation,
         )
         recovered = await begin_executor_recovery(
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=first_observation + timedelta(minutes=5),
         )
 
@@ -411,7 +411,7 @@ async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: 
         timeout = ExecutorRecoveryTimeout(recovered, phase="runtime_admission")
         assert timeout.detail == {
             "code": "executor_recovery_timeout",
-            "executor_id": "maitrea_riker",
+            "executor_id": "fixture-executor",
             "unavailable_since": first_observation.isoformat(),
             "deadline": recovered.deadline.isoformat(),
             "waited_seconds": EXECUTOR_RECOVERY_WINDOW_SECONDS,
@@ -422,7 +422,7 @@ async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: 
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
         )
         async with factory() as session:
             conversation = await get_conversation(session, "conv-a")
@@ -433,7 +433,7 @@ async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: 
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=second_observation,
         )
         assert second.unavailable_since == second_observation
@@ -453,7 +453,7 @@ async def test_executor_recovery_first_observation_uses_database_clock(tmp_path:
             await set_conversation_active_executor(
                 session,
                 "conv-a",
-                "maitrea_riker",
+                "fixture-executor",
                 source="explicit_primary",
             )
             before = await database_now(session)
@@ -463,7 +463,7 @@ async def test_executor_recovery_first_observation_uses_database_clock(tmp_path:
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
         )
         async with factory() as session:
             after = await database_now(session)
@@ -486,7 +486,7 @@ async def test_concurrent_unavailable_cas_returns_winning_timestamp(tmp_path: Pa
             await set_conversation_active_executor(
                 session,
                 "conv-a",
-                "maitrea_riker",
+                "fixture-executor",
                 source="selector_primary",
             )
             await session.commit()
@@ -497,7 +497,7 @@ async def test_concurrent_unavailable_cas_returns_winning_timestamp(tmp_path: Pa
                     session,
                     conversation_id="conv-a",
                     task_id=None,
-                    expected_executor_id="maitrea_riker",
+                    expected_executor_id="fixture-executor",
                     expected_generation=1,
                     observed_at=at,
                 )
@@ -583,7 +583,7 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
         await set_conversation_active_executor(
             session,
             "conv-a",
-            "maitrea_riker",
+            "fixture-executor",
             source="selector_primary",
         )
         await session.commit()
@@ -611,7 +611,7 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=unavailable_since,
         )
         old_fence = fence
@@ -630,7 +630,7 @@ async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
             factory,
             conversation_id="conv-a",
             task_id=None,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
             observed_at=unavailable_since + timedelta(minutes=10),
         )
         dispatch_boundary.set()

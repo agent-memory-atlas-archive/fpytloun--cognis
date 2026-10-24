@@ -1207,7 +1207,7 @@ async def test_start_authorization_uses_executor_loopback_redirect_uri(
         return server
 
     async def fake_get_executor_row(*args, **kwargs):
-        return SimpleNamespace(executor_id="exec-1", name="Olorin")
+        return SimpleNamespace(executor_id="exec-1", name="Fixture Mac")
 
     async def fake_create_transaction(session, **kwargs):
         row = SimpleNamespace(notification_id=None, **kwargs)
@@ -1252,7 +1252,7 @@ async def test_start_authorization_uses_executor_loopback_redirect_uri(
     assert query["redirect_uri"] == ["http://127.0.0.1:4567/oauth/callback"]
     assert result.callback_mode == "executor_loopback"
     assert result.oauth_executor_id == "exec-1"
-    assert result.oauth_executor_name == "Olorin"
+    assert result.oauth_executor_name == "Fixture Mac"
     assert result.redirect_uri == "http://127.0.0.1:4567/oauth/callback"
     assert started_states == [query["state"][0]]
     assert transaction_rows[0].redirect_uri == "http://127.0.0.1:4567/oauth/callback"
@@ -3545,7 +3545,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Executor:
-        executor_id = "olorin"
+        executor_id = "fixture-mac"
         desired_config_version = 4
         applied_config_version = 4
 
@@ -3629,10 +3629,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         reason="test",
     )
 
-    assert runtime_updates == [("olorin", "reconfiguring")]
+    assert runtime_updates == [("fixture-mac", "reconfiguring")]
     assert session.committed is True
-    assert scheduled == ["olorin"]
-    assert result == ["olorin"]
+    assert scheduled == ["fixture-mac"]
+    assert result == ["fixture-mac"]
 
     desired_before_refresh = executor.desired_config_version
     result = await schedule_mcp_server_executor_reconfigure_for_app(
@@ -3641,10 +3641,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         reason="mcp_oauth_refresh_succeeded",
     )
 
-    assert result == ["olorin"]
+    assert result == ["fixture-mac"]
     assert executor.desired_config_version == desired_before_refresh
-    assert runtime_updates == [("olorin", "reconfiguring")]
-    assert credential_reloads == [("olorin", "mcp-1")]
+    assert runtime_updates == [("fixture-mac", "reconfiguring")]
+    assert credential_reloads == [("fixture-mac", "mcp-1")]
 
     runtime_updates.clear()
     scheduled.clear()
@@ -3674,10 +3674,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         terminal_cleanup_transaction_id="txn-1",
     )
 
-    assert result == ["olorin"]
+    assert result == ["fixture-mac"]
     assert repeated == []
-    assert runtime_updates == [("olorin", "reconfiguring")]
-    assert scheduled == ["olorin"]
+    assert runtime_updates == [("fixture-mac", "reconfiguring")]
+    assert scheduled == ["fixture-mac"]
     assert cleanup_transaction.terminal_reconfigure_applied_at is not None
     assert cleanup_transaction.terminal_reconfigure_completed_at is not None
 
@@ -3706,7 +3706,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     assert cleanup_transaction.terminal_reconfigure_applied_at is not None
     assert cleanup_transaction.terminal_reconfigure_completed_at is None
     assert executor.desired_config_version == 5
-    assert runtime_updates == [("olorin", "reconfiguring")]
+    assert runtime_updates == [("fixture-mac", "reconfiguring")]
 
     monkeypatch.setattr(
         "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
@@ -3742,12 +3742,12 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         terminal_cleanup_transaction_id="txn-1",
     )
 
-    assert recovered == ["olorin"]
-    assert late_recovery == ["olorin"]
+    assert recovered == ["fixture-mac"]
+    assert late_recovery == ["fixture-mac"]
     assert completed == []
     assert repeated == []
-    assert runtime_updates == [("olorin", "reconfiguring")]
-    assert scheduled == ["olorin", "olorin"]
+    assert runtime_updates == [("fixture-mac", "reconfiguring")]
+    assert scheduled == ["fixture-mac", "fixture-mac"]
     assert cleanup_transaction.terminal_reconfigure_completed_at is not None
 
 
@@ -3775,7 +3775,7 @@ async def test_oauth_completion_schedules_reconfigure_and_emits_status(
 
     async def fake_schedule(_app: object, **kwargs: object) -> list[str]:
         scheduled.append(kwargs)
-        return ["olorin"]
+        return ["fixture-mac"]
 
     monkeypatch.setattr(
         "cognis.api.routes.mcp_oauth.get_mcp_oauth_transaction", fake_get_transaction

@@ -5,9 +5,9 @@ second chat client. Requires macOS 15+, Xcode/Swift 6 and Node/npm for builds.
 The initial public distribution is an **ad-hoc-signed prerelease**, not an Apple
 Developer ID-signed or notarized application. macOS or managed-device policy may
 restrict installation. GUI/browser acceptance remains unqualified for the initial
-0.18.0 prerelease; skipping it is not a passing result.
+0.18.1 prerelease; skipping it is not a passing result.
 
-Use the [macOS release](https://github.com/fpytloun/cognis/releases/tag/macos-v0.18.0)
+Use the [macOS release](https://github.com/fpytloun/cognis/releases/tag/macos-v0.18.1)
 for Apple Silicon and Intel disk images. Once the matching release and cask are
 published, install with:
 
@@ -20,6 +20,11 @@ where the operating system permits them. Do not disable Gatekeeper or remove
 quarantine to bypass policy. Ad-hoc builds use the standard app icon for
 notifications, not communication avatars. Intel packaging does not establish
 physical Intel runtime coverage.
+
+An operator may explicitly waive packaging unit/contract reruns for an ad-hoc
+prerelease with `skip_unit_tests: true` when dispatching the release workflow.
+The default remains to run them; trusted releases reject this waiver. Record it
+in the release qualification notes rather than treating skipped checks as passed.
 
 The companion includes optional existing-executor controls, resident native
 notifications and opt-in login/background restore. Build identity and signing

@@ -419,7 +419,7 @@ Before upgrading production:
 - review release notes for schema or executor changes
 - restart executors after controller upgrades when tool schemas or browser settings changed
 
-### Preparing for 0.18.0
+### Preparing for 0.18.1
 
 Review the upcoming notes in **Docs → What's new** before upgrading. Changes
 since 0.17.1 include project collaboration and knowledgebase grants, document

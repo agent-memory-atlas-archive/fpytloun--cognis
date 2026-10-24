@@ -390,9 +390,9 @@ def test_orchestration_target_catalog_enriches_schema_descriptor_and_validation(
         ),
     )
     managed_target = OrchestrationTarget(
-        agent_id="lumi",
-        name="Lumi",
-        description="Lumilens primary agent",
+        agent_id="fixture-primary",
+        name="Fixture primary agent",
+        description="Synthetic primary agent",
         agent_type="primary",
         is_system=False,
         profiles=(
@@ -416,7 +416,7 @@ def test_orchestration_target_catalog_enriches_schema_descriptor_and_validation(
     )
 
     assert tool_input_schema(delegate)["properties"]["agent_id"]["enum"] == ["system:code-review"]
-    assert tool_input_schema(managed)["properties"]["agent_id"]["enum"] == ["lumi"]
+    assert tool_input_schema(managed)["properties"]["agent_id"]["enum"] == ["fixture-primary"]
     assert (
         "Findings-first review"
         in tool_input_schema(delegate)["properties"]["agent_id"]["description"]

@@ -2997,7 +2997,7 @@ describe('chat page helpers', () => {
         { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
         {
           kind: 'system_message',
-          text: 'Turn failed: anthropic-lumilens rate-limited claude-fable-5 after 1 attempt(s).',
+          text: 'Turn failed: anthropic-fixture1 rate-limited claude-fixture-1 after 1 attempt(s).',
           noticeKind: 'model_error',
           noticeScope: 'failed_turn',
         },

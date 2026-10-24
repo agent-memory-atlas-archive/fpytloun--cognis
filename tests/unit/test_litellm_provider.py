@@ -1445,7 +1445,7 @@ async def test_user_owned_anthropic_provider_visible_with_actor_scope(tmp_path: 
                     "base_url": "http://127.0.0.1:8090",
                     "api_base": "http://127.0.0.1:8090",
                     "auth_config": {"mode": "none"},
-                    "executor_id": "maitrea",
+                    "executor_id": "fixture-linux",
                 },
                 status="active",
             )
@@ -3845,7 +3845,7 @@ async def test_litellm_provider_routes_executor_location_via_inference_router(
                 backend="litellm",
                 config={
                     "default_model": "gpt-4o-mini",
-                    "executor_id": "maitrea",
+                    "executor_id": "fixture-linux",
                     "executor_labels": {"location": "local"},
                 },
                 status="active",
@@ -3856,7 +3856,7 @@ async def test_litellm_provider_routes_executor_location_via_inference_router(
     class Router:
         async def route_generate(self, **kwargs: object) -> dict[str, object]:
             assert kwargs["model"] == "gpt-4o-mini"
-            assert kwargs["executor_id"] == "maitrea"
+            assert kwargs["executor_id"] == "fixture-linux"
             assert kwargs["executor_labels"] == {"location": "local"}
             return {"choices": [{"message": {"content": "hello"}}], "usage": {}}
 
@@ -4184,7 +4184,7 @@ async def test_litellm_provider_test_reports_executor_backend_metadata(
                 config={
                     "preset": "anthropic",
                     "default_model": "claude-opus-4-7",
-                    "executor_id": "olorin",
+                    "executor_id": "fixture-mac",
                     "base_url": "http://127.0.0.1:8090",
                     "api_base": "http://127.0.0.1:8090",
                     "auth_config": {"mode": "none"},
@@ -4197,7 +4197,7 @@ async def test_litellm_provider_test_reports_executor_backend_metadata(
     class Router:
         async def route_generate(self, **kwargs: object) -> dict[str, object]:
             assert kwargs["backend"] == "litellm"
-            assert kwargs["executor_id"] == "olorin"
+            assert kwargs["executor_id"] == "fixture-mac"
             return {"choices": [{"message": {"content": "hello"}}], "usage": {}}
 
     provider = LiteLLMProvider(session_factory, inference_router=Router())
@@ -4205,7 +4205,7 @@ async def test_litellm_provider_test_reports_executor_backend_metadata(
     result = await provider.test_provider("meridian-claude")
     assert result["ok"] is True, result
     assert result["executor_routed"] is True
-    assert result["executor_id"] == "olorin"
+    assert result["executor_id"] == "fixture-mac"
     assert result["executor_backend"] == "litellm"
     await engine.dispose()
 
@@ -6615,7 +6615,7 @@ async def test_litellm_provider_discover_models_routes_ollama_to_executor(
                     "preset": "ollama",
                     "base_url": "http://localhost:11434",
                     "api_base": "http://localhost:11434",
-                    "executor_id": "olorin",
+                    "executor_id": "fixture-mac",
                     "default_model": "ornith:9b",
                 },
                 status="active",
@@ -6641,7 +6641,7 @@ async def test_litellm_provider_discover_models_routes_ollama_to_executor(
             "preset": "ollama",
             "base_url": "http://localhost:11434",
             "api_key": "",
-            "executor_id": "olorin",
+            "executor_id": "fixture-mac",
             "executor_labels": None,
             "provider_id": "ollama",
             "owner_email": "owner@example.com",
@@ -6667,7 +6667,7 @@ async def test_litellm_provider_discover_models_rejects_non_ollama_executor(
                     "base_url": "http://ollama-compatible.example.test",
                     "api_base": "http://ollama-compatible.example.test",
                     "default_model": "gpt-4o-mini",
-                    "executor_id": "olorin",
+                    "executor_id": "fixture-mac",
                 },
                 status="active",
             )

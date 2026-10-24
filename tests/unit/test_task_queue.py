@@ -207,7 +207,7 @@ async def test_agent_workflow_edit_revokes_schedule_and_detached_task_origin(tmp
             call_id="call_scope",
             tool="bash",
             args=pinned.steps[0].tool_call.args,
-            executor_id="maitrea_riker",
+            executor_id="fixture-executor",
         )
         assert declaration.authorized_by == expected
         assert "scope_origin_reason" not in declaration.model_dump()
@@ -255,7 +255,7 @@ async def test_agent_workflow_edit_revokes_schedule_and_detached_task_origin(tmp
                 registry=registry,
                 executor=executor,
                 workflow_step_scope=scope,
-                workflow_executor_id="maitrea_riker",
+                workflow_executor_id="fixture-executor",
             )
             assert (
                 guardrails.declare_workflow_step.call_args.args[0].authorized_by == "agent_composed"

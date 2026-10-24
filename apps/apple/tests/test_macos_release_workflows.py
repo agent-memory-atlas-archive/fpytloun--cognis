@@ -83,7 +83,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--clobber", mac)
         self.assertNotIn("gh release create", mac)
         self.assertNotIn("gh release edit", mac)
-        self.assertIn(".draft == true and .prerelease == true", mac)
+        self.assertIn(".isDraft == true and .isPrerelease == true", mac)
+        self.assertIn(".tagName == env.RELEASE_TAG", mac)
         self.assertIn('record["identity"]["source"] == source', mac)
         docker = (directory / "docker-publish.yml").read_text()
         self.assertEqual(docker.count("if: needs.release-gate.outputs.project == 'true'"), 2)
@@ -133,9 +134,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         source = textwrap.dedent(workflow.split("run: |\n", 1)[1].split("\n  build:", 1)[0])
         for ref_type, tag, valid in (
-            ("tag", "v0.18.0", True),
-            ("branch", "v0.18.0", False),
-            ("tag", "0.18.0", False),
+            ("tag", "v0.18.1", True),
+            ("branch", "v0.18.1", False),
+            ("tag", "0.18.1", False),
             ("tag", "v0.17.1", False),
         ):
             with self.subTest(ref_type=ref_type, tag=tag):
@@ -147,6 +148,36 @@ class WorkflowTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
+
+    def test_unit_waiver_is_explicit_and_rejected_for_trusted_releases(self):
+        import textwrap
+
+        source = textwrap.dedent(embedded_python("macos-release.yml"))
+        for mode, waiver, valid in (
+            ("adhoc", "false", True),
+            ("adhoc", "true", True),
+            ("release", "false", True),
+            ("release", "true", False),
+            ("adhoc", "unrecognized", False),
+        ):
+            with self.subTest(mode=mode, waiver=waiver), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "output"
+                with patch.dict(
+                    os.environ,
+                    {
+                        "RELEASE_TAG": "macos-v0.18.1",
+                        "MODE": mode,
+                        "SKIP_GUI_TESTS": "false",
+                        "SKIP_UNIT_TESTS": waiver,
+                        "GITHUB_OUTPUT": str(output),
+                    },
+                ):
+                    if valid:
+                        exec(source, {})
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(source, {})
+                self.assertEqual(output.exists(), valid)
 
     def test_packaging_checks_isolate_the_release_flavor(self):
         import shlex

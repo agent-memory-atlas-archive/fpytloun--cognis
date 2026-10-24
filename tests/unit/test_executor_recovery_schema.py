@@ -85,7 +85,7 @@ async def test_recovery_schema_and_fenced_claim(tmp_path, dialect):
                 agent_id="a",
                 context_type="web",
             )
-            conversation.active_executor_id = "maitrea_riker"
+            conversation.active_executor_id = "fixture-executor"
             conversation.active_executor_unavailable_since = datetime.now(UTC) - timedelta(hours=1)
             active = await create_session(session, "c", "u@example.com", "a")
             conversation.active_session_id = active.session_id
@@ -123,7 +123,7 @@ async def test_recovery_schema_and_fenced_claim(tmp_path, dialect):
         recovery_args = {
             "conversation_id": "c",
             "task_id": None,
-            "executor_id": "maitrea_riker",
+            "executor_id": "fixture-executor",
             "notice_dispatcher": dispatcher,
         }
         await begin_executor_recovery(factory, **recovery_args)
